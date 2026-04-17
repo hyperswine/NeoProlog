@@ -4,6 +4,7 @@
 output/
 NOTES.txt
 .neoprolog_history
+.nprolog_history
 *.hex
 .vscode/
 dist-newstyle/
