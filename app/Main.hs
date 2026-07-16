@@ -3,6 +3,7 @@
 module Main where
 
 import qualified NeoProlog
+import qualified Infera
 
 main :: IO ()
-main = NeoProlog.main
+main = Infera.main

@@ -449,7 +449,7 @@ prop_clause_rule_fires = property $ do
   case parseProgram prog of
     Left e -> do annotate e; failure
     Right p ->
-      let solns = solveAll p [Compound rule [NProlog.Var "Z"]]
+      let solns = solveAll p [Compound rule [Var "Z"]]
        in assert (length solns >= 1)
 
 -- A goal that matches no clause yields no solutions

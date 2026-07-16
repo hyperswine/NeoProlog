@@ -1,12 +1,12 @@
-# NeoProlog
+# Infera
 
 A Prolog-inspired logic programming language implemented in Haskell.
 
 ## Usage
 
 ```prolog
-neoprolog <file.nprolog>      # load a file and drop into the REPL
-neoprolog reg <file.nprolog>  # register a module in ./neoprolog.conf
+infera <file.nprolog>      # load a file and drop into the REPL
+infera reg <file.nprolog>  # register a module in ./neoprolog.conf
 ```
 
 ## Modules

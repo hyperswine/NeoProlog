@@ -1,6 +1,6 @@
-name:                neoprolog
+name:                infera
 version:             0.1.0.0
-github:              "hyperswine/neoprolog"
+github:              "hyperswine/NeoProlog"
 license:             GPL-3
 author:              "Jasen Qin"
 maintainer:          "jasen.qin33@gmail.com"
@@ -9,7 +9,7 @@ copyright:           "2025 Jasen Qin"
 extra-source-files:
 - README.md
 
-description: NeoProlog — a Prolog-inspired logic programming language in Haskell
+description: Infera — a Prolog-inspired logic programming language in Haskell
 
 dependencies:
 - base >= 4.7 && < 5
@@ -41,27 +41,29 @@ library:
   source-dirs: src
   exposed-modules:
     - NeoProlog
+    - Infera
 
-executable neoprolog-exe:
-  main:                Main.hs
-  source-dirs:         app
-  ghc-options:
-    - -O2
-    - -threaded
-    - -rtsopts
-    - -with-rtsopts=-N
-  dependencies:
-    - neoprolog
+executables:
+  infera-exe:
+    main:                Main.hs
+    source-dirs:         app
+    ghc-options:
+      - -O2
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - infera
 
-test-suite neoprolog-test:
-  type:                exitcode-stdio-1.0
-  main-is:             Spec.hs
-  source-dirs:         test
-  ghc-options:
-    - -threaded
-    - -rtsopts
-    - -with-rtsopts=-N
-  dependencies:
-    - neoprolog
-    - hedgehog
-    - containers
+tests:
+  infera-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - infera
+      - hedgehog
+      - containers
