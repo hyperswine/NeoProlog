@@ -1,109 +1,92 @@
-cabal-version: 1.12
-
--- This file has been generated from package.yaml by hpack version 0.39.6.
---
--- see: https://github.com/sol/hpack
-
-name:           infera
-version:        2.0.0.0
-description:    Infera v2 - a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z)
-homepage:       https://github.com/hyperswine/NeoProlog#readme
-bug-reports:    https://github.com/hyperswine/NeoProlog/issues
-author:         Jasen Qin
-maintainer:     jasen.qin33@gmail.com
-copyright:      2025 Jasen Qin
-license:        GPL-3
-build-type:     Simple
-extra-source-files:
-    README.md
+cabal-version:      3.0
+name:               infera
+version:            2.0.0
+synopsis:           Prolog-inspired logic language with sorts, modes, tabling and CLP(Z)
+description:
+    Infera is a Prolog-inspired logic programming language.  Predicates can
+    declare (or have inferred) sorts, argument modes and determinism; the
+    engine indexes and tables predicates by default, supports cut and
+    if-then-else, a simple CLP(Z) solver, DCGs and a hash-addressed module
+    system.
+homepage:           https://github.com/hyperswine/NeoProlog
+bug-reports:        https://github.com/hyperswine/NeoProlog/issues
+license:            GPL-3.0-only
+author:             Jasen Qin
+maintainer:         jasen.qin33@gmail.com
+copyright:          2025 Jasen Qin
+category:           Language
+build-type:         Simple
+extra-doc-files:    README.md
+tested-with:        GHC == 9.8.2
 
 source-repository head
-  type: git
-  location: https://github.com/hyperswine/NeoProlog
+    type:     git
+    location: https://github.com/hyperswine/NeoProlog.git
+
+common warnings
+    ghc-options:
+        -Wall
+        -Wcompat
+        -Widentities
+        -Wincomplete-record-updates
+        -Wincomplete-uni-patterns
+        -Wmissing-home-modules
+        -Wpartial-fields
+        -Wredundant-constraints
 
 library
-  exposed-modules:
-      Infera
-      Infera.Syntax
-      Infera.Error
-      Infera.Unify
-      Infera.Arith
-      Infera.CLP
-      Infera.Program
-      Infera.Infer
-      Infera.Engine
-      Infera.Module
-      Infera.Repl
-  other-modules:
-      Paths_infera
-  hs-source-dirs:
-      src
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
-  build-depends:
-      base >=4.7 && <5
-    , bytestring
-    , containers
-    , cryptohash-sha1
-    , directory
-    , filepath
-    , haskeline
-    , hedgehog
-    , megaparsec
-    , mtl
-    , parser-combinators
-    , prettyprinter
-    , prettyprinter-ansi-terminal
-    , text
-  default-language: Haskell2010
+    import:           warnings
+    hs-source-dirs:   src
+    default-language: Haskell2010
+    exposed-modules:
+        Infera
+        Infera.Syntax
+        Infera.Error
+        Infera.Unify
+        Infera.Arith
+        Infera.CLP
+        Infera.Program
+        Infera.Infer
+        Infera.Engine
+        Infera.Module
+        Infera.Repl
+    build-depends:
+        base                        >= 4.14 && < 5,
+        bytestring                  >= 0.10,
+        containers                  >= 0.6,
+        cryptohash-sha1             >= 0.11,
+        directory                   >= 1.3,
+        filepath                    >= 1.4,
+        haskeline                   >= 0.8,
+        megaparsec                  >= 9.0,
+        mtl                         >= 2.2,
+        parser-combinators          >= 1.3,
+        prettyprinter               >= 1.7,
+        prettyprinter-ansi-terminal >= 1.1,
+        text                        >= 1.2
 
-executable infera-exe
-  main-is: Main.hs
-  other-modules:
-      Paths_infera
-  hs-source-dirs:
-      app
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -O2 -threaded -rtsopts -with-rtsopts=-N
-  build-depends:
-      base >=4.7 && <5
-    , bytestring
-    , containers
-    , cryptohash-sha1
-    , directory
-    , filepath
-    , haskeline
-    , hedgehog
-    , infera
-    , megaparsec
-    , mtl
-    , parser-combinators
-    , prettyprinter
-    , prettyprinter-ansi-terminal
-    , text
-  default-language: Haskell2010
+executable infera
+    import:           warnings
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    default-language: Haskell2010
+    ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N"
+    build-depends:
+        base,
+        infera
 
 test-suite infera-test
-  type: exitcode-stdio-1.0
-  main-is: Spec.hs
-  other-modules:
-      InferaTest
-      Paths_infera
-  hs-source-dirs:
-      test
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
-  build-depends:
-      base >=4.7 && <5
-    , bytestring
-    , containers
-    , cryptohash-sha1
-    , directory
-    , filepath
-    , haskeline
-    , hedgehog
-    , infera
-    , megaparsec
-    , mtl
-    , parser-combinators
-    , prettyprinter
-    , prettyprinter-ansi-terminal
-    , text
-  default-language: Haskell2010
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Spec.hs
+    other-modules:    InferaTest
+    default-language: Haskell2010
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
+    build-depends:
+        base,
+        containers,
+        directory,
+        filepath,
+        hedgehog   >= 1.0,
+        infera

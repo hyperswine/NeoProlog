@@ -27,11 +27,32 @@ import Infera.Program
 import Infera.Repl
 import Infera.Syntax
 import Infera.Unify
+import qualified Data.IntMap.Strict as IM
+import Control.Monad (forM)
 import System.Environment (getArgs)
+import System.Exit (exitFailure)
+import System.IO (hPutStrLn, stderr)
 
 main :: IO ()
 main = do
   args <- getArgs
   case args of
     ("reg" : paths) -> mapM_ registerModule paths
+    ("check" : paths) -> checkFiles paths
     _ -> runRepl
+
+-- | @infera check FILE...@: load each file (resolving imports and running the
+-- analyses) and report parse or module errors.  Exits non-zero on failure.
+checkFiles :: [FilePath] -> IO ()
+checkFiles paths = do
+  results <- forM paths $ \path -> do
+    res <- loadFile path
+    case res of
+      Left err -> do
+        hPutStrLn stderr (path ++ ": error: " ++ err)
+        return False
+      Right (prog, queries) -> do
+        let n = sum [IM.size (predClauses p) | p <- programPreds prog]
+        putStrLn (path ++ ": ok (" ++ show n ++ " clauses, " ++ show (length queries) ++ " queries)")
+        return True
+  if and results then return () else exitFailure

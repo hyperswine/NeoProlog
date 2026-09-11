@@ -1,0 +1,93 @@
+{
+  "name": "infera-lsp",
+  "displayName": "Infera",
+  "description": "Language support for Infera v2 (.nprolog / .infera): highlighting, hover, navigation, completion, diagnostics and module-aware go-to-definition.",
+  "version": "2.0.0",
+  "publisher": "hyperswine",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hyperswine/NeoProlog.git",
+    "directory": "lsp"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "infera",
+    "nprolog",
+    "prolog",
+    "logic programming"
+  ],
+  "main": "./client/extension.js",
+  "activationEvents": [
+    "onLanguage:infera"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "infera",
+        "aliases": [
+          "Infera",
+          "NProlog"
+        ],
+        "extensions": [
+          ".nprolog",
+          ".infera"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "infera",
+        "scopeName": "source.infera",
+        "path": "./syntaxes/infera.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Infera",
+      "properties": {
+        "infera.executable": {
+          "type": "string",
+          "default": "infera",
+          "description": "Path to the infera executable, used to run `infera check` on save for parser diagnostics."
+        },
+        "infera.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run `infera check <file>` when a file is opened or saved and show its errors."
+        }
+      }
+    },
+    "semanticTokenScopes": [
+      {
+        "language": "infera",
+        "scopes": {
+          "type": [
+            "support.type.infera"
+          ],
+          "namespace": [
+            "entity.name.namespace.infera"
+          ]
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "package": "vsce package",
+    "install-extension": "vsce package -o infera-lsp.vsix && code --install-extension infera-lsp.vsix"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.12"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0"
+  }
+}

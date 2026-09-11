@@ -7,19 +7,41 @@ DCGs, and a hash-addressed **module system**.
 
 The previous engine lives on the `v1` branch (tag `v1.0.0`).
 
+## Install
+
+With [Homebrew](https://brew.sh) (builds from source with Homebrew's GHC):
+
+```
+brew tap hyperswine/neoprolog https://github.com/hyperswine/NeoProlog
+brew install infera
+```
+
+From a checkout, with GHC and cabal-install (for example via
+[ghcup](https://www.haskell.org/ghcup/)):
+
+```
+cabal build
+cabal test
+cabal install            # puts `infera` in ~/.cabal/bin or ~/.local/bin
+```
+
+If linking fails on macOS with `tapi error: malformed file ... unknown
+architecture`, your Command Line Tools SDK is newer than the linker Xcode
+selects; build with `DEVELOPER_DIR=/Library/Developer/CommandLineTools`.
+
 ## Usage
 
 ```
 infera <file.nprolog>      # load a file, run its inline queries, drop into the REPL
 infera reg <file.nprolog>  # register a module in ./neoprolog.conf
+infera check <files...>    # parse and analyse files, report errors (exit 1 on failure)
 ```
 
 REPL: clauses end with `.`, queries with `?`.  Commands: `:load <file>`,
 `:reload`, `:sig [pred]` (declared and inferred signatures), `:preds`, `:quit`.
 
 ```
-stack build && stack test
-stack exec infera-exe -- examples/stdlib.nprolog
+cabal run infera -- examples/stdlib.nprolog
 ```
 
 ## Syntax
@@ -147,6 +169,19 @@ main <- mymod:greet "world".
 Imported clauses and declarations are prefixed with `mymod:`; a module's own
 imports are resolved recursively.
 
+## Editor support
+
+[lsp/](lsp/) contains a VS Code extension with a language server: semantic
+highlighting, hover (built-ins, declared signatures), go to definition and
+references (including `mod:pred` through `neoprolog.conf`), completion,
+document symbols, and diagnostics (undefined predicates, arity mismatches,
+declaration problems, singleton variables, plus the real parser's errors
+via `infera check <file>` when the binary is installed).
+
+```
+cd lsp && npm install && npm run install-extension
+```
+
 ## Layout
 
 ```
@@ -161,4 +196,6 @@ src/Infera/Module.hs    neoprolog.conf and imports
 src/Infera/Repl.hs      interactive loop
 test/InferaTest.hs      hedgehog test suite
 examples/               stdlib, v2_decls, v2_clp, v2_tabling, ...
+Formula/infera.rb       Homebrew formula
+lsp/                    VS Code extension and language server
 ```

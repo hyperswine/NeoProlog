@@ -22,10 +22,22 @@ import Infera.Syntax
 import Prettyprinter
 import Prettyprinter.Render.Terminal
 import System.Console.Haskeline
-import System.Environment (getArgs)
+import System.Environment (getArgs, lookupEnv)
+import System.IO (hIsTerminalDevice, stdout)
+import System.IO.Unsafe (unsafePerformIO)
+
+-- | Colour output only when stdout is a terminal and NO_COLOR is unset.
+useColour :: Bool
+useColour = unsafePerformIO $ do
+  tty <- hIsTerminalDevice stdout
+  noColor <- lookupEnv "NO_COLOR"
+  return (tty && maybe True null noColor)
+{-# NOINLINE useColour #-}
 
 renderDoc :: Doc AnsiStyle -> String
-renderDoc = unpack . renderStrict . layoutPretty defaultLayoutOptions
+renderDoc doc
+  | useColour = unpack (renderStrict (layoutPretty defaultLayoutOptions doc))
+  | otherwise = unpack (renderStrict (layoutPretty defaultLayoutOptions (unAnnotate doc)))
 
 docErr :: String -> Doc AnsiStyle
 docErr msg = annotate (bold <> color Red) (pretty "Error: ") <> annotate (color Red) (pretty msg)
