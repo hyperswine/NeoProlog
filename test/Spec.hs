@@ -1,14 +1,11 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wno-missing-export-lists #-}
-
-module Main where
+module Main (main) where
 
 import Control.Monad (unless)
 import Hedgehog
-import NeoPrologTest (neoPrologGroup)
+import InferaTest (inferaGroup)
 import System.Exit (exitFailure)
 
 main :: IO ()
 main = do
-  ok <- checkParallel neoPrologGroup
+  ok <- checkSequential inferaGroup
   unless ok exitFailure

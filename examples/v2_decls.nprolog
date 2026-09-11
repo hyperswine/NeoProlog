@@ -1,0 +1,55 @@
+# ─── Infera v2: declarations (determinism, sorts, modes) ─────────────────────
+#
+#   name : det flags (sort: mode) (sort: mode) ...
+#
+#   determinism   det | semidet | multi | nondet          (default: inferred, else nondet)
+#   sorts         int | float | num | str | char | atom | any | list <sort>
+#   modes         <=  input   (must be ground at call)
+#                 =>  output  (ground after the call)
+#                 <=> in/out  (no requirement)
+#   flags         table | notable | index | noindex
+#
+# Declared signatures are enforced at runtime: a mode or sort violation is an
+# error, `det`/`multi` predicates that fail raise a determinism error, and
+# `det`/`semidet` predicates commit to their first solution.
+#
+# Undeclared predicates are analysed: see `:sig <name>` in the REPL.
+
+fact : det (int: <=) (int: =>).
+fact 0 1.
+fact N R <- N > 0, N1 is N - 1, fact N1 R1, R is N * R1.
+
+len : semidet (list any: <=) (int: =>).
+len [] 0.
+len [_ | T] N <- len T N1, N is N1 + 1.
+
+# Several declarations give alternative modes; the first one whose input
+# arguments are ground is used.
+plus2 : det (int: <=) (int: =>).
+plus2 : det (int: =>) (int: <=).
+plus2 X Y <- nonvar X, !, Y is X + 2.
+plus2 X Y <- X is Y - 2.
+
+greet : det (str: <=) (str: =>).
+greet Name G <- str_concat "hello, " Name G.
+
+# Flags-only declarations apply to every arity of the name.
+nat : notable.
+nat 0.
+nat N <- nat M, N is M + 1.
+
+# Inferred: semidet when argument 1 is ground, (num: <=) (num: =>)
+sign N S <- (N > 0 -> S = pos ; N < 0 -> S = neg ; S = zero).
+
+> fact 5 R?
+> len [a, b, c] N?
+> plus2 1 Y?
+> plus2 X 5?
+> greet "infera" G?
+> nat X, X > 3, !?
+> sign -2 S?
+
+# Errors (each query reports and moves on):
+> fact X 5?
+> fact a R?
+> len "abc" N?

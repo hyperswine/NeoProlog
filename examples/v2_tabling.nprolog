@@ -1,0 +1,41 @@
+# ─── Infera v2: tabling and indexing ─────────────────────────────────────────
+#
+# Tabling (memoised, fixpoint evaluation of calls) is on by default for every
+# predicate that is recursive, pure (no write/nl) and not merely structurally
+# recursive (list walkers such as length/append terminate anyway and are
+# evaluated directly).  Turn it off with `name : notable.` or globally with
+# `<- notable.`; force it with `name : table ...`.
+#
+# First-argument-style indexing on every argument is also on by default;
+# `name : noindex.` / `<- noindex.` disable it.
+
+# Left recursion terminates under tabling.
+edge a b.
+edge b c.
+edge c a.
+edge c d.
+
+path X Y <- path X Z, edge Z Y.
+path X Y <- edge X Y.
+
+# Memoisation: naive fib runs in linear time.
+fib 0 0.
+fib 1 1.
+fib N F <- N > 1, N1 is N - 1, N2 is N - 2, fib N1 F1, fib N2 F2, F is F1 + F2.
+
+# A generator has infinitely many answers: it must not be tabled.
+nat : notable.
+nat 0.
+nat N <- nat M, N is M + 1.
+
+# Mutual recursion is tabled too.
+even 0.
+even N <- N > 0, N1 is N - 1, odd N1.
+odd N <- N > 0, N1 is N - 1, even N1.
+
+> path a X?
+> path X d?
+> fib 50 F?
+> nat X, X > 5, !?
+> even 100?
+> odd 7?

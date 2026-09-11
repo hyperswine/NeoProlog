@@ -1,12 +1,12 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.38.0.
+-- This file has been generated from package.yaml by hpack version 0.39.6.
 --
 -- see: https://github.com/sol/hpack
 
 name:           infera
-version:        0.1.0.0
-description:    Infera — a Prolog-inspired logic programming language in Haskell
+version:        2.0.0.0
+description:    Infera v2 - a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z)
 homepage:       https://github.com/hyperswine/NeoProlog#readme
 bug-reports:    https://github.com/hyperswine/NeoProlog/issues
 author:         Jasen Qin
@@ -23,8 +23,17 @@ source-repository head
 
 library
   exposed-modules:
-      NeoProlog
       Infera
+      Infera.Syntax
+      Infera.Error
+      Infera.Unify
+      Infera.Arith
+      Infera.CLP
+      Infera.Program
+      Infera.Infer
+      Infera.Engine
+      Infera.Module
+      Infera.Repl
   other-modules:
       Paths_infera
   hs-source-dirs:
@@ -76,7 +85,7 @@ test-suite infera-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      NeoPrologTest
+      InferaTest
       Paths_infera
   hs-source-dirs:
       test

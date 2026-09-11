@@ -1,5 +1,5 @@
 name:                infera
-version:             0.1.0.0
+version:             2.0.0.0
 github:              "hyperswine/NeoProlog"
 license:             GPL-3
 author:              "Jasen Qin"
@@ -9,7 +9,7 @@ copyright:           "2025 Jasen Qin"
 extra-source-files:
 - README.md
 
-description: Infera — a Prolog-inspired logic programming language in Haskell
+description: Infera v2 - a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z)
 
 dependencies:
 - base >= 4.7 && < 5
@@ -40,8 +40,17 @@ ghc-options:
 library:
   source-dirs: src
   exposed-modules:
-    - NeoProlog
     - Infera
+    - Infera.Syntax
+    - Infera.Error
+    - Infera.Unify
+    - Infera.Arith
+    - Infera.CLP
+    - Infera.Program
+    - Infera.Infer
+    - Infera.Engine
+    - Infera.Module
+    - Infera.Repl
 
 executables:
   infera-exe:

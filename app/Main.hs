@@ -1,8 +1,5 @@
-{-# OPTIONS_GHC -Wno-missing-export-lists #-}
+module Main (main) where
 
-module Main where
-
-import qualified NeoProlog
 import qualified Infera
 
 main :: IO ()
