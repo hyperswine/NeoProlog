@@ -10,3 +10,5 @@ dist-newstyle/
 neoprolog.conf
 nprolog.conf
 output/
+docs/dash/dist/
+.claude/

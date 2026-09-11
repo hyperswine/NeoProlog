@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine · Infera</title>
+<meta name="description" content="Infera: a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z).">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="menu" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">☰</button>
+  <a class="brand" href="index.html">Infera</a>
+  <span class="version">v2.0.0</span>
+  <nav class="links"><a href="https://github.com/hyperswine/NeoProlog">GitHub</a><a href="https://github.com/hyperswine/NeoProlog/releases">Releases</a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav>
+<h4>Start</h4>
+<a href="index.html">Overview</a>
+<a href="install.html">Install</a>
+<h4>Reference</h4>
+<a href="language.html">Language</a>
+<a href="declarations.html">Declarations</a>
+<a href="engine.html" class="active">Engine</a>
+<a href="clp.html">CLP(Z)</a>
+<a href="builtins.html">Built-ins</a>
+<h4>Tooling</h4>
+<a href="tools.html">REPL, CLI and modules</a>
+<a href="editor.html">Editor support</a>
+  </nav></aside>
+  <main class="content">
+<h1>Engine</h1>
+<p class="lead">Resolution with per-argument indexing, tabling by default, cut through barrier markers, and output collected per answer.</p>
+
+<h2 id="indexing" data-dash="Guide:Indexing">Indexing <a class="anchor" href="#indexing">#</a></h2>
+<p>Every argument position of every predicate is indexed on its principal functor (atom, number, string, character, or functor/arity). A call only tries clauses compatible with each of its bound arguments, so <code>step (cpu 3 …) S</code> or <code>instr 2 I</code> touch only matching clauses. Indexing never changes answers. Turn it off with <code>name : noindex.</code> or globally with <code>&lt;- noindex.</code>.</p>
+
+<h2 id="tabling" data-dash="Guide:Tabling">Tabling <a class="anchor" href="#tabling">#</a></h2>
+<p>A tabled call is evaluated to a fixpoint: its answers are collected in a table keyed by the call variant, recursive variant calls consume the table instead of recursing, and the evaluation repeats until no new answers appear. Left recursion terminates and repeated calls are memoised.</p>
+<pre><code>path <span class="v">X</span> <span class="v">Y</span> <span class="k">&lt;-</span> path <span class="v">X</span> <span class="v">Z</span>, edge <span class="v">Z</span> <span class="v">Y</span>.
+path <span class="v">X</span> <span class="v">Y</span> <span class="k">&lt;-</span> edge <span class="v">X</span> <span class="v">Y</span>.
+
+fib <span class="n">0</span> <span class="n">0</span>.
+fib <span class="n">1</span> <span class="n">1</span>.
+fib <span class="v">N</span> <span class="v">F</span> <span class="k">&lt;-</span> <span class="v">N</span> &gt; <span class="n">1</span>, <span class="v">N1</span> <span class="k">is</span> <span class="v">N</span> - <span class="n">1</span>, <span class="v">N2</span> <span class="k">is</span> <span class="v">N</span> - <span class="n">2</span>, fib <span class="v">N1</span> <span class="v">F1</span>, fib <span class="v">N2</span> <span class="v">F2</span>, <span class="v">F</span> <span class="k">is</span> <span class="v">F1</span> + <span class="v">F2</span>.
+
+<span class="k">&gt;</span> path a <span class="v">X</span>?
+<span class="o">X = b</span>
+<span class="o">X = c</span>
+<span class="k">&gt;</span> fib <span class="n">50</span> <span class="v">F</span>?
+<span class="o">F = 12586269025</span></code></pre>
+<p>Tabling is <strong>on by default</strong> for predicates that are</p>
+<ul>
+  <li>recursive (they can reach themselves through calls),</li>
+  <li>pure (no <code>write</code>/<code>nl</code>, directly or transitively), and</li>
+  <li>not merely structurally recursive: predicates whose every self-call recurses on a proper subterm of a head argument (list and tree walkers such as <code>length</code> or <code>append</code>) always terminate and would only pay for their tables.</li>
+</ul>
+<p>Control it with <code>name : table …</code> / <code>name : notable.</code> per predicate, or <code>&lt;- table.</code> / <code>&lt;- notable.</code> as the file default.</p>
+<div class="note">A tabled call collects <em>all</em> its answers before continuing, so a predicate with infinitely many answers (a generator like <code>nat</code>) must be declared <code>notable</code>. Otherwise the fixpoint stops after a bound and the answer reports "Search depth limit reached". Calls whose arguments carry CLP(Z) constraints, and answers that would carry constraints, are evaluated without tabling.</div>
+
+<h2 id="cut" data-dash="Guide:Cut">Cut and commitment <a class="anchor" href="#cut">#</a></h2>
+<p>Cut is implemented with barrier markers in the lazy answer stream: <code>!</code> emits a marker for its clause's activation, alternatives stop when they see it, and the activation that owns the barrier consumes it. Declared <code>det</code>/<code>semidet</code> predicates, and predicates inferred <code>semidet</code> with their switch arguments ground, are committed to their first solution.</p>
+
+<h2 id="output" data-dash="Guide:Output">Output <a class="anchor" href="#output">#</a></h2>
+<p><code>write</code>, <code>writeln</code>, <code>print</code> and <code>nl</code> append to an output log carried with the solver state, so each answer prints exactly the output of the branch that produced it, in order. Tabled predicates replay the output recorded with their answers.</p>
+
+<h2 id="limits" data-dash="Guide:Limits and errors">Limits and errors <a class="anchor" href="#limits">#</a></h2>
+<ul>
+  <li>Resolution depth is bounded (100 000 nested activations). When a branch hits it the answer says so instead of looping forever.</li>
+  <li>Errors are per branch: an error in one branch is reported alongside the answers of the others ("Some branches raised an error").</li>
+  <li>Arithmetic on unbound variables, division by zero, unknown predicates, mode/sort/determinism violations and CLP(Z) type errors are all reported with the offending term.</li>
+</ul>
+<div class="pager"><a href="declarations.html">← Declarations</a><a href="clp.html">CLP(Z) →</a></div>
+  </main>
+</div>
+<footer>Infera v2.0.0 · GPL-3.0 · <a href="https://github.com/hyperswine/NeoProlog">hyperswine/NeoProlog</a></footer>
+</body>
+</html>

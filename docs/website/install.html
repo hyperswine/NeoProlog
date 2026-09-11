@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install · Infera</title>
+<meta name="description" content="Infera: a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z).">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="menu" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">☰</button>
+  <a class="brand" href="index.html">Infera</a>
+  <span class="version">v2.0.0</span>
+  <nav class="links"><a href="https://github.com/hyperswine/NeoProlog">GitHub</a><a href="https://github.com/hyperswine/NeoProlog/releases">Releases</a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav>
+<h4>Start</h4>
+<a href="index.html">Overview</a>
+<a href="install.html" class="active">Install</a>
+<h4>Reference</h4>
+<a href="language.html">Language</a>
+<a href="declarations.html">Declarations</a>
+<a href="engine.html">Engine</a>
+<a href="clp.html">CLP(Z)</a>
+<a href="builtins.html">Built-ins</a>
+<h4>Tooling</h4>
+<a href="tools.html">REPL, CLI and modules</a>
+<a href="editor.html">Editor support</a>
+  </nav></aside>
+  <main class="content">
+<h1>Install</h1>
+<p class="lead">Infera is a single executable, <code>infera</code>. Install it with Homebrew on macOS or build it from source with cabal anywhere GHC runs.</p>
+
+<h2 id="homebrew" data-dash="Guide:Install with Homebrew">Homebrew (macOS) <a class="anchor" href="#homebrew">#</a></h2>
+<pre><code>brew tap hyperswine/neoprolog https://github.com/hyperswine/NeoProlog
+brew install infera</code></pre>
+<p>The formula builds from source with Homebrew's GHC (about a minute) and installs the binary, the README and the examples under <code>$(brew --prefix)/share/infera</code>.</p>
+
+<h2 id="cabal" data-dash="Guide:Build from source">From source with cabal <a class="anchor" href="#cabal">#</a></h2>
+<p>You need GHC 9.8 or newer and cabal-install, for example via <a href="https://www.haskell.org/ghcup/">ghcup</a>.</p>
+<pre><code>git clone https://github.com/hyperswine/NeoProlog
+cd NeoProlog
+cabal build
+cabal test
+cabal install        # puts `infera` into ~/.cabal/bin or ~/.local/bin</code></pre>
+<div class="note">If linking fails on macOS with <code>tapi error: malformed file … unknown architecture</code>, your Command Line Tools SDK is newer than the linker Xcode selects. Build with <code>DEVELOPER_DIR=/Library/Developer/CommandLineTools cabal build</code>.</div>
+
+<h2 id="check">Check it works <a class="anchor" href="#check">#</a></h2>
+<pre><code>infera examples/stdlib.nprolog     # loads the file, runs its inline queries, opens the REPL
+infera check examples/*.nprolog    # parse and analyse without running</code></pre>
+
+<h2 id="editor">Editor <a class="anchor" href="#editor">#</a></h2>
+<p>A VS Code extension with a language server ships in the repository; see <a href="editor.html">Editor support</a>.</p>
+<div class="pager"><a href="index.html">← Overview</a><a href="language.html">Language →</a></div>
+  </main>
+</div>
+<footer>Infera v2.0.0 · GPL-3.0 · <a href="https://github.com/hyperswine/NeoProlog">hyperswine/NeoProlog</a></footer>
+</body>
+</html>

@@ -1,0 +1,26 @@
+name: Release
+
+# On a version tag: build the Dash docset from docs/website and attach it to
+# the GitHub release, so the Dash feed (docs/dash/Infera.xml) resolves.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  docset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - run: node docs/dash/build.js
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: docs/dash/dist/Infera.tgz
+          generate_release_notes: true

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Built-ins · Infera</title>
+<meta name="description" content="Infera: a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z).">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="menu" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">☰</button>
+  <a class="brand" href="index.html">Infera</a>
+  <span class="version">v2.0.0</span>
+  <nav class="links"><a href="https://github.com/hyperswine/NeoProlog">GitHub</a><a href="https://github.com/hyperswine/NeoProlog/releases">Releases</a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav>
+<h4>Start</h4>
+<a href="index.html">Overview</a>
+<a href="install.html">Install</a>
+<h4>Reference</h4>
+<a href="language.html">Language</a>
+<a href="declarations.html">Declarations</a>
+<a href="engine.html">Engine</a>
+<a href="clp.html">CLP(Z)</a>
+<a href="builtins.html" class="active">Built-ins</a>
+<h4>Tooling</h4>
+<a href="tools.html">REPL, CLI and modules</a>
+<a href="editor.html">Editor support</a>
+  </nav></aside>
+  <main class="content">
+<h1>Built-ins</h1>
+<p class="lead">Predicates provided by the engine. Built-ins take precedence over user predicates of the same name and arity.</p>
+
+<h2 id="control" data-dash="Guide:Control built-ins">Control <a class="anchor" href="#control">#</a></h2>
+<table>
+<tr><th>Goal</th><th>Meaning</th></tr>
+<tr><td id="true" data-dash="Builtin:true/0"><code>true</code>, <code>fail</code>, <code>false</code></td><td>succeed; fail</td></tr>
+<tr><td id="cut" data-dash="Builtin:!/0"><code>!</code></td><td>cut</td></tr>
+<tr><td id="not" data-dash="Builtin:not/1"><code>not G</code></td><td>negation as failure</td></tr>
+<tr><td id="once" data-dash="Builtin:once/1"><code>once G</code></td><td>first solution of <code>G</code> only</td></tr>
+<tr><td id="forall" data-dash="Builtin:forall/2"><code>forall C A</code></td><td>succeeds if <code>A</code> holds for every solution of <code>C</code></td></tr>
+<tr><td id="findall" data-dash="Builtin:findall/3"><code>findall T G L</code></td><td><code>L</code> is the list of <code>T</code> for every solution of <code>G</code></td></tr>
+<tr><td id="call" data-dash="Builtin:call/N"><code>call G A…</code></td><td>call <code>G</code> with extra arguments appended; cuts inside are local</td></tr>
+<tr><td id="phrase" data-dash="Builtin:phrase/2"><code>phrase NT L</code></td><td>run DCG non-terminal <code>NT</code> on <code>L</code> with an empty remainder</td></tr>
+</table>
+
+<h2 id="comparison" data-dash="Guide:Comparison built-ins">Unification and comparison <a class="anchor" href="#comparison">#</a></h2>
+<table>
+<tr><th>Goal</th><th>Meaning</th></tr>
+<tr><td id="unify" data-dash="Operator:="><code>A = B</code></td><td>unification (with occurs check)</td></tr>
+<tr><td id="equiv" data-dash="Operator:=="><code>A == B</code></td><td>structural equality after substitution</td></tr>
+<tr><td id="neq" data-dash="Operator:!="><code>A != B</code></td><td>delayed disequality constraint</td></tr>
+<tr><td id="is" data-dash="Builtin:is/2"><code>V is E</code></td><td>evaluate arithmetic <code>E</code> (<code>+ - * / % ^</code>, <code>neg</code>, <code>abs</code>, <code>min</code>, <code>max</code>) and unify</td></tr>
+<tr><td id="cmp" data-dash="Operator:&lt;"><code>A &lt; B</code>, <code>A &gt; B</code>, <code>A &lt;= B</code>, <code>A &gt;= B</code></td><td>numeric comparison of evaluated expressions</td></tr>
+</table>
+
+<h2 id="types" data-dash="Guide:Type-check built-ins">Type checks <a class="anchor" href="#types">#</a></h2>
+<table>
+<tr><th>Goal</th><th>Succeeds when</th></tr>
+<tr><td id="var" data-dash="Builtin:var/1"><code>var X</code>, <code>nonvar X</code>, <code>ground X</code></td><td>unbound; bound; contains no unbound variables</td></tr>
+<tr><td id="is_int" data-dash="Builtin:is_int/1"><code>is_int X</code>, <code>is_float X</code>, <code>is_num X</code></td><td>integer; float; either</td></tr>
+<tr><td id="is_str" data-dash="Builtin:is_str/1"><code>is_str X</code>, <code>is_char X</code>, <code>is_atom X</code>, <code>is_list X</code></td><td>string; character; atom; proper list</td></tr>
+</table>
+
+<h2 id="strings" data-dash="Guide:String built-ins">Strings <a class="anchor" href="#strings">#</a></h2>
+<table>
+<tr><th>Goal</th><th>Meaning</th></tr>
+<tr><td id="str_concat" data-dash="Builtin:str_concat/3"><code>str_concat A B C</code></td><td><code>C</code> is <code>A ++ B</code>; with only <code>C</code> bound, enumerates every split</td></tr>
+<tr><td id="str_length" data-dash="Builtin:str_length/2"><code>str_length S N</code></td><td>length of <code>S</code></td></tr>
+<tr><td id="str_chars" data-dash="Builtin:str_chars/2"><code>str_chars S Cs</code></td><td>string ⇄ list of characters</td></tr>
+<tr><td id="str_atom" data-dash="Builtin:str_atom/2"><code>str_atom S A</code></td><td>string ⇄ atom</td></tr>
+<tr><td id="str_num" data-dash="Builtin:str_num/2"><code>str_num S N</code></td><td>string ⇄ number</td></tr>
+<tr><td id="str_upper" data-dash="Builtin:str_upper/2"><code>str_upper S U</code>, <code>str_lower S L</code></td><td>case conversion</td></tr>
+</table>
+
+<h2 id="output" data-dash="Guide:Output built-ins">Output <a class="anchor" href="#output">#</a></h2>
+<table>
+<tr><th>Goal</th><th>Meaning</th></tr>
+<tr><td id="write" data-dash="Builtin:write/1"><code>write T</code>, <code>print T</code></td><td>write a term (strings without quotes)</td></tr>
+<tr><td id="writeln" data-dash="Builtin:writeln/1"><code>writeln T</code></td><td>write a term and a newline</td></tr>
+<tr><td id="nl" data-dash="Builtin:nl/0"><code>nl</code></td><td>newline</td></tr>
+</table>
+
+<h2 id="clp">CLP(Z) <a class="anchor" href="#clp">#</a></h2>
+<p><code>in</code>, <code>#=</code>, <code>#!=</code>, <code>#&lt;</code>, <code>#&gt;</code>, <code>#&lt;=</code>, <code>#&gt;=</code>, <code>all_different</code>, <code>label</code>: see <a href="clp.html">CLP(Z)</a>.</p>
+
+<h2 id="directives" data-dash="Guide:Directives">Directives <a class="anchor" href="#directives">#</a></h2>
+<table>
+<tr><th>Directive</th><th>Meaning</th></tr>
+<tr><td id="import" data-dash="Directive:import"><code>&lt;- import "mod#hash".</code></td><td>import a registered module (see <a href="tools.html#modules">modules</a>)</td></tr>
+<tr><td id="dir-table" data-dash="Directive:table"><code>&lt;- table.</code> / <code>&lt;- notable.</code></td><td>tabling on/off by default for this file</td></tr>
+<tr><td id="dir-index" data-dash="Directive:index"><code>&lt;- index.</code> / <code>&lt;- noindex.</code></td><td>indexing on/off by default</td></tr>
+</table>
+
+<h2 id="stdlib" data-dash="Guide:Standard library">Standard library <a class="anchor" href="#stdlib">#</a></h2>
+<p><code>examples/stdlib.nprolog</code> defines the usual list predicates in Infera itself: <code>member</code>, <code>append</code>, <code>length</code>, <code>reverse</code>, <code>nth</code>, <code>last</code>, <code>take</code>, <code>drop</code>, <code>zip</code>, <code>sum_list</code>, <code>max_list</code>, <code>min_list</code>, <code>between</code>, <code>numlist</code>, <code>isort</code>, <code>msort</code>, <code>permutation</code>, <code>maplist</code>, <code>include</code>, <code>foldl</code> and an N-queens solver.</p>
+<div class="pager"><a href="clp.html">← CLP(Z)</a><a href="tools.html">REPL, CLI and modules →</a></div>
+  </main>
+</div>
+<footer>Infera v2.0.0 · GPL-3.0 · <a href="https://github.com/hyperswine/NeoProlog">hyperswine/NeoProlog</a></footer>
+</body>
+</html>

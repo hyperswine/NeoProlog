@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Declarations · Infera</title>
+<meta name="description" content="Infera: a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z).">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="menu" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">☰</button>
+  <a class="brand" href="index.html">Infera</a>
+  <span class="version">v2.0.0</span>
+  <nav class="links"><a href="https://github.com/hyperswine/NeoProlog">GitHub</a><a href="https://github.com/hyperswine/NeoProlog/releases">Releases</a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav>
+<h4>Start</h4>
+<a href="index.html">Overview</a>
+<a href="install.html">Install</a>
+<h4>Reference</h4>
+<a href="language.html">Language</a>
+<a href="declarations.html" class="active">Declarations</a>
+<a href="engine.html">Engine</a>
+<a href="clp.html">CLP(Z)</a>
+<a href="builtins.html">Built-ins</a>
+<h4>Tooling</h4>
+<a href="tools.html">REPL, CLI and modules</a>
+<a href="editor.html">Editor support</a>
+  </nav></aside>
+  <main class="content">
+<h1>Declarations</h1>
+<p class="lead">A declaration states a predicate's determinism, the sort and mode of each argument, and per-predicate flags. Declared signatures are enforced at runtime; undeclared predicates are analysed.</p>
+
+<h2 id="syntax" data-dash="Guide:Declaration syntax">Syntax <a class="anchor" href="#syntax">#</a></h2>
+<pre><code>mypred : <span class="k">semidet</span> (<span class="k">int</span>: &lt;=) (<span class="k">int</span>: &lt;=&gt;) (<span class="k">str</span>: =&gt;).
+len    : <span class="k">det</span> (<span class="k">list</span> <span class="k">any</span>: &lt;=) (<span class="k">int</span>: =&gt;).
+plus2  : <span class="k">det</span> &lt;= =&gt;.            # bare modes: sort any
+nat    : <span class="k">notable</span>.              # flags only: applies to every arity of nat</code></pre>
+<table>
+<tr><th>Part</th><th>Values</th></tr>
+<tr><td id="determinism" data-dash="Guide:Determinism categories">Determinism</td><td><code>det</code> exactly one solution · <code>semidet</code> at most one · <code>multi</code> at least one · <code>nondet</code> any number (default)</td></tr>
+<tr><td id="sorts" data-dash="Guide:Sorts">Sort</td><td><code>int</code> <code>float</code> <code>num</code> <code>str</code> <code>char</code> <code>atom</code> <code>any</code>, <code>list &lt;sort&gt;</code> (nest with parentheses: <code>list (list int)</code>)</td></tr>
+<tr><td id="modes" data-dash="Guide:Modes">Mode</td><td><code>&lt;=</code> input: ground at call · <code>=&gt;</code> output: ground after the call · <code>&lt;=&gt;</code> no requirement (default)</td></tr>
+<tr><td id="flags" data-dash="Guide:Flags">Flags</td><td><code>table</code> <code>notable</code> <code>index</code> <code>noindex</code></td></tr>
+</table>
+<p>A bare sort in parentheses means <code>&lt;=&gt;</code>: <code>(int)</code> is <code>(int: &lt;=&gt;)</code>. A declaration with only flags and no argument specs applies to every arity of the name. Several declarations of the same predicate are <em>alternative modes</em>; the first one whose input arguments are ground in the call is used.</p>
+
+<h3 id="keywords">Keywords <a class="anchor" href="#keywords">#</a></h3>
+<table>
+<tr><th>Word</th><th>Meaning</th></tr>
+<tr><td id="kw-det" data-dash="Keyword:det"><code>det</code></td><td>Exactly one solution. Failing is a determinism error; the first solution is committed to.</td></tr>
+<tr><td id="kw-semidet" data-dash="Keyword:semidet"><code>semidet</code></td><td>At most one solution; the first solution is committed to.</td></tr>
+<tr><td id="kw-multi" data-dash="Keyword:multi"><code>multi</code></td><td>At least one solution; failing is a determinism error.</td></tr>
+<tr><td id="kw-nondet" data-dash="Keyword:nondet"><code>nondet</code></td><td>Any number of solutions.</td></tr>
+<tr><td id="kw-table" data-dash="Keyword:table"><code>table</code> / <code>notable</code></td><td>Force tabling on or off for the predicate (see <a href="engine.html#tabling">tabling</a>).</td></tr>
+<tr><td id="kw-index" data-dash="Keyword:index"><code>index</code> / <code>noindex</code></td><td>Force argument indexing on or off.</td></tr>
+<tr><td id="sort-int" data-dash="Type:int"><code>int</code>, <code>float</code>, <code>num</code></td><td>Integers, floats, either.</td></tr>
+<tr><td id="sort-str" data-dash="Type:str"><code>str</code>, <code>char</code>, <code>atom</code></td><td>Strings, characters, atoms.</td></tr>
+<tr><td id="sort-list" data-dash="Type:list"><code>list S</code>, <code>any</code></td><td>Proper lists of sort S; anything.</td></tr>
+<tr><td id="mode-in" data-dash="Operator:&lt;="><code>&lt;=</code>, <code>=&gt;</code>, <code>&lt;=&gt;</code></td><td>Input, output, in/out mode.</td></tr>
+</table>
+
+<h2 id="enforced" data-dash="Guide:Enforcement of declarations">What is enforced <a class="anchor" href="#enforced">#</a></h2>
+<ul>
+  <li>An input argument that is not ground at the call: <em>mode error</em>.</li>
+  <li>An argument whose bound part does not match its sort, before or after the call: <em>sort error</em>. Output arguments must be ground after the call.</li>
+  <li><code>det</code> and <code>multi</code> predicates that fail: <em>determinism error</em>.</li>
+  <li><code>det</code> and <code>semidet</code> predicates commit to their first solution, so remaining choice points are dropped.</li>
+</ul>
+<pre><code>fact : <span class="k">det</span> (<span class="k">int</span>: &lt;=) (<span class="k">int</span>: =&gt;).
+fact <span class="n">0</span> <span class="n">1</span>.
+fact <span class="v">N</span> <span class="v">R</span> <span class="k">&lt;-</span> <span class="v">N</span> &gt; <span class="n">0</span>, <span class="v">N1</span> <span class="k">is</span> <span class="v">N</span> - <span class="n">1</span>, fact <span class="v">N1</span> <span class="v">R1</span>, <span class="v">R</span> <span class="k">is</span> <span class="v">N</span> * <span class="v">R1</span>.
+
+<span class="k">&gt;</span> fact <span class="v">X</span> <span class="n">5</span>?
+<span class="o">Error: mode error: argument 1 of fact/2 is declared input (&lt;=) but is not ground: X</span>
+<span class="k">&gt;</span> fact a <span class="v">R</span>?
+<span class="o">Error: sort error: argument 1 of fact/2 must be int, but got: a</span></code></pre>
+
+<h2 id="inference" data-dash="Guide:Inference">Inference <a class="anchor" href="#inference">#</a></h2>
+<p>Undeclared predicates get the most general signature, <code>nondet</code> with every argument <code>(any: &lt;=&gt;)</code>, unless the analysis can do better. The REPL command <code>:sig name</code> shows the result:</p>
+<pre><code><span class="k">&gt;</span> :sig length
+length/<span class="n">2</span>
+  inferred: length : <span class="k">semidet</span> (<span class="k">list</span> <span class="k">any</span>: &lt;=&gt;) (<span class="k">num</span>: =&gt;).   # <span class="k">semidet</span> when argument(s) <span class="n">1</span> ground
+  clauses: <span class="n">2</span>, tabled: no, indexed: yes, recursive: yes, pure: yes</code></pre>
+<ul>
+  <li><strong>Sorts</strong> come from head patterns, literals, arithmetic, string built-ins and the sorts of called predicates, iterated to a fixpoint. <code>int</code> and <code>float</code> evidence join to <code>num</code>; conflicting evidence gives <code>any</code>.</li>
+  <li><strong>Modes</strong>: <code>&lt;=</code> when some clause needs the argument ground before anything could bind it (a comparison, arithmetic, or an input of a callee); <code>=&gt;</code> when every clause leaves the argument ground.</li>
+  <li><strong>Determinism</strong>: <code>semidet</code> when the clauses are pairwise exclusive and every body has at most one solution. Clauses are exclusive when they have different principal functors at some argument, complementary guards as their first goal (<code>A &gt;= B</code> against <code>B &gt; A</code>), a literal against a guard that excludes it (<code>0</code> against <code>N &gt; 0</code>), or a cut. The exclusivity may require some arguments to be ground; those positions are recorded and checked at call time.</li>
+</ul>
+<div class="note">Inferred signatures are advisory and never raise errors. The engine uses an inferred <code>semidet</code> only to drop choice points, and only when the recorded argument positions are ground in the actual call. Everything else falls back to full backtracking, so inference cannot lose solutions.</div>
+<div class="pager"><a href="language.html">← Language</a><a href="engine.html">Engine →</a></div>
+  </main>
+</div>
+<footer>Infera v2.0.0 · GPL-3.0 · <a href="https://github.com/hyperswine/NeoProlog">hyperswine/NeoProlog</a></footer>
+</body>
+</html>

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Language · Infera</title>
+<meta name="description" content="Infera: a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z).">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="menu" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">☰</button>
+  <a class="brand" href="index.html">Infera</a>
+  <span class="version">v2.0.0</span>
+  <nav class="links"><a href="https://github.com/hyperswine/NeoProlog">GitHub</a><a href="https://github.com/hyperswine/NeoProlog/releases">Releases</a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav>
+<h4>Start</h4>
+<a href="index.html">Overview</a>
+<a href="install.html">Install</a>
+<h4>Reference</h4>
+<a href="language.html" class="active">Language</a>
+<a href="declarations.html">Declarations</a>
+<a href="engine.html">Engine</a>
+<a href="clp.html">CLP(Z)</a>
+<a href="builtins.html">Built-ins</a>
+<h4>Tooling</h4>
+<a href="tools.html">REPL, CLI and modules</a>
+<a href="editor.html">Editor support</a>
+  </nav></aside>
+  <main class="content">
+<h1>Language</h1>
+<p class="lead">Infera reads like Prolog with a lighter syntax: no parentheses around arguments, <code>&lt;-</code> for rules, <code>#</code> comments, and inline queries that run when a file loads.</p>
+
+<h2 id="items" data-dash="Guide:Files and items">Files and items <a class="anchor" href="#items">#</a></h2>
+<p>A file is a sequence of items, each ended by a period:</p>
+<pre><code><span class="c"># comment</span>
+color red.                                  # fact
+append [<span class="v">H</span> | <span class="v">T</span>] <span class="v">L</span> [<span class="v">H</span> | <span class="v">R</span>] <span class="k">&lt;-</span> append <span class="v">T</span> <span class="v">L</span> <span class="v">R</span>.   # rule
+greeting <span class="k">-&gt;</span> [hello], name.                  # <span class="v">DCG</span> rule
+mypred : <span class="k">semidet</span> (<span class="k">int</span>: &lt;=) (<span class="k">str</span>: =&gt;).       # declaration
+<span class="k">&lt;-</span> import <span class="s">&quot;mymod#3f2a...&quot;</span>.                  # directive
+<span class="k">&gt;</span> append <span class="v">X</span> <span class="v">Y</span> [<span class="n">1</span>, <span class="n">2</span>]?                        # inline query (runs on load)</code></pre>
+<p>Predicates are identified by <strong>name and arity</strong>: <code>maplist/2</code> and <code>maplist/3</code> are different predicates. Calling a predicate that does not exist is an error, not a failure.</p>
+
+<h2 id="terms" data-dash="Guide:Terms">Terms <a class="anchor" href="#terms">#</a></h2>
+<table>
+<tr><th>Form</th><th>Example</th><th>Notes</th></tr>
+<tr><td>Atom</td><td><code>red</code>, <code>nil</code></td><td>lower-case identifier; <code>mod:name</code> is a module-qualified atom</td></tr>
+<tr><td>Variable</td><td><code>X</code>, <code>_Tail</code>, <code>_</code></td><td>upper-case or underscore; each <code>_</code> is a fresh variable</td></tr>
+<tr><td>Integer, float</td><td><code>42</code>, <code>-3</code>, <code>1.5</code></td><td>arbitrary-precision integers</td></tr>
+<tr><td>Character, string</td><td><code>'c'</code>, <code>"text"</code></td><td>strings are atomic values, not lists</td></tr>
+<tr><td>Compound</td><td><code>cpu PC A B</code>, <code>f (g X) Y</code></td><td>functor followed by arguments; parenthesise nested compounds</td></tr>
+<tr><td>List</td><td><code>[1, 2 | T]</code>, <code>X :: Xs</code>, <code>[]</code></td><td>cons cells; <code>[]</code> is the atom <code>nil</code></td></tr>
+</table>
+
+<h2 id="operators" data-dash="Guide:Operators">Operators <a class="anchor" href="#operators">#</a></h2>
+<p>From tightest to loosest binding:</p>
+<table>
+<tr><th>Operators</th><th>Meaning</th></tr>
+<tr><td><code>^</code></td><td>power (right-associative)</td></tr>
+<tr><td><code>* / %</code></td><td>multiply, integer/float divide, modulo</td></tr>
+<tr><td><code>+ -</code></td><td>add, subtract</td></tr>
+<tr><td><code>::</code></td><td>list cons (right-associative)</td></tr>
+<tr><td><code>..</code></td><td>range, used with <code>in</code></td></tr>
+<tr><td><code>&lt; &gt; &lt;= &gt;=</code> <code>#&lt; #&gt; #&lt;= #&gt;=</code></td><td>numeric comparison; CLP(Z) comparison</td></tr>
+<tr><td><code>= == != #= #!= is in</code></td><td>unify, structural equality, disequality, CLP(Z) equality/disequality, arithmetic evaluation, domain</td></tr>
+<tr><td><code>,</code> <code>-&gt;</code> <code>;</code></td><td>conjunction, if-then, disjunction (inside bodies and parentheses)</td></tr>
+</table>
+<p>Ground arithmetic in call arguments is evaluated before head matching, so <code>fact (N - 1) R</code> calls <code>fact 4 R</code> when <code>N</code> is 5. Arithmetic left in answers is evaluated when printed.</p>
+
+<h2 id="control" data-dash="Guide:Control constructs">Clause bodies and control <a class="anchor" href="#control">#</a></h2>
+<pre><code>sign <span class="v">N</span> <span class="v">S</span> <span class="k">&lt;-</span> (<span class="v">N</span> &gt; <span class="n">0</span> <span class="k">-&gt;</span> <span class="v">S</span> = pos ; <span class="v">N</span> &lt; <span class="n">0</span> <span class="k">-&gt;</span> <span class="v">S</span> = neg ; <span class="v">S</span> = zero).
+first <span class="v">X</span> <span class="k">&lt;-</span> member <span class="v">X</span> [a, b, c], <span class="k">!</span>.
+safe <span class="v">X</span> <span class="k">&lt;-</span> not (dangerous <span class="v">X</span>).
+count <span class="v">L</span> <span class="v">N</span> <span class="k">&lt;-</span> findall <span class="v">X</span> (item <span class="v">X</span> <span class="v">L</span>) <span class="v">Xs</span>, length <span class="v">Xs</span> <span class="v">N</span>.</code></pre>
+<ul>
+  <li><code>A , B</code> conjunction; <code>A ; B</code> disjunction; <code>(C -&gt; T ; E)</code> if-then-else (the condition is committed to its first solution); <code>(C -&gt; T)</code> without an else fails when <code>C</code> fails.</li>
+  <li><code>!</code> cut: commits to the current clause and to the choices made before it. It is transparent through <code>,</code> <code>;</code> <code>-&gt;</code> and local inside <code>call</code>, <code>not</code>, <code>once</code>, <code>findall</code> and <code>forall</code>.</li>
+  <li><code>not G</code> negation as failure, <code>once G</code>, <code>forall C A</code>, <code>findall T G L</code>, <code>call G Args…</code>.</li>
+</ul>
+
+<h2 id="dcg" data-dash="Guide:DCG rules">DCG rules <a class="anchor" href="#dcg">#</a></h2>
+<p><code>Head -&gt; Body.</code> defines a grammar rule; two list arguments are appended. Terminals are lists or strings (as character lists), <code>{ Goal }</code> embeds an ordinary goal, and <code>,</code> <code>;</code> <code>-&gt;</code> <code>!</code> work as in bodies. Run a grammar with <code>phrase NT List</code> or call the translated predicate directly.</p>
+<pre><code>greeting <span class="k">-&gt;</span> [hello], name.
+name <span class="k">-&gt;</span> [world].
+name <span class="k">-&gt;</span> [infera].
+digits [<span class="v">D</span> | <span class="v">Ds</span>] <span class="k">-&gt;</span> [<span class="v">D</span>], {{ <span class="v">D</span> &gt;= &#x27;<span class="n">0</span>&#x27;, <span class="v">D</span> &lt;= &#x27;<span class="n">9</span>&#x27; }}, digits <span class="v">Ds</span>.
+digits [] <span class="k">-&gt;</span> [].
+
+<span class="k">&gt;</span> phrase greeting [hello, world]?
+<span class="o">true.</span>
+<span class="k">&gt;</span> greeting <span class="v">L</span> []?
+<span class="o">L = [hello, world]</span>
+<span class="o">L = [hello, infera]</span></code></pre>
+
+<h2 id="comments">Comments <a class="anchor" href="#comments">#</a></h2>
+<p><code>#</code> starts a line comment, except when immediately followed by one of <code>= ! &lt; &gt;</code>, which makes it a CLP(Z) operator (<code>#=</code>, <code>#!=</code>, <code>#&lt;</code>, <code>#&gt;</code>, <code>#&lt;=</code>, <code>#&gt;=</code>). Put a space after <code>#</code> in comments that start with those characters.</p>
+<div class="pager"><a href="install.html">← Install</a><a href="declarations.html">Declarations →</a></div>
+  </main>
+</div>
+<footer>Infera v2.0.0 · GPL-3.0 · <a href="https://github.com/hyperswine/NeoProlog">hyperswine/NeoProlog</a></footer>
+</body>
+</html>

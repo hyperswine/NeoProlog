@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLP(Z) · Infera</title>
+<meta name="description" content="Infera: a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z).">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="menu" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">☰</button>
+  <a class="brand" href="index.html">Infera</a>
+  <span class="version">v2.0.0</span>
+  <nav class="links"><a href="https://github.com/hyperswine/NeoProlog">GitHub</a><a href="https://github.com/hyperswine/NeoProlog/releases">Releases</a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav>
+<h4>Start</h4>
+<a href="index.html">Overview</a>
+<a href="install.html">Install</a>
+<h4>Reference</h4>
+<a href="language.html">Language</a>
+<a href="declarations.html">Declarations</a>
+<a href="engine.html">Engine</a>
+<a href="clp.html" class="active">CLP(Z)</a>
+<a href="builtins.html">Built-ins</a>
+<h4>Tooling</h4>
+<a href="tools.html">REPL, CLI and modules</a>
+<a href="editor.html">Editor support</a>
+  </nav></aside>
+  <main class="content">
+<h1>CLP(Z)</h1>
+<p class="lead">Integer constraints over interval domains with bounds propagation. Enough for puzzles, scheduling toys and N-queens; residual domains and constraints are shown in answers.</p>
+
+<h2 id="goals" data-dash="Guide:CLP(Z) goals">Goals <a class="anchor" href="#goals">#</a></h2>
+<table>
+<tr><th>Goal</th><th>Meaning</th></tr>
+<tr><td id="in" data-dash="Builtin:in/2"><code>X in Lo..Hi</code></td><td>restrict <code>X</code> to an interval; <code>inf</code> and <code>sup</code> give open bounds; a list on the left restricts every element</td></tr>
+<tr><td id="fd-eq" data-dash="Operator:#="><code>A #= B</code></td><td>integer equality of expressions</td></tr>
+<tr><td id="fd-ne" data-dash="Operator:#!="><code>A #!= B</code></td><td>disequality</td></tr>
+<tr><td id="fd-cmp" data-dash="Operator:#&lt;"><code>A #&lt; B</code>, <code>A #&gt; B</code>, <code>A #&lt;= B</code>, <code>A #&gt;= B</code></td><td>ordering</td></tr>
+<tr><td id="all-different" data-dash="Builtin:all_different/1"><code>all_different Xs</code></td><td>pairwise <code>#!=</code> over a list (<code>all_distinct</code> is a synonym)</td></tr>
+<tr><td id="label" data-dash="Builtin:label/1"><code>label Xs</code></td><td>enumerate the variables' finite domains, smallest domain first (<code>labeling</code> is a synonym)</td></tr>
+</table>
+<p>Expressions may use <code>+ - *</code> and integer literals; <code>*</code> of two unknowns, <code>/</code>, <code>%</code> and <code>^</code> stay residual until they become linear or ground.</p>
+
+<h2 id="examples">Examples <a class="anchor" href="#examples">#</a></h2>
+<pre><code><span class="k">&gt;</span> <span class="v">X</span> #= <span class="n">3</span> + <span class="n">4</span>?
+<span class="o">X = 7</span>
+<span class="k">&gt;</span> <span class="v">X</span> #&gt; <span class="n">3</span>, <span class="v">X</span> #&lt; <span class="n">6</span>?
+<span class="o">X in 4..5</span>
+<span class="k">&gt;</span> <span class="v">X</span> <span class="k">in</span> <span class="n">0</span>..5, <span class="v">Y</span> <span class="k">in</span> <span class="n">0</span>..5, <span class="v">X</span> + <span class="v">Y</span> #= <span class="n">10</span>?
+<span class="o">X = 5, Y = 5</span>
+<span class="k">&gt;</span> <span class="v">X</span> + <span class="v">Y</span> #= <span class="n">10</span>?
+<span class="v">X</span> + <span class="v">Y</span> #= <span class="n">10</span>
+<span class="k">&gt;</span> [<span class="v">X</span>, <span class="v">Y</span>] <span class="k">in</span> <span class="n">0</span>..20, <span class="v">X</span> + <span class="v">Y</span> #= <span class="n">10</span>, <span class="v">X</span> - <span class="v">Y</span> #= <span class="n">2</span>, label [<span class="v">X</span>, <span class="v">Y</span>]?
+<span class="o">X = 6, Y = 4</span></code></pre>
+<pre><code>send_more_money [<span class="v">S</span>, <span class="v">E</span>, <span class="v">N</span>, <span class="v">D</span>, <span class="v">M</span>, <span class="v">O</span>, <span class="v">R</span>, <span class="v">Y</span>] <span class="k">&lt;-</span>
+  <span class="v">Vars</span> = [<span class="v">S</span>, <span class="v">E</span>, <span class="v">N</span>, <span class="v">D</span>, <span class="v">M</span>, <span class="v">O</span>, <span class="v">R</span>, <span class="v">Y</span>],
+  <span class="v">Vars</span> <span class="k">in</span> <span class="n">0</span>..9,
+  all_different <span class="v">Vars</span>,
+  <span class="v">S</span> #!= <span class="n">0</span>, <span class="v">M</span> #!= <span class="n">0</span>,
+  <span class="n">1000</span> * <span class="v">S</span> + <span class="n">100</span> * <span class="v">E</span> + <span class="n">10</span> * <span class="v">N</span> + <span class="v">D</span> + <span class="n">1000</span> * <span class="v">M</span> + <span class="n">100</span> * <span class="v">O</span> + <span class="n">10</span> * <span class="v">R</span> + <span class="v">E</span>
+    #= <span class="n">10000</span> * <span class="v">M</span> + <span class="n">1000</span> * <span class="v">O</span> + <span class="n">100</span> * <span class="v">N</span> + <span class="n">10</span> * <span class="v">E</span> + <span class="v">Y</span>,
+  label <span class="v">Vars</span>.
+
+<span class="k">&gt;</span> send_more_money <span class="v">L</span>?
+<span class="o">L = [9, 5, 6, 7, 1, 0, 8, 2]</span></code></pre>
+
+<h2 id="propagation" data-dash="Guide:CLP(Z) propagation">How propagation works <a class="anchor" href="#propagation">#</a></h2>
+<ul>
+  <li>Domains are intervals with a set of excluded values. Unifying a constrained variable with an integer checks the domain; with another variable, the domains are intersected; with anything else it is a type error.</li>
+  <li>Linear constraints <code>Σ cᵢxᵢ + k ⋈ 0</code> get bounds propagation after every unification and every new constraint, to a fixpoint. A constraint over a single variable is absorbed into its domain; a domain that shrinks to one value binds the variable.</li>
+  <li><code>#!=</code> with one unknown punches a hole in its domain; with several it waits.</li>
+  <li>Labeling picks the unbound variable with the smallest finite domain and tries its values in order, propagating after each. Labeling a variable with an unbounded domain is an error.</li>
+</ul>
+<p>The general disequality <code>A != B</code> is also a delayed constraint (it is checked whenever its variables get bound) and appears in answers as <code>X != 1</code>.</p>
+<div class="pager"><a href="engine.html">← Engine</a><a href="builtins.html">Built-ins →</a></div>
+  </main>
+</div>
+<footer>Infera v2.0.0 · GPL-3.0 · <a href="https://github.com/hyperswine/NeoProlog">hyperswine/NeoProlog</a></footer>
+</body>
+</html>

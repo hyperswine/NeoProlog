@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editor support · Infera</title>
+<meta name="description" content="Infera: a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z).">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="menu" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">☰</button>
+  <a class="brand" href="index.html">Infera</a>
+  <span class="version">v2.0.0</span>
+  <nav class="links"><a href="https://github.com/hyperswine/NeoProlog">GitHub</a><a href="https://github.com/hyperswine/NeoProlog/releases">Releases</a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav>
+<h4>Start</h4>
+<a href="index.html">Overview</a>
+<a href="install.html">Install</a>
+<h4>Reference</h4>
+<a href="language.html">Language</a>
+<a href="declarations.html">Declarations</a>
+<a href="engine.html">Engine</a>
+<a href="clp.html">CLP(Z)</a>
+<a href="builtins.html">Built-ins</a>
+<h4>Tooling</h4>
+<a href="tools.html">REPL, CLI and modules</a>
+<a href="editor.html" class="active">Editor support</a>
+  </nav></aside>
+  <main class="content">
+<h1>Editor support</h1>
+<p class="lead">The repository ships a VS Code extension with a language server for <code>.nprolog</code> and <code>.infera</code> files.</p>
+
+<h2 id="install" data-dash="Guide:Editor: install">Install the extension <a class="anchor" href="#install">#</a></h2>
+<pre><code>cd lsp
+npm install
+npm run install-extension     # packages infera-lsp.vsix and installs it into VS Code</code></pre>
+<p>Or run <code>npm run package</code> and install the <code>.vsix</code> through <em>Extensions → … → Install from VSIX</em>.</p>
+
+<h2 id="features" data-dash="Guide:Editor: features">Features <a class="anchor" href="#features">#</a></h2>
+<ul>
+  <li><strong>Highlighting</strong>: a TextMate grammar plus semantic tokens for clause heads, declarations, sorts, modes, module namespaces and inline queries.</li>
+  <li><strong>Hover</strong>: built-in documentation, predicate clause counts and declared signatures, declaration keywords, imported modules.</li>
+  <li><strong>Navigation</strong>: go to definition, find references and document symbols (<code>name/arity</code>), including <code>mod:pred</code> calls resolved through <code>neoprolog.conf</code>.</li>
+  <li><strong>Completion</strong>: local predicates, module aliases (<code>mod:</code> completes the module's predicates), built-ins, and determinism words, flags, sorts and modes inside a declaration.</li>
+  <li><strong>Diagnostics</strong> from static analysis: undefined predicates, calls with an arity no clause defines, declarations without clauses or with the wrong arity, malformed declarations, unknown directives, unbalanced brackets, missing terminators and singleton variables.</li>
+  <li><strong>Parser diagnostics</strong>: when the <code>infera</code> binary is available, <code>infera check</code> runs on open and save and its errors are shown at the reported position.</li>
+</ul>
+
+<h2 id="settings" data-dash="Guide:Editor: settings">Settings <a class="anchor" href="#settings">#</a></h2>
+<table>
+<tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+<tr><td id="setting-executable" data-dash="Setting:infera.executable"><code>infera.executable</code></td><td><code>infera</code></td><td>binary used for <code>infera check</code></td></tr>
+<tr><td id="setting-check" data-dash="Setting:infera.checkOnSave"><code>infera.checkOnSave</code></td><td><code>true</code></td><td>run the parser check on open and save</td></tr>
+</table>
+
+<h2 id="other">Other editors <a class="anchor" href="#other">#</a></h2>
+<p>The server in <code>lsp/server/server.js</code> speaks standard LSP over stdio-less IPC as launched by the VS Code client; any editor that can launch a Node language server can use it by running <code>node lsp/server/server.js --stdio</code> after switching the connection to stdio, and the analyser in <code>lsp/server/analysis.js</code> is a plain module usable from other tooling.</p>
+<div class="pager"><a href="tools.html">← REPL, CLI and modules</a><span></span></div>
+  </main>
+</div>
+<footer>Infera v2.0.0 · GPL-3.0 · <a href="https://github.com/hyperswine/NeoProlog">hyperswine/NeoProlog</a></footer>
+</body>
+</html>

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REPL, CLI and modules · Infera</title>
+<meta name="description" content="Infera: a Prolog-inspired logic language with sorts, modes, determinism, tabling and CLP(Z).">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="menu" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">☰</button>
+  <a class="brand" href="index.html">Infera</a>
+  <span class="version">v2.0.0</span>
+  <nav class="links"><a href="https://github.com/hyperswine/NeoProlog">GitHub</a><a href="https://github.com/hyperswine/NeoProlog/releases">Releases</a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav>
+<h4>Start</h4>
+<a href="index.html">Overview</a>
+<a href="install.html">Install</a>
+<h4>Reference</h4>
+<a href="language.html">Language</a>
+<a href="declarations.html">Declarations</a>
+<a href="engine.html">Engine</a>
+<a href="clp.html">CLP(Z)</a>
+<a href="builtins.html">Built-ins</a>
+<h4>Tooling</h4>
+<a href="tools.html" class="active">REPL, CLI and modules</a>
+<a href="editor.html">Editor support</a>
+  </nav></aside>
+  <main class="content">
+<h1>REPL, CLI and modules</h1>
+<p class="lead">The <code>infera</code> executable is a REPL, a file loader, a checker and the module registry tool.</p>
+
+<h2 id="cli" data-dash="Guide:Command line">Command line <a class="anchor" href="#cli">#</a></h2>
+<table>
+<tr><th>Command</th><th>Meaning</th></tr>
+<tr><td id="cli-file" data-dash="Command:infera FILE"><code>infera FILE</code></td><td>load a file, run its inline <code>&gt;</code> queries, then start the REPL</td></tr>
+<tr><td id="cli-check" data-dash="Command:infera check"><code>infera check FILE…</code></td><td>parse, resolve imports and analyse each file; prints <code>ok (N clauses, M queries)</code> or the error; exit status 1 on failure</td></tr>
+<tr><td id="cli-reg" data-dash="Command:infera reg"><code>infera reg FILE…</code></td><td>register files as modules in <code>./neoprolog.conf</code></td></tr>
+</table>
+<p>Colours are used only when standard output is a terminal and <code>NO_COLOR</code> is unset, so the output is safe to pipe.</p>
+
+<h2 id="repl" data-dash="Guide:REPL">REPL <a class="anchor" href="#repl">#</a></h2>
+<p>Type a clause or declaration ending with <code>.</code> to add it, or goals ending with <code>?</code> to query. Programs are re-analysed after every addition.</p>
+<table>
+<tr><th>Command</th><th>Meaning</th></tr>
+<tr><td id="repl-load" data-dash="Command::load"><code>:load FILE</code></td><td>load a file (replaces the program) and run its inline queries</td></tr>
+<tr><td id="repl-reload" data-dash="Command::reload"><code>:reload</code>, <code>:r</code></td><td>reload the last file</td></tr>
+<tr><td id="repl-sig" data-dash="Command::sig"><code>:sig [NAME]</code></td><td>declared and inferred signatures, clause count, tabled/indexed/recursive/pure status</td></tr>
+<tr><td id="repl-preds" data-dash="Command::preds"><code>:preds</code></td><td>list predicates as <code>name/arity</code></td></tr>
+<tr><td id="repl-quit" data-dash="Command::quit"><code>:quit</code>, <code>:q</code>, Ctrl-D</td><td>exit</td></tr>
+</table>
+<pre><code><span class="k">&gt;</span> :sig fib
+fib/<span class="n">2</span>
+  inferred: fib : <span class="k">semidet</span> (<span class="k">num</span>: &lt;=) (<span class="k">num</span>: =&gt;).   # <span class="k">semidet</span> when argument(s) <span class="n">1</span> ground
+  clauses: <span class="n">3</span>, tabled: yes, indexed: yes, recursive: yes, pure: yes</code></pre>
+
+<h2 id="modules" data-dash="Guide:Modules">Modules <a class="anchor" href="#modules">#</a></h2>
+<p>Modules are files registered under a content-addressed name: <code>infera reg path/to/mymod.nprolog</code> appends <code>mymod#&lt;sha1 of the absolute path&gt; /abs/path/mymod.nprolog</code> to <code>neoprolog.conf</code> in the current directory. Infera looks for <code>neoprolog.conf</code> or <code>infera.conf</code> in the working directory, then in <code>~/nprolog/</code>.</p>
+<pre><code><span class="k">&lt;-</span> import <span class="s">&quot;mymod#3f2a9c...&quot;</span>.
+
+main <span class="k">&lt;-</span> mymod:greet <span class="s">&quot;world&quot;</span>.</code></pre>
+<ul>
+  <li>Imported clauses and declarations are prefixed with the module name: <code>mymod:greet</code>. Calls inside the module to its own predicates are qualified too.</li>
+  <li>A module's own imports are resolved recursively; cycles are ignored.</li>
+  <li>Inline queries in a module are not run when it is imported.</li>
+</ul>
+
+<h2 id="answers" data-dash="Guide:Answers">Answers <a class="anchor" href="#answers">#</a></h2>
+<p>Each answer lists the bindings of the query's named variables, then residual constraints: domains (<code>X in 1..3</code>), CLP(Z) relations (<code>X + Y #= 10</code>) and disequalities (<code>X != 1</code>) that reach a visible variable. Internal variables are named <code>_0</code>, <code>_1</code>, … and a query variable bound to an otherwise anonymous variable lends it its name. Output produced by a branch is printed before that branch's answer.</p>
+<div class="pager"><a href="builtins.html">← Built-ins</a><a href="editor.html">Editor support →</a></div>
+  </main>
+</div>
+<footer>Infera v2.0.0 · GPL-3.0 · <a href="https://github.com/hyperswine/NeoProlog">hyperswine/NeoProlog</a></footer>
+</body>
+</html>
