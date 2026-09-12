@@ -11,6 +11,7 @@
 # domains and constraints are shown in answers.
 
 # Two equations, solved by propagation once labeling fixes one variable.
+# simple puzzle: find two numbers X and Y such that their sum is 10 and their difference is 2.
 puzzle X Y <- [X, Y] in 0..20, X + Y #= 10, X - Y #= 2, label [X, Y].
 
 # SEND + MORE = MONEY
@@ -18,6 +19,7 @@ send_more_money [S, E, N, D, M, O, R, Y] <-
   Vars = [S, E, N, D, M, O, R, Y],
   Vars in 0..9,
   all_different Vars,
+  # S and M cant be 0 because they are the leading digits of their respective numbers.
   S #!= 0,
   M #!= 0,
   1000 * S + 100 * E + 10 * N + D + 1000 * M + 100 * O + 10 * R + E
@@ -33,6 +35,7 @@ mklist N [_ | T] <- N > 0, N1 is N - 1, mklist N1 T.
 safe [].
 safe [Q | Qs] <- noattack Q Qs 1, safe Qs.
 
+# basically, queens are not in each other's line of attack (same row, same column, or same diagonal)
 noattack _ [] _.
 noattack Q [Q1 | Qs] D <-
   Q #!= Q1, Q #!= Q1 + D, Q #!= Q1 - D,

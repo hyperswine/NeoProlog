@@ -195,7 +195,7 @@ src/Infera/Engine.hs    resolution, cut, tabling, labeling, answers
 src/Infera/Module.hs    neoprolog.conf and imports
 src/Infera/Repl.hs      interactive loop
 test/InferaTest.hs      hedgehog test suite
-examples/               stdlib, v2_decls, v2_clp, v2_tabling, ...
+examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), ...
 Formula/infera.rb       Homebrew formula
 lsp/                    VS Code extension and language server
 ```
