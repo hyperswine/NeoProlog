@@ -38,6 +38,9 @@ module Infera.Syntax
     Clause (..),
     Query (..),
     TopLevel (..),
+    SourceSpan (..),
+    LocatedTopLevel (..),
+    parseLocatedFile,
     clauseKey,
 
     -- * Parsing
@@ -57,6 +60,8 @@ import Control.Monad (void)
 import Control.Monad.Combinators.Expr
 import qualified Control.Monad.State.Strict as St
 import Data.List (intercalate)
+import Data.Char (ord)
+import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Void
@@ -297,6 +302,24 @@ data TopLevel
   | TLDecl Decl
   deriving (Show, Eq)
 
+-- | One-based lines and UTF-16 columns. Semantic diagnostics refer to the containing
+-- item; parser errors point at the offending character.
+data SourceSpan = SourceSpan
+  { spanFile :: FilePath,
+    spanLine :: Int,
+    spanColumn :: Int,
+    spanEndLine :: Int,
+    spanEndColumn :: Int
+  }
+  deriving (Show, Eq)
+
+data LocatedTopLevel = LocatedTopLevel
+  { locatedSpan :: SourceSpan,
+    locatedItem :: TopLevel,
+    locatedNames :: [(String, VarId)]
+  }
+  deriving (Show, Eq)
+
 clauseKey :: Clause -> Maybe (String, Int)
 clauseKey = functorOf . clauseHead
 
@@ -305,11 +328,12 @@ clauseKey = functorOf . clauseHead
 data ParseEnv = ParseEnv
   { peVars :: Map String VarId,
     peOrder :: [(String, VarId)],
+    peTokenEnd :: !Int,
     peNext :: !Int
   }
 
 emptyEnv :: ParseEnv
-emptyEnv = ParseEnv Map.empty [] 0
+emptyEnv = ParseEnv Map.empty [] 0 0
 
 type Parser = ParsecT Void String (St.State ParseEnv)
 
@@ -352,10 +376,15 @@ sc :: Parser ()
 sc = L.space space1 hashLineComment empty
 
 lexeme :: Parser a -> Parser a
-lexeme = L.lexeme sc
+lexeme p = do
+  value <- p
+  end <- getOffset
+  St.modify (\env -> env {peTokenEnd = end})
+  sc
+  pure value
 
 symbol :: String -> Parser String
-symbol = L.symbol sc
+symbol = lexeme . string
 
 keyword :: String -> Parser ()
 keyword s = void $ lexeme $ try $ string s <* notFollowedBy (alphaNumChar <|> char '_')
@@ -744,6 +773,31 @@ runP p input = case St.evalState (runParserT p "<input>" input) emptyEnv of
 -- | Parse a whole file: clauses, declarations, directives and inline queries.
 parseFile :: String -> Either String [TopLevel]
 parseFile = runP pFile
+
+parseLocatedFile :: FilePath -> String -> Either (SourceSpan, String) [LocatedTopLevel]
+parseLocatedFile path input =
+  case St.evalState (runParserT parser path input) emptyEnv of
+    Right items -> Right items
+    Left bundle ->
+      let (l, c) = position (errorOffset (NE.head (bundleErrors bundle)))
+       in Left (SourceSpan path l c l (c + 1), errorBundlePretty bundle)
+  where
+    parser = sc *> many located <* eof
+    located = do
+      start <- getOffset
+      item <- pTopLevel
+      env <- St.get
+      let (l, c) = position start
+          (el, ec) = position (peTokenEnd env)
+          loc = SourceSpan path l c el ec
+      pure (LocatedTopLevel loc item (peOrder env))
+    -- UTF-16 columns match the LSP protocol, including supplementary Unicode
+    -- characters and literal tabs (which occupy one character).
+    -- Index once so locating many items does not repeatedly scan the source.
+    positions = Map.fromDistinctAscList (zip [0 ..] (scanl advance (1, 1) input))
+    position offset = Map.findWithDefault (1, 1) offset positions
+    advance (l, _) '\n' = (l + 1, 1)
+    advance (l, c) ch = (l, c + if ord ch > 0xffff then 2 else 1)
 
 -- | Parse a program consisting only of clauses and declarations (no queries).
 parseProgram :: String -> Either String [TopLevel]

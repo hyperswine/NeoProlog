@@ -54,12 +54,17 @@
         "infera.executable": {
           "type": "string",
           "default": "infera",
-          "description": "Path to the infera executable, used to run `infera check` on save for parser diagnostics."
+          "description": "Path to the infera executable used for compiler diagnostics of live editor buffers."
         },
         "infera.checkOnSave": {
           "type": "boolean",
           "default": true,
-          "description": "Run `infera check <file>` when a file is opened or saved and show its errors."
+          "description": "Run the compiler checker on save (also on open when this or checkOnChange is enabled)."
+        },
+        "infera.checkOnChange": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the compiler checker on unsaved edits, after a short debounce."
         }
       }
     },
@@ -78,7 +83,7 @@
     ]
   },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "package": "vsce package",
     "install-extension": "vsce package -o infera-lsp.vsix && code --install-extension infera-lsp.vsix"
   },

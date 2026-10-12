@@ -9,6 +9,8 @@ module Infera.Module
     processTopLevels,
     loadSource,
     loadFile,
+    loadLocatedFile,
+    loadLocatedWithSources,
   )
 where
 
@@ -163,3 +165,55 @@ loadFile path = do
     Right contents -> do
       conf <- loadConf
       loadSource conf contents
+
+-- | Resolve imports while retaining the owning file and item range. Import
+-- queries are ignored, just as they are by 'loadSource'.
+loadLocatedFile :: FilePath -> IO (Either (SourceSpan, String) [LocatedTopLevel])
+loadLocatedFile = loadLocatedWithSources []
+
+-- | Source overrides use the original file's identity and import context.
+-- This lets editors check unsaved roots and dependencies without replacing
+-- their files on disk. Paths are canonicalised before lookup.
+loadLocatedWithSources :: [(FilePath, String)] -> FilePath -> IO (Either (SourceSpan, String) [LocatedTopLevel])
+loadLocatedWithSources sources path = do
+  result <- CE.try $ do
+    conf <- loadConf
+    overrides <- Map.fromList <$> mapM (\(file, src) -> do
+      absolute <- canonicalizePath file
+      pure (absolute, src)) sources
+    absolute <- canonicalizePath path
+    expand overrides conf [] absolute
+  pure $ case result of
+    Left ex -> Left (SourceSpan path 1 1 1 2, show (ex :: CE.IOException))
+    Right value -> value
+  where
+    expand overrides conf visited file = do
+      input <- case Map.lookup file overrides of
+        Just src -> pure (Right src)
+        Nothing -> CE.try (readFile file >>= \s -> length s `seq` pure s)
+      case input of
+        Left ex -> pure (Left (SourceSpan file 1 1 1 2, show (ex :: CE.IOException)))
+        Right src -> case parseLocatedFile file src of
+          Left err -> pure (Left err)
+          Right items -> foldM (step overrides conf visited) (Right []) items
+    step _ _ _ (Left err) _ = pure (Left err)
+    step overrides conf visited (Right acc) item = case locatedItem item of
+      TLDirective [Compound "import" [StrLit ref]] ->
+        case parseModRef ref of
+          Nothing -> pure (Left (locatedSpan item, "Invalid module reference: " ++ ref))
+          Just (name, _) -> case Map.lookup ref conf of
+            Nothing -> pure (Left (locatedSpan item, "Module '" ++ ref ++ "' not found in neoprolog.conf"))
+            Just file
+              | ref `elem` visited -> pure (Right acc)
+              | otherwise -> do
+                  absolute <- canonicalizePath file
+                  nested <- expand overrides conf (ref : visited) absolute
+                  pure $ do
+                    imported <- nested
+                    let own = [i | i <- imported, case locatedItem i of TLQuery _ -> False; _ -> True]
+                        known = definedNames (map locatedItem own)
+                    pure (acc ++ [i {locatedItem = qualifyItem name known (locatedItem i)} | i <- own])
+      TLDirective goals
+        | Nothing <- addDirective goals emptyProgram ->
+            pure (Left (locatedSpan item, "Unknown directive: " ++ show goals))
+      _ -> pure (Right (acc ++ [item]))

@@ -45,16 +45,18 @@ npm run install-extension     # packages infera-lsp.vsix and installs it into VS
   <li><strong>Hover</strong>: built-in documentation, predicate clause counts and declared signatures, declaration keywords, imported modules.</li>
   <li><strong>Navigation</strong>: go to definition, find references and document symbols (<code>name/arity</code>), including <code>mod:pred</code> calls resolved through <code>neoprolog.conf</code>.</li>
   <li><strong>Completion</strong>: local predicates, module aliases (<code>mod:</code> completes the module's predicates), built-ins, and determinism words, flags, sorts and modes inside a declaration.</li>
-  <li><strong>Diagnostics</strong> from static analysis: undefined predicates, calls with an arity no clause defines, declarations without clauses or with the wrong arity, malformed declarations, unknown directives, unbalanced brackets, missing terminators and singleton variables.</li>
-  <li><strong>Parser diagnostics</strong>: when the <code>infera</code> binary is available, <code>infera check</code> runs on open and save and its errors are shown at the reported position.</li>
+  <li><strong>Diagnostics</strong> come exclusively from the compiler: undefined calls, arities, declaration and literal-sort conflicts, singleton warnings, parser and import errors. The editor checks live buffers on open, after a short edit debounce, and on save using <code>infera check --json --stdin</code>. Unsaved imports are included, imported errors link to their owning files, and outdated checks are cancelled.</li>
+  <li><strong>Unsaved files</strong>: untitled buffers use the workspace as their import context. A missing or incompatible compiler produces an availability warning; highlighting and navigation remain available without a separate validator.</li>
 </ul>
 
 <h2 id="settings" data-dash="Guide:Editor: settings">Settings <a class="anchor" href="#settings">#</a></h2>
 <table>
 <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
-<tr><td id="setting-executable" data-dash="Setting:infera.executable"><code>infera.executable</code></td><td><code>infera</code></td><td>binary used for <code>infera check</code></td></tr>
-<tr><td id="setting-check" data-dash="Setting:infera.checkOnSave"><code>infera.checkOnSave</code></td><td><code>true</code></td><td>run the parser check on open and save</td></tr>
+<tr><td id="setting-executable" data-dash="Setting:infera.executable"><code>infera.executable</code></td><td><code>infera</code></td><td>binary used for <code>infera check --json</code></td></tr>
+<tr><td id="setting-check" data-dash="Setting:infera.checkOnSave"><code>infera.checkOnSave</code></td><td><code>true</code></td><td>run the compiler check on save</td></tr>
+<tr><td id="setting-change" data-dash="Setting:infera.checkOnChange"><code>infera.checkOnChange</code></td><td><code>true</code></td><td>run the compiler check after unsaved edits</td></tr>
 </table>
+<p>Opening a document checks it when either setting is enabled. Disable both to turn off diagnostics while retaining other editor features.</p>
 
 <h2 id="other">Other editors <a class="anchor" href="#other">#</a></h2>
 <p>The server in <code>lsp/server/server.js</code> speaks standard LSP over stdio-less IPC as launched by the VS Code client; any editor that can launch a Node language server can use it by running <code>node lsp/server/server.js --stdio</code> after switching the connection to stdio, and the analyser in <code>lsp/server/analysis.js</code> is a plain module usable from other tooling.</p>

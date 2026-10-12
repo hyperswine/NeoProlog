@@ -17,6 +17,7 @@ copyright:          2025 Jasen Qin
 category:           Language
 build-type:         Simple
 extra-doc-files:    README.md
+extra-source-files: examples/*.nprolog test/cli.py
 tested-with:        GHC == 9.8.2
 
 source-repository head
@@ -42,6 +43,7 @@ library
         Infera
         Infera.Syntax
         Infera.Error
+        Infera.Diagnostic
         Infera.Unify
         Infera.Arith
         Infera.CLP

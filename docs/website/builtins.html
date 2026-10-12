@@ -42,6 +42,7 @@
 <tr><td id="once" data-dash="Builtin:once/1"><code>once G</code></td><td>first solution of <code>G</code> only</td></tr>
 <tr><td id="forall" data-dash="Builtin:forall/2"><code>forall C A</code></td><td>succeeds if <code>A</code> holds for every solution of <code>C</code></td></tr>
 <tr><td id="findall" data-dash="Builtin:findall/3"><code>findall T G L</code></td><td><code>L</code> is the list of <code>T</code> for every solution of <code>G</code></td></tr>
+<tr><td id="minimize" data-dash="Builtin:minimize/2"><code>minimize Cost Goal</code></td><td>retain one least-cost answer of a finite search; the integer cost must be ground in every answer; cuts are local and only the winning answer's bindings and output survive</td></tr>
 <tr><td id="call" data-dash="Builtin:call/N"><code>call G A…</code></td><td>call <code>G</code> with extra arguments appended; cuts inside are local</td></tr>
 <tr><td id="phrase" data-dash="Builtin:phrase/2"><code>phrase NT L</code></td><td>run DCG non-terminal <code>NT</code> on <code>L</code> with an empty remainder</td></tr>
 </table>

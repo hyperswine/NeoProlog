@@ -42,7 +42,10 @@
 <tr><td id="fd-cmp" data-dash="Operator:#&lt;"><code>A #&lt; B</code>, <code>A #&gt; B</code>, <code>A #&lt;= B</code>, <code>A #&gt;= B</code></td><td>ordering</td></tr>
 <tr><td id="all-different" data-dash="Builtin:all_different/1"><code>all_different Xs</code></td><td>pairwise <code>#!=</code> over a list (<code>all_distinct</code> is a synonym)</td></tr>
 <tr><td id="label" data-dash="Builtin:label/1"><code>label Xs</code></td><td>enumerate the variables' finite domains, smallest domain first (<code>labeling</code> is a synonym)</td></tr>
+<tr><td id="label-min" data-dash="Builtin:labeling/2"><code>labeling [min Cost] Xs</code></td><td>return one minimum using branch-and-bound; finite integer domains, with an integer cost ground at each complete assignment</td></tr>
+<tr><td id="minimize" data-dash="Builtin:minimize/2"><code>minimize Cost Goal</code></td><td>scan a finite search while retaining only the first least-cost answer and its bindings/output; no branch pruning; every answer must have a ground integer cost</td></tr>
 </table>
+<p>Both optimisation forms return one optimum, fail if there are no solutions, and do not claim an optimum if any branch errors or the search is incomplete. Only <code>[min Cost]</code> is supported by two-argument labeling. Pruning can change the first tied assignment encountered. The breadboard example uses <code>minimize</code> for its post-placement scoring, avoiding a list of every placement.</p>
 <p>Expressions may use <code>+ - *</code> and integer literals; <code>*</code> of two unknowns, <code>/</code>, <code>%</code> and <code>^</code> stay residual until they become linear or ground.</p>
 
 <h2 id="examples">Examples <a class="anchor" href="#examples">#</a></h2>

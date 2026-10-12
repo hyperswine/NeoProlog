@@ -1,9 +1,9 @@
 // server.js — Language Server for Infera v2 (.nprolog / .infera)
 //
 // Features: semantic tokens, hover, go-to-definition, references, document
-// symbols, completion, diagnostics (static analysis of the v2 syntax plus,
-// when the `infera` binary is available, the real parser's errors via
-// `infera check`), and module-aware navigation through neoprolog.conf.
+// symbols, completion, compiler-owned live diagnostics, and module-aware
+// navigation through neoprolog.conf. JavaScript extracts symbols but never
+// validates the language.
 'use strict'
 
 const {
@@ -23,10 +23,12 @@ const {
 const { TextDocument } = require('vscode-languageserver-textdocument')
 const fs = require('fs')
 const path = require('path')
+const os = require('os')
 const { execFile } = require('child_process')
 const { pathToFileURL, fileURLToPath } = require('url')
 
 const analysis = require('./analysis')
+const { compilerDiagnostics } = require('./checker')
 const { tokenize, analyzeDocument, BUILTIN_DOCS, DECL_DOCS, BUILTIN_PREDICATES, KEYWORD_ATOMS, DET_WORDS, FLAG_WORDS, SORT_WORDS, TOKEN_TYPES, TOKEN_MODIFIERS, TT, TM } = analysis
 
 const connection = createConnection(ProposedFeatures.all)
@@ -36,7 +38,7 @@ let hasConfigurationCapability = false
 let hasWorkspaceFolderCapability = false
 const workspaceFolderPaths = []
 
-const DEFAULT_SETTINGS = { executable: 'infera', checkOnSave: true }
+const DEFAULT_SETTINGS = { executable: 'infera', checkOnSave: true, checkOnChange: true }
 let globalSettings = { ...DEFAULT_SETTINGS }
 
 // ─── neoprolog.conf ────────────────────────────────────────────────────────────
@@ -121,6 +123,11 @@ function uriToPath(uri) { try { return fileURLToPath(uri) } catch { return null 
 
 const documentCache = new Map()   // uri -> analysis
 const checkerDiagnostics = new Map() // uri -> diagnostics from `infera check`
+const checkerRuns = new Map()
+const checkerTimers = new Map()
+const checkerProcesses = new Map()
+const documentVersions = new Map()
+let checkerSerial = 0
 
 function refreshDocument(document) {
   const a = analyzeDocument(document.getText())
@@ -133,15 +140,8 @@ function getAnalysis(uri) { return documentCache.get(uri) || null }
 function locToRange(loc) { return Range.create(loc.line, loc.col, loc.line, loc.col + loc.length) }
 
 function publish(uri) {
-  const a = getAnalysis(uri)
-  const staticDiags = a ? a.diagnostics.map(d => ({
-    range: locToRange(d),
-    message: d.message,
-    severity: d.severity || DiagnosticSeverity.Warning,
-    source: 'infera'
-  })) : []
-  const checker = checkerDiagnostics.get(uri) || []
-  connection.sendDiagnostics({ uri, diagnostics: [...checker, ...staticDiags] })
+  connection.sendDiagnostics({ uri, version: documents.get(uri)?.version,
+    diagnostics: checkerDiagnostics.get(uri) || [] })
 }
 
 // ─── `infera check` integration ───────────────────────────────────────────────
@@ -156,40 +156,90 @@ async function getSettings() {
   }
 }
 
-let checkerAvailable = null // null = unknown, true/false once probed
+function invalidateCheck(uri) {
+  const run = ++checkerSerial
+  checkerRuns.set(uri, run)
+  clearTimeout(checkerTimers.get(uri))
+  checkerTimers.delete(uri)
+  const child = checkerProcesses.get(uri)
+  checkerProcesses.delete(uri)
+  if (child) child.kill()
+  checkerDiagnostics.delete(uri)
+  return run
+}
 
-function runChecker(uri) {
-  const filePath = uriToPath(uri)
-  if (!filePath) return
-  getSettings().then(settings => {
-    if (!settings.checkOnSave || checkerAvailable === false) return
+function queueCheck(uri, reason, delay = 200) {
+  const run = invalidateCheck(uri)
+  publish(uri)
+  checkerTimers.set(uri, setTimeout(() => {
+    checkerTimers.delete(uri)
+    runChecker(uri, run, reason)
+  }, delay))
+}
+
+function checkerFailure(uri, message) {
+  checkerDiagnostics.set(uri, [{ range: Range.create(0, 0, 0, 1),
+    severity: DiagnosticSeverity.Warning, code: 'checker-unavailable',
+    source: 'infera checker', message }])
+  publish(uri)
+}
+
+async function runChecker(uri, run, reason) {
+  // Untitled documents have no disk identity yet. Give the compiler a virtual
+  // path in the workspace for import context; source always comes from stdin.
+  const filePath = uriToPath(uri) || (uri.startsWith('untitled:')
+    ? path.join(workspaceFolderPaths[0] || process.cwd(), `.infera-${encodeURIComponent(uri)}.nprolog`) : null)
+  if (!filePath || !documents.get(uri) || checkerRuns.get(uri) !== run) return
+  const version = documents.get(uri)?.version
+  const current = () => documents.get(uri)?.version === version && checkerRuns.get(uri) === run
+  let temporary
+  try {
+    const settings = await getSettings()
+    if (!current()) return
+    const enabled = reason === 'save' ? settings.checkOnSave
+      : reason === 'change' ? settings.checkOnChange : settings.checkOnSave || settings.checkOnChange
+    if (!enabled) return
+    const source = documents.get(uri).getText()
+    const buffers = documents.all().filter(doc => doc.uri !== uri && uriToPath(doc.uri))
+      .map(doc => ({ path: uriToPath(doc.uri), text: doc.getText() }))
+    const args = ['check', '--json', '--stdin', filePath]
+    if (buffers.length) {
+      temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'infera-buffers-'))
+      for (const [i, buffer] of buffers.entries()) {
+        const snapshot = path.join(temporary, String(i))
+        await fs.promises.writeFile(snapshot, buffer.text, 'utf8')
+        args.push('--buffer', buffer.path, snapshot)
+      }
+    }
+    if (!current()) return
     const confPath = findConfFile(path.dirname(filePath))
     const cwd = confPath ? path.dirname(confPath) : path.dirname(filePath)
-    execFile(settings.executable, ['check', filePath], { cwd, timeout: 15000 }, (err, stdout, stderr) => {
-      if (err && err.code === 'ENOENT') {
-        checkerAvailable = false
-        connection.console.log(`infera executable not found (${settings.executable}); parser diagnostics disabled`)
-        return
-      }
-      checkerAvailable = true
-      const out = `${stdout || ''}\n${stderr || ''}`
-      const diags = []
-      const m = out.match(/error:\s*([\s\S]*)$/)
-      if (err && m) {
-        const msg = m[1].trim()
-        const pos = msg.match(/:(\d+):(\d+):/)
-        let range = Range.create(0, 0, 0, 1)
-        if (pos) {
-          const line = Math.max(0, parseInt(pos[1], 10) - 1)
-          const col = Math.max(0, parseInt(pos[2], 10) - 1)
-          range = Range.create(line, col, line, col + 1)
+    await new Promise(resolve => {
+      const child = execFile(settings.executable, args, { cwd, timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (checkerProcesses.get(uri) === child) checkerProcesses.delete(uri)
+        if (!current()) { resolve(); return }
+        try {
+          if (err && (err.killed || typeof err.code !== 'number')) throw err
+          const diags = compilerDiagnostics(stdout, filePath)
+          if (err && !diags.some(d => d.severity === DiagnosticSeverity.Error)) throw err
+          checkerDiagnostics.set(uri, diags)
+          publish(uri)
+        } catch (failure) {
+          connection.console.error(`infera check --json failed: ${stderr || failure.message}`)
+          checkerFailure(uri, `Compiler diagnostics unavailable. Check infera.executable and use a compiler supporting check --json --stdin. ${failure.code === 'ENOENT' ? 'Executable not found.' : failure.killed ? 'Check timed out.' : 'Check failed.'}`)
         }
-        diags.push({ range, message: msg, severity: DiagnosticSeverity.Error, source: 'infera check' })
-      }
-      checkerDiagnostics.set(uri, diags)
-      publish(uri)
+        resolve()
+      })
+      checkerProcesses.set(uri, child)
+      // A superseded/failed checker may close stdin before the write completes.
+      child.stdin.on('error', () => {})
+      child.stdin.end(source, 'utf8')
     })
-  })
+  } catch (failure) {
+    if (current()) checkerFailure(uri, `Compiler diagnostics unavailable: ${failure.message}`)
+  } finally {
+    if (temporary) await fs.promises.rm(temporary, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 // ─── Cursor inspection ─────────────────────────────────────────────────────────
@@ -345,31 +395,46 @@ connection.onDidChangeConfiguration(change => {
   if (!hasConfigurationCapability) {
     globalSettings = { ...DEFAULT_SETTINGS, ...((change.settings && change.settings.infera) || {}) }
   }
-  checkerAvailable = null
-  for (const doc of documents.all()) runChecker(doc.uri)
+  for (const doc of documents.all()) queueCheck(doc.uri, 'open', 0)
 })
 
 // ─── Document events ───────────────────────────────────────────────────────────
 
 documents.onDidOpen(e => {
   refreshDocument(e.document)
-  publish(e.document.uri)
-  runChecker(e.document.uri)
+  // TextDocuments emits an initial content event immediately after open.
 })
 
 documents.onDidChangeContent(change => {
   const p = uriToPath(change.document.uri)
   if (p) externalCache.delete(p)
   refreshDocument(change.document)
-  publish(change.document.uri)
+  const initial = !documentVersions.has(change.document.uri)
+  documentVersions.set(change.document.uri, change.document.version)
+  queueCheck(change.document.uri, initial ? 'open' : 'change')
+  for (const doc of documents.all()) {
+    if (doc.uri !== change.document.uri) queueCheck(doc.uri, 'change')
+  }
 })
 
-documents.onDidSave(e => runChecker(e.document.uri))
+documents.onDidSave(async () => {
+  const versions = new Map(documents.all().map(doc => [doc.uri, doc.version]))
+  const settings = await getSettings()
+  // A disabled save check must not cancel an enabled live check, for example
+  // when an editor autosaves immediately after sending a content change.
+  if (!settings.checkOnSave) return
+  for (const doc of documents.all()) {
+    if (versions.get(doc.uri) === doc.version) queueCheck(doc.uri, 'save', 0)
+  }
+})
 
 documents.onDidClose(e => {
   documentCache.delete(e.document.uri)
-  checkerDiagnostics.delete(e.document.uri)
+  documentVersions.delete(e.document.uri)
+  invalidateCheck(e.document.uri)
+  checkerRuns.delete(e.document.uri)
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] })
+  for (const doc of documents.all()) queueCheck(doc.uri, 'open')
 })
 
 connection.onDidChangeWatchedFiles(event => {
@@ -377,6 +442,7 @@ connection.onDidChangeWatchedFiles(event => {
     const p = uriToPath(change.uri)
     if (p && CONF_NAMES.includes(path.basename(p))) confCache.delete(p)
   }
+  for (const doc of documents.all()) queueCheck(doc.uri, 'open')
 })
 
 // ─── Hover ─────────────────────────────────────────────────────────────────────

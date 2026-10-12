@@ -35,7 +35,28 @@ selects; build with `DEVELOPER_DIR=/Library/Developer/CommandLineTools`.
 infera <file.nprolog>      # load a file, run its inline queries, drop into the REPL
 infera reg <file.nprolog>  # register a module in ./neoprolog.conf
 infera check <files...>    # parse and analyse files, report errors (exit 1 on failure)
+infera check --json <files...> # structured diagnostics for editors and tools
+infera check --json --stdin <file> # check source from stdin at this file's path
 ```
+
+`check` resolves imports and checks undefined predicates, call arities,
+declarations without matching clauses, and literal arguments that conflict
+with every declared signature. Singleton variables, conflicting flags, and
+unreachable clause heads produce warnings. Errors exit 1; warnings alone exit
+0. Checks do not execute inline queries or prove runtime mode/determinism
+contracts. Dynamic call targets remain runtime checks.
+
+JSON output is an array of `{file, severity, code, message, range}` objects on
+stdout. Ranges use zero-based lines and UTF-16 character offsets, with an
+exclusive end. Semantic ranges cover the containing clause, declaration or
+query; parse errors identify the offending position. Imported diagnostics
+retain their own source file. Human-readable diagnostics go to stderr.
+
+`--stdin FILE` checks an unsaved buffer without writing `FILE`; its path supplies
+the import context and diagnostic identity. Optional `--buffer SOURCE SNAPSHOT`
+arguments supply unsaved dependency snapshots, preserving each original source
+path. These checks use the same parser, import resolver and diagnostics as disk
+checks.
 
 REPL: clauses end with `.`, queries with `?`.  Commands: `:load <file>`,
 `:reload`, `:sig [pred]` (declared and inferred signatures), `:preds`, `:quit`.
@@ -148,12 +169,37 @@ X in 1..9            # also [X, Y] in 0..sup ; inf / sup for open bounds
 A #= B  A #!= B  A #< B  A #> B  A #<= B  A #>= B
 all_different Xs
 label Xs             # enumerate, smallest domain first
+labeling [min Cost] Xs # one minimum, with branch-and-bound pruning
+minimize Cost Goal   # one minimum of a finite goal's answers
 ```
 
 Interval domains with holes and bounds propagation for linear constraints;
 non-linear constraints wait until they become linear or ground.  Residual
 domains and constraints are shown in answers (`X in 4..5`, `X + Y #= 10`).
 See `examples/v2_clp.nprolog` (SEND + MORE = MONEY, N-queens).
+
+### Optimisation
+
+```prolog
+> [X, Y] in 0..10, X + Y #>= 7, Cost #= 2 * X + Y,
+  labeling [min Cost] [X, Y]?
+# X = 0, Y = 7, Cost = 7
+```
+
+`labeling [min Cost] Vars` propagates a strict cost bound after each improved
+answer. `Vars` must be a proper list of integers or variables with finite
+domains, and `Cost` must become a ground integer at each complete assignment.
+It returns one optimum and retains the first encountered on ties. Variable
+selection remains smallest-domain-first; pruning may change which tied
+assignment is encountered first. Only the `[min Cost]` option is supported.
+
+For costs computed after solving, `minimize Cost Goal` scans a finite search
+and retains only its best answer, including that answer's bindings and output.
+It does not prune the search and requires a ground integer cost in every
+answer. Ties keep the first answer; no answers means failure. Cuts inside
+`Goal` are local. Errors or an incomplete search produce no claimed optimum.
+The breadboard placer uses this form to avoid constructing a list of all
+placements while preserving its existing jumper/window priorities.
 
 ## Modules
 
@@ -175,8 +221,14 @@ imports are resolved recursively.
 highlighting, hover (built-ins, declared signatures), go to definition and
 references (including `mod:pred` through `neoprolog.conf`), completion,
 document symbols, and diagnostics (undefined predicates, arity mismatches,
-declaration problems, singleton variables, plus the real parser's errors
-via `infera check <file>` when the binary is installed).
+declaration problems, singleton variables and parser errors). All validation
+comes from the compiler through `infera check --json --stdin`; open, edited and
+saved buffers use the same messages, codes, severities and source ranges.
+Unsaved imports are included, and outdated checks are cancelled. Untitled
+buffers use the workspace as their import context. `infera.checkOnChange`
+controls live checks (enabled by default); `infera.checkOnSave` controls checks
+on save. A missing or incompatible compiler produces an explicit availability
+warning; navigation and highlighting continue without a separate validator.
 
 ```
 cd lsp && npm install && npm run install-extension
@@ -191,6 +243,7 @@ src/Infera/Arith.hs     numeric evaluation
 src/Infera/CLP.hs       domains, linear constraints, propagation
 src/Infera/Program.hs   predicate table, indexes, signatures, flags
 src/Infera/Infer.hs     sort / mode / determinism / recursion analysis
+src/Infera/Diagnostic.hs source-aware compiler diagnostics and JSON output
 src/Infera/Engine.hs    resolution, cut, tabling, labeling, answers
 src/Infera/Module.hs    neoprolog.conf and imports
 src/Infera/Repl.hs      interactive loop
@@ -198,4 +251,20 @@ test/InferaTest.hs      hedgehog test suite
 examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), ...
 Formula/infera.rb       Homebrew formula
 lsp/                    VS Code extension and language server
+```
+
+## Validation
+
+CI builds and tests on Linux and macOS with GHC 9.8.2 and Node 22. It runs the
+Haskell properties, editor and language-server integration tests, and real CLI
+diagnostic checks. Optimisation properties compare generated finite problems
+against exhaustive search; breadboard acceptance compares complete placements
+and costs for `rc`, `div`, and `tri` with the previous exhaustive implementation.
+
+```sh
+cabal build all
+cabal test --test-show-details=direct
+npm ci --prefix lsp
+INFERA_BIN="$(cabal list-bin exe:infera)" npm test --prefix lsp
+python3 test/cli.py "$(cabal list-bin exe:infera)"
 ```

@@ -68,6 +68,7 @@ subGoals g = case g of
   Compound "once" [a] -> subGoals a
   Compound "forall" [a, b] -> subGoals a ++ subGoals b
   Compound "findall" [_, a, _] -> subGoals a
+  Compound "minimize" [_, a] -> subGoals a
   _ -> [g]
 
 bodyGoals :: Clause -> [Term]
@@ -403,6 +404,8 @@ builtinDet name arity = case (name, arity) of
   ("all_distinct", 1) -> Just Semidet
   ("label", 1) -> Just Nondet
   ("labeling", 1) -> Just Nondet
+  ("labeling", 2) -> Just Semidet
+  ("minimize", 2) -> Just Semidet
   ("not", 1) -> Just Semidet
   ("once", 1) -> Just Semidet
   ("forall", 2) -> Just Semidet

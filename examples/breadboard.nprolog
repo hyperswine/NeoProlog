@@ -13,9 +13,10 @@
 #   * hard constraints are CLP(Z): holes are all_different, pins on the same
 #     net share a node (#=) unless that net is jumpered, and pins on
 #     different nets never share a node (#!=) -- the ASP model allowed shorts;
-#   * there is no #minimize, so the optimisation is layered search: fewest
+#   * optimisation is layered search: fewest
 #     jumpers first, then the narrowest column window around the centre,
 #     then the lowest cramping / mixed-half score among what is left.
+#     `minimize` retains only the winning placement while searching a window.
 #
 # Run:  infera examples/breadboard.nprolog        (or `> run rc?` in the REPL)
 
@@ -166,9 +167,6 @@ centre_cost [pl _ _ _ _ _ _ _ Col _ _ _ _ _ | T] C <- centre_cost T C1, C is C1 
 
 score P Cost <- pairs_cost P C1, centre_cost P C2, Cost is C1 + C2.
 
-min_cost [cost C P] C P.
-min_cost [cost C P | T] BC BP <- min_cost T C1 P1, (C1 < C -> BC = C1, BP = P1 ; BC = C, BP = P).
-
 # ─── Search: fewest jumpers, then narrowest window, then best score ──────────
 
 windows [win 7 11, win 5 13, win 3 15, win 1 16].
@@ -178,10 +176,8 @@ best Cs Ns Wired Placement Cost <-
   between 0 M K,
   choose K MNs Wired,
   windows Ws, member (win Lo Hi) Ws,
-  findall (cost C P) (solve Cs Wired Lo Hi P, score P C) Sols,
-  Sols != [],
-  !,
-  min_cost Sols Cost Placement.
+  minimize Cost (solve Cs Wired Lo Hi Placement, score Placement Cost),
+  !.
 
 # ─── Reporting ───────────────────────────────────────────────────────────────
 

@@ -6,8 +6,6 @@ const fs = require('fs')
 const path = require('path')
 const { tokenize, analyzeDocument, countArgs } = require('../server/analysis')
 
-const messages = a => a.diagnostics.map(d => d.message)
-
 test('tokenizer: CLP operators are not comments', () => {
   const toks = tokenize('p X <- X #= 1, X #!= 2, X #< 3, X #>= 4. # comment')
   const ops = toks.filter(t => t.type === 'op').map(t => t.text)
@@ -37,10 +35,9 @@ test('predicates are keyed by name with arity, DCG adds two', () => {
   assert.deepEqual(a.predicateDefs.get('append').map(d => d.arity), [3, 3])
   assert.deepEqual(a.predicateDefs.get('greeting').map(d => d.arity), [2])
   assert.deepEqual(a.predicateRefs.get('name').map(r => r.arity), [2])
-  assert.deepEqual(messages(a), [])
 })
 
-test('declarations are parsed and matched against clauses', () => {
+test('declarations are extracted for hovers and highlighting', () => {
   const a = analyzeDocument([
     'fact : det (int: <=) (int: =>).',
     'fact 0 1.',
@@ -58,8 +55,9 @@ test('declarations are parsed and matched against clauses', () => {
   assert.deepEqual(fact.args.map(x => `${x.sort}:${x.mode}`), ['int:<=', 'int:=>'])
   assert.equal(fact.text, 'fact : det (int: <=) (int: =>).')
   assert.equal(a.decls.get('gen')[0].flagsOnly, true)
-  assert.ok(messages(a).some(m => m.includes('`lonely/1` is declared but has no clauses')))
-  assert.ok(messages(a).some(m => m.includes('declaration is for `wrong/3`')))
+  assert.equal(a.decls.get('lonely')[0].arity, 1)
+  assert.equal(a.decls.get('wrong')[0].arity, 3)
+  assert.equal(a.predicateDefs.get('wrong')[0].arity, 2)
   assert.equal(a.declWordKinds.get('0:7'), 'determinism')
   assert.equal(a.declWordKinds.get('0:12'), 'sort')
   assert.equal(a.declWordKinds.get('0:17'), 'mode')
@@ -71,7 +69,6 @@ test('mod:pred is a qualified call, not a declaration', () => {
   assert.equal(a.imports[0].alias, 'facts')
   assert.equal(a.qualifiedRefs.get('facts')[0].pred, 'factorial')
   assert.equal(a.decls.size, 0)
-  assert.deepEqual(messages(a), [])
 })
 
 test('goals inside control constructs are references', () => {
@@ -82,10 +79,9 @@ test('goals inside control constructs are references', () => {
   ].join('\n'))
   assert.equal(a.predicateRefs.get('q').length, 4)
   assert.equal(a.predicateRefs.get('r').length, 2)
-  assert.deepEqual(messages(a), [])
 })
 
-test('diagnostics: undefined predicates, wrong arity, singletons, syntax', () => {
+test('symbol extraction tolerates incomplete and invalid buffers without validating', () => {
   const a = analyzeDocument([
     'q 1.',
     'p X <- nope X, q X Y.',
@@ -94,33 +90,30 @@ test('diagnostics: undefined predicates, wrong arity, singletons, syntax', () =>
     'broken (X <- true.',
     'last X'
   ].join('\n'))
-  const ms = messages(a)
-  assert.ok(ms.some(m => m.includes('`nope` is not defined')))
-  assert.ok(ms.some(m => m.includes('no clauses for `q/2`')))
-  assert.ok(ms.some(m => m.includes('singleton variable Y')))
-  assert.ok(ms.some(m => m.includes('singleton variable Z')))
-  assert.ok(ms.some(m => m.includes('unbalanced brackets')))
-  assert.ok(ms.some(m => m.includes('unknown directive')))
-  assert.ok(ms.some(m => m.includes("missing '.'")))
-  assert.ok(!ms.some(m => m.includes('singleton variable X')), 'X in p is used twice')
+  assert.ok(a.predicateDefs.has('q'))
+  assert.ok(a.predicateRefs.has('nope'))
+  assert.ok(!Object.hasOwn(a, 'diagnostics'), 'only the compiler generates diagnostics')
+  for (const text of ['p : det semidet.', 'p : (nonsense).', 'p : (', '<- import "bad".']) {
+    assert.doesNotThrow(() => analyzeDocument(text))
+  }
 })
 
-test('builtins, CLP goals and operator goals raise no diagnostics', () => {
+test('builtins, CLP goals and queries retain editor symbols', () => {
   const a = analyzeDocument([
     'puzzle X Y <- [X, Y] in 0..20, X + Y #= 10, X - Y #= 2, label [X, Y].',
     'sign N S <- (N > 0 -> S = pos ; N < 0 -> S = neg ; S = zero).',
     'w X <- write X, nl, str_concat "a" "b" _.',
     '> puzzle X Y?'
   ].join('\n'))
-  assert.deepEqual(messages(a), [])
+  assert.ok(a.predicateRefs.has('label'))
   assert.equal(a.queryPositions.size, 1)
 })
 
-test('the shipped examples analyse without errors', () => {
+test('the shipped examples retain predicate symbols', () => {
   const dir = path.join(__dirname, '..', '..', 'examples')
   for (const f of fs.readdirSync(dir).filter(n => n.endsWith('.nprolog'))) {
     const a = analyzeDocument(fs.readFileSync(path.join(dir, f), 'utf8'))
-    const errors = a.diagnostics.filter(d => d.severity === 1)
-    assert.deepEqual(errors, [], `${f}: ${errors.map(e => e.message).join('; ')}`)
+    assert.ok(a.predicateDefs.size > 0, f)
+    assert.ok(!Object.hasOwn(a, 'diagnostics'))
   }
 })

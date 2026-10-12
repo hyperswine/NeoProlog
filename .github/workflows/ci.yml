@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.8.2'
+          cabal-version: '3.12.1.0'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: lsp/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: cabal update
+      - run: cabal build all --enable-tests
+      - run: cabal test all --test-show-details=direct
+      - run: npm ci
+        working-directory: lsp
+      - run: INFERA_BIN="$(cabal list-bin exe:infera)" npm test --prefix lsp
+      - run: python3 test/cli.py "$(cabal list-bin exe:infera)"

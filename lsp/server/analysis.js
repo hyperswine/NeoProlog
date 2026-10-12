@@ -1,4 +1,5 @@
-// analysis.js — tokenizer and static analysis for Infera v2 source text.
+// analysis.js — tolerant tokenization and symbol extraction for editor features.
+// Validation belongs exclusively to the compiler, including unsaved buffers.
 //
 // Pure functions (no LSP dependencies) so they can be unit-tested with node.
 'use strict'
@@ -18,11 +19,12 @@ const BUILTIN_DOCS = {
   once: '`once Goal` — commits to the first solution of Goal.',
   forall: '`forall Cond Action` — succeeds if Action holds for every solution of Cond.',
   findall: '`findall Template Goal List` — collects Template for every solution of Goal.',
+  minimize: '`minimize Cost Goal` — returns the first least-cost answer of a finite search. Cost must be a ground integer in every answer; errors or incomplete search yield no optimum.',
   phrase: '`phrase NT List` — runs DCG non-terminal NT on List with an empty remainder.',
   is: '`Var is Expr` — evaluates the arithmetic expression Expr.',
   in: '`X in Lo..Hi` — CLP(Z) domain restriction; `inf`/`sup` for open bounds. A list on the left restricts every element.',
   label: '`label Vars` — CLP(Z) labeling: enumerates finite domains, smallest first.',
-  labeling: '`labeling Vars` — same as `label`.',
+  labeling: '`labeling Vars` — same as `label`. `labeling [min Cost] Vars` returns one minimum using branch-and-bound over finite domains.',
   all_different: '`all_different Xs` — pairwise `#!=` over the list.',
   all_distinct: '`all_distinct Xs` — same as `all_different`.',
   var: '`var X` — X is an unbound variable.',
@@ -88,11 +90,11 @@ const FLAG_WORDS = ['table', 'notable', 'index', 'noindex']
 const SORT_WORDS = ['int', 'float', 'num', 'str', 'char', 'atom', 'any', 'list']
 const DIRECTIVES = new Set(['import', 'table', 'notable', 'index', 'noindex'])
 
-const KEYWORD_ATOMS = new Set(['true', 'fail', 'false', 'nl', 'not', 'once', 'call', 'forall', 'findall', 'write', 'writeln', 'print', 'phrase', 'is', 'in', 'label', 'labeling', 'import'])
+const KEYWORD_ATOMS = new Set(['true', 'fail', 'false', 'nl', 'not', 'once', 'call', 'forall', 'findall', 'minimize', 'write', 'writeln', 'print', 'phrase', 'is', 'in', 'label', 'labeling', 'import'])
 
 const BUILTIN_PREDICATES = new Set(Object.keys(BUILTIN_DOCS).filter(k => /^[a-z]/.test(k)))
 
-const CONTROL_BUILTINS = new Set(['not', 'once', 'forall', 'findall', 'call'])
+const CONTROL_BUILTINS = new Set(['not', 'once', 'forall', 'findall', 'minimize', 'call'])
 
 // ─── Semantic token legend ─────────────────────────────────────────────────────
 
@@ -283,7 +285,6 @@ function parseDeclaration(tokens, ctx) {
     if (t.type === 'lparen') {
       const j = matchingClose(rest, i)
       if (j < 0) {
-        ctx.diagnostics.push({ ...loc(t), message: 'unbalanced parenthesis in declaration', severity: 1 })
         break
       }
       const inner = rest.slice(i + 1, j)
@@ -297,7 +298,6 @@ function parseDeclaration(tokens, ctx) {
         if (u.type === 'lparen' || u.type === 'rparen') { k++; continue }
         if (u.type === 'colon') { k++; continue }
         if (u.type === 'op' && ['<=', '=>', '<=>'].includes(u.text)) { spec.mode = u.text; mark(u, 'mode'); k++; continue }
-        ctx.diagnostics.push({ ...loc(u), message: `unexpected \`${u.text}\` in argument specification (expected a sort or a mode)`, severity: 1 })
         k++
       }
       if (sortParts.length) spec.sort = sortParts.join(' ')
@@ -305,11 +305,7 @@ function parseDeclaration(tokens, ctx) {
       i = j + 1
       continue
     }
-    ctx.diagnostics.push({ ...loc(t), message: `unknown declaration word \`${t.text}\` (expected det/semidet/multi/nondet, table/notable/index/noindex, a mode or a (sort: mode) spec)`, severity: 1 })
     i++
-  }
-  if (words.det.length > 1) {
-    ctx.diagnostics.push({ ...loc(words.det[1]), message: 'more than one determinism category in a declaration', severity: 1 })
   }
   const flagsOnly = words.det.length === 0 && words.args.length === 0
   const text = tokens.map((t, k) => (k > 0 && !t.adjPrev ? ' ' : '') + t.text).join('') + '.'
@@ -401,34 +397,28 @@ function analyzeDocument(text) {
     importKeyPositions: new Set(),
     directivePositions: new Set(),
     declNamePositions: new Set(),
-    declWordKinds: new Map(),
-    diagnostics: []
+    declWordKinds: new Map()
   }
 
   // Split into items at depth-0 terminators.
   const items = []
-  let current = [], depth = 0, unbalanced = false
+  let current = [], depth = 0
   for (const tok of tokens) {
     if (tok.type === 'comment') continue
     if (OPENERS.has(tok.type)) depth++
-    else if (CLOSERS.has(tok.type)) { depth--; if (depth < 0) { unbalanced = true; depth = 0 } }
+    else if (CLOSERS.has(tok.type)) depth = Math.max(0, depth - 1)
     current.push(tok)
     if ((tok.type === 'dot' || tok.type === 'qmark') && depth === 0) {
-      items.push({ tokens: current, unbalanced })
-      current = []; unbalanced = false
+      items.push({ tokens: current })
+      current = []
     }
   }
   if (current.length > 0) {
-    const last = current[current.length - 1]
-    ctx.diagnostics.push({ ...loc(last), message: "missing '.' at end of clause", severity: 1 })
-    items.push({ tokens: current, unbalanced: unbalanced || depth !== 0 })
+    items.push({ tokens: current })
   }
 
   for (const item of items) {
     const toks = item.tokens
-    if (item.unbalanced) {
-      ctx.diagnostics.push({ ...loc(toks[0]), message: 'unbalanced brackets in this clause', severity: 1 })
-    }
     const last = toks[toks.length - 1]
     const hasTerm = last.type === 'dot' || last.type === 'qmark'
     const body = hasTerm ? toks.slice(0, -1) : toks
@@ -450,11 +440,8 @@ function analyzeDocument(text) {
         const raw = goals[1].text.slice(1, -1)
         ctx.imports.push({ modId: raw, alias: raw.split('#')[0], ...loc(goals[1]) })
         ctx.importKeyPositions.add(`${head.line}:${head.col}`)
-        if (!raw.includes('#')) ctx.diagnostics.push({ ...loc(goals[1]), message: 'module references have the form "name#sha1" (see `infera reg`)', severity: 2 })
       } else if (head && head.type === 'atom' && DIRECTIVES.has(head.text) && goals.length === 1) {
         ctx.directivePositions.add(`${head.line}:${head.col}`)
-      } else {
-        ctx.diagnostics.push({ ...loc(head || first), message: 'unknown directive (expected import "mod#hash", table, notable, index or noindex)', severity: 1 })
       }
       continue
     }
@@ -481,7 +468,6 @@ function analyzeDocument(text) {
     const bodyToks = neckIdx >= 0 ? body.slice(neckIdx + 1) : []
 
     if (headToks.length === 0 || headToks[0].type !== 'atom') {
-      ctx.diagnostics.push({ ...loc(headToks[0] || first), message: 'clause head must start with an atom', severity: 1 })
       continue
     }
     const headAtom = headToks[0]
@@ -492,42 +478,6 @@ function analyzeDocument(text) {
 
     if (neckIdx >= 0) collectGoals(bodyToks, ctx, { dcg: isDcg })
 
-    // Singleton variables
-    const counts = new Map()
-    for (const t of body) if (t.type === 'variable') counts.set(t.text, (counts.get(t.text) || 0) + 1)
-    for (const t of body) {
-      if (t.type === 'variable' && counts.get(t.text) === 1 && !t.text.startsWith('_')) {
-        ctx.diagnostics.push({ ...loc(t), message: `singleton variable ${t.text} (use _ or _${t.text} if intended)`, severity: 2 })
-      }
-    }
-  }
-
-  // Undefined predicates (unqualified calls not defined here and not built in)
-  for (const [name, refs] of ctx.predicateRefs) {
-    if (BUILTIN_PREDICATES.has(name) || name === 'true' || name === 'fail') continue
-    const defs = ctx.predicateDefs.get(name)
-    for (const r of refs) {
-      if (!defs) {
-        ctx.diagnostics.push({ ...r, message: `predicate \`${name}\` is not defined in this file`, severity: 2 })
-      } else if (r.arity !== null && defs.every(dd => dd.arity !== null) && !defs.some(dd => dd.arity === r.arity)) {
-        const have = [...new Set(defs.map(dd => `${name}/${dd.arity}`))].join(', ')
-        ctx.diagnostics.push({ ...r, message: `no clauses for \`${name}/${r.arity}\` (defined: ${have})`, severity: 2 })
-      }
-    }
-  }
-
-  // Declarations without matching clauses
-  for (const [name, decls] of ctx.decls) {
-    const defs = ctx.predicateDefs.get(name) || []
-    for (const dcl of decls) {
-      if (dcl.flagsOnly) continue
-      if (defs.length === 0) {
-        ctx.diagnostics.push({ ...dcl, message: `\`${name}/${dcl.arity}\` is declared but has no clauses in this file`, severity: 3 })
-      } else if (defs.every(dd => dd.arity !== null) && !defs.some(dd => dd.arity === dcl.arity)) {
-        const have = [...new Set(defs.map(dd => `${name}/${dd.arity}`))].join(', ')
-        ctx.diagnostics.push({ ...dcl, message: `declaration is for \`${name}/${dcl.arity}\` but the clauses define ${have}`, severity: 2 })
-      }
-    }
   }
 
   return { tokens, ...ctx }

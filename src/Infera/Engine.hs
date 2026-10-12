@@ -227,6 +227,9 @@ solveGoal env fuel st g0 =
         Compound "in" [x, r] -> inDomain st x r
         Compound "label" [l] -> labeling env st l
         Compound "labeling" [l] -> labeling env st l
+        Compound "labeling" [options, l] -> case deepWalk s options of
+          Compound "cons" [Compound "min" [cost], Atom "nil"] -> labelMinimum st cost l
+          other -> [BranchError (TypeError "labeling options [min Cost]" other)]
         Compound "all_different" [l] -> allDifferent st l
         Compound "all_distinct" [l] -> allDifferent st l
         -- control
@@ -253,6 +256,7 @@ solveGoal env fuel st g0 =
         Compound "forall" [c, a] ->
           negation env fuel st (Compound "," [c, Compound "not" [a]])
         Compound "findall" [tmpl, g, l] -> findAll env fuel st tmpl g l
+        Compound "minimize" [cost, g] -> minimizeGoal env fuel st cost g
         -- output
         Compound "write" [x] -> [Found (emit (WriteEvent (showValue (deepEval s x))) st)]
         Compound "print" [x] -> [Found (emit (WriteEvent (showValue (deepEval s x))) st)]
@@ -388,6 +392,29 @@ findAll env fuel st tmpl g l =
         (e : _) -> [i | i@(ConsumedIncomplete _) <- pass] ++ [e]
         [] -> pass ++ checked st1 (storeUnify (ssStore st1) l (mkList results Nothing))
 
+-- | Keep only the least-cost answer, retaining the first on ties. The goal's
+-- bindings and output survive only for that answer. An error or incomplete
+-- search cannot establish a minimum and therefore produces no winning answer.
+minimizeGoal :: Env -> Int -> SolverState -> Term -> Term -> Search
+minimizeGoal env fuel st cost g = finishMinimum (foldl' step (Nothing, []) (opaque (solveGoal env fuel st g)))
+  where
+    step (best, issues) (Found candidate) = case evalIntExpr (subst candidate) cost of
+      Left err -> (best, BranchError err : issues)
+      Right Nothing -> (best, BranchError (InstantiationError (deepWalk (subst candidate) cost)) : issues)
+      Right (Just value) -> let best' = betterMinimum best (value, candidate) in best' `seq` (best', issues)
+    step (best, issues) item = (best, item : issues)
+
+betterMinimum :: Maybe (Integer, SolverState) -> (Integer, SolverState) -> Maybe (Integer, SolverState)
+betterMinimum Nothing candidate@(value, _) = value `seq` Just candidate
+betterMinimum old@(Just (value, _)) candidate@(value', _)
+  | value' < value = Just candidate
+  | otherwise = old
+
+finishMinimum :: (Maybe (Integer, SolverState), Search) -> Search
+finishMinimum (best, issues)
+  | not (null issues) = reverse issues
+  | otherwise = maybe [] (\(_, winner) -> [Found winner]) best
+
 -- ─── CLP(Z) GOALS ────────────────────────────────────────────────────────────
 
 parseBound :: Term -> Maybe Bound
@@ -448,6 +475,66 @@ labeling _ st0 l =
                                 Right (Just store') -> go st {ssStore = store'} pending
                             | n <- values
                             ]
+
+-- | Branch-and-bound labeling. Every new branch receives a strict upper
+-- bound from the incumbent; propagation can reject it before enumeration.
+-- Only finite integer variables may be labeled, and the cost must be ground
+-- at a leaf. This returns one optimum, retaining the first encountered on ties.
+labelMinimum :: SolverState -> Term -> Term -> Search
+labelMinimum st0 cost l =
+  let list = deepWalk (subst st0) l
+      (xs, tailTerm) = unfoldCons list
+   in case tailTerm of
+        Just _ -> [BranchError (TypeError "proper list of integer variables" list)]
+        Nothing
+          | any invalid xs -> [BranchError (TypeError "list of integer variables" list)]
+          | otherwise -> finishMinimum (go st0 (nub (concatMap termVars xs)) (Nothing, []))
+  where
+    invalid (Var _) = False
+    invalid (IntLit _) = False
+    invalid _ = True
+    bound store best = case best of
+      Nothing -> Right (Just store)
+      Just (value, _) -> addRelation RelLe cost (IntLit (value - 1)) store
+    go st vars acc@(best, issues) =
+      let bounded = bound (ssStore st) best
+       in case bounded of
+            Left err -> (best, BranchError err : issues)
+            Right Nothing -> acc
+            Right (Just store) ->
+              let candidate = st {ssStore = store}
+                  pending = nub [w | v <- vars, Var w <- [walk (subst candidate) (Var v)]]
+                  sizes = [(v, domainOf store v >>= domainSize) | v <- pending]
+               in case pending of
+                    [] -> case evalIntExpr (subst candidate) cost of
+                      Left err -> (best, BranchError err : issues)
+                      Right Nothing -> (best, BranchError (InstantiationError (deepWalk (subst candidate) cost)) : issues)
+                      Right (Just value) -> (betterMinimum best (value, candidate), issues)
+                    _ -> case [v | (v, Nothing) <- sizes] of
+                      v : _ -> (best, BranchError (UnboundedDomain (Var v)) : issues)
+                      [] -> case sortOn snd sizes of
+                        [] -> acc
+                        (v, _) : _ -> case domainOf store v of
+                          Just (Domain (Fin lo) _ _) -> explore candidate pending v lo acc
+                          _ -> (best, BranchError (UnboundedDomain (Var v)) : issues)
+    -- Recompute the remaining domain after each improved incumbent instead of
+    -- walking a stale list of values that propagation has already eliminated.
+    explore st vars v lower acc@(best, issues) =
+      case addDomain (Var v) (Fin lower) PosInf (ssStore st) >>= maybe (Right Nothing) (\store -> bound store best) of
+        Left err -> (best, BranchError err : issues)
+        Right Nothing -> acc
+        Right (Just store) ->
+          let values = case walk (stSubst store) (Var v) of
+                IntLit value -> [value]
+                _ -> maybe [] id (domainOf store v >>= domainValues)
+           in case values of
+                [] -> acc
+                value : _ -> case storeBind store v value of
+                  Left err -> (best, BranchError err : issues)
+                  Right Nothing -> explore st vars v (value + 1) acc
+                  Right (Just store') ->
+                    let acc' = go st {ssStore = store'} vars acc
+                     in acc' `seq` explore st vars v (value + 1) acc'
 
 -- ─── PREDICATE CALLS ─────────────────────────────────────────────────────────
 

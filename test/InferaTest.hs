@@ -3,7 +3,9 @@
 
 module InferaTest (inferaGroup) where
 
-import Data.List (isInfixOf, isPrefixOf, sort)
+import Data.List (isInfixOf, isPrefixOf, sort, minimumBy)
+import Data.Ord (comparing)
+import qualified Control.Exception as CE
 import qualified Data.Map.Strict as Map
 import Hedgehog hiding (Var)
 import qualified Hedgehog.Gen as Gen
@@ -11,6 +13,7 @@ import qualified Hedgehog.Range as Range
 import Infera
 import System.Directory (getTemporaryDirectory)
 import System.FilePath ((</>))
+import System.Timeout (timeout)
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -554,6 +557,119 @@ prop_clp_queens = unit $ do
   length (run prog "queens 6 Qs?") === 4
 
 -- ---------------------------------------------------------------------------
+-- Optimisation and breadboard acceptance
+-- ---------------------------------------------------------------------------
+
+prop_minimize :: Property
+prop_minimize = unit $ do
+  assertAnswers "" "minimize X (X = 3 ; X = 1 ; X = 2)?" ["X = 1"]
+  assertAnswers "" "minimize X fail?" ["false."]
+  assertAnswers "choice 1 first. choice 1 second." "minimize C (choice C P)?" ["C = 1, P = first"]
+  assertAnswers "" "minimize X ((X = 2 ; X = 1), write X)?" ["1", "X = 1"]
+  assertAnswers "" "minimize X ((X = 2 ; X = 1), !), (Y = a ; Y = b)?" ["X = 2, Y = a", "X = 2, Y = b"]
+  assertErrorContains "" "minimize X (X = 1 ; X is 1 / 0)?" "division by zero"
+  assertErrorContains "" "minimize X true?" "not sufficiently instantiated"
+  assertErrorContains "" "minimize X (X = 1.5)?" "expected an integer"
+  let src = "gen 0. gen N <- gen M, N is M + 1."
+  prog <- loadOrFail src
+  q <- case parseQuery "minimize X (gen X)?" of
+    Left err -> annotate err >> failure
+    Right query -> pure query
+  let summary = solveAll prog q
+  summaryAnswers summary === []
+  assert (summaryExhausted summary)
+
+prop_label_minimum :: Property
+prop_label_minimum = unit $ do
+  assertAnswers "" "X in 1..5, labeling [min (0 - X)] [X]?" ["X = 5"]
+  assertAnswers "" "X in 1..3, Y = X, labeling [min Y] [X, Y]?" ["X = 1, Y = 1"]
+  assertAnswers "" "[X, Y] in 1..4, X + Y #>= 5, labeling [min (X + Y)] [X, Y]?" ["X = 1, Y = 4"]
+  assertAnswers "" "X in 1..5, X #!= 1, X #!= 2, labeling [min X] [X]?" ["X = 3"]
+  assertAnswers "" "labeling [min 3] []?" ["true."]
+  assertErrorContains "" "labeling [min X] [X]?" "unbounded domain"
+  assertErrorContains "" "labeling [min X] []?" "not sufficiently instantiated"
+  assertErrorContains "" "labeling [min 1.5] []?" "expected an integer"
+  assertErrorContains "" "labeling [min X] [X | T]?" "proper list"
+  assertErrorContains "" "labeling [min X] [a]?" "integer variables"
+  assertErrorContains "" "labeling [max X] [X]?" "options [min Cost]"
+  -- A stale enumeration of the original domain would take effectively forever.
+  quick <- evalIO $ timeout 10000000 $ CE.evaluate $
+    run "" "X in 1..1000000000000, labeling [min X] [X]?" == ["X = 1"]
+  quick === Just True
+
+prop_label_minimum_matches_exhaustive :: Property
+prop_label_minimum_matches_exhaustive = property $ do
+  a <- forAll (Gen.integral (Range.linear (-4) 4) :: Gen Integer)
+  b <- forAll (Gen.integral (Range.linear (-4) 4) :: Gen Integer)
+  lower <- forAll (Gen.integral (Range.linear (-3) 3) :: Gen Integer)
+  required <- forAll (Gen.integral (Range.linear (-5) 8) :: Gen Integer)
+  expression <- forAll $ Gen.element
+    [show a ++ " * X + " ++ show b ++ " * Y", "X * Y", "abs (X - Y)"]
+  let prefix = "[X, Y] in " ++ show lower ++ ".." ++ show (lower + 4)
+        ++ ", X + Y #>= " ++ show required
+        ++ ", X #!= " ++ show (lower + 2)
+        ++ ", Cost #= " ++ expression ++ ", "
+  prog <- loadOrFail ""
+  exhaustive <- case parseQuery (prefix ++ "label [X, Y]?") of
+    Left err -> annotate err >> failure
+    Right q -> pure (solveAll prog q)
+  summaryErrors exhaustive === []
+  let cost answer = case lookup "Cost" (answerBindings answer) of
+        Just (IntLit value) -> value
+        other -> error ("missing cost: " ++ show other)
+      expected = case summaryAnswers exhaustive of
+        [] -> ["false."]
+        answers -> [showAnswer (minimumBy (comparing cost) answers)]
+  -- Tie order can change as the incumbent narrows domains. Compare minimum
+  -- costs below; both optimisers must still return an exhaustive-search answer.
+  let optimized = run "" (prefix ++ "labeling [min Cost] [X, Y]?")
+      aggregate = run "" (prefix ++ "minimize Cost (label [X, Y])?")
+  aggregate === expected
+  case summaryAnswers exhaustive of
+    [] -> optimized === ["false."]
+    answers -> do
+      assert (all (`elem` map showAnswer answers) optimized)
+      let optimal = [showAnswer ans | ans <- answers, cost ans == minimum (map cost answers)]
+      case optimized of
+        [answer] -> assert (answer `elem` optimal)
+        _ -> failure
+
+prop_breadboard_optimization :: Property
+prop_breadboard_optimization = unit $ do
+  source <- evalIO (readFile "examples/breadboard.nprolog")
+  -- Preserve the previous exhaustive implementation as an independent oracle.
+  let oracle = unlines
+        [ "min_cost [cost C P] C P.",
+          "min_cost [cost C P | T] BC BP <- min_cost T C1 P1, (C1 < C -> BC = C1, BP = P1 ; BC = C, BP = P).",
+          "best_exhaustive Cs Ns Wired Placement Cost <- multi_nets Cs Ns MNs, length MNs M, between 0 M K, choose K MNs Wired, windows Ws, member (win Lo Hi) Ws, findall (cost C P) (solve Cs Wired Lo Hi P, score P C) Sols, Sols != [], !, min_cost Sols Cost Placement.",
+          "accept Circuit Result <- comps Circuit Cs, nets Cs Ns, best Cs Ns W P C, Result = result W P C.",
+          "reference Circuit Result <- comps Circuit Cs, nets Cs Ns, best_exhaustive Cs Ns W P C, Result = result W P C."
+        ]
+  loaded <- evalIO (loadSource Map.empty (source ++ "\n" ++ oracle))
+  prog <- case loaded of
+    Left err -> annotate err >> failure
+    Right (p, _) -> pure p
+  let solve text = case parseQuery text of
+        Left err -> error err
+        Right q -> solveAll prog q
+  mapM_ (\circuit -> do
+      annotate circuit
+      let actual = solve ("accept " ++ circuit ++ " Result?")
+          expected = solve ("reference " ++ circuit ++ " Result?")
+      summaryErrors actual === []
+      summaryErrors expected === []
+      summaryExhausted actual === False
+      summaryExhausted expected === False
+      length (summaryAnswers actual) === 1
+      map showAnswer (summaryAnswers actual) === map showAnswer (summaryAnswers expected)
+      let reported = solve ("run " ++ circuit ++ "?")
+      summaryErrors reported === []
+      summaryExhausted reported === False
+      length (summaryAnswers reported) === 1
+      assert (any (isInfixOf "Breadboard" . concatMap renderOutputEvent . answerOutput) (summaryAnswers reported))
+    ) ["rc", "div", "tri"]
+
+-- ---------------------------------------------------------------------------
 -- Modules
 -- ---------------------------------------------------------------------------
 
@@ -626,5 +742,9 @@ inferaGroup =
       ("clp basic", prop_clp_basic),
       ("clp labeling", prop_clp_labeling_solves),
       ("clp queens", prop_clp_queens),
+      ("minimum search", prop_minimize),
+      ("branch-and-bound labeling", prop_label_minimum),
+      ("minimum matches exhaustive", prop_label_minimum_matches_exhaustive),
+      ("breadboard optimization", prop_breadboard_optimization),
       ("modules", prop_modules_import_and_qualify)
     ]
