@@ -1,0 +1,144 @@
+# Minefield generation with CLP(Z). Rows run top-to-bottom; 1 = bomb, 0 = clear.
+# Every rule window W H Max caps bombs in EVERY overlapping W-by-H rectangle.
+# Rules wider/taller than the board have no matching windows and are vacuous.
+#
+# Load: infera examples/minesweeper.nprolog
+#   once (mines 10 10 50 2 Grid)?
+#   show_mines 10 10 50 [window 2 2 2]?
+#   once (minefield 8 6 12 [window 2 2 2, window 3 3 3] Grid)?
+#   show_seeded 10 10 50 [window 2 2 2] 42?
+# Leave off once to enumerate all valid grids (potentially very many).
+# Search is deterministic, not uniform random sampling. Dense limits can force
+# stripes/checkerboards; a 2x2 cap alone does not limit long straight clusters.
+# minefield_seed shuffles search order with a reproducible integer seed. This
+# gives varied valid grids, but does not sample all valid grids uniformly.
+
+mines Width Height Bombs Max Grid <-
+  minefield Width Height Bombs [window 2 2 Max] Grid.
+
+minefield Width Height Bombs Rules Grid <-
+  minefield_constraints Width Height Bombs Rules Grid Cells,
+  label Cells.
+
+minefield_seed Width Height Bombs Rules Seed Grid <-
+  is_int Seed,
+  minefield_constraints Width Height Bombs Rules Grid Cells,
+  shuffle_cells Cells Seed Order, label Order.
+
+minefield_constraints Width Height Bombs Rules Grid Cells <-
+  is_int Width, is_int Height, is_int Bombs,
+  Width > 0, Height > 0, Bombs >= 0, Bombs <= Width * Height,
+  make_grid Width Height Grid,
+  flatten_grid Grid Cells,
+  Cells in 0..1,
+  sum_cells Cells Total, Total #= Bombs,
+  apply_rules Rules Grid Bombs.
+
+make_grid _ 0 [].
+make_grid Width Height [Row | Rows] <-
+  Height > 0, make_row Width Row,
+  Next is Height - 1, make_grid Width Next Rows.
+
+make_row 0 [].
+make_row Width [_ | Cells] <-
+  Width > 0, Next is Width - 1, make_row Next Cells.
+
+append [] Ys Ys.
+append [X | Xs] Ys [X | Zs] <- append Xs Ys Zs.
+
+flatten_grid [] [].
+flatten_grid [Row | Rows] Cells <-
+  flatten_grid Rows Rest, append Row Rest Cells.
+
+# Build one linear expression; the solver propagates the whole sum together.
+sum_cells [] 0.
+sum_cells [Cell | Cells] Sum <-
+  sum_cells Cells Rest, Sum = Cell + Rest.
+
+apply_rules [] _ _.
+apply_rules [window W H Max | Rules] Grid Bombs <-
+  is_int W, is_int H, is_int Max, W > 0, H > 0, Max >= 0,
+  window_rows W H Max Grid,
+  # Redundant partition sums expose regional capacity to bounds propagation.
+  # At 50 bombs on a 10x10 board, every disjoint 2x2 tile must contain 2.
+  # Partial edge tiles retain their actual cell capacity, not the window cap.
+  tile_rows W H Max Grid Counts,
+  sum_cells Counts Total, Total #= Bombs,
+  apply_rules Rules Grid Bombs.
+
+# Take exactly N elements, failing when fewer are available.
+take 0 _ [].
+take N [X | Xs] [X | Ys] <- N > 0, Next is N - 1, take Next Xs Ys.
+
+window_rows W H Max Rows <-
+  (take H Rows Block ->
+    window_cols W Max Block,
+    Rows = [_ | Rest], window_rows W H Max Rest
+  ; true).
+
+window_cols W Max Block <-
+  (take_cols W Block Cells ->
+    sum_cells Cells Total, Total #<= Max,
+    drop_cols Block Rest, window_cols W Max Rest
+  ; true).
+
+take_cols _ [] [].
+take_cols W [Row | Rows] Cells <-
+  take W Row Prefix, take_cols W Rows Rest, append Prefix Rest Cells.
+
+drop_cols [] [].
+drop_cols [[_ | Row] | Rows] [Row | Rest] <- drop_cols Rows Rest.
+
+# Partition the board into disjoint tiles, including partial boundary tiles.
+split 0 Xs [] Xs.
+split N [] [] [] <- N > 0.
+split N [X | Xs] [X | Prefix] Rest <-
+  N > 0, Next is N - 1, split Next Xs Prefix Rest.
+
+split_cols _ [] [] [].
+split_cols W [Row | Rows] [Left | Lefts] [Right | Rights] <-
+  split W Row Left Right, split_cols W Rows Lefts Rights.
+
+count_cells [] 0.
+count_cells [_ | Cells] N <- count_cells Cells Rest, N is Rest + 1.
+
+tile_rows _ _ _ [] [].
+tile_rows W H Max Rows Counts <-
+  Rows = [_ | _], split H Rows Block Rest,
+  tile_cols W H Max Block Here,
+  tile_rows W H Max Rest Later, append Here Later Counts.
+
+tile_cols _ _ _ [[] | _] [].
+tile_cols W H Max Block [Count | Counts] <-
+  Block = [[_ | _] | _], split_cols W Block Left Right,
+  flatten_grid Left Cells, count_cells Cells Capacity,
+  Count in 0..Capacity, sum_cells Cells Sum, Count #= Sum,
+  Left = [First | _],
+  ((take H Left _, take W First _) -> Count #<= Max ; true),
+  tile_cols W H Max Right Counts.
+
+# An explicit seeded permutation changes which cell is tried next. The LCG
+# supplies search priorities only; all bombs still satisfy the CLP constraints.
+shuffle_cells [] _ [].
+shuffle_cells Cells Seed [Cell | Order] <-
+  Cells = [_ | _], count_cells Cells Count,
+  Next is (1664525 * Seed + 1013904223) % 4294967296,
+  Index is Next % Count,
+  remove_at Index Cells Cell Rest, shuffle_cells Rest Next Order.
+
+remove_at 0 [Cell | Rest] Cell Rest.
+remove_at Index [Cell | Cells] Chosen [Cell | Rest] <-
+  Index > 0, Next is Index - 1, remove_at Next Cells Chosen Rest.
+
+show_mines Width Height Bombs Rules <-
+  once (minefield Width Height Bombs Rules Grid), print_grid Grid.
+
+show_seeded Width Height Bombs Rules Seed <-
+  once (minefield_seed Width Height Bombs Rules Seed Grid), print_grid Grid.
+
+print_grid [].
+print_grid [Row | Rows] <- print_row Row, nl, print_grid Rows.
+
+print_row [].
+print_row [Cell | Cells] <-
+  (Cell == 1 -> write "* " ; write ". "), print_row Cells.

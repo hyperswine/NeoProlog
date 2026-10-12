@@ -201,6 +201,39 @@ answer. Ties keep the first answer; no answers means failure. Cuts inside
 The breadboard placer uses this form to avoid constructing a list of all
 placements while preserving its existing jumper/window priorities.
 
+### Minefield generation
+
+`examples/minesweeper.nprolog` generates binary grids with an exact bomb count
+and limits on every overlapping rectangular window. It uses the existing
+CLP(Z) solver; no new builtins are required.
+
+```sh
+infera examples/minesweeper.nprolog
+```
+
+```prolog
+# Width 10, height 10, exactly 50 bombs, at most 2 in every 2x2 window:
+> once (mines 10 10 50 2 Grid)?
+
+# Change search order with a reproducible integer seed and print * / . cells:
+> show_seeded 10 10 50 [window 2 2 2] 42?
+
+# Combine limits: at most 2 per 2x2 and at most 3 per 3x3:
+> once (minefield_seed 8 6 12 [window 2 2 2, window 3 3 3] 42 Grid)?
+```
+
+`minefield Width Height Bombs Rules Grid` enumerates valid grids; wrap it in
+`once` to get one. `minefield_seed` adds a seed before `Grid` to permute search
+order. A grid contains `Height` rows of `Width` values (`1` bomb, `0` clear).
+Incompatible requirements return no answers. A window larger than the board
+has no matching region, so its rule is vacuous. Disjoint tile counts strengthen
+propagation without changing the solution set, including partial edge tiles.
+
+Seeded generation is reproducible, rather than uniform random sampling. A
+2x2 cap still allows long stripes; add larger windows to restrict those.
+Small-board properties compare all solutions against independent exhaustive
+enumeration, with acceptance checks for the 10x10 / 50-bomb case.
+
 ## Modules
 
 ```
