@@ -168,7 +168,7 @@ showTermWith name = go 0
     go _ (Var v) = name v
     go _ (IntLit n) = show n
     go _ (FloatLit d) = show d
-    go _ (CharLit c) = ['\'', c, '\'']
+    go _ (CharLit c) = show c
     go _ (StrLit s) = show s
     go _ t@(Compound "cons" [_, _]) = showList' t
     go ctx (Compound f [a, b])

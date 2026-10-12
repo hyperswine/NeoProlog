@@ -172,7 +172,7 @@ prop_parse_hash_comment = unit $ do
 prop_parse_nocrash :: Property
 prop_parse_nocrash = property $ do
   src <- forAll (Gen.string (Range.linear 0 40) Gen.unicode)
-  _ <- pure (either length (const 0) (parseTerm src))
+  _ <- evalIO (CE.evaluate (length (show (parseTerm src))))
   success
 
 prop_show_roundtrip :: Property

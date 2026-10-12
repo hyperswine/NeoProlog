@@ -248,6 +248,7 @@ src/Infera/Engine.hs    resolution, cut, tabling, labeling, answers
 src/Infera/Module.hs    neoprolog.conf and imports
 src/Infera/Repl.hs      interactive loop
 test/InferaTest.hs      hedgehog test suite
+test/CorrectnessTest.hs generated correctness tests with independent models
 examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), ...
 Formula/infera.rb       Homebrew formula
 lsp/                    VS Code extension and language server
@@ -261,6 +262,14 @@ diagnostic checks. Optimisation properties compare generated finite problems
 against exhaustive search; breadboard acceptance compares complete placements
 and costs for `rc`, `div`, and `tri` with the previous exhaustive implementation.
 
+The generated correctness properties run 300 cases each with structural
+shrinking and coverage checks. Independent Haskell models check unification,
+finite CLP solutions and both optimisers, tabled graph reachability, ordered
+fact indexing, arithmetic, and diagnostic arities, sorts and UTF-16 locations.
+It also exercises recursive term round trips, variable aliases, constraint
+ordering, domain holes, integers beyond machine size, and minimum-cost ties
+with output. Fixed regressions cover character and string escaping.
+
 ```sh
 cabal build all
 cabal test --test-show-details=direct
@@ -268,3 +277,8 @@ npm ci --prefix lsp
 INFERA_BIN="$(cabal list-bin exe:infera)" npm test --prefix lsp
 python3 test/cli.py "$(cabal list-bin exe:infera)"
 ```
+
+Failures print a seed and shrink path. To replay a counterexample, open
+`cabal repl infera-test` and call `replay "PROPERTY NAME" (Seed VALUE GAMMA)
+"SHRINK PATH"` with the values from the failure report. Replay is an interactive
+debugging aid; use `cabal test` for the suite's pass/fail exit status.
