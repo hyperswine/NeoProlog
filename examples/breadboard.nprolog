@@ -270,7 +270,7 @@ run Circuit <-
   comps Circuit Cs, nets Cs Ns,
   write "=== Circuit ", write Circuit, write " ===", nl,
   print_sources Circuit,
-  best Cs Ns Wired P Cost,
+  best Cs Ns _Wired P Cost,
   write "=== Placement (score ", write Cost, write ") ===", nl,
   print_placement P, nl,
   write "=== Nets ===", nl,
