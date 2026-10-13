@@ -126,7 +126,7 @@ function tokenize(text) {
     if (c === ' ' || c === '\t' || c === '\r' || c === '\n') { sawSpace = true; advance(); continue }
     const sl = line, sc = col, si = i
 
-    if (c === '#' && !'=!<>'.includes(text[i + 1] || '')) {
+    if (c === '#' && !/[=!<>]/.test(text[i + 1] || '')) {
       while (i < text.length && text[i] !== '\n') advance()
       push('comment', si, sl, sc)
       sawSpace = true

@@ -34,10 +34,19 @@ npm run install-extension      # packages a .vsix and installs it into VS Code
 Or package only (`npm run package`) and install the `.vsix` via
 *Extensions → … → Install from VSIX*.
 
+After updating an installed extension, run **Developer: Reload Window** and
+check that the file's language mode is **Infera**. Comments begin with `#`,
+except for the CLP operators `#=`, `#!=`, `#<`, `#>`, `#<=`, and `#>=`.
+
+If a machine still associates `.nprolog` files with the older **NeoProlog**
+language, use **Change Language Mode → Configure File Association for
+'.nprolog' → Infera**, or change its `files.associations` setting to
+`"*.nprolog": "infera"`.
+
 ## Develop
 
 ```
-npm test                       # symbol extraction, diagnostic adapter and server tests
+npm test                       # TextMate highlighting, symbols, diagnostics and server tests
 # Include the real-compiler integration test:
 INFERA_BIN="$(cd .. && cabal list-bin exe:infera)" npm test
 ```
@@ -46,6 +55,9 @@ INFERA_BIN="$(cd .. && cabal list-bin exe:infera)" npm test
 `server/server.js` wires it to the LSP; `client/extension.js` is the VS Code
 client.  Open this folder in VS Code and press F5 to launch an Extension
 Development Host.
+
+Highlighting tests use VS Code's TextMate and Oniguruma engine, and verify the
+entire Minesweeper example against both grammar scopes and LSP semantic tokens.
 
 ## Settings
 

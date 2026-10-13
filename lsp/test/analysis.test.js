@@ -7,10 +7,16 @@ const path = require('path')
 const { tokenize, analyzeDocument, countArgs } = require('../server/analysis')
 
 test('tokenizer: CLP operators are not comments', () => {
-  const toks = tokenize('p X <- X #= 1, X #!= 2, X #< 3, X #>= 4. # comment')
+  const toks = tokenize('p X <- X #= 1, X #!= 2, X #< 3, X #> 0, X #<= 5, X #>= 4. # comment')
   const ops = toks.filter(t => t.type === 'op').map(t => t.text)
-  assert.deepEqual(ops, ['#=', '#!=', '#<', '#>='])
+  assert.deepEqual(ops, ['#=', '#!=', '#<', '#>', '#<=', '#>='])
   assert.equal(toks.filter(t => t.type === 'comment').length, 1)
+})
+
+test('tokenizer: a bare hash at EOF is still a comment', () => {
+  for (const text of ['#', 'p. #', '#\n', '#\r\n']) {
+    assert.deepEqual(tokenize(text).filter(t => t.type === 'comment').map(t => t.text.trim()), ['#'])
+  }
 })
 
 test('tokenizer: modes, ranges and control tokens', () => {

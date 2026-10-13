@@ -41,7 +41,7 @@ async function client(t, executable, settings = {}, workspaceRoot = null) {
     workspaceFolders: workspaceRoot ? [{ uri: pathToFileURL(workspaceRoot).href, name: 'test' }] : [] })
   notify('initialized', {})
   notify('workspace/didChangeConfiguration', { settings: { infera: { executable, checkOnSave: true, ...settings } } })
-  return { notify, messages }
+  return { notify, request, messages }
 }
 
 async function until(predicate) {
@@ -58,6 +58,30 @@ function fixture(t) {
   const file = path.join(root, 'main.nprolog')
   return { root, file, uri: pathToFileURL(file).href }
 }
+
+test('semantic tokens classify the Minesweeper CLP goals as operators, not comments', async t => {
+  const { uri } = fixture(t)
+  const text = fs.readFileSync(path.join(__dirname, '../../examples/minesweeper.nprolog'), 'utf8')
+  const { notify, request } = await client(t, '/missing-infera', { checkOnSave: false, checkOnChange: false })
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text } })
+  const response = await request('textDocument/semanticTokens/full', { textDocument: { uri } })
+  assert.ok(!response.error, JSON.stringify(response.error))
+  const { TOKEN_TYPES, tokenize } = require('../server/analysis')
+  let line = 0, col = 0
+  const decoded = new Map()
+  for (let i = 0; i < response.result.data.length; i += 5) {
+    const [dl, dc, length, type] = response.result.data.slice(i, i + 5)
+    line += dl; col = dl === 0 ? col + dc : dc
+    decoded.set(`${line}:${col}`, { length, type: TOKEN_TYPES[type] })
+  }
+  for (const token of tokenize(text)) {
+    if (token.type === 'op' && token.text.startsWith('#')) {
+      assert.deepEqual(decoded.get(`${token.line}:${token.col}`), { length: token.text.length, type: 'operator' }, token.text)
+    } else if (token.type === 'comment') {
+      assert.equal(decoded.get(`${token.line}:${token.col}`).type, 'comment')
+    }
+  }
+})
 
 test('real compiler diagnostics arrive on open and clear after a saved correction', {
   skip: !process.env.INFERA_BIN, timeout: 20000
