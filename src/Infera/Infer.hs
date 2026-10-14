@@ -33,8 +33,8 @@ inferProgram prog0 =
   let prog1 = markGraphFacts prog0
       sorts = inferSorts prog1
       ins = inferInModes prog1
-      outs = inferOutModes prog1 ins
-      dets = inferDets prog1
+      (outs, deps) = inferGroundness prog1 ins
+      dets = inferDets prog1 ins outs deps
       finish p =
         let k = predKey p
             arity = snd k
@@ -281,11 +281,49 @@ inferSorts prog = go (10 :: Int) env0
 
 type ModeEnv = Map PredKey [Bool]
 
+-- Modes fixed by a predicate's (first) declaration: (inputs, outputs).  Both
+-- are enforced at runtime, so the analyses may trust them.
+declaredModes :: Program -> Map PredKey ([Bool], [Bool])
+declaredModes prog =
+  Map.fromList
+    [ (predKey p, (map ((== ModeIn) . argMode) (sigArgs s), map ((== ModeOut) . argMode) (sigArgs s)))
+    | p <- programPreds prog,
+      (s : _) <- [predDecls p]
+    ]
+
 -- Head variables that are the sole content of an argument position.
 plainHeadVars :: Clause -> [(Int, VarId)]
 plainHeadVars cl = case clauseHead cl of
   Compound _ as -> [(i, v) | (i, Var v) <- zip [0 ..] as]
   _ -> []
+
+-- | First plain head position of each head variable.  A variable that
+-- occupies several positions (@max2 A B A@) charges its requirements to the
+-- first one; the others are then outputs by aliasing.
+firstPlainPos :: Clause -> Map VarId Int
+firstPlainPos cl = Map.fromListWith (\_ old -> old) [(v, i) | (i, v) <- plainHeadVars cl]
+
+-- | Paths at which each variable occurs in the head: the argument index
+-- followed by subterm indices, in order of occurrence.
+headPaths :: Clause -> Map VarId [[Int]]
+headPaths cl = case clauseHead cl of
+  Compound _ as -> Map.fromListWith (flip (++)) (concat [walk [i] a | (i, a) <- zip [0 ..] as])
+  _ -> Map.empty
+  where
+    walk path t = case t of
+      Var v -> [(v, [reverse path])]
+      Compound _ xs -> concat [walk (j : path) x | (j, x) <- zip [0 ..] xs]
+      _ -> []
+
+termAtPath :: [Term] -> [Int] -> Maybe Term
+termAtPath as (i : rest)
+  | i < length as = go (as !! i) rest
+  | otherwise = Nothing
+  where
+    go t [] = Just t
+    go (Compound _ xs) (j : js) | j < length xs = go (xs !! j) js
+    go _ _ = Nothing
+termAtPath _ [] = Nothing
 
 -- | Input modes (least fixpoint): a position is input when some clause needs
 -- it ground before any goal could have bound it.
@@ -293,20 +331,22 @@ inferInModes :: Program -> ModeEnv
 inferInModes prog = go (10 :: Int) env0
   where
     preds = programPreds prog
+    decl = declaredModes prog
     env0 = Map.fromList [(predKey p, replicate (snd (predKey p)) False) | p <- preds]
     go 0 env = env
     go n env =
       let env' = Map.fromList [(predKey p, predIns env p) | p <- preds]
        in if env' == env then env else go (n - 1) env'
-    predIns env p =
-      let arity = snd (predKey p)
-          needed = Set.unions [clauseNeeds env cl | cl <- IM.elems (predClauses p)]
-       in [i `Set.member` needed | i <- [0 .. arity - 1]]
+    predIns env p = case Map.lookup (predKey p) decl of
+      Just (ins, _) -> ins
+      Nothing ->
+        let arity = snd (predKey p)
+            needed = Set.unions [clauseNeeds env cl | cl <- IM.elems (predClauses p)]
+         in [i `Set.member` needed | i <- [0 .. arity - 1]]
 
     clauseNeeds env cl =
-      let hv = plainHeadVars cl
-          required = requiredVars env (bodyGoals cl) Set.empty Set.empty
-       in Set.fromList [i | (i, v) <- hv, v `Set.member` required]
+      let required = requiredVars env (bodyGoals cl) Set.empty Set.empty
+       in Set.fromList [i | (v, i) <- Map.toList (firstPlainPos cl), v `Set.member` required]
 
     -- Walk goals in order; @bound@ are vars that may have been bound already.
     requiredVars _ [] _ req = req
@@ -331,45 +371,97 @@ inferInModes prog = go (10 :: Int) env0
               )
         _ -> ([], termVarIds g)
 
--- | Output modes (advisory): a position is output when every clause either
--- has a ground term there or a plain variable produced by the body.
-inferOutModes :: Program -> ModeEnv -> ModeEnv
-inferOutModes prog ins = go (10 :: Int) env0
+groundingBuiltins :: [String]
+groundingBuiltins =
+  [ "str_concat", "str_length", "str_chars", "str_atom", "str_num", "str_upper", "str_lower",
+    "ground", "label", "labeling"
+  ]
+
+-- | Variables known to be ground after a goal succeeds, given the variables
+-- known ground before it.  A callee's output positions count when its input
+-- positions are known ground at the call; its dependent positions count when
+-- every other argument is known ground.
+groundAfter :: ModeEnv -> ModeEnv -> ModeEnv -> Set VarId -> Term -> Set VarId
+groundAfter ins outs deps = go
+  where
+    go known g = case g of
+      Compound "," [a, b] -> go (go known a) b
+      Compound ";" [Compound "->" [c, t], e] -> Set.intersection (go (go known c) t) (go known e)
+      Compound ";" [a, b] -> Set.intersection (go known a) (go known b)
+      Compound "->" [c, t] -> go (go known c) t
+      Compound "once" [a] -> go known a
+      Compound "minimize" [_, a] -> go known a
+      Compound "is" [l, r] -> add known [l, r]
+      Compound op [a, b]
+        | op `elem` ["gt", "lt", "gte", "lte"] -> add known [a, b]
+        | op `elem` ["unify", "equiv"] ->
+            if allKnown known a then add known [b] else if allKnown known b then add known [a] else known
+      _ -> case (functorOf g, g) of
+        (Just (name, _), Compound _ as)
+          | name `elem` groundingBuiltins -> add known as
+        (Just k, Compound _ as) ->
+          let is = Map.findWithDefault [] k ins
+              os = Map.findWithDefault [] k outs
+              ds = Map.findWithDefault [] k deps
+              viaOuts
+                | and [allKnown known a | (a, True) <- zip as is] = [a | (a, True) <- zip as os]
+                | otherwise = []
+              viaDeps =
+                [ a
+                | (j, a, True) <- zip3 [0 :: Int ..] as ds,
+                  and [allKnown known b | (i, b) <- zip [0 ..] as, i /= j]
+                ]
+           in add known (viaOuts ++ viaDeps)
+        _ -> known
+    add known ts = foldl' (\k t -> Set.union k (Set.fromList (termVarIds t))) known ts
+    allKnown known t = all (`Set.member` known) (termVarIds t)
+
+-- | Output modes and dependent outputs (joint greatest fixpoint).
+--
+-- * output: the position is ground after success whenever the input
+--   positions were ground at the call;
+-- * dependent: the position is ground after success whenever every other
+--   argument was ground at the call.
+--
+-- Declared predicates use their declared outputs for both.
+inferGroundness :: Program -> ModeEnv -> (ModeEnv, ModeEnv)
+inferGroundness prog ins = go (10 :: Int) (env0, env0)
   where
     preds = programPreds prog
-    env0 = Map.fromList [(predKey p, replicate (snd (predKey p)) False) | p <- preds]
-    go 0 env = env
-    go n env =
-      let env' = Map.fromList [(predKey p, predOuts env p) | p <- preds]
-       in if env' == env then env else go (n - 1) env'
-    predOuts env p =
-      let arity = snd (predKey p)
-          rows = [clauseOuts env cl | cl <- IM.elems (predClauses p)]
-       in [not (null rows) && all (!! i) rows | i <- [0 .. arity - 1]]
-    clauseOuts env cl =
-      let produced = Set.fromList (concatMap (producedBy env) (bodyGoals cl))
-          available = Set.fromList [v | (i, v) <- plainHeadVars cl, inAt (clauseHead cl) i]
-          ok t = case t of
-            Var v -> v `Set.member` produced
-            Compound _ as -> all (\a -> case a of Var v -> v `Set.member` produced || v `Set.member` available; _ -> ok a) as
-            _ -> True
-       in case clauseHead cl of
-            Compound _ as -> map ok as
-            _ -> []
-    inAt hd i = case functorOf hd of
-      Just k -> maybe False (\bs -> i < length bs && bs !! i) (Map.lookup k ins)
-      Nothing -> False
-    producedBy env g = case g of
-      Compound "is" [l, _] -> termVarIds l
-      Compound "unify" [Var v, t] | notVar t -> [v]
-      Compound "unify" [t, Var v] | notVar t -> [v]
-      Compound "findall" [_, _, l] -> termVarIds l
-      _ -> case (functorOf g, g) of
-        (Just k, Compound _ as)
-          | Just outs <- Map.lookup k env -> concat [termVarIds a | (a, True) <- zip as outs]
-        _ -> []
-    notVar (Var _) = False
-    notVar _ = True
+    decl = declaredModes prog
+    env0 = Map.fromList [(predKey p, initial p) | p <- preds]
+    initial p = case Map.lookup (predKey p) decl of
+      Just (_, outs) -> outs
+      Nothing -> replicate (snd (predKey p)) (not (IM.null (predClauses p)))
+    go 0 envs = envs
+    go n envs =
+      let outs' = Map.fromList [(predKey p, predOuts envs p) | p <- preds]
+          deps' = Map.fromList [(predKey p, predDeps envs p) | p <- preds]
+       in if (outs', deps') == envs then envs else go (n - 1) (outs', deps')
+    arityOf p = snd (predKey p)
+    predOuts (outs, deps) p = case Map.lookup (predKey p) decl of
+      Just (_, os) -> os
+      Nothing ->
+        let pins = Map.findWithDefault [] (predKey p) ins
+            rows = [clauseGround outs deps (\i -> i < length pins && pins !! i) cl | cl <- IM.elems (predClauses p)]
+         in [not (null rows) && all (!! i) rows | i <- [0 .. arityOf p - 1]]
+    predDeps (outs, deps) p = case Map.lookup (predKey p) decl of
+      Just (_, os) -> os
+      Nothing ->
+        [ not (IM.null (predClauses p))
+            && all (\cl -> clauseGround outs deps (/= j) cl !! j) (IM.elems (predClauses p))
+        | j <- [0 .. arityOf p - 1]
+        ]
+    -- Which head arguments are ground after the clause succeeds, assuming the
+    -- arguments selected by @assumed@ were ground at the call.
+    clauseGround outs deps assumed cl =
+      let hs = case clauseHead cl of Compound _ as -> as; _ -> []
+          g0 = Set.fromList (concat [termVarIds a | (i, a) <- zip [0 ..] hs, assumed i])
+          step g = foldl' (groundAfter ins outs deps) g (clauseBody cl)
+          gEnd = stable (3 :: Int) step g0
+       in [all (`Set.member` gEnd) (termVarIds a) | a <- hs]
+    stable 0 _ g = g
+    stable n f g = let g' = f g in if g' == g then g else stable (n - 1) f g'
 
 -- ─── DETERMINISM INFERENCE ───────────────────────────────────────────────────
 
@@ -449,24 +541,31 @@ atMostOne d = d == Det || d == Semidet
 -- Orderings a guard admits between its two operands.
 data Ordering' = OLT | OEQ | OGT deriving (Eq, Ord, Show)
 
--- A guard on canonical operands: variables are replaced by their head
--- position (@PosArg i@), literals stay.
-data GuardOperand = PosArg Int | Lit Term deriving (Eq, Ord, Show)
+flipO :: Ordering' -> Ordering'
+flipO OLT = OGT
+flipO OGT = OLT
+flipO OEQ = OEQ
 
+-- A guard operand: a head variable, identified by every path at which it
+-- occurs in the head, or a literal.
+data GuardOperand = VarPaths [[Int]] | Lit Term deriving (Eq, Show)
+
+-- | The first body goal when it is a comparison between head variables and
+-- literals: (left operand, right operand, admitted orderings, needs ground).
+-- @needs ground@ marks == and != guards, which do not fail on unbound
+-- variables and therefore only exclude when their arguments are ground.
 guardOf :: Clause -> Maybe (GuardOperand, GuardOperand, Set Ordering', Bool)
 guardOf cl = case clauseBody cl of
   (Compound op [a, b] : _)
     | Just rels <- relOf op -> do
         x <- operand a
         y <- operand b
-        let needsGround = op `elem` ["neq", "equiv"]
-        pure (orient x y rels needsGround)
+        pure (x, y, rels, op `elem` ["neq", "equiv"])
   _ -> Nothing
   where
-    -- first position at which a variable is the whole head argument
-    positions = Map.fromListWith (\_ old -> old) [(v, i) | (i, v) <- plainHeadVars cl]
+    paths = headPaths cl
     operand t = case t of
-      Var v -> PosArg <$> Map.lookup v positions
+      Var v -> VarPaths <$> Map.lookup v paths
       _ | isLit t -> Just (Lit t)
       _ -> Nothing
     isLit t = case t of
@@ -484,12 +583,40 @@ guardOf cl = case clauseBody cl of
       "equiv" -> Just (Set.fromList [OEQ])
       "neq" -> Just (Set.fromList [OLT, OGT])
       _ -> Nothing
-    orient x y rels ng
-      | x <= y = (x, y, rels, ng)
-      | otherwise = (y, x, Set.map flipO rels, ng)
-    flipO OLT = OGT
-    flipO OGT = OLT
-    flipO OEQ = OEQ
+
+-- | When do two guard operands denote the same call-time value?  Returns the
+-- argument positions that must be ground for that to hold.
+--
+-- * the same literal: always;
+-- * variables where one head path set includes the other: always, because
+--   the clause with the smaller set only evaluates its guard once one of
+--   those paths is bound in the call, and the other clause's variable is
+--   unified with that same subterm;
+-- * variables sharing a head path: when the argument containing that path
+--   is ground, so both clauses read the same subterm.
+compatibleOperands :: GuardOperand -> GuardOperand -> Maybe [Int]
+compatibleOperands (Lit a) (Lit b) = if a == b then Just [] else Nothing
+compatibleOperands (VarPaths p) (VarPaths q)
+  | subset p q || subset q p = Just []
+  | otherwise = case [i | path@(i : _) <- p, path `elem` q] of
+      (i : _) -> Just [i]
+      [] -> Nothing
+  where
+    subset xs ys = all (`elem` ys) xs
+compatibleOperands _ _ = Nothing
+
+operandArgs :: GuardOperand -> [Int]
+operandArgs (VarPaths ps) = [i | (i : _) <- ps]
+operandArgs (Lit _) = []
+
+-- | Does a ground call argument distinguish the two head patterns?  True when
+-- the patterns carry different principal functors at some common path.
+distinctPatterns :: Int -> Term -> Term -> Bool
+distinctPatterns depth a b = case (indexKey a, indexKey b) of
+  (Just ka, Just kb)
+    | ka /= kb -> True
+    | depth > 0, Compound _ xs <- a, Compound _ ys <- b -> or (zipWith (distinctPatterns (depth - 1)) xs ys)
+  _ -> False
 
 -- | Are two clauses mutually exclusive?  Returns the argument positions that
 -- must be ground at call time for the exclusivity to hold.  When several
@@ -507,42 +634,37 @@ exclusive c1 c2 = case options of
         ++ maybe [] pure (literalVsGuard c1 c2)
         ++ maybe [] pure (literalVsGuard c2 c1)
     guardOption = case (guardOf c1, guardOf c2) of
-      (Just (x1, y1, r1, ng1), Just (x2, y2, r2, ng2))
-        | x1 == x2 && y1 == y2 && Set.null (Set.intersection r1 r2) ->
-            [if ng1 || ng2 then operandPositions [x1, y1] else []]
+      (Just (x1, y1, r1, ng1), Just (x2, y2, r2, ng2)) ->
+        let groundAll = if ng1 || ng2 then concatMap operandArgs [x1, y1, x2, y2] else []
+            option rx ry disjoint = do
+              px <- rx
+              py <- ry
+              if disjoint then Just (nub (groundAll ++ px ++ py)) else Nothing
+            same = option (compatibleOperands x1 x2) (compatibleOperands y1 y2) (Set.null (Set.intersection r1 r2))
+            swapped = option (compatibleOperands x1 y2) (compatibleOperands y1 x2) (Set.null (Set.intersection r1 (Set.map flipO r2)))
+         in maybe [] pure same ++ maybe [] pure swapped
       _ -> []
     args (Clause (Compound _ as) _ _) = as
     args _ = []
     switchPositions =
-      [ i
-      | (i, (a, b)) <- zip [0 ..] (zip (args c1) (args c2)),
-        Just ka <- [indexKey a],
-        Just kb <- [indexKey b],
-        ka /= kb
-      ]
-    operandPositions ops = [i | PosArg i <- ops]
-    -- c1 has a literal at position i; c2 has a plain variable there guarded
-    -- by a comparison against the same literal that excludes equality.
+      [i | (i, (a, b)) <- zip [0 ..] (zip (args c1) (args c2)), distinctPatterns 3 a b]
+    -- c1 has a literal where c2 has a variable (occurring only there) guarded
+    -- by a comparison against a literal that excludes c1's.
     literalVsGuard lit gd = case guardOf gd of
       Just (x, y, rels, ng)
         | Just i <- excluded x y rels ->
             Just (if ng then [i] else [])
       _ -> Nothing
       where
-        -- position i of the literal clause is excluded by the guard on the
-        -- variable clause when the guard cannot hold for that literal
-        excluded (PosArg i) (Lit l) rels = check i l rels
-        excluded (Lit l) (PosArg i) rels = check i l (Set.map flipO rels)
+        excluded (VarPaths [p]) (Lit l) rels = check p l rels
+        excluded (Lit l) (VarPaths [p]) rels = check p l (Set.map flipO rels)
         excluded _ _ _ = Nothing
-        flipO OLT = OGT
-        flipO OGT = OLT
-        flipO OEQ = OEQ
-        check i l rels
-          | i < length (args lit),
-            Just o <- compareLits (args lit !! i) l,
+        check p@(i : _) l rels
+          | Just t <- termAtPath (args lit) p,
+            Just o <- compareLits t l,
             not (o `Set.member` rels) =
               Just i
-          | otherwise = Nothing
+        check _ _ _ = Nothing
         -- ordering of the head literal relative to the guard literal
         compareLits a b = case (a, b) of
           (IntLit p, IntLit q) -> Just (ordOf (compare p q))
@@ -567,10 +689,11 @@ hasCut cl = any isCut (clauseBody cl)
     isCut (Atom "!") = True
     isCut _ = False
 
-inferDets :: Program -> DetEnv
-inferDets prog = go env0
+inferDets :: Program -> ModeEnv -> ModeEnv -> ModeEnv -> DetEnv
+inferDets prog ins outs deps = go env0
   where
     preds = programPreds prog
+    after = groundAfter ins outs deps
     declared p = case predDecls p of
       (s : _) -> Just (sigDet s)
       [] -> Nothing
@@ -614,32 +737,30 @@ inferDets prog = go env0
     isCutGoal (Atom "!") = True
     isCutGoal _ = False
 
-    goalsDet env known gs = foldl' (\(d, kn) g -> let (d', kn') = goalDet env kn g in (conj d d', kn')) (Det, known) gs
+    goalsDet env known gs = foldl' (\(d, kn) g -> (conj d (goalDet env kn g), after kn g)) (Det, known) gs
 
-    goalDet :: DetEnv -> Set VarId -> Term -> (Det, Set VarId)
+    -- Determinism of one goal given the variables known ground before it.
+    goalDet :: DetEnv -> Set VarId -> Term -> Det
     goalDet env known g = case g of
-      Compound "," [a, b] ->
-        let (da, k1) = goalDet env known a
-            (db, k2) = goalDet env k1 b
-         in (conj da db, k2)
+      Compound "," [a, b] -> conj (goalDet env known a) (goalDet env (after known a) b)
       Compound ";" [Compound "->" [c, t], e] ->
-        let (dc, kc) = goalDet env known c
-            (dt, _) = goalDet env kc t
-            (de, _) = goalDet env known e
-            d = if atMostOne dc && atMostOne dt && atMostOne de then (if dt == Det && de == Det && dc == Det then Det else Semidet) else Nondet
-         in (d, known)
-      Compound ";" [_, _] -> (Nondet, known)
+        let dc = goalDet env known c
+            dt = goalDet env (after known c) t
+            de = goalDet env known e
+         in if atMostOne dc && atMostOne dt && atMostOne de
+              then (if dt == Det && de == Det && dc == Det then Det else Semidet)
+              else Nondet
+      Compound ";" [_, _] -> Nondet
       Compound "->" [c, t] ->
-        let (dc, kc) = goalDet env known c
-            (dt, _) = goalDet env kc t
-         in (if atMostOne dc && atMostOne dt then Semidet else Nondet, known)
-      Compound "is" [l, _] -> (Semidet, Set.union known (Set.fromList (termVarIds l)))
-      Atom "!" -> (Det, known)
+        let dc = goalDet env known c
+            dt = goalDet env (after known c) t
+         in if atMostOne dc && atMostOne dt then Semidet else Nondet
+      Atom "!" -> Det
       _ -> case functorOf g of
         Just (name, arity)
-          | Just d <- builtinDet name arity -> (d, known)
+          | Just d <- builtinDet name arity -> d
           | Just (d, sw) <- Map.lookup (name, arity) env ->
               let as = case g of Compound _ xs -> xs; _ -> []
                   groundAt i = i < length as && all (`Set.member` known) (termVarIds (as !! i))
-               in if all groundAt sw then (d, known) else (Nondet, known)
-        _ -> (Nondet, known)
+               in if all groundAt sw then d else Nondet
+        _ -> Nondet

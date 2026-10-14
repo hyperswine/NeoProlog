@@ -437,6 +437,72 @@ prop_infer_commit_is_sound = unit $ do
   assertFirst listsProg "length [a | T] N?" "T = [], N = 1"
   assertAnswers "zflag 0 1.\nzflag V 0 <- V != 0." "zflag V Z?" ["V = 0, Z = 1", "Z = 0, V != 0"]
 
+-- The stdlib is the golden file for the mode and determinism analysis: every
+-- line below was checked by hand against the predicate's real behaviour.
+prop_infer_stdlib_golden :: Property
+prop_infer_stdlib_golden = unit $ do
+  res <- evalIO (loadFile "examples/stdlib.nprolog")
+  prog <- case res of
+    Left err -> annotate err >> failure
+    Right (p, _) -> pure p
+  let render p = showSignature (fst (predKey p)) (predInferred p) ++ " " ++ show (sigSwitch (predInferred p))
+      actual = Map.fromList [(showPredKey (predKey p), render p) | p <- programPreds prog]
+      expected =
+        [ ("abs1/2", "abs1 : semidet (num: <=) (num: =>). []"),
+          ("add3/3", "add3 : semidet (num: <=) (num: <=) (num: =>). []"),
+          ("append/3", "append : semidet (list any: <=>) (any: <=>) (list any: <=>). [0]"),
+          ("between/3", "between : nondet (num: <=) (num: <=) (num: =>). []"),
+          ("drop/3", "drop : semidet (list any: <=>) (num: <=) (any: <=>). []"),
+          ("foldl/4", "foldl : nondet (any: <=>) (list any: <=>) (any: <=>) (any: <=>). []"),
+          ("gcd/3", "gcd : semidet (num: <=) (num: <=) (num: =>). []"),
+          ("include/3", "include : nondet (any: <=>) (list any: <=>) (list any: <=>). []"),
+          ("insert_sorted/3", "insert_sorted : semidet (num: <=) (list num: <=>) (list num: <=>). [1]"),
+          ("isort/2", "isort : semidet (list num: <=>) (list num: <=>). [0]"),
+          ("last/2", "last : nondet (list any: <=>) (any: <=>). []"),
+          ("length/2", "length : semidet (list any: <=>) (num: =>). [0]"),
+          ("maplist/2", "maplist : nondet (any: <=>) (list any: <=>). []"),
+          ("maplist/3", "maplist : nondet (any: <=>) (list any: <=>) (list any: <=>). []"),
+          ("max2/3", "max2 : semidet (num: <=) (num: <=) (num: =>). []"),
+          ("max_list/2", "max_list : nondet (list num: <=>) (num: <=>). []"),
+          ("member/2", "member : nondet (any: <=>) (list any: <=>). []"),
+          ("merge_sorted/3", "merge_sorted : nondet (list num: <=>) (list num: <=>) (list num: <=>). []"),
+          ("min2/3", "min2 : semidet (num: <=) (num: <=) (num: =>). []"),
+          ("msort/2", "msort : nondet (list any: <=>) (list num: <=>). []"),
+          ("no_attack/3", "no_attack : semidet (num: <=) (list num: =>) (num: <=>). [1]"),
+          ("nth/3", "nth : semidet (list any: <=>) (num: <=) (any: <=>). []"),
+          ("numlist/3", "numlist : semidet (num: <=) (num: <=) (list num: =>). []"),
+          ("permutation/2", "permutation : nondet (list any: <=>) (list any: <=>). []"),
+          ("queens/2", "queens : nondet (num: <=) (list num: <=>). []"),
+          ("reverse/2", "reverse : semidet (list any: <=>) (list any: <=>). [0]"),
+          ("safe_queens/1", "safe_queens : semidet (list num: <=>). [0]"),
+          ("select_elem/3", "select_elem : nondet (any: <=>) (list any: <=>) (list any: <=>). []"),
+          ("split/3", "split : semidet (list any: <=>) (list any: <=>) (list any: <=>). [0]"),
+          ("sum_list/2", "sum_list : semidet (list num: =>) (num: =>). [0]"),
+          ("take/3", "take : nondet (list any: <=>) (num: <=) (list any: <=>). []"),
+          ("zip/3", "zip : semidet (list any: <=>) (list any: <=>) (list any: <=>). [0]")
+        ]
+  mapM_ (\(k, line) -> do annotate k; Map.lookup k actual === Just line) expected
+
+-- Guard exclusivity must not be fooled by variables that are bound through
+-- different aliased head positions in the two clauses.
+prop_infer_alias_guard_is_sound :: Property
+prop_infer_alias_guard_is_sound = unit $ do
+  let prog = unlines ["p H _ H _ <- H > 0.", "p H _ _ H <- H <= 0."]
+  prog' <- loadOrFail prog
+  p <- predOrFail prog' ("p", 4)
+  -- exclusive only once the shared head position is ground
+  sigDet (predInferred p) === Semidet
+  sigSwitch (predInferred p) === [0]
+  assertAnswers prog "p U a 7 -1?" ["U = 7", "U = -1"]
+  assertAnswers prog "p 7 a X Y?" ["X = 7"]
+  -- aliased outputs and shared-path guards are still recognised
+  prog2 <- loadOrFail (unlines ["max2 A B A <- A >= B.", "max2 A B B <- B > A.", "ins X [H | T] [X, H | T] <- X <= H.", "ins X [H | T] [H | R] <- X > H, ins X T R.", "ins X [] [X]."])
+  m <- predOrFail prog2 ("max2", 3)
+  map argMode (sigArgs (predInferred m)) === [ModeIn, ModeIn, ModeOut]
+  i <- predOrFail prog2 ("ins", 3)
+  sigDet (predInferred i) === Semidet
+  sigSwitch (predInferred i) === [1]
+
 prop_infer_tabling_defaults :: Property
 prop_infer_tabling_defaults = unit $ do
   prog <-
@@ -733,6 +799,8 @@ inferaGroup =
       ("infer signatures", prop_infer_signatures),
       ("infer guards", prop_infer_guards),
       ("infer commit is sound", prop_infer_commit_is_sound),
+      ("infer stdlib golden", prop_infer_stdlib_golden),
+      ("infer alias guard is sound", prop_infer_alias_guard_is_sound),
       ("infer tabling defaults", prop_infer_tabling_defaults),
       ("tabling left recursion", prop_tabling_left_recursion),
       ("tabling memoises", prop_tabling_memoises),
