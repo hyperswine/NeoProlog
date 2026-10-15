@@ -1,0 +1,21 @@
+app([], L, L).
+app([H|T], L, [H|R]) :- app(T, L, R).
+nrev([], []).
+nrev([H|T], R) :- nrev(T, RT), app(RT, [H], R).
+range(N, N, [N]) :- !.
+range(I, N, [I|T]) :- I < N, I1 is I + 1, range(I1, N, T).
+loop(0) :- !.
+loop(N) :- N1 is N - 1, loop(N1).
+bench_nrev(0) :- !.
+bench_nrev(K) :- range(1, 30, L), nrev(L, _), K1 is K - 1, bench_nrev(K1).
+fib(0, 0). fib(1, 1).
+fib(N, F) :- N > 1, N1 is N - 1, N2 is N - 2, fib(N1, F1), fib(N2, F2), F is F1 + F2.
+queens(N, Qs) :- range(1, N, Ns), perm(Ns, Qs), safe(Qs).
+perm([], []).
+perm(L, [H|T]) :- sel(H, L, R), perm(R, T).
+sel(X, [X|T], T).
+sel(X, [H|T], [H|R]) :- sel(X, T, R).
+safe([]).
+safe([Q|Qs]) :- noatt(Q, Qs, 1), safe(Qs).
+noatt(_, [], _).
+noatt(Q, [Q1|Qs], D) :- Q =\= Q1, D1 is Q1 - Q, D1 =\= D, D2 is Q - Q1, D2 =\= D, D3 is D + 1, noatt(Q, Qs, D3).

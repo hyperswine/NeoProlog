@@ -328,6 +328,15 @@ warning; navigation and highlighting continue without a separate validator.
 cd lsp && npm install && npm run install-extension
 ```
 
+## Roadmap
+
+The resolution core is a lazy-list interpreter, roughly 30 to 50 times slower
+than SWI-Prolog or Scryer on raw inference and limited to 100 000 nested
+activations.  [docs/engine-roadmap.md](docs/engine-roadmap.md) is the plan
+for replacing it: first an explicit abstract machine (trail, choice-point
+stack, last-call optimisation, tracing hooks), then bytecode compilation.
+`bench/run.sh` runs the benchmarks the plan is measured against.
+
 ## Layout
 
 ```
@@ -346,6 +355,8 @@ test/CorrectnessTest.hs generated correctness tests with independent models
 test/InferenceTest.hs   inferred pruning compared with unpruned execution
 examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), jumpman (one rule set: verify / solve / play / generate), ...
 Formula/infera.rb       Homebrew formula
+bench/                  engine benchmarks (infera vs swipl vs scryer)
+docs/engine-roadmap.md  plan for the abstract machine and bytecode engine
 lsp/                    VS Code extension and language server
 ```
 
