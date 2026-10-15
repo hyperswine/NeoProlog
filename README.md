@@ -282,7 +282,7 @@ src/Infera/Module.hs    neoprolog.conf and imports
 src/Infera/Repl.hs      interactive loop
 test/InferaTest.hs      hedgehog test suite
 test/CorrectnessTest.hs generated correctness tests with independent models
-examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), ...
+examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), jumpman (one rule set: verify / solve / play / generate), ...
 Formula/infera.rb       Homebrew formula
 lsp/                    VS Code extension and language server
 ```
