@@ -37,3 +37,5 @@ jobs:
         working-directory: lsp
       - run: INFERA_BIN="$(cabal list-bin exe:infera)" npm test --prefix lsp
       - run: python3 test/cli.py "$(cabal list-bin exe:infera)"
+      - run: python3 -m unittest discover -s test -p bench_harness_test.py
+      - run: INFERA_BIN="$(cabal list-bin exe:infera)" sh bench/run.sh --engine infera --case fib --runs 1 --warmup 0 --timeout 30 --json

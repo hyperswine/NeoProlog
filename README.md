@@ -330,12 +330,13 @@ cd lsp && npm install && npm run install-extension
 
 ## Roadmap
 
-The resolution core is a lazy-list interpreter, roughly 30 to 50 times slower
-than SWI-Prolog or Scryer on raw inference and limited to 100 000 nested
-activations.  [docs/engine-roadmap.md](docs/engine-roadmap.md) is the plan
+The resolution core is a lazy-list interpreter limited to 100 000 nested
+activations. [docs/engine-roadmap.md](docs/engine-roadmap.md) is the plan
 for replacing it: first an explicit abstract machine (trail, choice-point
 stack, last-call optimisation, tracing hooks), then bytecode compilation.
-`bench/run.sh` runs the benchmarks the plan is measured against.
+`bench/run.sh` runs checked engine benchmarks. Earlier relative-speed numbers
+from the unchecked harness are historical observations, not validated baselines.
+The roadmap records a fresh local baseline with checked warmups and samples.
 
 ## Layout
 
@@ -389,7 +390,29 @@ cabal test --test-show-details=direct
 npm ci --prefix lsp
 INFERA_BIN="$(cabal list-bin exe:infera)" npm test --prefix lsp
 python3 test/cli.py "$(cabal list-bin exe:infera)"
+python3 -m unittest discover -s test -p bench_harness_test.py
 ```
+
+The engine benchmark harness checks successful execution and independent expected
+results for naive reverse, a counting loop, untabled Fibonacci and 8 queens.
+Every warmup is validated; timed runs report medians and individual samples.
+Errors, wrong answers, missing completion markers and timeouts exit nonzero
+without a timing result for the failed case. Engine processes run in temporary
+directories, and executable paths are passed directly without a shell.
+
+```sh
+INFERA_BIN="$(cabal list-bin exe:infera)" sh bench/run.sh --runs 3 --warmup 1 --timeout 30
+# Select an engine/workload or emit JSON Lines:
+sh bench/run.sh --engine infera --case fib --json
+```
+
+Without `--engine`, the runner includes installed SWI-Prolog and Scryer engines.
+Explicitly requesting an unavailable engine is an error. `--binary` overrides
+the Infera executable; `SWIPL_BIN` and `SCRYER_BIN` override comparison binaries.
+JSON records include workload hashes, executable paths, runner information and
+the Infera RTS options. Timings include CLI startup/loading/output; record build
+revision and compiler flags alongside any baseline. Ordinary CI runs harness
+failure tests and a checked smoke workload, with no noisy timing threshold.
 
 Performance tests compare the constraint store with a frozen full-scan reference,
 and eligible delta tabling with ordered observations from the general evaluator.

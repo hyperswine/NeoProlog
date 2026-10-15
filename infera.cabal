@@ -16,8 +16,11 @@ maintainer:         jasen.qin33@gmail.com
 copyright:          2025 Jasen Qin
 category:           Language
 build-type:         Simple
-extra-doc-files:    README.md
+extra-doc-files:    README.md docs/engine-roadmap.md
+                    docs/engine-baseline-2026-10-16.jsonl
 extra-source-files: examples/*.nprolog test/cli.py test/bench.py
+                    test/bench_harness_test.py bench/run.sh bench/run.py
+                    bench/bench.nprolog bench/bench.pl
 tested-with:        GHC == 9.8.2
 
 source-repository head
