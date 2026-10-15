@@ -43,7 +43,7 @@ nat    : <span class="k">notable</span>.              # flags only: applies to e
 <tr><td id="determinism" data-dash="Guide:Determinism categories">Determinism</td><td><code>det</code> exactly one solution · <code>semidet</code> at most one · <code>multi</code> at least one · <code>nondet</code> any number (default)</td></tr>
 <tr><td id="sorts" data-dash="Guide:Sorts">Sort</td><td><code>int</code> <code>float</code> <code>num</code> <code>str</code> <code>char</code> <code>atom</code> <code>any</code>, <code>list &lt;sort&gt;</code> (nest with parentheses: <code>list (list int)</code>)</td></tr>
 <tr><td id="modes" data-dash="Guide:Modes">Mode</td><td><code>&lt;=</code> input: ground at call · <code>=&gt;</code> output: ground after the call · <code>&lt;=&gt;</code> no requirement (default)</td></tr>
-<tr><td id="flags" data-dash="Guide:Flags">Flags</td><td><code>table</code> <code>notable</code> <code>index</code> <code>noindex</code></td></tr>
+<tr><td id="flags" data-dash="Guide:Flags">Flags</td><td><code>table</code> <code>notable</code> <code>index</code> <code>noindex</code> <code>unsafe</code> <code>dynamic</code></td></tr>
 </table>
 <p>A bare sort in parentheses means <code>&lt;=&gt;</code>: <code>(int)</code> is <code>(int: &lt;=&gt;)</code>. A declaration with only flags and no argument specs applies to every arity of the name. Several declarations of the same predicate are <em>alternative modes</em>; the first one whose input arguments are ground in the call is used.</p>
 
@@ -56,6 +56,8 @@ nat    : <span class="k">notable</span>.              # flags only: applies to e
 <tr><td id="kw-nondet" data-dash="Keyword:nondet"><code>nondet</code></td><td>Any number of solutions.</td></tr>
 <tr><td id="kw-table" data-dash="Keyword:table"><code>table</code> / <code>notable</code></td><td>Force tabling on or off for the predicate (see <a href="engine.html#tabling">tabling</a>).</td></tr>
 <tr><td id="kw-index" data-dash="Keyword:index"><code>index</code> / <code>noindex</code></td><td>Force argument indexing on or off.</td></tr>
+<tr><td id="kw-unsafe" data-dash="Keyword:unsafe"><code>unsafe</code></td><td>The predicate may perform effects (output, file reads, assert/retract, cut) and call other unsafe predicates. Without it those are load-time errors; inline queries are always allowed to.</td></tr>
+<tr><td id="kw-dynamic" data-dash="Keyword:dynamic"><code>dynamic</code></td><td>The predicate has no clauses; its facts are managed with <code>assert</code> and <code>retract</code> and are undone on backtracking.</td></tr>
 <tr><td id="sort-int" data-dash="Type:int"><code>int</code>, <code>float</code>, <code>num</code></td><td>Integers, floats, either.</td></tr>
 <tr><td id="sort-str" data-dash="Type:str"><code>str</code>, <code>char</code>, <code>atom</code></td><td>Strings, characters, atoms.</td></tr>
 <tr><td id="sort-list" data-dash="Type:list"><code>list S</code>, <code>any</code></td><td>Proper lists of sort S; anything.</td></tr>
@@ -85,11 +87,12 @@ length/<span class="n">2</span>
   inferred: length : <span class="k">semidet</span> (<span class="k">list</span> <span class="k">any</span>: &lt;=&gt;) (<span class="k">num</span>: =&gt;).   # <span class="k">semidet</span> when argument(s) <span class="n">1</span> ground
   clauses: <span class="n">2</span>, tabled: no, indexed: yes, recursive: yes, pure: yes</code></pre>
 <ul>
-  <li><strong>Sorts</strong> come from head patterns, literals, arithmetic, string built-ins and the sorts of called predicates, iterated to a fixpoint. <code>int</code> and <code>float</code> evidence join to <code>num</code>; conflicting evidence gives <code>any</code>.</li>
-  <li><strong>Modes</strong>: <code>&lt;=</code> when some clause needs the argument ground before anything could bind it (a comparison, arithmetic, or an input of a callee); <code>=&gt;</code> when every clause leaves the argument ground.</li>
+  <li><strong>Sorts</strong> use bounded evidence propagation from head patterns, literals, arithmetic, string built-ins and called predicates. <code>int</code> and <code>float</code> evidence join to <code>num</code>; conflicting evidence gives <code>any</code>.</li>
+  <li><strong>Modes</strong>: <code>&lt;=</code> is a conservative grounding prerequisite; <code>=&gt;</code> promises grounding after success under the inferred prerequisites. Branches retain only common guarantees, and a constraint does not imply grounding. Input and output analyses run to convergence; input hints may overestimate prerequisites of predicates with several relational modes.</li>
   <li><strong>Determinism</strong>: <code>semidet</code> when the clauses are pairwise exclusive and every body has at most one solution. Clauses are exclusive when they have different principal functors at some argument, complementary guards as their first goal (<code>A &gt;= B</code> against <code>B &gt; A</code>), a literal against a guard that excludes it (<code>0</code> against <code>N &gt; 0</code>), or a cut. The exclusivity may require some arguments to be ground; those positions are recorded and checked at call time.</li>
 </ul>
-<div class="note">Inferred signatures are advisory and never raise errors. The engine uses an inferred <code>semidet</code> only to drop choice points, and only when the recorded argument positions are ground in the actual call. Everything else falls back to full backtracking, so inference cannot lose solutions.</div>
+<div class="note">Inferred signatures are advisory and never raise errors. The engine uses an inferred <code>semidet</code> only when its recorded positions are ground in the actual call; otherwise it retains backtracking. Guard proofs account for aliased arguments and distinguish term identity from value ordering. Declaration alternatives contribute guarantees according to the modes that could be selected at runtime.</div>
+<p>Generated differential tests compare ordered answers, residuals, output, errors and exhaustion with inferred pruning disabled, preserving declared contracts, indexing and tabling. Numeric ordering places NaN after other numbers and compares numeric NaNs equally; term identity remains separate.</p>
 <div class="pager"><a href="language.html">← Language</a><a href="engine.html">Engine →</a></div>
   </main>
 </div>

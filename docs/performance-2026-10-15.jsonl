@@ -1,0 +1,22 @@
+{"version":"before","case": "mine-setup-16", "status": "ok", "samples_seconds": [1.599396, 1.576883, 1.579242], "median_seconds": 1.579242, "timeout_seconds": null}
+{"version":"before","case": "mine-seeded-10", "status": "ok", "samples_seconds": [0.398239, 0.403951, 0.415118], "median_seconds": 0.403951, "timeout_seconds": null}
+{"version":"before","case": "mine-ordinary-16", "status": "ok", "samples_seconds": [2.176675, 2.15758, 2.16298], "median_seconds": 2.16298, "timeout_seconds": null}
+{"version":"before","case": "mine-seeded-16", "status": "timeout", "samples_seconds": [], "median_seconds": null, "timeout_seconds": 8.0}
+{"version":"before","case": "breadboard-rc", "status": "ok", "samples_seconds": [0.031261, 0.03396, 0.02622], "median_seconds": 0.031261, "timeout_seconds": null}
+{"version":"before","case": "breadboard-div", "status": "ok", "samples_seconds": [0.026584, 0.026522, 0.026587], "median_seconds": 0.026584, "timeout_seconds": null}
+{"version":"before","case": "breadboard-tri", "status": "ok", "samples_seconds": [0.030074, 0.041899, 0.034563], "median_seconds": 0.034563, "timeout_seconds": null}
+{"version":"before","case": "path-100", "status": "ok", "samples_seconds": [0.018368, 0.015932, 0.019443], "median_seconds": 0.018368, "timeout_seconds": null}
+{"version":"before","case": "path-200", "status": "ok", "samples_seconds": [0.03869, 0.034512, 0.047111], "median_seconds": 0.03869, "timeout_seconds": null}
+{"version":"before","case": "path-all-100", "status": "ok", "samples_seconds": [0.576701, 0.652377, 0.594922], "median_seconds": 0.594922, "timeout_seconds": null}
+{"version":"before","case": "breadboard-wide", "status": "ok", "samples_seconds": [0.811525, 0.79834, 0.809399], "median_seconds": 0.809399, "timeout_seconds": null}
+{"version":"after","case": "mine-setup-16", "status": "ok", "samples_seconds": [0.696314, 0.074987, 0.076543], "median_seconds": 0.076543, "timeout_seconds": null}
+{"version":"after","case": "mine-seeded-10", "status": "ok", "samples_seconds": [0.140371, 0.138036, 0.141556], "median_seconds": 0.140371, "timeout_seconds": null}
+{"version":"after","case": "mine-ordinary-16", "status": "ok", "samples_seconds": [0.118959, 0.114486, 0.116405], "median_seconds": 0.116405, "timeout_seconds": null}
+{"version":"after","case": "mine-seeded-16", "status": "ok", "samples_seconds": [2.371837, 2.354092, 2.278577], "median_seconds": 2.354092, "timeout_seconds": null}
+{"version":"after","case": "breadboard-rc", "status": "ok", "samples_seconds": [0.027321, 0.030597, 0.034777], "median_seconds": 0.030597, "timeout_seconds": null}
+{"version":"after","case": "breadboard-div", "status": "ok", "samples_seconds": [0.032786, 0.036329, 0.029464], "median_seconds": 0.032786, "timeout_seconds": null}
+{"version":"after","case": "breadboard-tri", "status": "ok", "samples_seconds": [0.035948, 0.038366, 0.034942], "median_seconds": 0.035948, "timeout_seconds": null}
+{"version":"after","case": "path-100", "status": "ok", "samples_seconds": [0.016045, 0.017448, 0.015443], "median_seconds": 0.016045, "timeout_seconds": null}
+{"version":"after","case": "path-200", "status": "ok", "samples_seconds": [0.019419, 0.01549, 0.019461], "median_seconds": 0.019419, "timeout_seconds": null}
+{"version":"after","case": "path-all-100", "status": "ok", "samples_seconds": [0.033302, 0.031852, 0.032338], "median_seconds": 0.032338, "timeout_seconds": null}
+{"version":"after","case": "breadboard-wide", "status": "ok", "samples_seconds": [0.036875, 0.042683, 0.0347], "median_seconds": 0.036875, "timeout_seconds": null}

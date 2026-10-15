@@ -110,7 +110,7 @@ prop_dense_acceptance = withTests 1 $ property $ do
       first === repeated
       first /== second
     _ -> failure
-  rendered <- solve prog "show_seeded 10 10 50 [window 2 2 2] 42?"
+  rendered <- solve prog "emit (show_seeded 10 10 50 [window 2 2 2] 42)?"
   case summaryAnswers rendered of
     [answer] -> do
       let rows = lines (concatMap renderOutputEvent (answerOutput answer))

@@ -13,10 +13,13 @@
 #   generate  - invent a level that is guaranteed solvable (values unknown; the
 #               constraints prune the choices, a seeded shuffle picks among them)
 #
+# Everything that produces text is a DCG: a pure description of the output
+# that `emit` prints at the top level.  No predicate here is `unsafe`.
+#
 # Load: infera examples/jumpman.nprolog
-#   verify demo [1, 2, 4, 6]?          play demo [1, 3, 4, 6]?
-#   routes demo?                        best demo?
-#   show_level 7 42?                    once (generate 8 7 L), routes L?
+#   demo L, emit (verify L [1, 2, 4, 6])?     demo L, emit (play L [2, 4, 6])?
+#   demo L, emit (routes L)?                  demo L, emit (best L)?
+#   emit (show_level 7 42)?                   once (generate 8 7 L), emit (routes L)?
 
 <- notable.
 
@@ -49,43 +52,39 @@ route Level From Goal [From | Path] <- reach Level From Next, route Level Next G
 
 # ─── Verify ──────────────────────────────────────────────────────────────────
 
-verify Level Seq <-
-  start_of Level S, goal_of Level G,
-  (route Level S G Seq -> write "valid route" ; write "NOT a valid route"), nl.
+verify Level Seq ->
+  { start_of Level S, goal_of Level G },
+  ( { route Level S G Seq } -> "valid route" ; "NOT a valid route" ), nl.
 
 # ─── Solve ───────────────────────────────────────────────────────────────────
 
-routes Level <-
-  start_of Level S, goal_of Level G,
-  findall P (route Level S G P) Ps, length Ps N,
-  write N, write " route(s):", nl, print_routes Ps.
+routes Level ->
+  { start_of Level S, goal_of Level G, findall P (route Level S G P) Ps, length Ps N },
+  wr N, " route(s):", nl, route_lines Ps.
 
-print_routes [].
-print_routes [P | Ps] <- write "  ", write P, nl, print_routes Ps.
+route_lines [] -> [].
+route_lines [P | Ps] -> "  ", wr P, nl, route_lines Ps.
 
-best Level <-
-  start_of Level S, goal_of Level G,
-  minimize Len (route Level S G P, length P Len),
-  write "shortest: ", write P, write " (", write Len, write " platforms)", nl.
+best Level ->
+  { start_of Level S, goal_of Level G, minimize Len (route Level S G P, length P Len) },
+  "shortest: ", wr P, " (", wr Len, " platforms)", nl.
 
 # ─── Play ────────────────────────────────────────────────────────────────────
 # Inputs are the platforms the player tries to jump to, in order.
 
-play Level Inputs <-
-  start_of Level S, goal_of Level G,
-  print_level Level S,
-  (Inputs = [S | Moves] -> true ; Moves = Inputs),
+play Level Inputs ->
+  { start_of Level S, goal_of Level G, (Inputs = [S | Moves] -> true ; Moves = Inputs) },
+  board Level S,
   run Level S G Moves.
 
-run _ Cur Goal [] <-
-  (Cur == Goal -> write "You reached the goal!" ; write "Stranded on platform ", write Cur), nl.
-run Level Cur Goal [Next | Rest] <-
-  (reach Level Cur Next ->
-     write "jump ", write Cur, write " -> ", write Next, nl,
-     print_level Level Next,
-     run Level Next Goal Rest
-   ; write "jump ", write Cur, write " -> ", write Next,
-     write ": too far, Jump Man falls. GAME OVER", nl).
+run _ Cur Goal [] ->
+  ( { Cur == Goal } -> "You reached the goal!" ; "Stranded on platform ", wr Cur ), nl.
+run Level Cur Goal [Next | Rest] ->
+  ( { reach Level Cur Next } ->
+      "jump ", wr Cur, " -> ", wr Next, nl,
+      board Level Next,
+      run Level Next Goal Rest
+  ; "jump ", wr Cur, " -> ", wr Next, ": too far, Jump Man falls. GAME OVER", nl ).
 
 # ─── Generate ────────────────────────────────────────────────────────────────
 # Each new platform gets constraint variables; jump_ok links it to the one
@@ -108,9 +107,9 @@ gen_plats N Id Prev Seed [plat Id X Y | Rest] <-
   N1 is N - 1, Id1 is Id + 1,
   gen_plats N1 Id1 (plat Id X Y) S2 Rest.
 
-show_level N Seed <-
-  generate N Seed L, !, write "seed ", write Seed, write ": ", write L, nl,
-  start_of L S, print_level L S.
+show_level N Seed ->
+  { once (generate N Seed L), start_of L S },
+  "seed ", wr Seed, ": ", wr L, nl, board L S.
 
 # Linear congruential generator and a seeded shuffle.
 next_seed Seed Next <- Next is (Seed * 1103515245 + 12345) % 2147483648.
@@ -121,33 +120,28 @@ shuffled Seed Xs [Pick | Rest] <-
   nth Xs Idx Pick, remove_at Xs Idx Others,
   next_seed Seed S1, shuffled S1 Others Rest.
 
-# ─── Rendering ───────────────────────────────────────────────────────────────
+# ─── Rendering (DCGs) ────────────────────────────────────────────────────────
 
-print_level Level Player <-
-  findall X (member (plat _ X _) Level) Xs, max_list Xs W,
-  findall Y (member (plat _ _ Y) Level) Ys, max_list Ys H,
-  Top is H + 1,
-  print_rows Level Player Top W, nl.
+board Level Player ->
+  { findall X (member (plat _ X _) Level) Xs, max_list Xs W,
+    findall Y (member (plat _ _ Y) Level) Ys, max_list Ys H,
+    Top is H + 1 },
+  rows Level Player Top W, nl.
 
-print_rows Level Player Row W <-
-  Row >= 0, !,
-  print_cells Level Player Row 0 W, nl,
-  Next is Row - 1, print_rows Level Player Next W.
-print_rows _ _ _ _.
+rows Level Player Row W ->
+  ( { Row >= 0 } -> cells Level Player Row 0 W, nl, { Next is Row - 1 }, rows Level Player Next W ; [] ).
 
-print_cells Level Player Row X W <-
-  X <= W, !,
-  cell Level Player Row X C, write C,
-  X1 is X + 1, print_cells Level Player Row X1 W.
-print_cells _ _ _ _ _.
+cells Level Player Row X W ->
+  ( { X <= W } -> { cell Level Player Row X C, X1 is X + 1 }, wr C, cells Level Player Row X1 W ; [] ).
 
 cell Level Player Row X C <-
   (member (plat Player X PY) Level, Row is PY + 1 -> C = "@"
    ; member (plat Id X Row) Level -> id_char Id C
    ; C = ".").
 
-id_char Id C <- Id < 10, !, str_num C Id.
-id_char Id C <- Code is Id - 10, nth ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"] Code C.
+id_char Id C <-
+  (Id < 10 -> str_num C Id
+   ; Code is Id - 10, nth ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"] Code C).
 
 # ─── List helpers ────────────────────────────────────────────────────────────
 
@@ -171,13 +165,13 @@ max_list [H | T] M <- max_list T MT, (H >= MT -> M = H ; M = MT).
 
 # ─── Demo ────────────────────────────────────────────────────────────────────
 
-> demo L, verify L [1, 2, 4, 6]?
-> demo L, verify L [1, 3, 5, 6]?
-> demo L, routes L?
-> demo L, best L?
-> demo L, play L [1, 2, 4, 6]?
-> demo L, play L [3, 5]?
-> show_level 7 7?
-> show_level 7 42?
-> show_level 7 99?
-> once (generate 9 2024 L), routes L, best L?
+> demo L, emit (verify L [1, 2, 4, 6])?
+> demo L, emit (verify L [1, 3, 5, 6])?
+> demo L, emit (routes L)?
+> demo L, emit (best L)?
+> demo L, emit (play L [1, 2, 4, 6])?
+> demo L, emit (play L [3, 5])?
+> emit (show_level 7 7)?
+> emit (show_level 7 42)?
+> emit (show_level 7 99)?
+> once (generate 9 2024 L), emit (routes L), emit (best L)?

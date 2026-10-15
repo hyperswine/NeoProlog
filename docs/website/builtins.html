@@ -79,10 +79,33 @@
 <h2 id="output" data-dash="Guide:Output built-ins">Output <a class="anchor" href="#output">#</a></h2>
 <table>
 <tr><th>Goal</th><th>Meaning</th></tr>
-<tr><td id="write" data-dash="Builtin:write/1"><code>write T</code>, <code>print T</code></td><td>write a term (strings without quotes)</td></tr>
+<tr><td id="write" data-dash="Builtin:write/1"><code>write T</code>, <code>print T</code></td><td>write a term (strings without quotes); an effect, see below</td></tr>
 <tr><td id="writeln" data-dash="Builtin:writeln/1"><code>writeln T</code></td><td>write a term and a newline</td></tr>
 <tr><td id="nl" data-dash="Builtin:nl/0"><code>nl</code></td><td>newline</td></tr>
 </table>
+
+<h2 id="effects" data-dash="Guide:Effects">Effects (unsafe) <a class="anchor" href="#effects">#</a></h2>
+<p>These builtins perform effects and may only appear in inline queries or in predicates declared <code>unsafe</code>; anywhere else the program is rejected at load time with an <code>unsafe-call</code> error. Cut (<code>!</code>) is treated the same way.</p>
+<table>
+<tr><th>Goal</th><th>Meaning</th></tr>
+<tr><td id="emit" data-dash="Builtin:emit/1"><code>emit NT</code></td><td>run the DCG <code>NT</code> once and print the text it describes</td></tr>
+<tr><td id="read_file" data-dash="Builtin:read_file/2"><code>read_file "path" S</code></td><td><code>S</code> is the file's contents; the path must be a string literal (files are read when the program loads)</td></tr>
+<tr><td id="phrase_from_file" data-dash="Builtin:phrase_from_file/2"><code>phrase_from_file NT "path"</code></td><td>parse the file with the DCG <code>NT</code></td></tr>
+<tr><td id="assert" data-dash="Builtin:assert/1"><code>assert Fact</code></td><td>add a fact of a <code>dynamic</code> predicate; undone on backtracking</td></tr>
+<tr><td id="retract" data-dash="Builtin:retract/1"><code>retract Fact</code>, <code>retractall Pattern</code></td><td>remove a matching dynamic fact; remove every matching fact</td></tr>
+</table>
+
+<h2 id="dcg-helpers" data-dash="Guide:DCG helpers">DCG helpers <a class="anchor" href="#dcg-helpers">#</a></h2>
+<p>Pure non-terminals for describing text. Together with string literals they make a DCG a complete description of its output; <code>phrase</code> parses with the same grammars (a string argument is read as characters).</p>
+<table>
+<tr><th>Non-terminal</th><th>Describes</th></tr>
+<tr><td id="seq" data-dash="Builtin:seq//1"><code>seq Xs</code></td><td>the elements of a list or string in sequence; with <code>Xs</code> unknown, enumerates prefixes</td></tr>
+<tr><td id="wr" data-dash="Builtin:wr//1"><code>wr Term</code></td><td>the text of a term (strings without quotes)</td></tr>
+<tr><td id="dcg-nl" data-dash="Builtin:nl//0"><code>nl</code>, <code>sp</code></td><td>a newline; a space</td></tr>
+<tr><td id="fmt" data-dash="Builtin:fmt//2"><code>fmt "…" Args</code></td><td>formatted text: <code>~w</code> term, <code>~d</code> integer, <code>~s</code> string, <code>~a</code> atom, <code>~n</code> newline, <code>~~</code> tilde</td></tr>
+<tr><td id="padl" data-dash="Builtin:padl//2"><code>padl Term W</code>, <code>padr Term W</code></td><td>the text of <code>Term</code> right- or left-aligned in <code>W</code> columns</td></tr>
+</table>
+<p>Related plain builtins: <code>term_str Term S</code>, <code>str_lines S Lines</code>, <code>char_code C N</code>; the comparison operators order characters, strings and atoms as well as numbers.</p>
 
 <h2 id="clp">CLP(Z) <a class="anchor" href="#clp">#</a></h2>
 <p><code>in</code>, <code>#=</code>, <code>#!=</code>, <code>#&lt;</code>, <code>#&gt;</code>, <code>#&lt;=</code>, <code>#&gt;=</code>, <code>all_different</code>, <code>label</code>: see <a href="clp.html">CLP(Z)</a>.</p>

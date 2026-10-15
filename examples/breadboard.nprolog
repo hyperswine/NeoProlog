@@ -16,9 +16,10 @@
 #   * optimisation is layered search: fewest
 #     jumpers first, then the narrowest column window around the centre,
 #     then the lowest cramping / mixed-half score among what is left.
-#     `minimize` retains only the winning placement while searching a window.
+#     The score is constrained before labeling, so branch-and-bound can reject
+#     expensive partial placements while searching a window.
 #
-# Run:  infera examples/breadboard.nprolog        (or `> run rc?` in the REPL)
+# Run:  infera examples/breadboard.nprolog   (or `> emit (report rc)?` in the REPL)
 
 <- notable.
 
@@ -55,8 +56,7 @@ between Lo Hi Lo <- Lo <= Hi.
 between Lo Hi X <- Lo < Hi, Lo1 is Lo + 1, between Lo1 Hi X.
 
 dedup [] [].
-dedup [X | T] R <- member X T, !, dedup T R.
-dedup [X | T] [X | R] <- dedup T R.
+dedup [X | T] R <- (member X T -> R = R1 ; R = [X | R1]), dedup T R1.
 
 # choose K Xs Sub: Sub is a K-element sub-list of Xs (in order).
 choose 0 _ [].
@@ -65,15 +65,11 @@ choose K [_ | Xs] S <- K > 0, choose K Xs S.
 
 # ─── String helpers ──────────────────────────────────────────────────────────
 
-pad_left S W Out <- str_length S L, (L >= W -> Out = S ; str_concat " " S S1, pad_left S1 W Out).
-pad_right S W Out <- str_length S L, (L >= W -> Out = S ; str_concat S " " S1, pad_right S1 W Out).
-
 join [] _ "".
-join [X] _ X <- !.
-join [X | T] Sep S <- join T Sep R, str_concat X Sep S1, str_concat S1 R S.
+join [X] _ X.
+join [X, Y | T] Sep S <- join [Y | T] Sep R, str_concat X Sep S1, str_concat S1 R S.
 
-repeat_str _ 0 "" <- !.
-repeat_str S N Out <- N1 is N - 1, repeat_str S N1 R, str_concat S R Out.
+repeat_str S N Out <- (N <= 0 -> Out = "" ; N1 is N - 1, repeat_str S N1 R, str_concat S R Out).
 
 atom_upper A S <- str_atom S0 A, str_upper S0 S.
 
@@ -132,13 +128,21 @@ connect_with (pin N1 X) [pin N2 Y | T] Wired <-
   (N1 == N2 -> (member N1 Wired -> true ; X #= Y) ; X #!= Y),
   connect_with (pin N1 X) T Wired.
 
-solve Cs Wired Lo Hi P <-
+placement_constraints Cs Wired Lo Hi P Vs <-
   vars Cs Lo Hi P,
   P = [pl _ _ _ _ _ _ _ _ 0 _ _ _ _ | _],      # symmetry: first part on top
   holes P Hs, all_different Hs,
   pins P Pins, connect Pins Wired,
-  cols P Cols, halves P Halves, append Cols Halves Vs,
-  label Vs.
+  cols P Cols, halves P Halves, append Cols Halves Vs.
+
+# Keep the ordinary enumerator available for inspecting every valid placement.
+solve Cs Wired Lo Hi P <-
+  placement_constraints Cs Wired Lo Hi P Vs, label Vs.
+
+solve_min Cs Wired Lo Hi P Cost <-
+  placement_constraints Cs Wired Lo Hi P Vs,
+  score_constraints P Cost,
+  labeling [min Cost] Vs.
 
 # ─── Scoring (secondary preferences, evaluated on labelled placements) ───────
 #   4 per cramped pair (unconnected parts crowded in the same half)
@@ -167,17 +171,51 @@ centre_cost [pl _ _ _ _ _ _ _ Col _ _ _ _ _ | T] C <- centre_cost T C1, C is C1 
 
 score P Cost <- pairs_cost P C1, centre_cost P C2, Cost is C1 + C2.
 
+# The same score expressed as constraints. Reification connects each Boolean
+# to the truth of its relation in both directions. Cramped is Same AND Near.
+# The ground score above remains an independent, readable check of the model.
+pair_cost_constraints P1 P2 C <-
+  P1 = pl _ _ _ _ _ _ _ Col1 H1 _ _ _ _,
+  P2 = pl _ _ _ _ _ _ _ Col2 H2 _ _ _ _,
+  reify (H1 #= H2) Same,
+  (shares_net P1 P2 -> Cramped = 0
+   ; D #= abs (Col1 - Col2),
+     reify (D #<= 2) Near,
+     Cramped in 0..1,
+     Cramped #<= Same, Cramped #<= Near,
+     Cramped #>= Same + Near - 1),
+  C #= 2 * (1 - Same) + 4 * Cramped.
+
+pairs_cost_constraints [] 0.
+pairs_cost_constraints [P | T] C <-
+  pairs_cost_with_constraints P T C1, pairs_cost_constraints T C2,
+  C #= C1 + C2.
+
+pairs_cost_with_constraints _ [] 0.
+pairs_cost_with_constraints P [Q | T] C <-
+  pair_cost_constraints P Q C1, pairs_cost_with_constraints P T C2,
+  C #= C1 + C2.
+
+centre_cost_constraints [] 0.
+centre_cost_constraints [pl _ _ _ _ _ _ _ Col _ _ _ _ _ | T] C <-
+  D #= abs (Col - 9), centre_cost_constraints T C1, C #= C1 + D.
+
+score_constraints P Cost <-
+  pairs_cost_constraints P C1, centre_cost_constraints P C2, Cost #= C1 + C2.
+
 # ─── Search: fewest jumpers, then narrowest window, then best score ──────────
 
 windows [win 7 11, win 5 13, win 3 15, win 1 16].
 
 best Cs Ns Wired Placement Cost <-
+  once (feasible Cs Ns Wired Placement Cost).
+
+feasible Cs Ns Wired Placement Cost <-
   multi_nets Cs Ns MNs, length MNs M,
   between 0 M K,
   choose K MNs Wired,
   windows Ws, member (win Lo Hi) Ws,
-  minimize Cost (solve Cs Wired Lo Hi Placement, score Placement Cost),
-  !.
+  solve_min Cs Wired Lo Hi Placement Cost.
 
 # ─── Reporting ───────────────────────────────────────────────────────────────
 
@@ -197,40 +235,39 @@ net_holes N P Hs <-
   findall H (member (pl _ _ _ A B _ R Col Half _ _ _ _) P,
              ((A == N, hole_name Col Half R H) ; (B == N, Col2 is Col + 1, hole_name Col2 Half R H))) Hs.
 
-print_placement [].
-print_placement [pl N K V _ _ _ R Col Half _ _ _ _ | T] <-
-  atom_upper N NS, pad_right NS 6 NP,
-  atom_upper K KS, pad_left V 6 VP,
-  hole_name Col Half R Ha, Col2 is Col + 1, hole_name Col2 Half R Hb, pad_right Ha 5 HaP,
-  write "  ", write NP, write "  (", write KS, write ", ", write VP, write ")   pin_a -> ", write HaP, write "  pin_b -> ", write Hb, nl,
-  print_placement T.
+# The report is a DCG: a description of the text, printed by `emit` at the
+# top level.  No predicate below performs an effect, so none needs `unsafe`.
 
-print_nets [] _.
-print_nets [N | T] P <-
-  atom_upper N NS, pad_right NS 8 NP,
-  net_holes N P Hs, join Hs ", " HS,
-  nodes_of N P Nodes, length Nodes K,
-  write "  ", write NP, write HS,
-  (K > 1 -> J is K - 1, write "   <- WIRE NEEDED (", write J, write " jumper)" ; true), nl,
-  print_nets T P.
+placement_lines [] -> [].
+placement_lines [pl N K V _ _ _ R Col Half _ _ _ _ | T] ->
+  { atom_upper N NS, atom_upper K KS,
+    hole_name Col Half R Ha, Col2 is Col + 1, hole_name Col2 Half R Hb },
+  "  ", padr NS 6, "  (", wr KS, ", ", padl V 6, ")   pin_a -> ", padr Ha 5, "  pin_b -> ", wr Hb, nl,
+  placement_lines T.
 
-print_wires Ns P <-
-  findall N (member N Ns, nodes_of N P Nodes, length Nodes K, K > 1) Ws,
-  (Ws == [] -> write "  none" , nl
-   ; print_wire_list Ws).
+net_lines [] _ -> [].
+net_lines [N | T] P ->
+  { atom_upper N NS, net_holes N P Hs, join Hs ", " HS, nodes_of N P Nodes, length Nodes K },
+  "  ", padr NS 8, wr HS,
+  ( { K > 1 } -> { J is K - 1 }, "   <- WIRE NEEDED (", wr J, " jumper)" ; [] ), nl,
+  net_lines T P.
 
-print_wire_list [].
-print_wire_list [N | T] <- atom_upper N NS, write "  Jumper on net ", write NS, nl, print_wire_list T.
+wire_lines Ns P ->
+  { findall N (member N Ns, nodes_of N P Nodes, length Nodes K, K > 1) Ws },
+  ( { Ws == [] } -> "  none", nl ; wire_list Ws ).
 
-print_sources Circuit <-
-  findall (s N K V A B) (source Circuit N K V A B) Ss,
-  (Ss == [] -> true ; write "  Sources (not placed): ", print_source_list Ss, nl).
+wire_list [] -> [].
+wire_list [N | T] -> { atom_upper N NS }, "  Jumper on net ", wr NS, nl, wire_list T.
 
-print_source_list [].
-print_source_list [s N _ V A B | T] <-
-  atom_upper N NS, atom_upper A AS, atom_upper B BS,
-  write NS, write " (", write V, write ") between ", write AS, write " and ", write BS, write "  ",
-  print_source_list T.
+source_line Circuit ->
+  { findall (s N K V A B) (source Circuit N K V A B) Ss },
+  ( { Ss == [] } -> [] ; "  Sources (not placed): ", source_list Ss, nl ).
+
+source_list [] -> [].
+source_list [s N _ V A B | T] ->
+  { atom_upper N NS, atom_upper A AS, atom_upper B BS },
+  wr NS, " (", wr V, ") between ", wr AS, " and ", wr BS, "  ",
+  source_list T.
 
 # ─── ASCII board ─────────────────────────────────────────────────────────────
 
@@ -239,47 +276,43 @@ cell P Col Half Row S <-
    ; ColA is Col - 1, member (pl N _ _ _ _ _ Row ColA Half _ _ _ _) P -> pin_label N "b" S
    ; S = ".").
 
-board_row P Half Row <-
-  row_letter Half Row L, write "  ", write L, write " |",
-  board_cells P Half Row 1, nl.
+board_row P Half Row ->
+  { row_letter Half Row L }, "  ", wr L, " |", board_cells P Half Row 1, nl.
 
-board_cells P Half Row Col <-
-  Col <= 17, !,
-  cell P Col Half Row S, pad_left S 4 SP, write SP, write " ",
-  Col1 is Col + 1, board_cells P Half Row Col1.
-board_cells _ _ _ _.
+board_cells P Half Row Col ->
+  ( { Col <= 17 } ->
+      { cell P Col Half Row S, Col1 is Col + 1 }, padl S 4, " ", board_cells P Half Row Col1
+  ; [] ).
 
-board_header <- write "    ", header_cols 1, nl.
-header_cols Col <- Col <= 17, !, str_num S Col, pad_left S 5 SP, write SP, Col1 is Col + 1, header_cols Col1.
-header_cols _.
+board_header -> "    ", header_cols 1, nl.
+header_cols Col -> ( { Col <= 17 } -> { Col1 is Col + 1 }, padl Col 5, header_cols Col1 ; [] ).
 
-board_rows _ _ 6 <- !.
-board_rows P Half Row <- board_row P Half Row, Row1 is Row + 1, board_rows P Half Row1.
+board_rows P Half Row ->
+  ( { Row <= 5 } -> board_row P Half Row, { Row1 is Row + 1 }, board_rows P Half Row1 ; [] ).
 
-print_board P <-
-  repeat_str "-----" 17 Sep,
-  board_header, write "    ", write Sep, nl,
+board P ->
+  { repeat_str "-----" 17 Sep },
+  board_header, "    ", wr Sep, nl,
   board_rows P 0 1,
-  nl, write "    ==== centre gap ====", nl, nl,
+  nl, "    ==== centre gap ====", nl, nl,
   board_rows P 1 1,
-  write "    ", write Sep, nl, board_header.
+  "    ", wr Sep, nl, board_header.
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
-run Circuit <-
-  comps Circuit Cs, nets Cs Ns,
-  write "=== Circuit ", write Circuit, write " ===", nl,
-  print_sources Circuit,
-  best Cs Ns _Wired P Cost,
-  write "=== Placement (score ", write Cost, write ") ===", nl,
-  print_placement P, nl,
-  write "=== Nets ===", nl,
-  print_nets Ns P, nl,
-  write "=== Wires needed ===", nl,
-  print_wires Ns P, nl,
-  write "=== Breadboard (170-tie) ===", nl,
-  print_board P, nl.
+report Circuit ->
+  { comps Circuit Cs, nets Cs Ns, best Cs Ns _Wired P Cost },
+  "=== Circuit ", wr Circuit, " ===", nl,
+  source_line Circuit,
+  "=== Placement (score ", wr Cost, ") ===", nl,
+  placement_lines P, nl,
+  "=== Nets ===", nl,
+  net_lines Ns P, nl,
+  "=== Wires needed ===", nl,
+  wire_lines Ns P, nl,
+  "=== Breadboard (170-tie) ===", nl,
+  board P, nl.
 
-> run rc?
-> run div?
-> run tri?
+> emit (report rc)?
+> emit (report div)?
+> emit (report tri)?

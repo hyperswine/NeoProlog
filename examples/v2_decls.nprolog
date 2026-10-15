@@ -27,8 +27,7 @@ len [_ | T] N <- len T N1, N is N1 + 1.
 # arguments are ground is used.
 plus2 : det (int: <=) (int: =>).
 plus2 : det (int: =>) (int: <=).
-plus2 X Y <- nonvar X, !, Y is X + 2.
-plus2 X Y <- X is Y - 2.
+plus2 X Y <- (nonvar X -> Y is X + 2 ; X is Y - 2).
 
 greet : det (str: <=) (str: =>).
 greet Name G <- str_concat "hello, " Name G.

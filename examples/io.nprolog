@@ -1,0 +1,75 @@
+# ─── Pure IO with DCGs ───────────────────────────────────────────────────────
+#
+# Infera predicates are pure: they describe relations.  Text is produced by
+# DCGs (grammars that describe a character list) and consumed by DCGs that
+# parse one.  Effects happen only at the edges:
+#
+#   emit NT                      print the text described by NT        (effect)
+#   phrase_from_file NT "path"   parse a file with NT                  (effect)
+#   read_file "path" S           the whole file as a string            (effect)
+#   phrase NT "text"             parse a string (pure)
+#
+# Effects are allowed in inline queries (`> ...?`) and in predicates declared
+# `unsafe`; anywhere else the program is rejected when it is loaded.
+#
+# DCG helpers (all pure):
+#   "literal"   wr Term   nl   sp   seq List   fmt "~w ~d ~s ~a ~n" Args
+#   padl Term Width   padr Term Width
+#
+# Run from the repository root:  infera examples/io.nprolog
+
+# ─── Writing: a report is a grammar for its own text ─────────────────────────
+
+report Rows ->
+  "name      score", nl,
+  "---------------", nl,
+  rows Rows,
+  { total Rows T, length Rows N },
+  fmt "~d players, total ~d~n" [N, T].
+
+rows [] -> [].
+rows [row Name Score | Rs] -> padr Name 8, padl Score 7, nl, rows Rs.
+
+total [] 0.
+total [row _ S | Rs] T <- total Rs T1, T is T1 + S.
+
+# ─── Reading: the same grammar style parses the input file ───────────────────
+# scores.txt holds lines of `name score`.
+
+file_rows [row Name Score | Rs] -> word Cs, " ", digits Ds, "\n",
+  { str_chars NS Cs, str_atom NS Name, str_chars SS Ds, str_num SS Score },
+  file_rows Rs.
+file_rows [] -> [].
+
+word [C | Cs] -> [C], { C != ' ', C != '\n' }, word_rest Cs.
+word_rest [C | Cs] -> [C], { C != ' ', C != '\n' }, word_rest Cs.
+word_rest [] -> [].
+
+digits [D | Ds] -> [D], { D >= '0', D <= '9' }, digits_rest Ds.
+digits_rest [D | Ds] -> [D], { D >= '0', D <= '9' }, digits_rest Ds.
+digits_rest [] -> [].
+
+# Grammars run in both directions: `phrase (rows R) Text` recovers the rows
+# from a rendered table, and `phrase (file_rows R) "..."` parses a string.
+
+# ─── State: dynamic facts need an unsafe predicate ───────────────────────────
+
+best_so_far : dynamic.
+
+record : unsafe.
+record Name Score <-
+  (best_so_far _ Old -> (Score > Old -> retractall (best_so_far _ _), assert (best_so_far Name Score) ; true)
+   ; assert (best_so_far Name Score)).
+
+leader -> ( { best_so_far N S } -> "leader: ", wr N, " with ", wr S ; "no scores yet" ), nl.
+
+length [] 0.
+length [_ | T] N <- length T N1, N is N1 + 1.
+
+# ─── Demo ────────────────────────────────────────────────────────────────────
+
+> emit (report [row alice 3, row bob 12])?
+> phrase (file_rows Rows) "carol 7\ndave 10\n"?
+> phrase_from_file (file_rows Rows) "examples/scores.txt", emit (report Rows)?
+> emit leader, record alice 3, record bob 12, record carol 7, emit leader?
+> read_file "examples/scores.txt" S, str_lines S Lines, length Lines N?

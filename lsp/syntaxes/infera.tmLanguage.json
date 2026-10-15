@@ -53,7 +53,7 @@
       },
       "patterns": [
         { "match": "\\b(det|semidet|multi|nondet)\\b", "name": "keyword.other.determinism.infera" },
-        { "match": "\\b(table|notable|index|noindex)\\b", "name": "keyword.other.flag.infera" },
+        { "match": "\\b(table|notable|index|noindex|unsafe|dynamic)\\b", "name": "keyword.other.flag.infera" },
         { "match": "\\b(int|float|num|str|char|atom|any|list)\\b", "name": "support.type.infera" },
         { "match": "<=>|<=|=>", "name": "keyword.operator.mode.infera" },
         { "match": "_", "name": "support.type.infera" }
@@ -80,7 +80,7 @@
       "name": "variable.other.infera"
     },
     "builtin": {
-      "match": "\\b(true|fail|false|nl|write|writeln|print|call|not|once|forall|findall|minimize|phrase|label|labeling|all_different|all_distinct|var|nonvar|ground|is_int|is_float|is_num|is_str|is_atom|is_char|is_list|str_concat|str_length|str_chars|str_atom|str_num|str_upper|str_lower)\\b",
+      "match": "\\b(true|fail|false|nl|write|writeln|print|call|not|once|forall|findall|minimize|reify|phrase|label|labeling|all_different|all_distinct|var|nonvar|ground|is_int|is_float|is_num|is_str|is_atom|is_char|is_list|str_concat|str_length|str_chars|str_atom|str_num|str_upper|str_lower|emit|read_file|phrase_from_file|assert|retract|retractall|seq|wr|sp|fmt|padl|padr|term_str|str_lines|char_code)\\b",
       "name": "support.function.builtin.infera"
     },
     "qualified": {

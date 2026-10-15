@@ -4,9 +4,9 @@
 #
 # Load: infera examples/minesweeper.nprolog
 #   once (mines 10 10 50 2 Grid)?
-#   show_mines 10 10 50 [window 2 2 2]?
+#   emit (show_mines 10 10 50 [window 2 2 2])?
 #   once (minefield 8 6 12 [window 2 2 2, window 3 3 3] Grid)?
-#   show_seeded 10 10 50 [window 2 2 2] 42?
+#   emit (show_seeded 10 10 50 [window 2 2 2] 42)?
 # Leave off once to enumerate all valid grids (potentially very many).
 # Search is deterministic, not uniform random sampling. Dense limits can force
 # stripes/checkerboards; a 2x2 cap alone does not limit long straight clusters.
@@ -130,15 +130,16 @@ remove_at 0 [Cell | Rest] Cell Rest.
 remove_at Index [Cell | Cells] Chosen [Cell | Rest] <-
   Index > 0, Next is Index - 1, remove_at Next Cells Chosen Rest.
 
-show_mines Width Height Bombs Rules <-
-  once (minefield Width Height Bombs Rules Grid), print_grid Grid.
+# Rendering is a DCG (pure); print it with `emit` at the top level:
+#   > emit (show_seeded 10 10 50 [window 2 2 2] 42)?
+show_mines Width Height Bombs Rules ->
+  { once (minefield Width Height Bombs Rules Grid) }, grid Grid.
 
-show_seeded Width Height Bombs Rules Seed <-
-  once (minefield_seed Width Height Bombs Rules Seed Grid), print_grid Grid.
+show_seeded Width Height Bombs Rules Seed ->
+  { once (minefield_seed Width Height Bombs Rules Seed Grid) }, grid Grid.
 
-print_grid [].
-print_grid [Row | Rows] <- print_row Row, nl, print_grid Rows.
+grid [] -> [].
+grid [Row | Rows] -> grid_row Row, nl, grid Rows.
 
-print_row [].
-print_row [Cell | Cells] <-
-  (Cell == 1 -> write "* " ; write ". "), print_row Cells.
+grid_row [] -> [].
+grid_row [Cell | Cells] -> ( { Cell == 1 } -> "* " ; ". " ), grid_row Cells.

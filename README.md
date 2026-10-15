@@ -88,7 +88,9 @@ sign N S <- (N > 0 -> S = pos ; N < 0 -> S = neg ; S = zero).
 first X <- member X [a, b, c], !.
 ```
 
-Builtins: `true fail not once call phrase findall forall write writeln nl`,
+Builtins: `true fail not once call phrase findall forall minimize`,
+effects `write writeln nl emit read_file phrase_from_file assert retract retractall`,
+DCG helpers `seq wr nl sp fmt padl padr`,
 type checks `var nonvar ground is_int is_float is_num is_str is_atom is_char is_list`,
 strings `str_concat str_length str_chars str_atom str_num str_upper str_lower`.
 
@@ -106,7 +108,7 @@ mypred : semidet (int: <=) (int: <=>) (str: =>).
 | determinism | `det` (exactly one), `semidet` (at most one), `multi` (at least one), `nondet` |
 | sort | `int float num str char atom any`, `list <sort>` |
 | mode | `<=` input: ground at call, `=>` output: ground after, `<=>` no requirement |
-| flags | `table notable index noindex` |
+| flags | `table notable index noindex unsafe dynamic` |
 
 Bare modes are allowed (`f : det <= =>.`), a bare sort means `<=>`, and a
 declaration with only flags (`nat : notable.`) applies to every arity of the
@@ -128,9 +130,12 @@ length/2
 ```
 
 * **Sorts** come from head patterns, literals, arithmetic, string builtins and
-  the sorts of called predicates, iterated to a fixpoint.
-* **Modes**: `<=` when a clause needs the argument ground before anything could
-  bind it; `=>` when every clause leaves it ground.
+  the sorts of called predicates, using bounded evidence propagation.
+* **Modes**: `<=` is a conservative grounding prerequisite; `=>` promises
+  grounding after success under the inferred prerequisites. Branches retain
+  only common guarantees. Constraints on an unknown variable do not imply
+  grounding. Input and output analyses run to convergence; input hints may
+  overestimate prerequisites of predicates used in several relational modes.
 * **Determinism**: `semidet` when clauses are pairwise exclusive (distinct
   principal functors, complementary guards such as `A >= B` / `B > A`, or a
   literal against a guard like `0` / `N > 0`, or cuts) and every body is at
@@ -141,6 +146,14 @@ Inferred signatures are advisory: they never raise errors.  The engine only
 uses an inferred `semidet` to drop choice points, and only when the recorded
 positions are ground in the actual call.  Everything else falls back to plain
 backtracking.
+
+Declaration alternatives are analysed in runtime selection order: every mode
+that could precede the first definitely eligible mode contributes to the
+guarantee. Guard proofs require shared operands to be ground before the call,
+including calls with aliased arguments. Term identity (`==`, `!=`) is analysed
+separately from numeric or lexical ordering. Numeric ordering places NaN after
+other numeric values and compares numeric NaNs equally, so reversing operands
+reverses the ordering; this does not change term identity.
 
 ## Engine
 
@@ -160,7 +173,41 @@ backtracking.
 * **Cut** is implemented with barrier markers in the lazy answer stream; it is
   transparent through `,` `;` `->` and local inside `call`, `not`, `once`,
   `findall`.
-* Output (`write`, `nl`) is collected per answer and printed with it.
+* Output (`write`, `nl`, `emit`) is collected per answer and printed with it.
+
+## Effects and pure IO
+
+Predicates are pure unless declared `unsafe`.  A clause of a predicate that
+is not `unsafe` may not use `write`/`writeln`/`print`/`nl`, `emit`,
+`read_file`/`phrase_from_file`, `assert`/`retract`/`retractall`, or cut, and
+may not call an unsafe predicate; the program is rejected at load time with
+an `unsafe-call` error naming the fix.  Inline queries (`> ...?`) are the
+entry points and may do anything.
+
+Text is produced and consumed with DCGs, so a report is a grammar for its own
+output and effects stay at the edges:
+
+```prolog
+report Rows -> "name      score", nl, rows Rows.
+rows [] -> [].
+rows [row N S | Rs] -> padr N 8, padl S 7, nl, rows Rs.
+line [row N S] -> seq Cs, " ", wr S, { str_chars NS Cs, str_atom NS N }.
+
+> emit (report [row alice 3, row bob 12])?          # print a grammar's text
+> phrase_from_file (file_rows Rows) "scores.txt"?   # parse a file
+> phrase (line R) "alice 3"?                        # parse a string, purely
+```
+
+DCG helpers: `"literal"`, `seq Xs`, `wr Term`, `nl`, `sp`,
+`fmt "~w ~d ~s ~a ~n" Args`, `padl Term Width`, `padr Term Width`.  Plain
+builtins: `term_str`, `str_lines`, `char_code`; comparisons order characters,
+strings and atoms as well as numbers.  File paths must be string literals: the
+engine is pure, so the loader reads the files up front.
+
+Dynamic facts: `seen : dynamic.` declares a predicate with no clauses whose
+facts are added with `assert (seen X)` and removed with `retract`/`retractall`
+from an `unsafe` predicate.  They live in the solver state, so they are
+undone on backtracking.  See `examples/io.nprolog`.
 
 ## CLP(Z)
 
@@ -168,15 +215,27 @@ backtracking.
 X in 1..9            # also [X, Y] in 0..sup ; inf / sup for open bounds
 A #= B  A #!= B  A #< B  A #> B  A #<= B  A #>= B
 all_different Xs
+reify (A #<= B) Truth # Truth is 0 or 1, equivalent to the relation
 label Xs             # enumerate, smallest domain first
 labeling [min Cost] Xs # one minimum, with branch-and-bound pruning
 minimize Cost Goal   # one minimum of a finite goal's answers
 ```
 
-Interval domains with holes and bounds propagation for linear constraints;
-non-linear constraints wait until they become linear or ground.  Residual
+Interval domains with holes and bounds propagation for linear constraints.
+Changed variables wake their dependent constraints, and list domains are posted
+as a batch. Linear sums use aggregate bounds instead of rescanning the sum for
+each variable. Other non-linear constraints wait until they become linear or ground. Residual
 domains and constraints are shown in answers (`X in 4..5`, `X + Y #= 10`).
 See `examples/v2_clp.nprolog` (SEND + MORE = MONEY, N-queens).
+
+`all_different` is a global constraint: fixed values are excluded from other
+variables, and bounded Hall-interval and matching checks detect impossible
+groups and prune unsupported values. Large domains retain cheaper propagation.
+Stronger pruning can change the order of labeled solutions.
+`reify Relation Truth` supports all six CLP comparisons; either the relation or
+its Boolean truth can constrain the other. `D #= abs Expr` propagates bounds
+when `D` and `Expr` are linear expressions, retaining the absolute-value
+relation while its sign is unknown.
 
 ### Optimisation
 
@@ -198,8 +257,10 @@ and retains only its best answer, including that answer's bindings and output.
 It does not prune the search and requires a ground integer cost in every
 answer. Ties keep the first answer; no answers means failure. Cuts inside
 `Goal` are local. Errors or an incomplete search produce no claimed optimum.
-The breadboard placer uses this form to avoid constructing a list of all
-placements while preserving its existing jumper/window priorities.
+The breadboard placer posts a constrained score before
+`labeling [min Cost] Vars`, so incumbent bounds prune partial placements while
+preserving its jumper/window priorities. The original ground score and ordinary
+placement enumerator remain available for exhaustive comparisons.
 
 ### Minefield generation
 
@@ -282,6 +343,7 @@ src/Infera/Module.hs    neoprolog.conf and imports
 src/Infera/Repl.hs      interactive loop
 test/InferaTest.hs      hedgehog test suite
 test/CorrectnessTest.hs generated correctness tests with independent models
+test/InferenceTest.hs   inferred pruning compared with unpruned execution
 examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), jumpman (one rule set: verify / solve / play / generate), ...
 Formula/infera.rb       Homebrew formula
 lsp/                    VS Code extension and language server
@@ -303,6 +365,13 @@ It also exercises recursive term round trips, variable aliases, constraint
 ordering, domain holes, integers beyond machine size, and minimum-cost ties
 with output. Fixed regressions cover character and string escaping.
 
+Inference tests compare ordered answers (including duplicates and residual
+constraints), output, errors and exhaustion against the same loaded program
+with only inferred pruning disabled. Declared commitments, indexes and tabling
+remain identical. Generated programs vary guards, mixed literal types, nested
+and aliased heads, declaration alternatives, long dependencies, controls and
+cuts; positive controls keep useful conditional semidet optimisations enabled.
+
 ```sh
 cabal build all
 cabal test --test-show-details=direct
@@ -310,6 +379,13 @@ npm ci --prefix lsp
 INFERA_BIN="$(cabal list-bin exe:infera)" npm test --prefix lsp
 python3 test/cli.py "$(cabal list-bin exe:infera)"
 ```
+
+Performance tests compare the constraint store with a frozen full-scan reference,
+and eligible delta tabling with ordered observations from the general evaluator.
+Breadboard scoring and optima have independent arithmetic and exhaustive models.
+Run `python3 test/bench.py "$(cabal list-bin exe:infera)"` for validated local
+timings; see [benchmark results and scope](docs/performance.md). Timing thresholds
+are not correctness gates.
 
 Failures print a seed and shrink path. To replay a counterexample, open
 `cabal repl infera-test` and call `replay "PROPERTY NAME" (Seed VALUE GAMMA)

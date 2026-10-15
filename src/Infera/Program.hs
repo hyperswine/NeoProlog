@@ -21,6 +21,11 @@ module Infera.Program
     predIsIndexed,
     predDeclaredKeys,
     effectiveFlags,
+    nameHasFlag,
+    predIsUnsafe,
+    predIsDynamic,
+    dynamicNames,
+    addFiles,
   )
 where
 
@@ -148,6 +153,9 @@ data Program = Program
     -- | Flags from declarations that name a predicate without arguments or
     -- determinism (@gen : notable.@); they apply to every arity.
     progNameFlags :: Map String [Flag],
+    -- | Contents of files named by literal @read_file@ / @phrase_from_file@
+    -- goals, read when the program was loaded (the engine is pure).
+    progFiles :: Map String String,
     -- | Global defaults set by @<- table.@ / @<- notable.@ etc.
     progTableDefault :: Bool,
     progIndexDefault :: Bool
@@ -155,7 +163,7 @@ data Program = Program
   deriving (Show)
 
 emptyProgram :: Program
-emptyProgram = Program Map.empty [] Map.empty True True
+emptyProgram = Program Map.empty [] Map.empty Map.empty True True
 
 lookupPred :: PredKey -> Program -> Maybe Pred
 lookupPred k = Map.lookup k . progPreds
@@ -198,6 +206,28 @@ addDecl d prog
 -- | Effective flags of a predicate: its own plus name-wide ones.
 effectiveFlags :: Program -> Pred -> [Flag]
 effectiveFlags prog p = predFlags p ++ Map.findWithDefault [] (fst (predKey p)) (progNameFlags prog)
+
+-- | Does any declaration for this name (any arity) carry the flag?
+nameHasFlag :: Program -> String -> Flag -> Bool
+nameHasFlag prog name flag =
+  flag `elem` Map.findWithDefault [] name (progNameFlags prog)
+    || or [flag `elem` predFlags p | p <- programPreds prog, fst (predKey p) == name]
+
+-- | Unsafe predicates may perform effects (output, file reads, cut,
+-- assert/retract) and call other unsafe predicates.
+predIsUnsafe :: Program -> Pred -> Bool
+predIsUnsafe prog p = FlagUnsafe `elem` effectiveFlags prog p
+
+-- | Dynamic predicates have no static clauses; their facts live in the
+-- solver state and are changed with assert/retract.
+predIsDynamic :: Program -> Pred -> Bool
+predIsDynamic prog p = FlagDynamic `elem` effectiveFlags prog p
+
+dynamicNames :: Program -> [String]
+dynamicNames prog = [name | (name, flags) <- Map.toList (progNameFlags prog), FlagDynamic `elem` flags]
+
+addFiles :: [(String, String)] -> Program -> Program
+addFiles files prog = prog {progFiles = Map.union (Map.fromList files) (progFiles prog)}
 
 -- | Handle a global directive; returns Nothing for directives the program
 -- table does not understand (e.g. imports, handled elsewhere).

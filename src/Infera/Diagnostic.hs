@@ -13,6 +13,7 @@ import Infera.Arith (arithOps, evalArithSafe)
 import Infera.Infer (builtinDet)
 import Infera.Module (loadLocatedFile, loadLocatedWithSources)
 import Infera.Program
+import Infera.Purity (clauseViolations, describeViolation)
 import Infera.Syntax
 import Numeric (showHex)
 
@@ -48,7 +49,7 @@ diagnose items = concatMap inspect items
     inspect item = case locatedItem item of
       TLClause cl ->
         calls item (clauseBody cl) ++ singletons item (clauseHead cl : clauseBody cl)
-          ++ headSort item cl
+          ++ headSort item cl ++ effects item cl
       TLQuery q -> calls item (queryGoals q) ++ singletons item (queryGoals q)
       TLDecl d ->
         let key = (declName d, length (declArgs d))
@@ -60,6 +61,9 @@ diagnose items = concatMap inspect items
                  | (FlagTable `elem` flags && FlagNoTable `elem` flags)
                     || (FlagIndex `elem` flags && FlagNoIndex `elem` flags)]
       _ -> []
+    effects item cl = case clauseKey cl of
+      Just key -> [emit item Error "unsafe-call" (describeViolation prog key g) | g <- clauseViolations prog cl]
+      Nothing -> []
     singletons item terms =
       let occurrences = concatMap variables terms
        in [emit item Warning "singleton-variable" ("singleton variable " ++ name ++ " (use _ or _" ++ name ++ " if intended)")
@@ -88,6 +92,7 @@ diagnose items = concatMap inspect items
         Nothing -> [emit item Error "not-callable" ("goal is not callable: " ++ show t)]
         Just key@(name, arity)
           | isBuiltin key -> []
+          | nameHasFlag prog name FlagDynamic -> []
           | key `elem` defined -> case lookupPred key prog of
               Just p | not (null (predDecls p)), all (incompatible (arguments t)) (predDecls p) ->
                 [emit item Error "call-sort-mismatch" ("literal arguments of " ++ showPredKey key ++ " conflict with every declared signature")]

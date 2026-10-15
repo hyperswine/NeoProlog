@@ -25,7 +25,8 @@ const BUILTIN_DOCS = {
   in: '`X in Lo..Hi` — CLP(Z) domain restriction; `inf`/`sup` for open bounds. A list on the left restricts every element.',
   label: '`label Vars` — CLP(Z) labeling: enumerates finite domains, smallest first.',
   labeling: '`labeling Vars` — same as `label`. `labeling [min Cost] Vars` returns one minimum using branch-and-bound over finite domains.',
-  all_different: '`all_different Xs` — pairwise `#!=` over the list.',
+  all_different: '`all_different Xs` — integer variables take distinct values; finite domains use global propagation.',
+  reify: '`reify (A #<= B) Truth` — Truth is 0 or 1 and is equivalent to the integer relation; supports all six CLP comparisons.',
   all_distinct: '`all_distinct Xs` — same as `all_different`.',
   var: '`var X` — X is an unbound variable.',
   nonvar: '`nonvar X` — X is bound.',
@@ -46,6 +47,8 @@ const BUILTIN_DOCS = {
   str_lower: '`str_lower S L` — lower-cases S.',
   import: '`<- import "mod#hash".` — imports a registered module; its predicates are called as `mod:name`.',
   table: '`<- table.` — tabling on by default (the default).',
+  unsafe: 'Flag: the predicate may perform effects (write, emit, read_file, cut, assert/retract) and call other unsafe predicates.',
+  dynamic: 'Flag: the predicate has no clauses; its facts are added and removed with assert/retract.',
   notable: '`<- notable.` — tabling off by default.',
   index: '`<- index.` — argument indexing on (the default).',
   noindex: '`<- noindex.` — argument indexing off.',
@@ -58,7 +61,22 @@ const BUILTIN_DOCS = {
   '#>': '`A #> B` — CLP(Z) greater-than.',
   '#<=': '`A #<= B` — CLP(Z) less-or-equal.',
   '#>=': '`A #>= B` — CLP(Z) greater-or-equal.',
-  '!': '`!` — cut: commits to the current clause and the choices made so far.',
+  '!': '`!` — cut: commits to the current clause and the choices made so far. Needs an `unsafe` declaration.',
+  emit: '`emit NT` — prints the text described by DCG NT (first solution). Effect: needs `unsafe` outside queries.',
+  read_file: '`read_file "path" S` — S is the contents of the file (a string literal path, read at load time). Effect.',
+  phrase_from_file: '`phrase_from_file NT "path"` — parses the file with DCG NT. Effect.',
+  assert: '`assert Fact` — adds a fact of a `dynamic` predicate (per branch). Effect.',
+  retract: '`retract Fact` — removes a matching dynamic fact. Effect.',
+  retractall: '`retractall Pattern` — removes every matching dynamic fact. Effect.',
+  seq: '`seq Xs` (DCG) — the elements of a list or string in sequence.',
+  wr: '`wr Term` (DCG) — the text of a term.',
+  sp: '`sp` (DCG) — a space.',
+  fmt: '`fmt "~w ~d ~s ~a ~n" Args` (DCG) — formatted text.',
+  padl: '`padl Term Width` (DCG) — the text of Term right-aligned in Width.',
+  padr: '`padr Term Width` (DCG) — the text of Term left-aligned in Width.',
+  term_str: '`term_str Term S` — S is the text of Term.',
+  str_lines: '`str_lines S Lines` — splits a string into lines.',
+  char_code: '`char_code C N` — converts between a character and its code.',
   '->': '`(C -> T ; E)` — if-then-else; in a rule head, `->` defines a DCG rule.',
   ';': '`A ; B` — disjunction.'
 }
@@ -86,7 +104,7 @@ const DECL_DOCS = {
 }
 
 const DET_WORDS = ['det', 'semidet', 'multi', 'nondet']
-const FLAG_WORDS = ['table', 'notable', 'index', 'noindex']
+const FLAG_WORDS = ['table', 'notable', 'index', 'noindex', 'unsafe', 'dynamic']
 const SORT_WORDS = ['int', 'float', 'num', 'str', 'char', 'atom', 'any', 'list']
 const DIRECTIVES = new Set(['import', 'table', 'notable', 'index', 'noindex'])
 

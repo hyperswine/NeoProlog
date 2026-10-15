@@ -38,6 +38,7 @@
 
 <h2 id="tabling" data-dash="Guide:Tabling">Tabling <a class="anchor" href="#tabling">#</a></h2>
 <p>A tabled call is evaluated to a fixpoint: its answers are collected in a table keyed by the call variant, recursive variant calls consume the table instead of recursing, and the evaluation repeats until no new answers appear. Left recursion terminates and repeated calls are memoised.</p>
+<p>Eligible positive rules with one recursive call first in the body consume only newly discovered answer batches. This avoids repeating old derivations. Mutual or nonlinear recursion, different recursive variants, declared contracts, control constructs, effects and constrained calls retain the general evaluator. Errors or resource exhaustion encountered by the fast path also fall back to that evaluator.</p>
 <pre><code>path <span class="v">X</span> <span class="v">Y</span> <span class="k">&lt;-</span> path <span class="v">X</span> <span class="v">Z</span>, edge <span class="v">Z</span> <span class="v">Y</span>.
 path <span class="v">X</span> <span class="v">Y</span> <span class="k">&lt;-</span> edge <span class="v">X</span> <span class="v">Y</span>.
 
@@ -62,8 +63,9 @@ fib <span class="v">N</span> <span class="v">F</span> <span class="k">&lt;-</spa
 <h2 id="cut" data-dash="Guide:Cut">Cut and commitment <a class="anchor" href="#cut">#</a></h2>
 <p>Cut is implemented with barrier markers in the lazy answer stream: <code>!</code> emits a marker for its clause's activation, alternatives stop when they see it, and the activation that owns the barrier consumes it. Declared <code>det</code>/<code>semidet</code> predicates, and predicates inferred <code>semidet</code> with their switch arguments ground, are committed to their first solution.</p>
 
-<h2 id="output" data-dash="Guide:Output">Output <a class="anchor" href="#output">#</a></h2>
-<p><code>write</code>, <code>writeln</code>, <code>print</code> and <code>nl</code> append to an output log carried with the solver state, so each answer prints exactly the output of the branch that produced it, in order. Tabled predicates replay the output recorded with their answers.</p>
+<h2 id="output" data-dash="Guide:Output">Effects and output <a class="anchor" href="#output">#</a></h2>
+<p>Predicates are pure unless declared <code>unsafe</code>. Output builtins, file reads, <code>assert</code>/<code>retract</code> and cut are effects: a clause of a predicate without the flag that uses one, or that calls an unsafe predicate, is an <code>unsafe-call</code> error at load time. Inline queries are the entry points and may do anything. The intended style is to describe text with DCGs (<code>seq</code>, <code>wr</code>, <code>fmt</code>, <code>padl</code>…) and print it with <code>emit</code> from a query; see <a href="builtins.html#effects">effects</a> and <a href="builtins.html#dcg-helpers">DCG helpers</a>.</p>
+<p><code>write</code>, <code>writeln</code>, <code>print</code>, <code>nl</code> and <code>emit</code> append to an output log carried with the solver state, so each answer prints exactly the output of the branch that produced it, in order. Tabled predicates replay the output recorded with their answers; predicates that produce output or read dynamic facts are never tabled automatically.</p>
 
 <h2 id="limits" data-dash="Guide:Limits and errors">Limits and errors <a class="anchor" href="#limits">#</a></h2>
 <ul>

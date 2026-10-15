@@ -226,7 +226,7 @@ data ArgSpec = ArgSpec
   }
   deriving (Show, Eq, Ord)
 
-data Flag = FlagTable | FlagNoTable | FlagIndex | FlagNoIndex
+data Flag = FlagTable | FlagNoTable | FlagIndex | FlagNoIndex | FlagUnsafe | FlagDynamic
   deriving (Show, Eq, Ord)
 
 -- | A predicate declaration: @name : det flags (sort: mode) ...@
@@ -269,6 +269,8 @@ showFlag FlagTable = "table"
 showFlag FlagNoTable = "notable"
 showFlag FlagIndex = "index"
 showFlag FlagNoIndex = "noindex"
+showFlag FlagUnsafe = "unsafe"
+showFlag FlagDynamic = "dynamic"
 
 showDecl :: Decl -> String
 showDecl (Decl n d fs as) =
@@ -681,6 +683,8 @@ pDeclItem =
       DIFlag FlagNoTable <$ keyword "notable",
       DIFlag FlagIndex <$ keyword "index",
       DIFlag FlagNoIndex <$ keyword "noindex",
+      DIFlag FlagUnsafe <$ keyword "unsafe",
+      DIFlag FlagDynamic <$ keyword "dynamic",
       DIArg <$> pArgSpec
     ]
 

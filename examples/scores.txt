@@ -1,0 +1,4 @@
+alice 3
+bob 12
+carol 7
+dave 10

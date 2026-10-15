@@ -32,7 +32,16 @@ numericDouble (NVFloat d) = d
 
 compareNumeric :: NumericValue -> NumericValue -> Ordering
 compareNumeric (NVInt a) (NVInt b) = compare a b
-compareNumeric a b = compare (numericDouble a) (numericDouble b)
+compareNumeric a b = compareFloat (numericDouble a) (numericDouble b)
+  where
+    -- Double's default ordering is not antisymmetric for NaN. Infera guards
+    -- require a lawful ordering so reversing the operands reverses the result.
+    -- Keep the existing numeric ordering, placing all NaNs after other values.
+    compareFloat x y
+      | isNaN x && isNaN y = EQ
+      | isNaN x = GT
+      | isNaN y = LT
+      | otherwise = compare x y
 
 arithOps :: [String]
 arithOps = ["plus", "minus", "mul", "div", "mod", "^", "neg", "abs", "min", "max"]

@@ -4,9 +4,10 @@
 -- facts (recursion, purity) used to decide default tabling.
 --
 -- Inferred signatures are advisory: the engine only uses the inferred
--- determinism (together with its 'sigSwitch' positions) to drop choice points,
--- and that analysis is sound by construction.  Declared signatures are
--- enforced at runtime.
+-- determinism (together with its 'sigSwitch' positions) to drop choice points.
+-- Groundness proofs converge on finite Boolean environments; guards and
+-- alternative declarations are checked conservatively. Declared signatures
+-- are enforced at runtime.
 module Infera.Infer
   ( inferProgram,
     subGoals,
@@ -23,6 +24,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Infera.Arith (compareNumeric, evalNumeric)
 import Infera.Program
 import Infera.Syntax
 
@@ -75,7 +77,7 @@ bodyGoals :: Clause -> [Term]
 bodyGoals = concatMap subGoals . clauseBody
 
 impureBuiltins :: [String]
-impureBuiltins = ["write", "writeln", "print", "nl"]
+impureBuiltins = ["write", "writeln", "print", "nl", "emit", "read_file", "phrase_from_file", "assert", "retract", "retractall"]
 
 isUserCall :: Program -> Term -> Maybe PredKey
 isUserCall prog t = case functorOf t of
@@ -102,7 +104,7 @@ markGraphFacts prog =
       recursive k = Set.member k (reachable k)
       directlyImpure p =
         any
-          (\g -> maybe False (`elem` impureBuiltins) (fst <$> functorOf g))
+          (\g -> maybe False (\name -> name `elem` impureBuiltins || nameHasFlag prog name FlagDynamic) (fst <$> functorOf g))
           (concatMap bodyGoals (IM.elems (predClauses p)))
       impure0 = Set.fromList [predKey p | p <- preds, directlyImpure p]
       closeImpure imp =
@@ -242,6 +244,7 @@ clauseVarEvidence env cl = iterate pass IM.empty !! 3
         | op `elem` ["gt", "lt", "gte", "lte"] -> arithVars a (arithVars b ev)
         | op `elem` ["int_eq", "fd_ne", "fd_lt", "fd_gt", "fd_le", "fd_ge"] -> intVars a (intVars b ev)
       Compound "in" [x, _] -> intVars x ev
+      Compound "reify" [relation, truth] -> intVars truth (goalEv ev relation)
       Compound "unify" [a, b] ->
         let ev1 = patternEvidence a (termSort ev b) ev
          in patternEvidence b (termSort ev1 a) ev1
@@ -281,15 +284,34 @@ inferSorts prog = go (10 :: Int) env0
 
 type ModeEnv = Map PredKey [Bool]
 
--- Modes fixed by a predicate's (first) declaration: (inputs, outputs).  Both
--- are enforced at runtime, so the analyses may trust them.
+type DeclEnv = Map PredKey [Signature]
+
+declaredSignatures :: Program -> DeclEnv
+declaredSignatures prog = Map.fromList
+  [(predKey p, predDecls p) | p <- programPreds prog, not (null (predDecls p))]
+
+-- The runtime selects the first mode whose inputs are ground. An earlier
+-- mode whose inputs are not *known* ground can still be eligible at runtime.
+-- Include every candidate up to the first definitely eligible signature.
+possibleSignatures :: Set VarId -> [Term] -> [Signature] -> [Signature]
+possibleSignatures _ _ [] = []
+possibleSignatures known as (sig : rest) = sig :
+  if and [all (`Set.member` known) (termVarIds a)
+         | (ArgSpec _ ModeIn, a) <- zip (sigArgs sig) as]
+    then [] else possibleSignatures known as rest
+
+-- A single displayed signature can promise only modes common to every
+-- alternative. Call-site analysis below retains the individual signatures.
 declaredModes :: Program -> Map PredKey ([Bool], [Bool])
 declaredModes prog =
   Map.fromList
-    [ (predKey p, (map ((== ModeIn) . argMode) (sigArgs s), map ((== ModeOut) . argMode) (sigArgs s)))
+    [ (predKey p, (common ModeIn sigs, common ModeOut sigs))
     | p <- programPreds prog,
-      (s : _) <- [predDecls p]
+      let sigs = predDecls p, not (null sigs)
     ]
+  where
+    common mode sigs = foldl1 (zipWith (&&))
+      [map ((== mode) . argMode) (sigArgs sig) | sig <- sigs]
 
 -- Head variables that are the sole content of an argument position.
 plainHeadVars :: Clause -> [(Int, VarId)]
@@ -326,63 +348,77 @@ termAtPath as (i : rest)
 termAtPath _ [] = Nothing
 
 -- | Input modes (least fixpoint): a position is input when some clause needs
--- it ground before any goal could have bound it.
+-- it ground before a goal is known to have grounded it. Requirements are
+-- conservative hints, especially for predicates with several relational modes.
 inferInModes :: Program -> ModeEnv
-inferInModes prog = go (10 :: Int) env0
+inferInModes prog = go env0
   where
     preds = programPreds prog
     decl = declaredModes prog
+    signatures = declaredSignatures prog
     env0 = Map.fromList [(predKey p, replicate (snd (predKey p)) False) | p <- preds]
-    go 0 env = env
-    go n env =
-      let env' = Map.fromList [(predKey p, predIns env p) | p <- preds]
-       in if env' == env then env else go (n - 1) env'
-    predIns env p = case Map.lookup (predKey p) decl of
+    go env =
+      let (outs, deps) = inferGroundness prog env
+          transfer = groundAfter signatures env outs deps
+          found = Map.fromList [(predKey p, predIns env transfer p) | p <- preds]
+          env' = Map.unionWith (zipWith (||)) env found
+       in if env' == env then env else go env'
+    predIns env transfer p = case Map.lookup (predKey p) decl of
       Just (ins, _) -> ins
       Nothing ->
         let arity = snd (predKey p)
-            needed = Set.unions [clauseNeeds env cl | cl <- IM.elems (predClauses p)]
+            needed = Set.unions [clauseNeeds env transfer cl | cl <- IM.elems (predClauses p)]
          in [i `Set.member` needed | i <- [0 .. arity - 1]]
 
-    clauseNeeds env cl =
-      let required = requiredVars env (bodyGoals cl) Set.empty Set.empty
-       in Set.fromList [i | (v, i) <- Map.toList (firstPlainPos cl), v `Set.member` required]
+    clauseNeeds env transfer cl =
+      let (required, _) = goalsNeeds env transfer Set.empty (clauseBody cl)
+          owners = Map.union (firstPlainPos cl)
+            (Map.map (\paths -> minimum [i | (i : _) <- paths]) (headPaths cl))
+       in Set.fromList [i | (v, i) <- Map.toList owners, v `Set.member` required]
 
-    -- Walk goals in order; @bound@ are vars that may have been bound already.
-    requiredVars _ [] _ req = req
-    requiredVars env (g : gs) bound req =
-      let (needs, binds) = goalNeeds env g
-          req' = Set.union req (Set.fromList [v | v <- needs, not (v `Set.member` bound)])
-          bound' = Set.union bound (Set.fromList (needs ++ binds))
-       in requiredVars env gs bound' req'
+    goalsNeeds env transfer = foldl' (\(req, known) g ->
+      let (needed, next) = goalNeeds env transfer known g
+       in (Set.union req needed, next)) . (,) Set.empty
 
-    -- (variables that must be ground, variables that may become bound)
-    goalNeeds env g = case g of
-      Compound "is" [l, r] -> (termVarIds r, termVarIds l)
-      Compound op [a, b]
-        | op `elem` ["gt", "lt", "gte", "lte"] -> (termVarIds a ++ termVarIds b, [])
-        | op `elem` ["unify", "int_eq", "fd_ne", "fd_lt", "fd_gt", "fd_le", "fd_ge", "in", "equiv", "neq"] -> ([], termVarIds a ++ termVarIds b)
-      Compound "write" [_] -> ([], [])
-      _ -> case (functorOf g, g) of
-        (Just k, Compound _ as)
-          | Just ins <- Map.lookup k env ->
-              ( concat [termVarIds a | (a, True) <- zip as ins],
-                concat [termVarIds a | (a, False) <- zip as ins]
-              )
-        _ -> ([], termVarIds g)
+    -- Track definite grounding on each branch. A constraint or an alias
+    -- between two unknowns does not discharge a later arithmetic input.
+    goalNeeds env transfer known g = case g of
+      Compound "," [a, b] -> goalsNeeds env transfer known [a, b]
+      Compound ";" [Compound "->" [c, t], e] -> branches [Compound "," [c, t], e]
+      Compound ";" [a, b] -> branches [a, b]
+      Compound "->" [c, t] -> goalsNeeds env transfer known [c, t]
+      Compound "once" [a] -> goalNeeds env transfer known a
+      Compound "minimize" [_, a] -> goalNeeds env transfer known a
+      Compound "not" [a] -> let (req, _) = goalNeeds env transfer known a in (req, known)
+      Compound "forall" [a, b] -> let (req, _) = goalsNeeds env transfer known [a, b] in (req, known)
+      Compound "findall" [_, a, _] -> let (req, _) = goalNeeds env transfer known a in (req, known)
+      _ ->
+        let needs = case g of
+              Compound "is" [_, r] -> termVarIds r
+              Compound op [a, b] | op `elem` ["gt", "lt", "gte", "lte"] -> termVarIds a ++ termVarIds b
+              Compound f as | Just pins <- Map.lookup (f, length as) env ->
+                concat [termVarIds a | (a, True) <- zip as pins]
+              _ -> []
+            required = Set.difference (Set.fromList needs) known
+            assumed = Set.union known required
+         in (required, transfer assumed g)
+      where
+        branches gs =
+          let results = map (goalNeeds env transfer known) gs
+           in (Set.unions (map fst results), foldl1 Set.intersection (map snd results))
 
 groundingBuiltins :: [String]
 groundingBuiltins =
   [ "str_concat", "str_length", "str_chars", "str_atom", "str_num", "str_upper", "str_lower",
-    "ground", "label", "labeling"
+    "ground"
   ]
 
 -- | Variables known to be ground after a goal succeeds, given the variables
 -- known ground before it.  A callee's output positions count when its input
 -- positions are known ground at the call; its dependent positions count when
 -- every other argument is known ground.
-groundAfter :: ModeEnv -> ModeEnv -> ModeEnv -> Set VarId -> Term -> Set VarId
-groundAfter ins outs deps = go
+groundAfter :: DeclEnv -> ModeEnv -> ModeEnv -> ModeEnv -> Set VarId -> Term -> Set VarId
+groundAfter signatures ins outs deps = go
   where
     go known g = case g of
       Compound "," [a, b] -> go (go known a) b
@@ -396,22 +432,35 @@ groundAfter ins outs deps = go
         | op `elem` ["gt", "lt", "gte", "lte"] -> add known [a, b]
         | op `elem` ["unify", "equiv"] ->
             if allKnown known a then add known [b] else if allKnown known b then add known [a] else known
+      Compound name [l] | name `elem` ["label", "labeling"] ->
+        -- One-argument labeling enumerates the visible prefix; it does not
+        -- instantiate an unknown list or the tail of an open list.
+        add known (fst (unfoldCons l))
+      Compound "labeling" [options, l] -> add known [options, l]
       _ -> case (functorOf g, g) of
         (Just (name, _), Compound _ as)
           | name `elem` groundingBuiltins -> add known as
         (Just k, Compound _ as) ->
-          let is = Map.findWithDefault [] k ins
-              os = Map.findWithDefault [] k outs
-              ds = Map.findWithDefault [] k deps
-              viaOuts
-                | and [allKnown known a | (a, True) <- zip as is] = [a | (a, True) <- zip as os]
-                | otherwise = []
-              viaDeps =
-                [ a
-                | (j, a, True) <- zip3 [0 :: Int ..] as ds,
-                  and [allKnown known b | (i, b) <- zip [0 ..] as, i /= j]
-                ]
-           in add known (viaOuts ++ viaDeps)
+          case Map.lookup k signatures of
+            Just sigs ->
+              let guarantees sig = Set.fromList (concat
+                    [termVarIds a | (ArgSpec _ mode, a) <- zip (sigArgs sig) as,
+                     mode `elem` [ModeIn, ModeOut]])
+               in Set.union known (foldl1 Set.intersection
+                    (map guarantees (possibleSignatures known as sigs)))
+            Nothing ->
+              let is = Map.findWithDefault [] k ins
+                  os = Map.findWithDefault [] k outs
+                  ds = Map.findWithDefault [] k deps
+                  viaOuts
+                    | and [allKnown known a | (a, True) <- zip as is] = [a | (a, True) <- zip as os]
+                    | otherwise = []
+                  viaDeps =
+                    [ a
+                    | (j, a, True) <- zip3 [0 :: Int ..] as ds,
+                      and [allKnown known b | (i, b) <- zip [0 ..] as, i /= j]
+                    ]
+              in add known (viaOuts ++ viaDeps)
         _ -> known
     add known ts = foldl' (\k t -> Set.union k (Set.fromList (termVarIds t))) known ts
     allKnown known t = all (`Set.member` known) (termVarIds t)
@@ -425,19 +474,19 @@ groundAfter ins outs deps = go
 --
 -- Declared predicates use their declared outputs for both.
 inferGroundness :: Program -> ModeEnv -> (ModeEnv, ModeEnv)
-inferGroundness prog ins = go (10 :: Int) (env0, env0)
+inferGroundness prog ins = go (env0, env0)
   where
     preds = programPreds prog
     decl = declaredModes prog
+    signatures = declaredSignatures prog
     env0 = Map.fromList [(predKey p, initial p) | p <- preds]
     initial p = case Map.lookup (predKey p) decl of
       Just (_, outs) -> outs
       Nothing -> replicate (snd (predKey p)) (not (IM.null (predClauses p)))
-    go 0 envs = envs
-    go n envs =
+    go envs =
       let outs' = Map.fromList [(predKey p, predOuts envs p) | p <- preds]
           deps' = Map.fromList [(predKey p, predDeps envs p) | p <- preds]
-       in if (outs', deps') == envs then envs else go (n - 1) (outs', deps')
+       in if (outs', deps') == envs then envs else go (outs', deps')
     arityOf p = snd (predKey p)
     predOuts (outs, deps) p = case Map.lookup (predKey p) decl of
       Just (_, os) -> os
@@ -457,11 +506,24 @@ inferGroundness prog ins = go (10 :: Int) (env0, env0)
     clauseGround outs deps assumed cl =
       let hs = case clauseHead cl of Compound _ as -> as; _ -> []
           g0 = Set.fromList (concat [termVarIds a | (i, a) <- zip [0 ..] hs, assumed i])
-          step g = foldl' (groundAfter ins outs deps) g (clauseBody cl)
-          gEnd = stable (3 :: Int) step g0
+          ordered = foldl' (groundAfter signatures ins outs deps) g0 (clauseBody cl)
+          -- Aliasing persists after later bindings. Close only unifications;
+          -- replaying calls could apply guarantees with inputs grounded later.
+          aliases g = foldl' aliasAfter g (clauseBody cl)
+          gEnd = stable aliases ordered
        in [all (`Set.member` gEnd) (termVarIds a) | a <- hs]
-    stable 0 _ g = g
-    stable n f g = let g' = f g in if g' == g then g else stable (n - 1) f g'
+    stable f g = let g' = f g in if g' == g then g else stable f g'
+    aliasAfter known g = case g of
+      Compound op [a, b] | op `elem` ["unify", "equiv"] ->
+        groundAfter signatures Map.empty Map.empty Map.empty known (Compound op [a, b])
+      Compound "," [a, b] -> aliasAfter (aliasAfter known a) b
+      Compound ";" [Compound "->" [c, t], e] ->
+        Set.intersection (aliasAfter (aliasAfter known c) t) (aliasAfter known e)
+      Compound ";" [a, b] -> Set.intersection (aliasAfter known a) (aliasAfter known b)
+      Compound "->" [c, t] -> aliasAfter (aliasAfter known c) t
+      Compound "once" [a] -> aliasAfter known a
+      Compound "minimize" [_, a] -> aliasAfter known a
+      _ -> known
 
 -- ─── DETERMINISM INFERENCE ───────────────────────────────────────────────────
 
@@ -492,6 +554,7 @@ builtinDet name arity = case (name, arity) of
   ("fd_le", 2) -> Just Semidet
   ("fd_ge", 2) -> Just Semidet
   ("in", 2) -> Just Semidet
+  ("reify", 2) -> Just Semidet
   ("all_different", 1) -> Just Semidet
   ("all_distinct", 1) -> Just Semidet
   ("label", 1) -> Just Nondet
@@ -521,6 +584,24 @@ builtinDet name arity = case (name, arity) of
   ("str_num", 2) -> Just Semidet
   ("str_upper", 2) -> Just Semidet
   ("str_lower", 2) -> Just Semidet
+  ("term_str", 2) -> Just Semidet
+  ("char_code", 2) -> Just Semidet
+  ("str_lines", 2) -> Just Semidet
+  -- pure DCG helpers (two extra list arguments)
+  ("seq", 3) -> Just Nondet
+  ("wr", 3) -> Just Semidet
+  ("nl", 2) -> Just Semidet
+  ("sp", 2) -> Just Semidet
+  ("fmt", 4) -> Just Semidet
+  ("padl", 4) -> Just Semidet
+  ("padr", 4) -> Just Semidet
+  -- effects (require an unsafe declaration)
+  ("emit", 1) -> Just Semidet
+  ("read_file", 2) -> Just Semidet
+  ("phrase_from_file", 2) -> Just Nondet
+  ("assert", 1) -> Just Det
+  ("retract", 1) -> Just Nondet
+  ("retractall", 1) -> Just Det
   _ -> Nothing
 
 type DetEnv = Map PredKey (Det, [Int])
@@ -550,17 +631,18 @@ flipO OEQ = OEQ
 -- occurs in the head, or a literal.
 data GuardOperand = VarPaths [[Int]] | Lit Term deriving (Eq, Show)
 
+data GuardKind = TermIdentity | ValueOrdering deriving (Eq)
+
 -- | The first body goal when it is a comparison between head variables and
--- literals: (left operand, right operand, admitted orderings, needs ground).
--- @needs ground@ marks == and != guards, which do not fail on unbound
--- variables and therefore only exclude when their arguments are ground.
-guardOf :: Clause -> Maybe (GuardOperand, GuardOperand, Set Ordering', Bool)
+-- literals. Term identity and value ordering have different equivalence
+-- classes: in particular, integer 1 and float 1.0 are distinct terms.
+guardOf :: Clause -> Maybe (GuardOperand, GuardOperand, Set Ordering', GuardKind)
 guardOf cl = case clauseBody cl of
   (Compound op [a, b] : _)
     | Just rels <- relOf op -> do
         x <- operand a
         y <- operand b
-        pure (x, y, rels, op `elem` ["neq", "equiv"])
+        pure (x, y, rels, if op `elem` ["neq", "equiv"] then TermIdentity else ValueOrdering)
   _ -> Nothing
   where
     paths = headPaths cl
@@ -588,26 +670,16 @@ guardOf cl = case clauseBody cl of
 -- argument positions that must be ground for that to hold.
 --
 -- * the same literal: always;
--- * variables where one head path set includes the other: always, because
---   the clause with the smaller set only evaluates its guard once one of
---   those paths is bound in the call, and the other clause's variable is
---   unified with that same subterm;
--- * variables sharing a head path: when the argument containing that path
---   is ground, so both clauses read the same subterm.
+-- * variables sharing a head path: only when the argument containing that
+--   path is ground. Aliases among query arguments can otherwise let the two
+--   clause heads bind the same variable to different values before the guard.
 compatibleOperands :: GuardOperand -> GuardOperand -> Maybe [Int]
 compatibleOperands (Lit a) (Lit b) = if a == b then Just [] else Nothing
-compatibleOperands (VarPaths p) (VarPaths q)
-  | subset p q || subset q p = Just []
-  | otherwise = case [i | path@(i : _) <- p, path `elem` q] of
+compatibleOperands (VarPaths p) (VarPaths q) =
+    case [i | path@(i : _) <- p, path `elem` q] of
       (i : _) -> Just [i]
       [] -> Nothing
-  where
-    subset xs ys = all (`elem` ys) xs
 compatibleOperands _ _ = Nothing
-
-operandArgs :: GuardOperand -> [Int]
-operandArgs (VarPaths ps) = [i | (i : _) <- ps]
-operandArgs (Lit _) = []
 
 -- | Does a ground call argument distinguish the two head patterns?  True when
 -- the patterns carry different principal functors at some common path.
@@ -634,12 +706,11 @@ exclusive c1 c2 = case options of
         ++ maybe [] pure (literalVsGuard c1 c2)
         ++ maybe [] pure (literalVsGuard c2 c1)
     guardOption = case (guardOf c1, guardOf c2) of
-      (Just (x1, y1, r1, ng1), Just (x2, y2, r2, ng2)) ->
-        let groundAll = if ng1 || ng2 then concatMap operandArgs [x1, y1, x2, y2] else []
-            option rx ry disjoint = do
+      (Just (x1, y1, r1, kind1), Just (x2, y2, r2, kind2)) | kind1 == kind2 ->
+        let option rx ry disjoint = do
               px <- rx
               py <- ry
-              if disjoint then Just (nub (groundAll ++ px ++ py)) else Nothing
+              if disjoint then Just (nub (px ++ py)) else Nothing
             same = option (compatibleOperands x1 x2) (compatibleOperands y1 y2) (Set.null (Set.intersection r1 r2))
             swapped = option (compatibleOperands x1 y2) (compatibleOperands y1 x2) (Set.null (Set.intersection r1 (Set.map flipO r2)))
          in maybe [] pure same ++ maybe [] pure swapped
@@ -651,37 +722,33 @@ exclusive c1 c2 = case options of
     -- c1 has a literal where c2 has a variable (occurring only there) guarded
     -- by a comparison against a literal that excludes c1's.
     literalVsGuard lit gd = case guardOf gd of
-      Just (x, y, rels, ng)
-        | Just i <- excluded x y rels ->
-            Just (if ng then [i] else [])
+      Just (x, y, rels, kind)
+        | Just i <- excluded kind x y rels -> Just [i]
       _ -> Nothing
       where
-        excluded (VarPaths [p]) (Lit l) rels = check p l rels
-        excluded (Lit l) (VarPaths [p]) rels = check p l (Set.map flipO rels)
-        excluded _ _ _ = Nothing
-        check p@(i : _) l rels
+        excluded kind (VarPaths [p]) (Lit l) rels = check kind p l rels
+        excluded kind (Lit l) (VarPaths [p]) rels = check kind p l (Set.map flipO rels)
+        excluded _ _ _ _ = Nothing
+        check kind p@(i : _) l rels
           | Just t <- termAtPath (args lit) p,
-            Just o <- compareLits t l,
+            Just o <- compareLits kind t l,
             not (o `Set.member` rels) =
               Just i
-        check _ _ _ = Nothing
+        check _ _ _ _ = Nothing
         -- ordering of the head literal relative to the guard literal
-        compareLits a b = case (a, b) of
-          (IntLit p, IntLit q) -> Just (ordOf (compare p q))
-          (IntLit p, FloatLit q) -> Just (ordOf (compare (fromIntegral p) q))
-          (FloatLit p, IntLit q) -> Just (ordOf (compare p (fromIntegral q)))
-          (FloatLit p, FloatLit q) -> Just (ordOf (compare p q))
-          _ | a == b -> Just OEQ
-            | isAtomic a && isAtomic b -> Just OLT -- distinct non-numeric literals: only != can exclude
-            | otherwise -> Nothing
+        compareLits TermIdentity a b
+          | null (termVarIds a) = Just (if a == b then OEQ else OLT)
+          | otherwise = Nothing
+        compareLits ValueOrdering a b = case (a, b) of
+          (Atom p, Atom q) -> Just (ordOf (compare p q))
+          (StrLit p, StrLit q) -> Just (ordOf (compare p q))
+          (CharLit p, CharLit q) -> Just (ordOf (compare p q))
+          _ -> case (evalNumeric IM.empty a, evalNumeric IM.empty b) of
+            (Right (Just p), Right (Just q)) -> Just (ordOf (compareNumeric p q))
+            _ -> Nothing
         ordOf LT = OLT
         ordOf EQ = OEQ
         ordOf GT = OGT
-        isAtomic t = case t of
-          Atom _ -> True
-          StrLit _ -> True
-          CharLit _ -> True
-          _ -> False
 
 hasCut :: Clause -> Bool
 hasCut cl = any isCut (clauseBody cl)
@@ -693,10 +760,15 @@ inferDets :: Program -> ModeEnv -> ModeEnv -> ModeEnv -> DetEnv
 inferDets prog ins outs deps = go env0
   where
     preds = programPreds prog
-    after = groundAfter ins outs deps
+    signatures = declaredSignatures prog
+    after = groundAfter signatures ins outs deps
     declared p = case predDecls p of
-      (s : _) -> Just (sigDet s)
       [] -> Nothing
+      sigs -> Just (declarationsDet sigs)
+    declarationsDet sigs
+      | all ((== Det) . sigDet) sigs = Det
+      | all (atMostOne . sigDet) sigs = Semidet
+      | otherwise = Nondet
     env0 = Map.fromList [(predKey p, initial p) | p <- preds]
     initial p = case declared p of
       Just d -> (d, [])
@@ -759,6 +831,9 @@ inferDets prog ins outs deps = go env0
       _ -> case functorOf g of
         Just (name, arity)
           | Just d <- builtinDet name arity -> d
+          | Just sigs <- Map.lookup (name, arity) signatures ->
+              let as = case g of Compound _ xs -> xs; _ -> []
+               in declarationsDet (possibleSignatures known as sigs)
           | Just (d, sw) <- Map.lookup (name, arity) env ->
               let as = case g of Compound _ xs -> xs; _ -> []
                   groundAt i = i < length as && all (`Set.member` known) (termVarIds (as !! i))

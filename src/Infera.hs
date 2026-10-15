@@ -10,6 +10,7 @@ module Infera
     module Infera.Arith,
     module Infera.CLP,
     module Infera.Program,
+    module Infera.Purity,
     module Infera.Infer,
     module Infera.Engine,
     module Infera.Module,
@@ -26,6 +27,7 @@ import Infera.Diagnostic
 import Infera.Infer
 import Infera.Module
 import Infera.Program
+import Infera.Purity
 import Infera.Repl
 import Infera.Syntax
 import Infera.Unify

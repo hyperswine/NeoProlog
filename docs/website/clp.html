@@ -40,13 +40,15 @@
 <tr><td id="fd-eq" data-dash="Operator:#="><code>A #= B</code></td><td>integer equality of expressions</td></tr>
 <tr><td id="fd-ne" data-dash="Operator:#!="><code>A #!= B</code></td><td>disequality</td></tr>
 <tr><td id="fd-cmp" data-dash="Operator:#&lt;"><code>A #&lt; B</code>, <code>A #&gt; B</code>, <code>A #&lt;= B</code>, <code>A #&gt;= B</code></td><td>ordering</td></tr>
-<tr><td id="all-different" data-dash="Builtin:all_different/1"><code>all_different Xs</code></td><td>pairwise <code>#!=</code> over a list (<code>all_distinct</code> is a synonym)</td></tr>
+<tr><td id="all-different" data-dash="Builtin:all_different/1"><code>all_different Xs</code></td><td>distinct integer values, with global finite-domain propagation (<code>all_distinct</code> is a synonym)</td></tr>
+<tr><td id="reify" data-dash="Builtin:reify/2"><code>reify (A #&lt;= B) Truth</code></td><td><code>Truth</code> is 0 or 1, equivalent to the relation; supports all six CLP comparisons in both directions</td></tr>
 <tr><td id="label" data-dash="Builtin:label/1"><code>label Xs</code></td><td>enumerate the variables' finite domains, smallest domain first (<code>labeling</code> is a synonym)</td></tr>
 <tr><td id="label-min" data-dash="Builtin:labeling/2"><code>labeling [min Cost] Xs</code></td><td>return one minimum using branch-and-bound; finite integer domains, with an integer cost ground at each complete assignment</td></tr>
 <tr><td id="minimize" data-dash="Builtin:minimize/2"><code>minimize Cost Goal</code></td><td>scan a finite search while retaining only the first least-cost answer and its bindings/output; no branch pruning; every answer must have a ground integer cost</td></tr>
 </table>
-<p>Both optimisation forms return one optimum, fail if there are no solutions, and do not claim an optimum if any branch errors or the search is incomplete. Only <code>[min Cost]</code> is supported by two-argument labeling. Pruning can change the first tied assignment encountered. The breadboard example uses <code>minimize</code> for its post-placement scoring, avoiding a list of every placement.</p>
+<p>Both optimisation forms return one optimum, fail if there are no solutions, and do not claim an optimum if any branch errors or the search is incomplete. Only <code>[min Cost]</code> is supported by two-argument labeling. Pruning can change the first tied assignment encountered. The breadboard example constrains its score before <code>labeling [min Cost]</code>, allowing incumbent bounds to prune partial placements.</p>
 <p>Expressions may use <code>+ - *</code> and integer literals; <code>*</code> of two unknowns, <code>/</code>, <code>%</code> and <code>^</code> stay residual until they become linear or ground.</p>
+<p><code>D #= abs Expr</code> propagates bounds when <code>D</code> and <code>Expr</code> are linear expressions. Once the sign is known, it becomes a linear equality. Otherwise the absolute-value relation remains residual. Reification and absolute values let objective costs constrain a model before labeling.</p>
 
 <h2 id="examples">Examples <a class="anchor" href="#examples">#</a></h2>
 <pre><code><span class="k">&gt;</span> <span class="v">X</span> #= <span class="n">3</span> + <span class="n">4</span>?
@@ -74,7 +76,8 @@
 <h2 id="propagation" data-dash="Guide:CLP(Z) propagation">How propagation works <a class="anchor" href="#propagation">#</a></h2>
 <ul>
   <li>Domains are intervals with a set of excluded values. Unifying a constrained variable with an integer checks the domain; with another variable, the domains are intersected; with anything else it is a type error.</li>
-  <li>Linear constraints <code>Σ cᵢxᵢ + k ⋈ 0</code> get bounds propagation after every unification and every new constraint, to a fixpoint. A constraint over a single variable is absorbed into its domain; a domain that shrinks to one value binds the variable.</li>
+  <li>Changed variables wake only their dependent constraints. List domains are posted together before propagation. Linear constraints <code>Σ cᵢxᵢ + k ⋈ 0</code> use aggregate bounds, with linear coefficient visits per pass. A constraint over a single variable is absorbed into its domain; a domain that shrinks to one value binds the variable.</li>
+  <li>Global <code>all_different</code> excludes fixed values and uses bounded Hall-interval and matching checks for finite domains. These checks detect impossible groups and remove unsupported values; larger domains retain cheaper propagation.</li>
   <li><code>#!=</code> with one unknown punches a hole in its domain; with several it waits.</li>
   <li>Labeling picks the unbound variable with the smallest finite domain and tries its values in order, propagating after each. Labeling a variable with an unbounded domain is an error.</li>
 </ul>

@@ -48,8 +48,9 @@ import Data.Char (toLower, toUpper)
 import Infera.Arith
 import Infera.CLP
 import Infera.Error
-import Infera.Infer (inferProgram)
+import Infera.Infer (builtinDet, inferProgram)
 import Infera.Program
+import Infera.Purity (describeViolation, programViolations)
 import Infera.Syntax
 import Infera.Unify
 
@@ -77,7 +78,10 @@ data SolverState = SolverState
     -- | Output events, most recent first.
     ssOutput :: [OutputEvent],
     ssOutLen :: !Int,
-    ssTables :: Map Term TableEntry
+    ssTables :: Map Term TableEntry,
+    -- | Facts of dynamic predicates (assert/retract), canonical with their
+    -- variable counts, per predicate in assertion order.
+    ssDynamic :: Map PredKey [(Term, Int)]
   }
 
 data SearchItem
@@ -92,11 +96,13 @@ data SearchItem
 type Search = [SearchItem]
 
 data Env = Env
-  { envProg :: Program
+  { envProg :: Program,
+    -- | Contents of files preloaded for read_file / phrase_from_file.
+    envFiles :: Map String String
   }
 
 mkEnv :: Program -> Env
-mkEnv = Env
+mkEnv prog = Env prog (progFiles prog)
 
 maxResolutionDepth :: Int
 maxResolutionDepth = 100000
@@ -114,7 +120,8 @@ initialState fresh =
       ssFresh = fresh,
       ssOutput = [],
       ssOutLen = 0,
-      ssTables = Map.empty
+      ssTables = Map.empty,
+      ssDynamic = Map.empty
     }
 
 emit :: OutputEvent -> SolverState -> SolverState
@@ -224,6 +231,7 @@ solveGoal env fuel st g0 =
         Compound "fd_lt" [a, b] -> checked st (addRelation RelLe (Compound "plus" [a, IntLit 1]) b store)
         Compound "fd_ge" [a, b] -> checked st (addRelation RelLe b a store)
         Compound "fd_gt" [a, b] -> checked st (addRelation RelLe (Compound "plus" [b, IntLit 1]) a store)
+        Compound "reify" [relation, truth] -> reifyRelation st relation truth
         Compound "in" [x, r] -> inDomain st x r
         Compound "label" [l] -> labeling env st l
         Compound "labeling" [l] -> labeling env st l
@@ -242,11 +250,37 @@ solveGoal env fuel st g0 =
                 then opaque (solveGoal env fuel st (replaceCuts (negate (ssFresh st) - 1) goal))
                 else [BranchError (TypeError "callable" (deepWalk s goal))]
         Compound "phrase" [nt, l] ->
-          let goal = case walk s nt of
-                Atom f -> Compound f [l, nil]
-                Compound f as -> Compound f (as ++ [l, nil])
-                other -> Compound "call" [other, l, nil]
-           in solveGoal env fuel st goal
+          let input = case walk s l of
+                StrLit str -> mkList (map CharLit str) Nothing
+                _ -> l
+           in solveGoal env fuel st (phraseGoal (walk s nt) input nil)
+        Compound "phrase_from_file" [nt, path] -> withFile env s path $ \contents ->
+          solveGoal env fuel st (phraseGoal (walk s nt) (mkList (map CharLit contents) Nothing) nil)
+        Compound "read_file" [path, str] -> withFile env s path $ \contents ->
+          checked st (storeUnify store str (StrLit contents))
+        Compound "emit" [nt] -> emitGoal env fuel st nt
+        -- dynamic facts
+        Compound "assert" [t] -> assertFact env st t
+        Compound "retract" [t] -> retractFact st t
+        Compound "retractall" [t] -> retractAll st t
+        -- pure DCG helpers: NT S0 S
+        Compound "seq" [cs, s0, s1] -> seqGoal st cs s0 s1
+        Compound "wr" [x, s0, s1] -> dcgText st (showValue (deepEval s x)) s0 s1
+        Compound "nl" [s0, s1] -> dcgText st "\n" s0 s1
+        Compound "sp" [s0, s1] -> dcgText st " " s0 s1
+        Compound "padl" [x, w, s0, s1] -> padGoal True st x w s0 s1
+        Compound "padr" [x, w, s0, s1] -> padGoal False st x w s0 s1
+        Compound "fmt" [f, args, s0, s1] -> case formatText s f args of
+          Left err -> [BranchError err]
+          Right text -> dcgText st text s0 s1
+        Compound "char_code" [c, n] -> case (walk s c, walk s n) of
+          (CharLit ch, _) -> checked st (storeUnify store n (IntLit (fromIntegral (fromEnum ch))))
+          (_, IntLit code) -> checked st (storeUnify store c (CharLit (toEnum (fromIntegral code))))
+          (other, _) -> [BranchError (InstantiationError other)]
+        Compound "term_str" [t, str] -> checked st (storeUnify store str (StrLit (showValue (deepEval s t))))
+        Compound "str_lines" [a, l] -> case walk s a of
+          StrLit str -> checked st (storeUnify store l (mkList (map StrLit (lines str)) Nothing))
+          other -> [BranchError (TypeError "string" other)]
         Compound "not" [g] -> negation env fuel st g
         Compound "once" [g] ->
           let sub = solveGoal env fuel st g
@@ -308,6 +342,138 @@ showValue :: Term -> String
 showValue (StrLit s) = s
 showValue t = show t
 
+-- | The goal that runs a DCG non-terminal between two list arguments.
+phraseGoal :: Term -> Term -> Term -> Term
+phraseGoal nt s0 s = case nt of
+  Atom f -> Compound f [s0, s]
+  Compound f as -> Compound f (as ++ [s0, s])
+  other -> Compound "call" [other, s0, s]
+
+-- | Unify @s0@ with the characters of a text followed by @s@.
+dcgText :: SolverState -> String -> Term -> Term -> Search
+dcgText st text s0 s = checked st (storeUnify (ssStore st) s0 (mkList (map CharLit text) (Just s)))
+
+-- | @seq Xs@ as a DCG: the elements of Xs (a list or a string) in sequence.
+-- With Xs unbound and a proper input list, enumerates prefixes.
+seqGoal :: SolverState -> Term -> Term -> Term -> Search
+seqGoal st cs s0 s =
+  let sub = subst st
+      store = ssStore st
+   in case deepWalk sub cs of
+        StrLit str -> dcgText st str s0 s
+        t | (xs, Nothing) <- unfoldCons t -> checked st (storeUnify store s0 (mkList xs (Just s)))
+        _ -> case deepWalk sub s0 of
+          t0 | (xs, Nothing) <- unfoldCons t0 ->
+            alts
+              [ checked st (storeUnify store cs (mkList pre Nothing) >>= maybe (Right Nothing) (\st' -> storeUnify st' s (mkList rest Nothing)))
+              | i <- [0 .. length xs],
+                let (pre, rest) = splitAt i xs
+              ]
+          other -> [BranchError (InstantiationError other)]
+
+padGoal :: Bool -> SolverState -> Term -> Term -> Term -> Term -> Search
+padGoal left st x w s0 s =
+  let sub = subst st
+      text = showValue (deepEval sub x)
+   in case walk sub w of
+        IntLit n ->
+          let fill = replicate (fromIntegral n - length text) ' '
+           in dcgText st (if left then fill ++ text else text ++ fill) s0 s
+        other -> [BranchError (TypeError "integer width" other)]
+
+-- | @fmt Format Args@: ~w term, ~s string or character list, ~d integer,
+-- ~a atom, ~n newline, ~~ tilde.
+formatText :: Subst -> Term -> Term -> Either SolveError String
+formatText s f args = case (walk s f, unfoldCons (deepWalk s args)) of
+  (StrLit format, (as, Nothing)) -> go format as
+  (StrLit _, _) -> Left (TypeError "argument list" (deepWalk s args))
+  (other, _) -> Left (TypeError "format string" other)
+  where
+    go ('~' : '~' : rest) as = ('~' :) <$> go rest as
+    go ('~' : 'n' : rest) as = ('\n' :) <$> go rest as
+    go ('~' : c : rest) (a : as) | c `elem` "wsda" = do
+      piece <- directive c (deepEval s a)
+      (piece ++) <$> go rest as
+    go ('~' : c : _) [] | c `elem` "wsda" = Left (UserError "fmt: not enough arguments for the format string")
+    go ('~' : c : _) _ = Left (UserError ("fmt: unknown directive ~" ++ [c]))
+    go (c : rest) as = (c :) <$> go rest as
+    go [] [] = Right []
+    go [] _ = Left (UserError "fmt: too many arguments for the format string")
+    directive 'w' t = Right (showValue t)
+    directive 'a' (Atom a) = Right a
+    directive 'd' (IntLit n) = Right (show n)
+    directive 's' (StrLit str) = Right str
+    directive 's' t | Just str <- charList t = Right str
+    directive c t = Left (TypeError (case c of 'd' -> "integer for ~d"; 'a' -> "atom for ~a"; _ -> "string for ~s") t)
+
+-- | Run a file-backed builtin against the preloaded file contents.
+withFile :: Env -> Subst -> Term -> (String -> Search) -> Search
+withFile env s path k = case walk s path of
+  StrLit p -> case Map.lookup p (envFiles env) of
+    Just contents -> k contents
+    Nothing -> [BranchError (UserError ("read_file: \"" ++ p ++ "\" was not loaded (paths must be string literals in the program or query)"))]
+  other -> [BranchError (TypeError "file path string" other)]
+
+-- | @emit NT@: run the DCG once and append its text to the output.
+emitGoal :: Env -> Int -> SolverState -> Term -> Search
+emitGoal env fuel st nt =
+  let cs = Var (ssFresh st)
+      st1 = st {ssFresh = ssFresh st + 1}
+      sub = solveGoal env fuel st1 (phraseGoal (walk (subst st) nt) cs nil)
+   in case firstFound sub of
+        (pre, Just st') -> case charList (deepWalk (subst st') cs) of
+          Just text -> pre ++ [Found (emit (WriteEvent text) st')]
+          Nothing -> pre ++ [BranchError (TypeError "character list from the DCG" (deepWalk (subst st') cs))]
+        (pre, Nothing) -> pre
+
+-- ─── DYNAMIC FACTS ───────────────────────────────────────────────────────────
+
+dynamicKey :: Env -> Subst -> Term -> Either SolveError (PredKey, Term)
+dynamicKey env s t =
+  let fact = deepWalk s t
+   in case functorOf fact of
+        Nothing -> Left (TypeError "callable fact" fact)
+        Just key@(name, _)
+          | nameHasFlag (envProg env) name FlagDynamic -> Right (key, fact)
+          | otherwise -> Left (UserError (showPredKey key ++ " is not declared dynamic (add `" ++ name ++ " : dynamic.`)"))
+
+assertFact :: Env -> SolverState -> Term -> Search
+assertFact env st t = case dynamicKey env (subst st) t of
+  Left err -> [BranchError err]
+  Right (key, fact) ->
+    let (canon, vs) = canonicalize emptySubst fact
+     in [Found st {ssDynamic = Map.insertWith (flip (++)) key [(canon, length vs)] (ssDynamic st)}]
+
+-- | Facts of a dynamic predicate, instantiated with fresh variables.
+dynamicFacts :: SolverState -> PredKey -> [(Int, Term, SolverState)]
+dynamicFacts st key =
+  [ (i, instantiate (ssFresh st) canon, st {ssFresh = ssFresh st + n})
+  | (i, (canon, n)) <- zip [0 ..] (Map.findWithDefault [] key (ssDynamic st))
+  ]
+
+callDynamic :: SolverState -> PredKey -> Term -> Search
+callDynamic st key goal =
+  alts [checked st' (storeUnify (ssStore st') goal fact) | (_, fact, st') <- dynamicFacts st key]
+
+retractFact :: SolverState -> Term -> Search
+retractFact st t = case functorOf (deepWalk (subst st) t) of
+  Nothing -> [BranchError (TypeError "callable fact" t)]
+  Just key ->
+    alts
+      [ checked (dropFact i st') (storeUnify (ssStore st') t fact)
+      | (i, fact, st') <- dynamicFacts st key
+      ]
+  where
+    dropFact i st' = st' {ssDynamic = Map.adjust (\fs -> [f | (j, f) <- zip [0 :: Int ..] fs, j /= i]) (fst (functorKey st')) (ssDynamic st')}
+    functorKey st' = case functorOf (deepWalk (subst st') t) of Just k -> (k, ()); Nothing -> (("", 0), ())
+
+retractAll :: SolverState -> Term -> Search
+retractAll st t = case functorOf (deepWalk (subst st) t) of
+  Nothing -> [BranchError (TypeError "callable fact" t)]
+  Just key ->
+    let keep = [ (canon, n) | (i, fact, st') <- dynamicFacts st key, let (canon, n) = Map.findWithDefault [] key (ssDynamic st) !! i, Nothing <- [unifyPlain (subst st') t fact] ]
+     in [Found st {ssDynamic = Map.insert key keep (ssDynamic st)}]
+
 charList :: Term -> Maybe String
 charList t = case unfoldCons t of
   (xs, Nothing) -> mapM (\x -> case x of CharLit c -> Just c; _ -> Nothing) xs
@@ -321,6 +487,15 @@ isProperList s t = case walk s t of
 
 comparison :: (Ordering -> Bool) -> SolverState -> Term -> Term -> Search
 comparison ok st a b =
+  let s = subst st
+   in case (walk s a, walk s b) of
+        (CharLit x, CharLit y) -> [Found st | ok (compare x y)]
+        (StrLit x, StrLit y) -> [Found st | ok (compare x y)]
+        (Atom x, Atom y) -> [Found st | ok (compare x y)]
+        _ -> numericComparison ok st a b
+
+numericComparison :: (Ordering -> Bool) -> SolverState -> Term -> Term -> Search
+numericComparison ok st a b =
   let s = subst st
    in case (evalNumeric s a, evalNumeric s b) of
         (Left err, _) -> [BranchError err]
@@ -433,7 +608,7 @@ inDomain st x r =
               let targets = case deepWalk s x of
                     t@(Compound "cons" _) -> fst (unfoldCons t)
                     t -> [t]
-               in checked st (foldl' (\acc t -> acc >>= maybe (Right Nothing) (addDomain t l h)) (Right (Just (ssStore st))) targets)
+               in checked st (addDomains targets l h (ssStore st))
         other -> [BranchError (TypeError "range (Lo..Hi)" other)]
 
 allDifferent :: SolverState -> Term -> Search
@@ -442,9 +617,24 @@ allDifferent st l =
       (xs, rest) = unfoldCons (deepWalk s l)
    in case rest of
         Just _ -> [BranchError (InstantiationError (deepWalk s l))]
-        Nothing ->
-          let pairs = [(a, b) | (i, a) <- zip [0 :: Int ..] xs, (j, b) <- zip [0 ..] xs, i < j]
-           in checked st (foldl' (\acc (a, b) -> acc >>= maybe (Right Nothing) (addRelation RelNe a b)) (Right (Just (ssStore st))) pairs)
+        Nothing -> checked st (addAllDifferent xs (ssStore st))
+
+-- | A Boolean view of an integer constraint. Posting it does not execute a
+-- goal or enumerate alternatives: both the relation and its truth value are
+-- maintained by the constraint store.
+reifyRelation :: SolverState -> Term -> Term -> Search
+reifyRelation st relation truth =
+  let store = ssStore st
+      post rel a b = checked st (addReified rel a b truth store)
+   in case walk (subst st) relation of
+        Compound "int_eq" [a, b] -> post RelEq a b
+        Compound "fd_ne" [a, b] -> post RelNe a b
+        Compound "fd_le" [a, b] -> post RelLe a b
+        Compound "fd_lt" [a, b] -> post RelLe (Compound "plus" [a, IntLit 1]) b
+        Compound "fd_ge" [a, b] -> post RelLe b a
+        Compound "fd_gt" [a, b] -> post RelLe (Compound "plus" [b, IntLit 1]) a
+        other@(Var _) -> [BranchError (InstantiationError other)]
+        other -> [BranchError (TypeError "integer relation (#=, #!=, #<, #<=, #>, #>=)" other)]
 
 labeling :: Env -> SolverState -> Term -> Search
 labeling _ st0 l =
@@ -542,7 +732,9 @@ callPred :: Env -> Int -> SolverState -> Term -> Search
 callPred env fuel st goal = case functorOf goal of
   Nothing -> [BranchError (TypeError "callable goal" goal)]
   Just key -> case lookupPred key (envProg env) of
-    Nothing -> [BranchError (UnknownPredicate key)]
+    Nothing
+      | nameHasFlag (envProg env) (fst key) FlagDynamic -> callDynamic st key goal
+      | otherwise -> [BranchError (UnknownPredicate key)]
     Just p ->
       let s = subst st
           goalN = normArithTerm s goal
@@ -670,8 +862,10 @@ tryClause env fuel st base goal cl =
 
 -- ─── TABLING ─────────────────────────────────────────────────────────────────
 
--- | Tabled evaluation (linear tabling with fixpoint iteration).  Calls whose
--- arguments involve constrained variables, and answers that would carry
+-- | Tabled evaluation (linear tabling with fixpoint iteration). Positive
+-- same-variant linear recursion consumes only the preceding round's new
+-- answers. Other recursive shapes retain the general fixpoint evaluator.
+-- Calls whose arguments involve constrained variables, and answers that carry
 -- constraints, fall back to plain evaluation.
 evalTabled :: Env -> Int -> SolverState -> Pred -> Term -> Search
 evalTabled env fuel st0 p goal
@@ -680,7 +874,8 @@ evalTabled env fuel st0 p goal
       Just te
         | teComplete te -> [BranchExhausted | teTruncated te] ++ consumeAnswers st0 (teAnswers te)
         | otherwise -> ConsumedIncomplete callKey : consumeAnswers st0 (teAnswers te)
-      Nothing -> fixpoint (0 :: Int) (ssTables st0) [] Set.empty
+      Nothing -> fixpoint (case deltaClauses of Just _ -> True; Nothing -> False)
+        (0 :: Int) (ssTables st0) [] Set.empty []
   where
     store0 = ssStore st0
     s0 = stSubst store0
@@ -688,9 +883,67 @@ evalTabled env fuel st0 p goal
     argsW = case deepWalk s0 goal of Compound _ as -> as; _ -> []
     plain st = evalClauses env fuel st p goal argsW
 
-    fixpoint iteration tables answers answerSet =
-      let st1 = st0 {ssTables = Map.insert callKey (TableEntry False False answers answerSet) tables}
-          items = evalClauses env fuel st1 p goal argsW
+    -- A delta is sound only when removing an old derivation cannot change a
+    -- later call's behaviour. Keep the initial fast path deliberately narrow:
+    -- one self-call first in a clause, exactly the current variant, followed
+    -- by acyclic positive goals with no declared contracts, effects or CLP.
+    -- In particular this excludes mutual/nonlinear recursion and all control
+    -- constructs; their ordering, errors and cuts still use the old evaluator.
+    deltaClauses
+      | not (safeContract p) || inferredCommit = Nothing
+      | otherwise = fmap (map fst . filter snd) (mapM classifyClause candidates)
+      where
+        inferredCommit = sigDet (predInferred p) == Semidet
+          && all (\i -> i < length argsW && isGroundTerm (argsW !! i))
+            (sigSwitch (predInferred p))
+        candidates = candidateClauses p
+          (if predIsIndexed (envProg env) p then map indexKey argsW else [])
+        classifyClause ci =
+          let cl = predClauses p IM.! ci
+           in case clauseBody cl of
+                recursive : rest
+                  | functorOf recursive == Just (predKey p) ->
+                      if all (safeGoal (Set.singleton (predKey p))) rest && sameVariant cl recursive
+                        then Just (ci, True)
+                        else Nothing
+                body
+                  | all (safeGoal (Set.singleton (predKey p))) body -> Just (ci, False)
+                  | otherwise -> Nothing
+        sameVariant cl recursive =
+          let base = ssFresh st0
+           in case storeUnify store0 goal (renameTerm base (clauseHead cl)) of
+                Left _ -> False
+                Right Nothing -> True -- This clause cannot contribute.
+                Right (Just store) ->
+                  let s = stSubst store
+                   in fst (canonicalize s (normArithTerm s (renameTerm base recursive))) == callKey
+        safeContract predicate =
+          null (predDecls predicate)
+            && not (predIsUnsafe (envProg env) predicate)
+            && not (predIsDynamic (envProg env) predicate)
+        safeGoal _ (Atom name) | name `elem` ["true", "fail", "false"] = True
+        safeGoal _ (Compound "unify" [_, _]) = True
+        safeGoal seen term = case functorOf term of
+          Just key@(name, arity)
+            | builtinDet name arity == Nothing && Set.notMember key seen ->
+                case lookupPred key (envProg env) of
+                  Just predicate ->
+                    safeContract predicate
+                      && all (all (safeGoal (Set.insert key seen)) . clauseBody)
+                        (IM.elems (predClauses predicate))
+                  Nothing -> False
+          _ -> False
+
+    fixpoint useDelta iteration tables answers answerSet delta =
+      let visible = if useDelta then delta else answers
+          st1 = st0 {ssTables = Map.insert callKey (TableEntry False False visible answerSet) tables}
+          items = case (useDelta && iteration > 0, deltaClauses) of
+            (True, Just recursive) ->
+              let base = ssFresh st1
+               in if fuel <= 0 then [BranchExhausted] else
+                    consumeMarkers base (alts
+                      [tryClause env fuel st1 base goal (predClauses p IM.! ci) | ci <- recursive])
+            _ -> evalClauses env fuel st1 p goal argsW
           founds = [stf | Found stf <- items]
           extracted = map extract founds
           unsafe = any (\(_, _, _, bad) -> bad) extracted
@@ -703,7 +956,13 @@ evalTabled env fuel st0 p goal
           tables' = Map.union completed (Map.delete callKey tables)
           converged = null fresh
           gaveUp = iteration >= maxTableIterations
-       in if unsafe
+          -- Resource exhaustion can make an otherwise independent base clause
+          -- observable on every round. Restart with the general algorithm
+          -- rather than silently dropping such an issue on subsequent rounds.
+          deltaIssue = useDelta && (not (null deps) || not (null others))
+       in if deltaIssue
+            then fixpoint False 0 (ssTables st0) [] Set.empty []
+            else if unsafe
             then plain st0
             else
               if converged || gaveUp
@@ -717,7 +976,7 @@ evalTabled env fuel st0 p goal
                         ++ others
                         ++ [BranchExhausted | gaveUp]
                         ++ consumeAnswers stC answers'
-                else fixpoint (iteration + 1) tables' answers' answerSet'
+                else fixpoint useDelta (iteration + 1) tables' answers' answerSet' fresh
 
     extract stf =
       let sf = subst stf
@@ -847,7 +1106,10 @@ solveAll prog q = summarizeSearch q (solveQuery prog q)
 loadProgramText :: String -> Either String Program
 loadProgramText src = do
   items <- parseProgram src
-  pure (inferProgram (buildProgram items))
+  let prog = inferProgram (buildProgram items)
+  case programViolations prog of
+    [] -> pure prog
+    ((key, g) : _) -> Left ("unsafe-call: " ++ describeViolation prog key g)
 
 -- | Convenience for tests and scripting: run a query against program text and
 -- render the answers.

@@ -16,6 +16,7 @@ import Data.Text (unpack)
 import Infera.Engine
 import Infera.Error
 import Infera.Infer (inferProgram)
+import Infera.Purity (describeViolation, programViolations)
 import Infera.Module
 import Infera.Program
 import Infera.Syntax
@@ -178,7 +179,8 @@ runRepl = do
           case parseQuery trimmed of
             Left err -> outputStrLn (renderDoc (docErr err))
             Right q -> do
-              prog <- liftIO (readIORef progRef)
+              prog0 <- liftIO (readIORef progRef)
+              prog <- liftIO (preloadFiles prog0 (queryGoals q))
               renderQuerySummary (solveAll prog q)
           loop progRef fileRef
       | null trimmed = loop progRef fileRef
@@ -188,8 +190,12 @@ runRepl = do
             Right items -> do
               prog <- liftIO (readIORef progRef)
               let prog' = inferProgram (foldl addItem prog items)
-              liftIO (writeIORef progRef prog')
-              outputStrLn (renderDoc (docInfo ("Added " ++ show (length items) ++ " item(s).")))
+              case programViolations prog' of
+                ((key, g) : _) -> outputStrLn (renderDoc (docErr ("unsafe-call: " ++ describeViolation prog' key g)))
+                [] -> do
+                  prog'' <- liftIO (preloadFiles prog' (concat [clauseBody c | TLClause c <- items]))
+                  liftIO (writeIORef progRef prog'')
+                  outputStrLn (renderDoc (docInfo ("Added " ++ show (length items) ++ " item(s).")))
           loop progRef fileRef
 
     addItem prog (TLClause c) = addClause c prog

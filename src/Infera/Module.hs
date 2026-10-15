@@ -11,6 +11,9 @@ module Infera.Module
     loadFile,
     loadLocatedFile,
     loadLocatedWithSources,
+    buildChecked,
+    preloadFiles,
+    fileGoals,
   )
 where
 
@@ -20,9 +23,11 @@ import qualified Crypto.Hash.SHA1 as SHA1
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.List (nub)
+import qualified Data.IntMap.Strict as IM
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Infera.Infer (inferProgram)
+import Infera.Purity (describeViolation, programViolations)
 import Infera.Program
 import Infera.Syntax
 import Numeric (showHex)
@@ -147,6 +152,40 @@ expandImports conf visited = foldM step (Right ([], []))
 processTopLevels :: ModuleConf -> [TopLevel] -> IO (Either String ([TopLevel], [Query]))
 processTopLevels conf = expandImports conf []
 
+-- | Build and analyse a program, refusing it when a predicate performs
+-- effects without an @unsafe@ declaration.
+buildChecked :: [TopLevel] -> Either String Program
+buildChecked items =
+  let prog = inferProgram (buildProgram items)
+   in case programViolations prog of
+        [] -> Right prog
+        ((key, g) : _) -> Left ("unsafe-call: " ++ describeViolation prog key g)
+
+-- | Literal file paths named by read_file / phrase_from_file goals.
+fileGoals :: [Term] -> [String]
+fileGoals = nub . concatMap go
+  where
+    go t = case t of
+      Compound "read_file" [StrLit p, _] -> [p]
+      Compound "phrase_from_file" [_, StrLit p] -> [p]
+      Compound _ as -> concatMap go as
+      _ -> []
+
+-- | Read the files a program and its queries refer to, so the pure engine can
+-- serve them.  Missing files are reported when the goal runs, not here.
+preloadFiles :: Program -> [Term] -> IO Program
+preloadFiles prog goals = do
+  let wanted = [p | p <- fileGoals goals, not (Map.member p (progFiles prog))]
+  loaded <- mapM readOne wanted
+  return (addFiles [(p, c) | (p, Just c) <- zip wanted loaded] prog)
+  where
+    readOne p = do
+      r <- CE.try (readFile p >>= \c -> length c `seq` return c) :: IO (Either CE.IOException String)
+      return (either (const Nothing) Just r)
+
+programGoals :: Program -> [Term]
+programGoals prog = concat [clauseBody cl | p <- programPreds prog, cl <- IM.elems (predClauses p)]
+
 -- | Load program source text (with imports) into an inferred program.
 loadSource :: ModuleConf -> String -> IO (Either String (Program, [Query]))
 loadSource conf src = case parseFile src of
@@ -155,7 +194,11 @@ loadSource conf src = case parseFile src of
     res <- processTopLevels conf items
     case res of
       Left err -> return (Left err)
-      Right (progItems, qs) -> return (Right (inferProgram (buildProgram progItems), qs))
+      Right (progItems, qs) -> case buildChecked progItems of
+        Left err -> return (Left err)
+        Right prog -> do
+          prog' <- preloadFiles prog (programGoals prog ++ concatMap queryGoals qs)
+          return (Right (prog', qs))
 
 loadFile :: FilePath -> IO (Either String (Program, [Query]))
 loadFile path = do

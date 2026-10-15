@@ -250,6 +250,9 @@ prop_engine_cut = unit $ do
           [ "q 1.",
             "q 2.",
             "q 3.",
+            "first : unsafe.",
+            "s : unsafe.",
+            "max3 : unsafe.",
             "first X <- q X, !.",
             "first 0.",
             "s X <- q X, X > 5, !.",
@@ -374,7 +377,8 @@ prop_decl_multiple_modes :: Property
 prop_decl_multiple_modes = unit $ do
   let prog =
         unlines
-          [ "plus2 : det (int: <=) (int: =>).",
+          [ "plus2 : unsafe.",
+            "plus2 : det (int: <=) (int: =>).",
             "plus2 : det (int: =>) (int: <=).",
             "plus2 X Y <- nonvar X, !, Y is X + 2.",
             "plus2 X Y <- X is Y - 2."
@@ -437,8 +441,8 @@ prop_infer_commit_is_sound = unit $ do
   assertFirst listsProg "length [a | T] N?" "T = [], N = 1"
   assertAnswers "zflag 0 1.\nzflag V 0 <- V != 0." "zflag V Z?" ["V = 0, Z = 1", "Z = 0, V != 0"]
 
--- The stdlib is the golden file for the mode and determinism analysis: every
--- line below was checked by hand against the predicate's real behaviour.
+-- Conservative stdlib summaries, including the grounding conditions required
+-- for pruning. Input hints may overestimate prerequisites of relational calls.
 prop_infer_stdlib_golden :: Property
 prop_infer_stdlib_golden = unit $ do
   res <- evalIO (loadFile "examples/stdlib.nprolog")
@@ -448,36 +452,36 @@ prop_infer_stdlib_golden = unit $ do
   let render p = showSignature (fst (predKey p)) (predInferred p) ++ " " ++ show (sigSwitch (predInferred p))
       actual = Map.fromList [(showPredKey (predKey p), render p) | p <- programPreds prog]
       expected =
-        [ ("abs1/2", "abs1 : semidet (num: <=) (num: =>). []"),
+        [ ("abs1/2", "abs1 : semidet (num: <=) (num: =>). [0]"),
           ("add3/3", "add3 : semidet (num: <=) (num: <=) (num: =>). []"),
           ("append/3", "append : semidet (list any: <=>) (any: <=>) (list any: <=>). [0]"),
           ("between/3", "between : nondet (num: <=) (num: <=) (num: =>). []"),
-          ("drop/3", "drop : semidet (list any: <=>) (num: <=) (any: <=>). []"),
+          ("drop/3", "drop : semidet (list any: <=>) (num: <=) (any: <=>). [1]"),
           ("foldl/4", "foldl : nondet (any: <=>) (list any: <=>) (any: <=>) (any: <=>). []"),
-          ("gcd/3", "gcd : semidet (num: <=) (num: <=) (num: =>). []"),
+          ("gcd/3", "gcd : semidet (num: <=) (num: <=) (num: =>). [1]"),
           ("include/3", "include : nondet (any: <=>) (list any: <=>) (list any: <=>). []"),
-          ("insert_sorted/3", "insert_sorted : semidet (num: <=) (list num: <=>) (list num: <=>). [1]"),
-          ("isort/2", "isort : semidet (list num: <=>) (list num: <=>). [0]"),
+          ("insert_sorted/3", "insert_sorted : semidet (num: <=) (list num: <=) (list num: =>). [1,0]"),
+          ("isort/2", "isort : semidet (list num: <=) (list num: =>). [0]"),
           ("last/2", "last : nondet (list any: <=>) (any: <=>). []"),
           ("length/2", "length : semidet (list any: <=>) (num: =>). [0]"),
           ("maplist/2", "maplist : nondet (any: <=>) (list any: <=>). []"),
           ("maplist/3", "maplist : nondet (any: <=>) (list any: <=>) (list any: <=>). []"),
-          ("max2/3", "max2 : semidet (num: <=) (num: <=) (num: =>). []"),
-          ("max_list/2", "max_list : nondet (list num: <=>) (num: <=>). []"),
+          ("max2/3", "max2 : semidet (num: <=) (num: <=) (num: =>). [0,1]"),
+          ("max_list/2", "max_list : nondet (list num: <=) (num: =>). []"),
           ("member/2", "member : nondet (any: <=>) (list any: <=>). []"),
-          ("merge_sorted/3", "merge_sorted : nondet (list num: <=>) (list num: <=>) (list num: <=>). []"),
-          ("min2/3", "min2 : semidet (num: <=) (num: <=) (num: =>). []"),
+          ("merge_sorted/3", "merge_sorted : nondet (list num: <=) (list num: <=) (list num: =>). []"),
+          ("min2/3", "min2 : semidet (num: <=) (num: <=) (num: =>). [0,1]"),
           ("msort/2", "msort : nondet (list any: <=>) (list num: <=>). []"),
-          ("no_attack/3", "no_attack : semidet (num: <=) (list num: =>) (num: <=>). [1]"),
-          ("nth/3", "nth : semidet (list any: <=>) (num: <=) (any: <=>). []"),
-          ("numlist/3", "numlist : semidet (num: <=) (num: <=) (list num: =>). []"),
+          ("no_attack/3", "no_attack : semidet (num: <=) (list num: <=) (num: <=). [1]"),
+          ("nth/3", "nth : semidet (list any: <=>) (num: <=) (any: <=>). [1]"),
+          ("numlist/3", "numlist : semidet (num: <=) (num: <=) (list num: =>). [2]"),
           ("permutation/2", "permutation : nondet (list any: <=>) (list any: <=>). []"),
-          ("queens/2", "queens : nondet (num: <=) (list num: <=>). []"),
+          ("queens/2", "queens : nondet (num: <=) (list num: <=). []"),
           ("reverse/2", "reverse : semidet (list any: <=>) (list any: <=>). [0]"),
-          ("safe_queens/1", "safe_queens : semidet (list num: <=>). [0]"),
+          ("safe_queens/1", "safe_queens : semidet (list num: <=). [0]"),
           ("select_elem/3", "select_elem : nondet (any: <=>) (list any: <=>) (list any: <=>). []"),
           ("split/3", "split : semidet (list any: <=>) (list any: <=>) (list any: <=>). [0]"),
-          ("sum_list/2", "sum_list : semidet (list num: =>) (num: =>). [0]"),
+          ("sum_list/2", "sum_list : semidet (list num: <=) (num: =>). [0]"),
           ("take/3", "take : nondet (list any: <=>) (num: <=) (list any: <=>). []"),
           ("zip/3", "zip : semidet (list any: <=>) (list any: <=>) (list any: <=>). [0]")
         ]
@@ -501,7 +505,98 @@ prop_infer_alias_guard_is_sound = unit $ do
   map argMode (sigArgs (predInferred m)) === [ModeIn, ModeIn, ModeOut]
   i <- predOrFail prog2 ("ins", 3)
   sigDet (predInferred i) === Semidet
-  sigSwitch (predInferred i) === [1]
+  sigSwitch (predInferred i) === [0, 1]
+
+-- ---------------------------------------------------------------------------
+-- Effects: the unsafe gate, pure DCG output, dynamic facts
+-- ---------------------------------------------------------------------------
+
+prop_effects_require_unsafe :: Property
+prop_effects_require_unsafe = unit $ do
+  let bad = "log X <- write X."
+  case loadProgramText bad of
+    Left err -> assert ("unsafe-call" `isInfixOf` err && "log : unsafe" `isInfixOf` err)
+    Right _ -> failure
+  -- effects propagate: calling an unsafe predicate needs unsafe too
+  case loadProgramText "log : unsafe.\nlog X <- write X.\np X <- log X." of
+    Left err -> assert ("p/1 is not declared unsafe" `isInfixOf` err)
+    Right _ -> failure
+  -- cut is an effect; if-then-else is not
+  case loadProgramText "first X <- member X [a, b], !.\nmember X [X | _].\nmember X [_ | T] <- member X T." of
+    Left err -> assert ("cut" `isInfixOf` err)
+    Right _ -> failure
+  assertAnswers "sign N S <- (N > 0 -> S = pos ; S = other)." "sign 1 S?" ["S = pos"]
+  -- declared unsafe predicates may do anything; queries are entry points
+  assertAnswers "log : unsafe.\nlog X <- write X, nl." "log hi?" ["hi\n", "true."]
+  assertAnswers "" "write direct, nl?" ["direct\n", "true."]
+  -- the checker reports the same thing with a position
+  ds <- evalIO (checkSource "gate.nprolog" bad [])
+  map diagnosticCode ds === ["unsafe-call"]
+
+prop_dcg_output :: Property
+prop_dcg_output = unit $ do
+  let prog =
+        unlines
+          [ "greeting Name -> \"Hello, \", wr Name, \"!\", nl.",
+            "row N S -> padr N 6, padl S 4, nl.",
+            "table [] -> [].",
+            "table [r N S | Rs] -> row N S, table Rs.",
+            "report X -> fmt \"x=~d (~w) ~s~n\" [X, foo X, \"ok\"].",
+            "parse_greeting Name -> \"Hello, \", seq Cs, \"!\", nl, { str_chars S Cs, str_atom S Name }."
+          ]
+  assertAnswers prog "emit (greeting world)?" ["Hello, world!\n", "true."]
+  assertAnswers prog "emit (table [r alice 3, r bob 12])?" ["alice    3\nbob     12\n", "true."]
+  assertAnswers prog "emit (report 7)?" ["x=7 (foo 7) ok\n", "true."]
+  assertAnswers prog "phrase (parse_greeting X) \"Hello, bob!\\n\"?" ["X = bob"]
+  assertAnswers "" "phrase (seq Xs) \"abc\"?" ["Xs = ['a', 'b', 'c']"]
+  assertAnswers "" "seq [X] [a, b] R?" ["X = a, R = [b]"]
+  assertAnswers "" "term_str (f a 1) S?" ["S = \"f a 1\""]
+  assertAnswers "" "'a' < 'b', \"ab\" < \"b\", char_code 'A' N?" ["N = 65"]
+  assertErrorContains "" "emit (fmt \"~d\" [a])?" "integer for ~d"
+
+prop_dynamic_facts :: Property
+prop_dynamic_facts = unit $ do
+  let prog =
+        unlines
+          [ "seen : dynamic.",
+            "visit : unsafe.",
+            "visit X <- assert (seen X).",
+            "count N <- findall X (seen X) Xs, length Xs N.",
+            "length [] 0.",
+            "length [_ | T] N <- length T N1, N is N1 + 1."
+          ]
+  assertAnswers prog "visit a, visit b, count N, retract (seen a), count M, seen Y?" ["N = 2, M = 1, Y = b"]
+  assertAnswers prog "count N?" ["N = 0"]
+  assertAnswers prog "visit a, retractall (seen _), count N?" ["N = 0"]
+  assertErrorContains prog "assert (other 1)?" "not declared dynamic"
+  -- facts are per branch: asserting in a failed branch leaves nothing behind
+  assertAnswers prog "(visit a, fail ; true), count N?" ["N = 0"]
+
+prop_read_file :: Property
+prop_read_file = unit $ do
+  tmp <- evalIO getTemporaryDirectory
+  let dataPath = tmp </> "infera_scores.txt"
+      prog =
+        unlines
+          [ "rows [N | Ns] -> digits N, nl, rows Ns.",
+            "rows [] -> [].",
+            "digits N -> { N in 0..9 }, [C], { char_code C Code, N is Code - 48 }.",
+            "total : unsafe.",
+            "total T <- phrase_from_file (rows Ns) \"" ++ dataPath ++ "\", sum Ns T.",
+            "sum [] 0.",
+            "sum [X | Xs] S <- sum Xs S1, S is S1 + X.",
+            "> total T?"
+          ]
+  evalIO (writeFile dataPath "3\n4\n5\n")
+  res <- evalIO (loadSource Map.empty prog)
+  case res of
+    Left err -> annotate err >> failure
+    Right (p, [q]) -> map showAnswer (summaryAnswers (solveAll p q)) === ["T = 12"]
+    Right _ -> failure
+  -- total/1 is pure in the sense of the gate? No: file reads are effects.
+  case loadProgramText "peek S <- read_file \"x\" S." of
+    Left err -> assert ("read_file/2 performs an effect" `isInfixOf` err)
+    Right _ -> failure
 
 prop_infer_tabling_defaults :: Property
 prop_infer_tabling_defaults = unit $ do
@@ -511,6 +606,7 @@ prop_infer_tabling_defaults = unit $ do
         [ "edge a b.",
           "path X Y <- path X Z, edge Z Y.",
           "path X Y <- edge X Y.",
+          "noisy : unsafe.",
           "noisy N <- write N, noisy N.",
           "quiet : notable.",
           "quiet X <- quiet X.",
@@ -563,7 +659,7 @@ prop_tabling_memoises = unit $ do
 
 prop_tabling_keeps_output :: Property
 prop_tabling_keeps_output = unit $ do
-  let prog = "count : table (int: <=).\ncount 0 <- write done.\ncount N <- N > 0, N1 is N - 1, count N1."
+  let prog = "count : table unsafe (int: <=).\ncount 0 <- write done.\ncount N <- N > 0, N1 is N - 1, count N1."
   assertAnswers prog "count 2?" ["done", "true."]
 
 prop_notable_generator_streams :: Property
@@ -707,7 +803,8 @@ prop_breadboard_optimization = unit $ do
   let oracle = unlines
         [ "min_cost [cost C P] C P.",
           "min_cost [cost C P | T] BC BP <- min_cost T C1 P1, (C1 < C -> BC = C1, BP = P1 ; BC = C, BP = P).",
-          "best_exhaustive Cs Ns Wired Placement Cost <- multi_nets Cs Ns MNs, length MNs M, between 0 M K, choose K MNs Wired, windows Ws, member (win Lo Hi) Ws, findall (cost C P) (solve Cs Wired Lo Hi P, score P C) Sols, Sols != [], !, min_cost Sols Cost Placement.",
+          "best_exhaustive Cs Ns Wired Placement Cost <- once (exhaustive Cs Ns Wired Sols), min_cost Sols Cost Placement.",
+          "exhaustive Cs Ns Wired Sols <- multi_nets Cs Ns MNs, length MNs M, between 0 M K, choose K MNs Wired, windows Ws, member (win Lo Hi) Ws, findall (cost C P) (solve Cs Wired Lo Hi P, score P C) Sols, Sols != [].",
           "accept Circuit Result <- comps Circuit Cs, nets Cs Ns, best Cs Ns W P C, Result = result W P C.",
           "reference Circuit Result <- comps Circuit Cs, nets Cs Ns, best_exhaustive Cs Ns W P C, Result = result W P C."
         ]
@@ -728,7 +825,7 @@ prop_breadboard_optimization = unit $ do
       summaryExhausted expected === False
       length (summaryAnswers actual) === 1
       map showAnswer (summaryAnswers actual) === map showAnswer (summaryAnswers expected)
-      let reported = solve ("run " ++ circuit ++ "?")
+      let reported = solve ("emit (report " ++ circuit ++ ")?")
       summaryErrors reported === []
       summaryExhausted reported === False
       length (summaryAnswers reported) === 1
@@ -801,6 +898,10 @@ inferaGroup =
       ("infer commit is sound", prop_infer_commit_is_sound),
       ("infer stdlib golden", prop_infer_stdlib_golden),
       ("infer alias guard is sound", prop_infer_alias_guard_is_sound),
+      ("effects require unsafe", prop_effects_require_unsafe),
+      ("dcg output", prop_dcg_output),
+      ("dynamic facts", prop_dynamic_facts),
+      ("read file", prop_read_file),
       ("infer tabling defaults", prop_infer_tabling_defaults),
       ("tabling left recursion", prop_tabling_left_recursion),
       ("tabling memoises", prop_tabling_memoises),
