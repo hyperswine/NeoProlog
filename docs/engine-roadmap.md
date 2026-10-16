@@ -41,8 +41,8 @@ the runner and executable paths. This is a local macOS arm64 baseline, not
 a controlled CI threshold: Infera engine revision
 `b08d850de8b11f7982f1054910df36a7ad9a3b89`, GHC 9.8.2, default Cabal library
 profile `-O1`, executable `-O2`, RTS `-N1`; SWI-Prolog 10.0.2 and Scryer
-0.10.0. The harness and checked fixtures are the working-tree changes accompanying
-this roadmap revision. Timings include startup, loading, solving and output;
+0.10.0. The harness and checked fixtures were recorded with this roadmap
+revision. Timings include startup, loading, solving and output;
 warmups are validated and excluded from the samples. Re-record on the same
 controlled runner/build configuration before judging a future regression.
 Inference counts must also be checked before reporting an inference rate;
@@ -67,6 +67,30 @@ that contract is established.
 
 ## Step 1: the abstract machine
 
+### Implementation status
+
+The first isolated foundation is in
+[`Infera.Machine.Heap`](../src/Infera/Machine/Heap.hs): paged mutable cells and
+trail, reversible occurs-checked unification, activation-local variable
+environments, typed constant/functor interning, and immutable copy-on-write
+heap snapshots. Twelve heap properties include 1,500 generated comparisons
+with `Infera.Unify`, plus fixed failure, aliasing, scalar, rollback and
+page-boundary cases.
+
+This starts milestone 1. The production resolver still uses `Infera.Engine`;
+the search driver, compatible frozen `SolverState` exports, control stack,
+CLP/table adapters and collector remain to be implemented. Initial structures
+hold child-address lists rather than packed WAM cells, and every binding is
+trailed. The opaque layout can change after profiling. No query-speed or
+bounded-residency improvement is claimed by this isolated layer.
+
+Heap addresses, activation environments and rollback marks belong to one
+branch. They may accompany the matching frozen snapshot, but must not cross
+independent heaps or divergent resumed branches. Allocation generations reject
+discarded addresses within a branch; they are not global heap identities.
+`ST` contains mutable pages, but the address type alone does not enforce this
+ownership rule. The control driver must preserve it explicitly.
+
 ### Data model
 
 Terms stay the `Term` type of `Infera.Syntax` for everything outside the
@@ -89,8 +113,11 @@ data Cell
   Trail elision requires a proven allocation-age condition relative to every
   live rollback scope, including sub-search barriers. The absence of an
   ordinary clause choice point is not sufficient.
-* Interned constants and functors: two tables mapping names to small ints, so
-  unification compares ints.  Strings and bignums live in the constant table.
+* Interned constants and functors: two tables mapping typed values and
+  name/arity pairs to small ints. Strings and bignums live in the constant
+  table. Scalar equality retains the reference semantics: floating-point
+  interning uses bit keys, but unification compares values so signed zeros
+  unify and NaN does not unify with itself.
 * Loaded clauses remain immutable templates. `Term -> heap` instantiation
   happens per activation in step 1; repeated occurrences of a variable share
   one cell. Step 2 replaces template traversal with instructions. `heap ->
@@ -424,8 +451,9 @@ work through the instruction loop's event hook.
 
 ## Validation throughout
 
-* The current 109 Hedgehog properties (including correctness models and the
-  signature golden file), plus new machine/compiler properties, must pass
+* The established 109 Hedgehog properties (including correctness models and the
+  signature golden file), plus the 12 heap properties and subsequent
+  machine/compiler properties, must pass
   against each engine. Keep generated comparisons with independent models as
   well as the reference; agreement between two engines is not a proof.
 * Compare ordered answers, duplicates, residual constraints, output, error

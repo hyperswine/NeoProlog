@@ -48,6 +48,7 @@ library
         Infera.Error
         Infera.Diagnostic
         Infera.Unify
+        Infera.Machine.Heap
         Infera.Arith
         Infera.CLP
         Infera.Program
@@ -58,6 +59,7 @@ library
         Infera.Repl
     build-depends:
         base                        >= 4.14 && < 5,
+        array                       >= 0.5 && < 0.6,
         bytestring                  >= 0.10,
         containers                  >= 0.6,
         cryptohash-sha1             >= 0.11,
@@ -69,7 +71,8 @@ library
         parser-combinators          >= 1.3,
         prettyprinter               >= 1.7,
         prettyprinter-ansi-terminal >= 1.1,
-        text                        >= 1.2
+        text                        >= 1.2,
+        transformers                >= 0.5 && < 0.7
 
 executable infera
     import:           warnings
@@ -88,6 +91,7 @@ test-suite infera-test
     main-is:          Spec.hs
     other-modules:    InferaTest CorrectnessTest MinesweeperTest InferenceTest
                       CLPPerformanceTest ReferenceCLP BreadboardTest TablingTest
+                      MachineHeapTest
     default-language: Haskell2010
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
     build-depends:
