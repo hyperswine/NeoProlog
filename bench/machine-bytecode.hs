@@ -18,14 +18,27 @@ import System.CPUTime (getCPUTime)
 import System.Info (arch, compilerName, compilerVersion, os)
 import System.Timeout (timeout)
 
-data Model = SumTo Integer | Entries Int
-data Case = Case String String Model
+data Model = SumTo Integer | Entries Int | Done
+data Case = Case String String String Model
 
 cases :: [Case]
 cases =
-  [ Case "helper-dispatch-10000" "loop 10000 0 Result?" (SumTo 10000),
-    Case "structured-list-300" "build 300 [] Result?" (Entries 300),
-    Case "structured-head-10000" "head_loop 10000 0 Result?" (SumTo 10000)
+  [ Case "helper-dispatch-10000" fixture "loop 10000 0 Result?" (SumTo 10000),
+    Case "structured-list-300" fixture "build 300 [] Result?" (Entries 300),
+    Case "structured-head-10000" fixture "head_loop 10000 0 Result?" (SumTo 10000),
+    Case "early-fail-body-2000" failureFixture "(huge _ ; Result = done)?" Done
+  ]
+
+-- A separate program avoids adding this large cold compiler workload to the
+-- other cases. The fallback answer exposes metrics accumulated before failure.
+failureFixture :: String
+failureFixture = unlines
+  [ "<- notable.",
+    "sink _ _.",
+    "huge Result <- fail, " ++ intercalate ", "
+      ["sink (entry " ++ show n ++ " (pair " ++ show n ++ " " ++ show n
+        ++ ") [" ++ intercalate ", " (replicate 3 (show n)) ++ "]) Result"
+      | n <- [1 .. 2000 :: Int]] ++ "."
   ]
 
 fixture :: String
@@ -74,6 +87,7 @@ independent model = [AnswerObservation [("Result", result)] [] []]
             mkList (replicate 3 (IntLit value)) Nothing]
         | value <- map toInteger [1 .. count]
         ] Nothing
+      Done -> Atom "done"
 
 -- Distinct unused logical-variable bases prevent pure applications from
 -- sharing an already evaluated search across samples. Named variables stay
@@ -92,13 +106,13 @@ forceObservations observations = do
   pure ()
 
 validate :: Case -> [Observation] -> [Observation] -> IO ()
-validate (Case name _ model) expected actual = do
+validate (Case name _ _ model) expected actual = do
   unless (actual == independent model) (fail (name ++ ": independent result model failed"))
   unless (actual == expected) (fail (name ++ ": ordered answer/residual/output/error/exhaustion stream differs from Reference"))
 
 checkedRun :: Int -> String -> (Program -> Query -> Search) -> Program -> Query
   -> Case -> [Observation] -> IO (Double, Double)
-checkedRun serial engine resolver program query testCase@(Case name _ _) expected = do
+checkedRun serial engine resolver program query testCase@(Case name _ _ _) expected = do
   wallStart <- getMonotonicTimeNSec
   cpuStart <- getCPUTime
   completed <- timeout budgetMicroseconds $ do
@@ -124,7 +138,7 @@ drain checkpoint = do
 -- Sampling is opt-in and outside all timing rows. A positive counter check
 -- prevents a successful all-fallback benchmark from being called bytecode.
 compiledProbe :: Program -> Query -> Case -> [Observation] -> IO ()
-compiledProbe program query testCase@(Case name _ _) expected = do
+compiledProbe program query testCase@(Case name _ _ model) expected = do
   completed <- timeout budgetMicroseconds $ do
     checkpoint <- either (fail . show) pure
       (Machine.startMeasuredWithBackend Machine.Bytecode program
@@ -135,10 +149,17 @@ compiledProbe program query testCase@(Case name _ _) expected = do
     validate testCase expected actual
     unless (Machine.metricCompiledActivations metrics > 0
       && Machine.metricBytecodeInstructions metrics > 0
-      && Machine.metricDirectCalls metrics > 0
       && Machine.metricHeadInstructions metrics > 0
       && Machine.metricHeadCellsAvoided metrics > 0)
-      (fail (name ++ ": compiled/direct dispatch was not exercised"))
+      (fail (name ++ ": compiled head matching was not exercised"))
+    case model of
+      Done -> unless (Machine.metricBodyGoalsMaterialized metrics == 1
+        && Machine.metricMaxHeapCells metrics < 64
+        && Machine.metricMaxTasks metrics <= 4
+        && Machine.metricMaxActivationRegisters metrics <= 2)
+          (fail (name ++ ": unreachable body goals were allocated"))
+      _ -> unless (Machine.metricDirectCalls metrics > 0)
+        (fail (name ++ ": direct dispatch was not exercised"))
     _ <- evaluate (length (show metrics))
     pure metrics
   case completed of
@@ -151,6 +172,10 @@ compiledProbe program query testCase@(Case name _ _) expected = do
         "head_instructions=" ++ show (Machine.metricHeadInstructions metrics),
         "head_cells_avoided=" ++ show (Machine.metricHeadCellsAvoided metrics),
         "max_activation_registers=" ++ show (Machine.metricMaxActivationRegisters metrics),
+        "body_goals_materialized=" ++ show (Machine.metricBodyGoalsMaterialized metrics),
+        "body_allocation_instructions=" ++ show (Machine.metricBodyAllocationInstructions metrics),
+        "max_heap_cells=" ++ show (Machine.metricMaxHeapCells metrics),
+        "max_tasks=" ++ show (Machine.metricMaxTasks metrics),
         "fully_drained=true", "timed=false"
       ])
 
@@ -159,9 +184,6 @@ median values = sort values !! div (length values) 2
 
 main :: IO ()
 main = do
-  items <- either fail pure (parseFile fixture)
-  program <- either fail pure (buildChecked items)
-  _ <- evaluate (length (show program))
   let paths =
         [ "src/Infera/Compile.hs", "src/Infera/Machine/Bytecode.hs",
           "src/Infera/Machine/Control.hs", "src/Infera/Machine/Heap.hs",
@@ -179,13 +201,18 @@ main = do
   _ <- evaluate (length fingerprint)
   putStrLn ("# source-fingerprint=" ++ fingerprint)
   putStrLn ("# compiler=" ++ compilerName ++ "-" ++ showVersion compilerVersion ++ " platform=" ++ arch ++ "-" ++ os)
-  putStrLn "# scope=loaded checked program; cold per-query compilation/cache construction+execution+projection+validation; no parsing or CLI startup"
+  putStrLn "# scope=loaded case-specific checked program; cold per-query compilation/cache construction+execution+projection+validation; no parsing or CLI startup"
   putStrLn "# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)"
   putStrLn "# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 measured_probe=5 normal_counters=false no_timing_threshold"
-  putStrLn "# compiled counters describe accepted activations; failed head instruction work is excluded"
+  putStrLn "# head counters describe accepted heads; failed head work is excluded; body counters count reached materializations"
   putStrLn "engine\tcase\tmedian_wall_seconds\tmedian_cpu_seconds\twall_samples\tcpu_samples"
-  forM_ cases $ \testCase@(Case name text model) -> do
+  forM_ cases $ \testCase@(Case name source text model) -> do
+    items <- either fail pure (parseFile source)
+    program <- either fail pure (buildChecked items)
+    _ <- evaluate (length (show program))
     query <- either fail pure (parseQuery text)
+    putStrLn ("# workload_fingerprint case=" ++ name ++ " value=" ++
+      show (fingerprintString (source ++ text ++ show (independent model))))
     let expected = execute 0 Reference.solveQuery program query
     initial <- timeout budgetMicroseconds $ do
       forceObservations expected
@@ -206,10 +233,12 @@ main = do
             cpus = map snd samples
         putStrLn (intercalate "\t"
           [engine, name, show (median walls), show (median cpus), show walls, show cpus])
-  let plans = [code | TLClause clause <- items, Just code <- [Compile.compileClause clause]]
-  putStrLn (intercalate " "
-    [ "# register_plan", "scope=all_supported_fixture_clauses",
-      "unshared_slots=" ++ show (sum (map Compile.codeUnsharedSlotCount plans)),
-      "pooled_slots=" ++ show (sum (map Compile.codeSlotCount plans)),
-      "timed=false"
-    ])
+    let plans = [code | TLClause clause <- items, Just code <- [Compile.compileClause clause]]
+    putStrLn (intercalate " "
+      [ "# register_plan", "case=" ++ name, "scope=all_supported_case_clauses",
+        "unshared_slots=" ++ show (sum (map Compile.codeUnsharedSlotCount plans)),
+        "pooled_slots=" ++ show (sum (map Compile.codeSlotCount plans)),
+        "max_body_temporary_registers=" ++ show
+          (maximum (0 : [Compile.goalRegisterCount goal | code <- plans, goal <- Compile.codeGoals code])),
+        "timed=false"
+      ])

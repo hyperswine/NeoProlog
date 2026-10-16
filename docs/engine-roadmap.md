@@ -78,7 +78,7 @@ signatures and result types. The original resolver lives in
 parity oracle for both roadmap steps. No machine resolution path calls the
 reference interpreter. **Step 1's historical local exit gates passed on
 2026-10-16; Step 2 now has opt-in compiled activation, specialized head matching,
-shared construction registers and direct calls.**
+temporary register reuse, per-goal body allocation and direct calls.**
 The [Step 1 acceptance report](engine-step1-acceptance-2026-10-16.md) records
 that snapshot's checks and measurements. The
 [Step 2 foundation report](engine-step2-foundation-2026-10-16.md) records the
@@ -599,8 +599,9 @@ Typed scalar comparison retains NaN's non-reflexive unification semantics.
 Head writes accumulate in the original depth-first order, and
 `Machine.CLP.unifyUsing` propagates them once after the entire structural
 match succeeds. A later mismatch therefore suppresses earlier delayed CLP
-errors exactly as whole-head unification does. An outer activation checkpoint
-rolls back roots, head/body nodes, trail and interning on any rejection.
+errors exactly as whole-head unification does. An outer head checkpoint
+rolls back roots, head nodes, trail and interning on rejection; each later
+body materialization owns its allocation transaction.
 
 Body construction begins after accepted head matching and propagation.
 Variable/scalar registers share values using exact scalar bits, retaining
@@ -609,15 +610,24 @@ The construction-register array is allocated lazily, separately from the head
 target stack. A known-shape fact may need no head constructors or construction
 registers, while its logical roots still reserve the same source IDs. Matched
 caller compounds are never substituted for body templates, whose raw local
-IDs remain observable. All body roots are currently built after head success;
-incremental per-goal construction and register/environment lifetimes remain
+IDs remain observable. The driver now builds only the next reached body goal.
+Its flat postorder plan uses direct local-variable operands and recycles scalar
+and constructor registers after their last read. The immutable continuation
+stores an activation base, remaining code and persistent suffix-live local-ID
+sets, without heap addresses or mutable registers. Collection retains those
+future locals and the current physical goal; materialization looks up the
+existing raw roots after relocation and never recreates retired locals. The
+final goal removes the continuation before dispatch so tail reuse still sees
+the return boundary. The source-local ID range is reserved up front; full
+argument/environment register allocation and lazy root reservation are still
 future work.
 
 Known ordinary user calls use `DirectRun`; builtins retain their existing
 dispatch precedence. The driver retains clause selection, contracts, success
 guards, tail eligibility and backtracking. VM head/allocation/avoidance/register
-counters describe accepted activations only; rejected attempts return no
-activation statistics.
+counters distinguish accepted-head work from reached body materializations;
+rejected heads return no activation statistics. Normal execution performs no
+instruction-statistic writes.
 
 Clauses containing control/meta calls, variable or noncallable goals,
 malformed local IDs, or recursively nested body cuts use the interpreter.
@@ -634,7 +644,9 @@ initial slice from the remaining WAM-style design. Its initial validated
 samples established compiled execution and parity without establishing a
 throughput gain over the interpreted driver. The
 [head/register report](engine-step2-head-register-2026-10-16.md) records
-subsequent implementation and validation.
+subsequent implementation and validation. The
+[lifetime report](engine-step2-lifetimes-2026-10-16.md) records incremental body
+construction, temporary register reuse and their acceptance results.
 
 ### Planned instruction set (WAM-lite)
 
@@ -704,8 +716,8 @@ the old program.
 
 ### Milestones
 
-1. **In progress:** compiled activation, specialized head matching, shared
-   variable/scalar registers and direct ordinary user calls for
+1. **In progress:** compiled activation, specialized head matching, per-goal
+   body construction, temporary register reuse and direct ordinary user calls for
    facts/first-order rules, with opt-in backend selection and interpreter
    fallback. Generated tests compare both native backends with Reference,
    including whole-head CLP error order, raw local IDs, contracts, source frames
@@ -713,7 +725,7 @@ the old program.
    their template path. Broader stdlib acceptance and the remaining compiled
    paths must pass before declaring the full first-order milestone complete.
 2. Control constructs and cut barriers; the full suite.
-3. Indexing instructions; register/environment lifetimes and trimming; LCO in
+3. Indexing instructions; full argument/environment registers and trimming; LCO in
    `execute`; load-time predicate caches with REPL invalidation.
 4. Determinism-directed code generation from declarations and inference.
 5. Full differential and API-lifetime suite against both the step 1 machine

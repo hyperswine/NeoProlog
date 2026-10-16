@@ -31,6 +31,7 @@ module Infera.Machine.Heap
     freezeHeap,
     restoreHeap,
     emptyEnvironment,
+    validateEnvironment,
     environmentFromRoots,
     copyReachable,
     newVariable,
@@ -107,6 +108,15 @@ data Environment = Environment !(IntMap Address) !(Maybe Address)
 
 emptyEnvironment :: Environment
 emptyEnvironment = Environment IM.empty Nothing
+
+-- | Validate an environment's allocation-prefix witness without importing,
+-- allocating, dereferencing or opening a transaction. Under branch ownership,
+-- the newest root certifies every earlier root, including entries that the
+-- caller does not currently use. Even an empty requested-variable lookup must
+-- validate this witness before accepting an existing environment.
+validateEnvironment :: Heap s -> Environment -> ST s (Either HeapError ())
+validateEnvironment heap (Environment _ frontier) =
+  runExceptT $ forM_ frontier (readCell heap)
 
 -- | Restore an activation environment from its existing raw variable roots.
 -- Bound variables retain a raw reference cell and are accepted. Every entry

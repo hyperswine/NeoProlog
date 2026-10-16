@@ -68,6 +68,7 @@ data ExecutionBackend = Interpreted | Bytecode deriving (Eq, Show)
 data Task
   = Run !Heap.Address !Int Scopes
   | DirectRun !PredKey !Heap.Address !Int Scopes
+  | CompiledBody !BytecodeVM.BodyFrame !Int Scopes !(Maybe Trace.ClauseSource)
   | Located (Maybe SourceSpan) Task
   | Return !Call
   | Emit SearchItem
@@ -185,12 +186,14 @@ data Metrics = Metrics
     -- failed heads can execute instructions without returning an activation.
     metricHeadInstructions :: !Int,
     metricHeadCellsAvoided :: !Int,
-    metricMaxActivationRegisters :: !Int
+    metricMaxActivationRegisters :: !Int,
+    metricBodyGoalsMaterialized :: !Int,
+    metricBodyAllocationInstructions :: !Int
   }
   deriving (Eq, Show)
 
 emptyMetrics :: Metrics
-emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 data Checkpoint = Checkpoint !Env !Heap.FrozenHeap !Running
 
@@ -353,11 +356,43 @@ driveSampled environment heap running = case runningPhase running of
               case lookupPred key (envProg environment) of
                 Just definition -> callPredicate environment heap counted address fuel scopes definition
                 Nothing -> runGoal environment heap counted address fuel scopes
+            CompiledBody frame fuel scopes source -> materializeBody environment heap next frame fuel scopes source
             Return call -> returnCall environment heap next call
             Emit item -> emitRecorded environment heap next item
             Fail -> drive environment heap next {runningPhase = Backtracking}
             Label variables -> label environment heap next variables
             Optimize variables cost -> optimize environment heap next variables cost
+
+-- Pending code holds logical IDs only. Reacquire their current roots after
+-- collection, then construct just the reached goal. Removing the final body
+-- frame before dispatch preserves the ordinary tail-call return boundary.
+materializeBody :: Env -> Heap.Heap s -> Running -> BytecodeVM.BodyFrame -> Int
+  -> Scopes -> Maybe Trace.ClauseSource -> MachineM s DriverStep
+materializeBody environment heap running frame fuel scopes source = do
+  let build = if runningMeasured running
+        then BytecodeVM.materializeNextMeasured else BytecodeVM.materializeNext
+  materialized <- checked (build heap (branchBindings (runningBranch running)) frame)
+  case materialized of
+    Nothing -> drive environment heap running
+    Just step -> do
+      let bodyCall = BytecodeVM.stepCall step
+          task = compiledTask environment (Compile.bodyKey bodyCall)
+            (BytecodeVM.stepRoot step) fuel scopes
+          located = if runningTraced running
+            then Located ((\site -> Trace.goalSourceSpan site (Compile.bodyTemplate bodyCall)) <$> source) task
+            else task
+          continuation = maybe [] (\pending -> [CompiledBody pending fuel scopes source])
+            (BytecodeVM.stepNextFrame step)
+          previous = runningMetrics running
+          metrics = if runningMeasured running then previous
+            {metricBodyGoalsMaterialized = metricBodyGoalsMaterialized previous + 1,
+             metricBodyAllocationInstructions = metricBodyAllocationInstructions previous
+               + BytecodeVM.stepAllocationInstructions step,
+             metricBytecodeInstructions = metricBytecodeInstructions previous
+               + BytecodeVM.stepAllocationInstructions step,
+             metricMaxActivationRegisters = max (metricMaxActivationRegisters previous)
+               (BytecodeVM.stepRegisterSlots step)} else previous
+      drive environment heap (withTasks (located : continuation) running {runningMetrics = metrics})
 
 beginTaskTrace :: Heap.Heap s -> Running -> Heap.Address -> MachineM s Running
 beginTaskTrace _ running _ | not (runningTraced running) = pure running
@@ -378,6 +413,7 @@ sample heap running = do
       owners (Located _ task) = owners task
       owners (Run _ _ scopes) = length scopes
       owners (DirectRun _ _ _ scopes) = length scopes
+      owners (CompiledBody _ _ scopes _) = length scopes
       owners _ = 0
       scopeDepth Nothing = 0
       scopeDepth (Just scope) = 1 + scopeDepth (runningScope (scopeParent scope))
@@ -428,6 +464,8 @@ prune requested running
       Run address fuel [(owner, min barrier depth) | (owner, barrier) <- scopes]
     clampTask (DirectRun key address fuel scopes) =
       DirectRun key address fuel [(owner, min barrier depth) | (owner, barrier) <- scopes]
+    clampTask (CompiledBody frame fuel scopes source) =
+      CompiledBody frame fuel [(owner, min barrier depth) | (owner, barrier) <- scopes] source
     clampTask (Return call) = Return call {callEntryDepth = min (callEntryDepth call) depth}
     clampTask task = task
 
@@ -909,6 +947,7 @@ collectLive heap running = do
           then concatMap termVars (callGoalTerm call : [goal | (goal, _, _) <- callTraceParents call]) else []
         variables (Label pending) = pending
         variables (Optimize pending cost) = pending ++ termVars cost
+        variables (CompiledBody frame _ _ _) = BytecodeVM.frameVariables frame
         variables _ = []
         scopeVariables = case runningScope running of
           Nothing -> []
@@ -984,18 +1023,17 @@ tryClauses environment heap running goal fuel scopes call ((ordinal, clause) : r
   (bindings, result, tasks, activation, acceptedFresh) <-
     case Map.lookup (callKey call, ordinal) (runningCode running) of
       Just code -> do
-        let activate = if runningMeasured running then BytecodeVM.activateMeasured else BytecodeVM.activate
+        let activate = if runningMeasured running then BytecodeVM.activateHeadMeasured else BytecodeVM.activateHead
         matched <- checked (activate heap (branchBindings branch)
           (ssStore (branchState branch)) goal base code)
         case matched of
           Left problem -> pure (branchBindings branch, Left problem, [], Nothing, base)
           Right Nothing -> pure (branchBindings branch, Right Nothing, [], Nothing, base)
           Right (Just accepted) -> do
-            let allocated = BytecodeVM.activationBindings accepted
-                task bodyCall bodyRoot = located (Compile.bodyTemplate bodyCall)
-                  (compiledTask environment (Compile.bodyKey bodyCall) bodyRoot (fuel - 1) scopes)
-            pure (allocated, Right (Just (allocated, BytecodeVM.activationStore accepted)),
-              zipWith task (Compile.codeBody code) (BytecodeVM.activationBodyRoots accepted),
+            let allocated = BytecodeVM.headBindings accepted
+                pending = maybe [] (\frame -> [CompiledBody frame (fuel - 1) scopes source])
+                  (BytecodeVM.headBodyFrame accepted)
+            pure (allocated, Right (Just (allocated, BytecodeVM.headStore accepted)), pending,
               Just accepted, fresh)
       Nothing -> do
         let headTerm = renameTerm base (clauseHead clause)
@@ -1014,12 +1052,12 @@ tryClauses environment heap running goal fuel scopes call ((ordinal, clause) : r
         Just accepted | runningMeasured withRetry -> previous
           {metricCompiledActivations = metricCompiledActivations previous + 1,
            metricBytecodeInstructions = metricBytecodeInstructions previous
-             + BytecodeVM.activationHeadInstructions accepted
-             + BytecodeVM.activationAllocationInstructions accepted,
-           metricHeadInstructions = metricHeadInstructions previous + BytecodeVM.activationHeadInstructions accepted,
-           metricHeadCellsAvoided = metricHeadCellsAvoided previous + BytecodeVM.activationHeadCellsAvoided accepted,
+             + BytecodeVM.headInstructions accepted
+             + BytecodeVM.headAllocationInstructions accepted,
+           metricHeadInstructions = metricHeadInstructions previous + BytecodeVM.headInstructions accepted,
+           metricHeadCellsAvoided = metricHeadCellsAvoided previous + BytecodeVM.headCellsAvoided accepted,
            metricMaxActivationRegisters = max (metricMaxActivationRegisters previous)
-             (BytecodeVM.activationRegisterSlots accepted)}
+             (BytecodeVM.headRegisterSlots accepted)}
         _ -> previous
       nextBranch = branch
         { branchBindings = bindings,

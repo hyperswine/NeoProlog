@@ -1,0 +1,32 @@
+# runtime-source-sha256=e95dbbb215c8a4ef82c8a3afbe3e14068addd3afada4a5161481d39626ac54c9
+# source-fingerprint=c0851ceafcb5cbe82f1e05e2a697448d
+# compiler=ghc-9.8 platform=aarch64-darwin
+# scope=loaded case-specific checked program; cold per-query compilation/cache construction+execution+projection+validation; no parsing or CLI startup
+# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)
+# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 measured_probe=5 normal_counters=false no_timing_threshold
+# head counters describe accepted heads; failed head work is excluded; body counters count reached materializations
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples
+# workload_fingerprint case=helper-dispatch-10000 value=9e801455f778ebadc46cb06c32c893cb
+# compiled_probe case=helper-dispatch-10000 compiled_activations=20001 bytecode_instructions=180004 direct_calls=20000 head_instructions=90004 head_cells_avoided=20001 max_activation_registers=1 body_goals_materialized=50000 body_allocation_instructions=90000 max_heap_cells=1027 max_tasks=5 fully_drained=true timed=false
+reference	helper-dispatch-10000	8.0009e-2	7.5756e-2	[9.8849e-2,7.3502e-2,8.0009e-2]	[8.8656e-2,7.061e-2,7.5756e-2]
+interpreted	helper-dispatch-10000	0.220584	0.209669	[0.195812,0.220584,0.221855]	[0.191252,0.209669,0.213005]
+bytecode	helper-dispatch-10000	0.254488	0.246769	[0.254488,0.242438,0.299929]	[0.246769,0.235084,0.27799]
+# register_plan case=helper-dispatch-10000 scope=all_supported_case_clauses unshared_slots=135 pooled_slots=84 max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=structured-list-300 value=1fb6142a448e9821a63828e2497c1678
+# compiled_probe case=structured-list-300 compiled_activations=601 bytecode_instructions=7204 direct_calls=600 head_instructions=2404 head_cells_avoided=601 max_activation_registers=10 body_goals_materialized=1200 body_allocation_instructions=2100 max_heap_cells=3679 max_tasks=3 fully_drained=true timed=false
+reference	structured-list-300	0.129473	0.124073	[0.129473,0.13116,0.12591]	[0.124073,0.125678,0.11903]
+interpreted	structured-list-300	0.378489	0.371976	[0.468853,0.378489,0.375501]	[0.440794,0.371976,0.368464]
+bytecode	structured-list-300	0.353759	0.348369	[0.377027,0.353759,0.341048]	[0.368766,0.348369,0.337922]
+# register_plan case=structured-list-300 scope=all_supported_case_clauses unshared_slots=135 pooled_slots=84 max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=structured-head-10000 value=feb3dd40986114f7bc9ebb73f88b4d37
+# compiled_probe case=structured-head-10000 compiled_activations=20001 bytecode_instructions=370004 direct_calls=20000 head_instructions=210004 head_cells_avoided=80001 max_activation_registers=3 body_goals_materialized=50000 body_allocation_instructions=160000 max_heap_cells=1026 max_tasks=3 fully_drained=true timed=false
+reference	structured-head-10000	8.94e-2	8.8258e-2	[9.2723e-2,8.94e-2,8.1635e-2]	[9.0496e-2,8.8258e-2,8.1283e-2]
+interpreted	structured-head-10000	0.286338	0.281209	[0.288992,0.284122,0.286338]	[0.283731,0.279766,0.281209]
+bytecode	structured-head-10000	0.325	0.31755	[0.325,0.290972,0.345457]	[0.31755,0.286669,0.33485]
+# register_plan case=structured-head-10000 scope=all_supported_case_clauses unshared_slots=135 pooled_slots=84 max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=early-fail-body-2000 value=835cfe0ab5d1658e123e2e8271275837
+# compiled_probe case=early-fail-body-2000 compiled_activations=1 bytecode_instructions=3 direct_calls=0 head_instructions=2 head_cells_avoided=1 max_activation_registers=1 body_goals_materialized=1 body_allocation_instructions=1 max_heap_cells=16 max_tasks=3 fully_drained=true timed=false
+reference	early-fail-body-2000	3.0e-6	4.0e-6	[5.0e-6,3.0e-6,3.0e-6]	[4.0e-6,4.0e-6,2.0e-6]
+interpreted	early-fail-body-2000	3.3979e-2	3.2988e-2	[3.4542e-2,3.3979e-2,3.0246e-2]	[3.4056e-2,3.2988e-2,2.9812e-2]
+bytecode	early-fail-body-2000	1.0811e-2	1.0749e-2	[1.0811e-2,1.081e-2,1.1046e-2]	[1.0749e-2,1.0687e-2,1.0974e-2]
+# register_plan case=early-fail-body-2000 scope=all_supported_case_clauses unshared_slots=28006 pooled_slots=14007 max_body_temporary_registers=3 timed=false

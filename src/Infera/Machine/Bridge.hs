@@ -6,6 +6,7 @@ module Infera.Machine.Bridge
   ( Bindings,
     newBindings,
     allocateActivation,
+    lookupVariables,
     bindingCount,
     bindingVariables,
     rebuild,
@@ -83,6 +84,27 @@ allocateActivation heap bindings base count
   | count <= 0 = pure (Left IncompatibleBindings)
   | base > maxBound - count = pure (Left HeapCapacityExceeded)
   | otherwise = importTerms heap bindings (map Var [base .. base + count - 1])
+
+-- | Look up existing logical roots without allocating or extending an
+-- activation. Missing IDs fail rather than recreating locals retired by
+-- collection. Request order and duplicates are preserved, as are the raw
+-- roots of bound aliases; this operation never dereferences a variable.
+--
+-- The environment's allocation-prefix witness is validated once even when
+-- the request is empty, then every requested root and source ID is checked.
+-- The bindings and heap must still belong to the same branch. This read-only
+-- operation needs neither a checkpoint nor an imported wrapper term.
+lookupVariables :: Heap s -> Bindings -> [VarId]
+  -> ST s (Either HeapError [Address])
+lookupVariables heap (Bindings roots names environment) variables = runExceptT $ do
+  checked (Heap.validateEnvironment heap environment)
+  forM variables $ \variable -> do
+    address <- maybe (throwError IncompatibleBindings) pure (IM.lookup variable roots)
+    unless (Map.lookup address names == Just variable) (throwError IncompatibleBindings)
+    shape <- checked (Heap.viewRaw heap address)
+    case shape of
+      Heap.VariableView original | original == address -> pure address
+      _ -> throwError IncompatibleBindings
 
 -- | Rebuild at a deterministic collection safe point. The caller must prove
 -- that every surviving rollback owner has its own immutable frozen heap;

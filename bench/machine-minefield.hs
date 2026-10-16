@@ -157,7 +157,9 @@ metricFields metrics =
    ("direct_calls", show (Machine.metricDirectCalls metrics)),
    ("head_instructions", show (Machine.metricHeadInstructions metrics)),
    ("head_cells_avoided", show (Machine.metricHeadCellsAvoided metrics)),
-   ("max_activation_registers", show (Machine.metricMaxActivationRegisters metrics))]
+   ("max_activation_registers", show (Machine.metricMaxActivationRegisters metrics)),
+   ("body_goals_materialized", show (Machine.metricBodyGoalsMaterialized metrics)),
+   ("body_allocation_instructions", show (Machine.metricBodyAllocationInstructions metrics))]
 
 main :: IO ()
 main = do
@@ -216,6 +218,7 @@ main = do
     unless (engine /= Bytecode || not measured || case metrics of
       Just counts -> Machine.metricCompiledActivations counts > 0
         && Machine.metricHeadInstructions counts > 0 && Machine.metricHeadCellsAvoided counts > 0
+        && Machine.metricBodyGoalsMaterialized counts > 0 && Machine.metricBodyAllocationInstructions counts > 0
       Nothing -> False) (fail "Bytecode minefield did not exercise compiled head matching")
     either fail pure (validate phase size bombs result)
     case oracle of

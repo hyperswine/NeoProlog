@@ -130,6 +130,40 @@ checkedRun serial resolver program query testCase optimum expected = do
 median :: [Double] -> Double
 median values = sort values !! (length values `div` 2)
 
+compiledProbe :: Program -> Query -> Case -> Integer -> QuerySummary -> IO ()
+compiledProbe program query testCase@(Case name _ _ _ _) optimum expected = do
+  completed <- timeout 30000000 $ do
+    checkpoint <- either (fail . show) pure (Machine.startMeasuredWithBackend Machine.Bytecode program
+      (query {queryNVars = queryNVars query + 5}))
+    (search, metrics) <- either fail pure (drain checkpoint)
+    let actual = summarizeSearch query search
+    _ <- evaluate (length (show actual))
+    either fail pure (validate testCase optimum actual)
+    unless (observe actual == observe expected) (fail "Compiled probe differs from reference placement/order")
+    unless (Machine.metricCompiledActivations metrics > 0
+      && Machine.metricHeadInstructions metrics > 0
+      && Machine.metricBodyGoalsMaterialized metrics > 0
+      && Machine.metricBodyAllocationInstructions metrics > 0)
+      (fail "Compiled breadboard probe did not exercise incremental allocation")
+    pure metrics
+  case completed of
+    Nothing -> fail (name ++ ": compiled breadboard probe exceeded 30 seconds")
+    Just metrics -> putStrLn (intercalate " "
+      ["# compiled_probe", "case=" ++ name,
+       "compiled_activations=" ++ show (Machine.metricCompiledActivations metrics),
+       "head_instructions=" ++ show (Machine.metricHeadInstructions metrics),
+       "body_goals_materialized=" ++ show (Machine.metricBodyGoalsMaterialized metrics),
+       "body_allocation_instructions=" ++ show (Machine.metricBodyAllocationInstructions metrics),
+       "max_activation_registers=" ++ show (Machine.metricMaxActivationRegisters metrics),
+       "fully_drained=true", "timed=false"])
+  where
+    drain checkpoint = case Machine.resume checkpoint of
+      Left problem -> Left (show problem)
+      Right Machine.Finished -> Right ([], Machine.checkpointMetrics checkpoint)
+      Right (Machine.Yield item next) -> do
+        (remaining, metrics) <- drain next
+        pure (item : remaining, metrics)
+
 main :: IO ()
 main = do
   source <- readFile "examples/breadboard.nprolog"
@@ -137,11 +171,13 @@ main = do
   program <- either fail pure (buildChecked [item | item <- items, case item of TLQuery _ -> False; _ -> True])
   -- Force the parsed/checked program before the first timed execution.
   _ <- evaluate (length (show program))
-  let sourcePaths = ["src/Infera/Machine/Control.hs", "src/Infera/Machine/Tail.hs", "src/Infera/Machine/CLP.hs",
+  let sourcePaths = ["src/Infera/Compile.hs", "src/Infera/Machine/Bytecode.hs",
+        "src/Infera/Machine/Control.hs", "src/Infera/Machine/Tail.hs", "src/Infera/Machine/CLP.hs",
         "src/Infera/Machine/Bridge.hs", "src/Infera/Machine/Heap.hs", "src/Infera/Engine.hs", "src/Infera/Engine/Reference.hs",
         "src/Infera/Machine/Builtins.hs", "src/Infera/Machine/Table.hs", "src/Infera/Machine/Trace/Types.hs",
         "src/Infera/Engine/Contracts.hs", "src/Infera/CLP.hs",
         "src/Infera/Syntax.hs", "src/Infera/Unify.hs", "src/Infera/Arith.hs", "src/Infera/Program.hs",
+        "src/Infera/Infer.hs", "src/Infera/Purity.hs", "src/Infera/Diagnostic.hs",
         "examples/breadboard.nprolog", "bench/machine-breadboard.hs"]
   sources <- mapM (\path -> readFile path >>= \contents -> pure (path, contents)) sourcePaths
   putStrLn ("# source-fingerprint=" ++ show (fingerprintString (concatMap (\(path, contents) -> path ++ "\n" ++ contents) sources)))
@@ -157,7 +193,9 @@ main = do
     case initial of Nothing -> fail (name ++ ": reference validation timed out"); Just _ -> pure ()
     optimum <- either fail pure (expectedCost testCase expected)
     either fail pure (validate testCase optimum expected)
-    forM_ [("reference", Reference.solveQuery), ("machine", Machine.solveQuery)] $ \(engine, resolver) -> do
+    compiledProbe program query testCase optimum expected
+    forM_ [("reference", Reference.solveQuery), ("machine", Machine.solveQuery),
+      ("bytecode", Machine.solveQueryWithBackend Machine.Bytecode)] $ \(engine, resolver) -> do
       _ <- checkedRun 1 resolver program query testCase optimum expected
       samples <- forM [2 .. 4] $ \serial -> checkedRun serial resolver program query testCase optimum expected
       let walls = map fst samples

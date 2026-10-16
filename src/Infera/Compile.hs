@@ -11,6 +11,15 @@ module Infera.Compile
     Instruction (..),
     HeadInstruction (..),
     BodyCall (..),
+    GoalOperand (..),
+    GoalInstruction (..),
+    GoalCode,
+    goalCall,
+    goalInstructions,
+    goalRoot,
+    goalRegisterCount,
+    goalVariables,
+    goalSuffixVariables,
     ClauseCode,
     codeVariableCount,
     codeSlotCount,
@@ -20,11 +29,15 @@ module Infera.Compile
     codeHead,
     codeHeadInstructions,
     codeBody,
+    codeGoals,
     compileClause,
   )
 where
 
 import Data.Array (Array, (!), listArray)
+import qualified Data.IntMap.Strict as IM
+import qualified Data.IntSet as IS
+import Data.List (foldl')
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import GHC.Float (castDoubleToWord64)
@@ -60,41 +73,78 @@ data BodyCall = BodyCall
   }
   deriving (Eq, Show)
 
+-- | Logical locals never consume a construction register. Temporary operands
+-- address a physical register, which may be reused after its last read.
+data GoalOperand = Local !Int | Temporary !Int
+  deriving (Eq, Show)
+
+data GoalInstruction
+  = GoalConstant !Int !Term
+  | GoalCompound !Int !String [GoalOperand]
+  deriving (Eq, Show)
+
+-- The suffix sets share persistent IntSet subtrees. Keeping an eager list of
+-- every future local at every goal would be quadratic for large bodies.
+data GoalCode = GoalCode !BodyCall [GoalInstruction] !GoalOperand !Int
+  !IS.IntSet !IS.IntSet
+  deriving (Eq, Show)
+
+goalCall :: GoalCode -> BodyCall
+goalCall (GoalCode call _ _ _ _ _) = call
+
+goalInstructions :: GoalCode -> [GoalInstruction]
+goalInstructions (GoalCode _ instructions _ _ _ _) = instructions
+
+goalRoot :: GoalCode -> GoalOperand
+goalRoot (GoalCode _ _ root _ _ _) = root
+
+goalRegisterCount :: GoalCode -> Int
+goalRegisterCount (GoalCode _ _ _ count _ _) = count
+
+goalVariables :: GoalCode -> IS.IntSet
+goalVariables (GoalCode _ _ _ _ variables _) = variables
+
+goalSuffixVariables :: GoalCode -> IS.IntSet
+goalSuffixVariables (GoalCode _ _ _ _ _ variables) = variables
+
 -- Keep both the constructor and record-update syntax private: an instruction
 -- operand cannot refer forward, use an invalid local variable, or smuggle a
 -- compound into PutConstant.
 data ClauseCode = ClauseCode !Int !Int !Int [Instruction]
-  (Array Slot Instruction) !Slot [HeadInstruction] [BodyCall]
+  (Array Slot Instruction) !Slot [HeadInstruction] [BodyCall] [GoalCode]
   deriving (Eq, Show)
 
 codeVariableCount :: ClauseCode -> Int
-codeVariableCount (ClauseCode count _ _ _ _ _ _ _) = count
+codeVariableCount (ClauseCode count _ _ _ _ _ _ _ _) = count
 
 codeSlotCount :: ClauseCode -> Int
-codeSlotCount (ClauseCode _ count _ _ _ _ _ _) = count
+codeSlotCount (ClauseCode _ count _ _ _ _ _ _ _) = count
 
 -- | Source-node count before variable/scalar register sharing.
 codeUnsharedSlotCount :: ClauseCode -> Int
-codeUnsharedSlotCount (ClauseCode _ _ count _ _ _ _ _) = count
+codeUnsharedSlotCount (ClauseCode _ _ count _ _ _ _ _ _) = count
 
 codeInstructions :: ClauseCode -> [Instruction]
-codeInstructions (ClauseCode _ _ _ instructions _ _ _ _) = instructions
+codeInstructions (ClauseCode _ _ _ instructions _ _ _ _ _) = instructions
 
 -- | Constant-time access to the immutable construction plan, shared across
 -- activations rather than rebuilding its instruction array for each call.
 codeInstructionAt :: ClauseCode -> Slot -> Maybe Instruction
-codeInstructionAt (ClauseCode _ count _ _ instructions _ _ _) slot
+codeInstructionAt (ClauseCode _ count _ _ instructions _ _ _ _) slot
   | slot < 0 || slot >= count = Nothing
   | otherwise = Just (instructions ! slot)
 
 codeHead :: ClauseCode -> Slot
-codeHead (ClauseCode _ _ _ _ _ slot _ _) = slot
+codeHead (ClauseCode _ _ _ _ _ slot _ _ _) = slot
 
 codeHeadInstructions :: ClauseCode -> [HeadInstruction]
-codeHeadInstructions (ClauseCode _ _ _ _ _ _ instructions _) = instructions
+codeHeadInstructions (ClauseCode _ _ _ _ _ _ instructions _ _) = instructions
 
 codeBody :: ClauseCode -> [BodyCall]
-codeBody (ClauseCode _ _ _ _ _ _ _ body) = body
+codeBody (ClauseCode _ _ _ _ _ _ _ body _) = body
+
+codeGoals :: ClauseCode -> [GoalCode]
+codeGoals (ClauseCode _ _ _ _ _ _ _ _ goals) = goals
 
 -- Reverse instructions avoid quadratic list appends during compilation.
 -- Share only local roots and immutable scalars, preserving float bits. Source
@@ -126,10 +176,12 @@ compileClause clause
       if all firstOrderGoal (clauseBody clause) then pure () else Nothing
       (headSlot, headNode, afterHead) <- compileTerm (Builder 0 0 [] Map.empty) (clauseHead clause)
       (body, Builder slots unshared instructions _) <- compileBody afterHead (clauseBody clause)
+      goals <- mapM compileGoal (clauseBody clause)
       let (_, headInstructions) = flattenHead headNode
           allocation = reverse instructions
       pure (ClauseCode (max 1 count) slots unshared allocation
-        (listArray (0, slots - 1) allocation) headSlot (headInstructions []) body)
+        (listArray (0, slots - 1) allocation) headSlot (headInstructions []) body
+        (suffixGoals goals))
   where
     count = clauseNVars clause
     variables = concatMap termVarIds (clauseHead clause : clauseBody clause)
@@ -217,3 +269,78 @@ flattenHead node = case node of
         (childrenWidth, instructions) = foldr combine (0, id) children
         totalWidth = 1 + childrenWidth
      in (totalWidth, (HeadCompound slot name (length children) totalWidth :) . instructions)
+
+compileGoal :: Term -> Maybe GoalCode
+compileGoal template = do
+  key <- functorOf template
+  (rootSlot, _, Builder _ _ reversed _) <- compileTerm (Builder 0 0 [] Map.empty) template
+  (virtual, roots) <- virtualGoal (reverse reversed)
+  root <- IM.lookup rootSlot roots
+  (instructions, physicalRoot, registers) <- allocateGoal virtual root
+  let rootRegister = case physicalRoot of Local local -> local; Temporary register -> register
+      variables = IS.fromList (termVarIds template)
+  pure (GoalCode (BodyCall rootRegister key template) instructions physicalRoot registers variables IS.empty)
+
+-- Erase variable move instructions before physical allocation. Source locals
+-- are resolved through their stable IDs only when this goal materializes.
+virtualGoal :: [Instruction] -> Maybe ([GoalInstruction], IM.IntMap GoalOperand)
+virtualGoal = go [] IM.empty
+  where
+    go instructions roots [] = Just (reverse instructions, roots)
+    go instructions roots (instruction : rest) = case instruction of
+      UseVariable slot local -> go instructions (IM.insert slot (Local local) roots) rest
+      PutConstant slot scalar -> go (GoalConstant slot scalar : instructions)
+        (IM.insert slot (Temporary slot) roots) rest
+      PutCompound slot name children -> do
+        operands <- mapM (\child -> IM.lookup child roots) children
+        go (GoalCompound slot name operands : instructions)
+          (IM.insert slot (Temporary slot) roots) rest
+
+-- Read every child using the old assignment, retire its final uses, then
+-- assign the destination from the free pool. The runtime must likewise read
+-- every child address before overwriting a recycled destination register.
+allocateGoal :: [GoalInstruction] -> GoalOperand
+  -> Maybe ([GoalInstruction], GoalOperand, Int)
+allocateGoal instructions root = do
+  let countOperand counts (Local _) = counts
+      countOperand counts (Temporary temporary) = IM.insertWith (+) temporary (1 :: Int) counts
+      operands (GoalConstant _ _) = []
+      operands (GoalCompound _ _ children) = children
+      uses = foldl' countOperand IM.empty (root : concatMap operands instructions)
+      resolve _ local@(Local _) = Just local
+      resolve assignments (Temporary temporary) = Temporary <$> IM.lookup temporary assignments
+      release (assignments, remaining, free) operand = case operand of
+        Local _ -> Just (assignments, remaining, free)
+        Temporary temporary -> do
+          count <- IM.lookup temporary remaining
+          register <- IM.lookup temporary assignments
+          if count <= 0 then Nothing else if count == 1
+            then Just (IM.delete temporary assignments, IM.delete temporary remaining, IS.insert register free)
+            else Just (assignments, IM.insert temporary (count - 1) remaining, free)
+      claim next free = case IS.minView free of
+        Just (register, remaining) -> Just (register, next, remaining)
+        Nothing | next < maxBound -> Just (next, next + 1, free)
+        _ -> Nothing
+      step (built, assignments, remaining, free, next) instruction = do
+        let children = operands instruction
+        physicalChildren <- mapM (resolve assignments) children
+        (retained, usesLeft, available) <- foldMaybe release (assignments, remaining, free) children
+        (destination, following, pool) <- claim next available
+        let (virtualDestination, physical) = case instruction of
+              GoalConstant temporary scalar -> (temporary, GoalConstant destination scalar)
+              GoalCompound temporary name _ -> (temporary, GoalCompound destination name physicalChildren)
+        pure (physical : built, IM.insert virtualDestination destination retained, usesLeft, pool, following)
+  (reversed, assignments, _, _, registers) <- foldMaybe step ([], IM.empty, uses, IS.empty, 0) instructions
+  physicalRoot <- resolve assignments root
+  pure (reverse reversed, physicalRoot, registers)
+
+foldMaybe :: (state -> value -> Maybe state) -> state -> [value] -> Maybe state
+foldMaybe _ state [] = Just state
+foldMaybe step state (value : rest) = step state value >>= \next -> foldMaybe step next rest
+
+suffixGoals :: [GoalCode] -> [GoalCode]
+suffixGoals = snd . foldr add (IS.empty, [])
+  where
+    add (GoalCode call instructions root registers variables _) (following, goals) =
+      let live = IS.union variables following
+       in (live, GoalCode call instructions root registers variables live : goals)

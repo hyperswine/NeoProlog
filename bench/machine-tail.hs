@@ -184,7 +184,9 @@ metricFields metrics =
     ("direct_calls", show (Machine.metricDirectCalls metrics)),
     ("head_instructions", show (Machine.metricHeadInstructions metrics)),
     ("head_cells_avoided", show (Machine.metricHeadCellsAvoided metrics)),
-    ("max_activation_registers", show (Machine.metricMaxActivationRegisters metrics))
+    ("max_activation_registers", show (Machine.metricMaxActivationRegisters metrics)),
+    ("body_goals_materialized", show (Machine.metricBodyGoalsMaterialized metrics)),
+    ("body_allocation_instructions", show (Machine.metricBodyAllocationInstructions metrics))
   ]
 
 main :: IO ()
@@ -227,6 +229,8 @@ main = do
     then do
       unless (Machine.metricTailCalls metrics > count - 1000) (fail "Tail loop did not reuse its frame")
       unless (Machine.metricCollections metrics > 0) (fail "Tail loop did not exercise collection")
+      unless (backend /= Machine.Bytecode || Machine.metricBodyGoalsMaterialized metrics >= count)
+        (fail "Bytecode tail loop did not exercise deferred body construction")
     else pure ()
   ended <- getMonotonicTimeNSec
   performGC

@@ -7,8 +7,9 @@ module CompileTest (compileGroup) where
 
 import Control.Monad (foldM, forM_)
 import qualified Data.IntMap.Strict as IM
+import qualified Data.IntSet as IS
 import Data.List (nub)
-import Data.Maybe (isNothing)
+import Data.Maybe (isNothing, listToMaybe)
 import Data.Word (Word64)
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import Hedgehog hiding (Var)
@@ -100,6 +101,29 @@ nodeCount :: Term -> Int
 nodeCount (Compound _ arguments) = 1 + sum (map nodeCount arguments)
 nodeCount _ = 1
 
+-- Physical registers may be overwritten. Resolve all child values from the
+-- old register map before installing a constructor into a recycled slot.
+decodeGoal :: GoalCode -> Maybe Term
+decodeGoal goal = do
+  registers <- foldM step IM.empty (goalInstructions goal)
+  operand registers (goalRoot goal)
+  where
+    valid register = register >= 0 && register < goalRegisterCount goal
+    operand _ (Local variable) = Just (Var variable)
+    operand registers (Temporary register)
+      | valid register = IM.lookup register registers
+      | otherwise = Nothing
+    step registers instruction = do
+      (destination', term) <- case instruction of
+        GoalConstant register scalar -> case scalar of
+          Var _ -> Nothing
+          Compound _ _ -> Nothing
+          _ -> Just (register, scalar)
+        GoalCompound register name children -> do
+          values <- mapM (operand registers) children
+          pure (register, Compound name values)
+      if valid destination' then Just (IM.insert destination' term registers) else Nothing
+
 genScalar :: Gen Term
 genScalar = Gen.choice
   [ Atom <$> Gen.element ["nil", "leaf", "true", "\955"],
@@ -152,6 +176,16 @@ prop_generated_register_program_preserves_raw_clause = withTests 250 . property 
   map destination (codeInstructions code) === [0 .. codeSlotCount code - 1]
   map (observe . bodyTemplate) (codeBody code) === map observe (clauseBody clause)
   map (Just . bodyKey) (codeBody code) === map functorOf (clauseBody clause)
+  let goals = codeGoals code
+      variables = map (IS.fromList . termVarIds) (clauseBody clause)
+  physical <- evalMaybe (mapM decodeGoal goals)
+  map observe physical === map observe (clauseBody clause)
+  map (observe . bodyTemplate . goalCall) goals === map observe (clauseBody clause)
+  map (Just . bodyKey . goalCall) goals === map functorOf (clauseBody clause)
+  map goalVariables goals === variables
+  map goalSuffixVariables goals === init (scanr IS.union IS.empty variables)
+  forM_ goals $ \goal ->
+    assert (goalRegisterCount goal <= length (goalInstructions goal))
 
 unit :: PropertyT IO () -> Property
 unit = withTests 1 . property
@@ -214,8 +248,10 @@ prop_register_sharing_retains_scalar_bits_and_distinct_constructors = unit $ do
   code <- evalMaybe (compileClause clause)
   decoded <- evalMaybe (decode code)
   decodedHead <- evalMaybe (decodeHead code)
+  physical <- evalMaybe (mapM decodeGoal (codeGoals code))
   map observe decoded === map observe (clauseHead clause : clauseBody clause)
   observe decodedHead === observe (clauseHead clause)
+  map observe physical === map observe (clauseBody clause)
   let instructions = codeInstructions code
       constants = [observe scalar | PutConstant _ scalar <- instructions]
   length [() | UseVariable _ 0 <- instructions] === 1
@@ -227,11 +263,35 @@ prop_register_sharing_retains_scalar_bits_and_distinct_constructors = unit $ do
   assert (isNothing (codeInstructionAt code (-1)))
   assert (isNothing (codeInstructionAt code (codeSlotCount code)))
 
+prop_per_goal_register_lifetimes_and_future_local_roots :: Property
+prop_per_goal_register_lifetimes_and_future_local_roots = unit $ do
+  let nested = foldr (\_ child -> Compound "box" [child]) (Var 0) [1 .. 200 :: Int]
+      clause = Clause (Compound "p" [Var 0])
+        [ Compound "helper" [nested],
+          Compound "helper" [Compound "pair" [Var 1, Var 1]],
+          Atom "fail", Compound "helper" [Var 2]
+        ] 3
+  code <- evalMaybe (compileClause clause)
+  let goals = codeGoals code
+  first <- evalMaybe (listToMaybe goals)
+  physical <- evalMaybe (mapM decodeGoal goals)
+  map observe physical === map observe (clauseBody clause)
+  map goalRegisterCount goals === [1, 1, 1, 1]
+  map goalSuffixVariables goals === map IS.fromList [[0, 1, 2], [1, 2], [2], [2]]
+  assert (length (goalInstructions first) > 200)
+  assert (codeSlotCount code > 200)
+  -- Every constructor in the first goal can overwrite the child's final-use
+  -- register, while source-local variables never occupy temporary registers.
+  forM_ (goalInstructions first) $ \instruction -> case instruction of
+    GoalCompound destination' _ _ -> destination' === 0
+    GoalConstant _ _ -> failure
+
 compileGroup :: Group
 compileGroup = Group "clause compiler"
   [ ("generated_register_program_preserves_raw_clause", prop_generated_register_program_preserves_raw_clause),
     ("control_and_nested_cuts_fall_back", prop_control_and_nested_cuts_fall_back),
     ("malformed_variables_and_uncallable_goals_fall_back", prop_malformed_variables_and_uncallable_goals_fall_back),
     ("first_order_data_and_scalar_identities_remain_distinct", prop_first_order_data_and_scalar_identities_remain_distinct),
-    ("register_sharing_retains_scalar_bits_and_distinct_constructors", prop_register_sharing_retains_scalar_bits_and_distinct_constructors)
+    ("register_sharing_retains_scalar_bits_and_distinct_constructors", prop_register_sharing_retains_scalar_bits_and_distinct_constructors),
+    ("per_goal_register_lifetimes_and_future_local_roots", prop_per_goal_register_lifetimes_and_future_local_roots)
   ]
