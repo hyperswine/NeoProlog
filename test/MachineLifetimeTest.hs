@@ -19,7 +19,7 @@ import Hedgehog hiding (Var)
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Infera.CLP
-import Infera.Compile
+import Infera.Compile hiding (Cut)
 import qualified Infera.Engine.Reference as Reference
 import Infera.Error
 import qualified Infera.Machine.Bridge as Bridge
@@ -173,6 +173,9 @@ decodeGoal base code = do
     operand registers (Temporary temporary) =
       maybe (Left "read of an uninitialized physical register") Right (IM.lookup temporary registers)
     instruction (registers, reused) operation = case operation of
+      GoalOwner destination
+        | not (valid destination) -> Left "owner destination outside register array"
+        | otherwise -> Right (IM.insert destination (OInt (toInteger base)) registers, reused)
       GoalConstant destination scalar
         | not (valid destination) -> Left "constant destination outside register array"
         | otherwise -> case scalar of
@@ -188,7 +191,7 @@ decodeGoal base code = do
 
 genScalar :: Gen Term
 genScalar = Gen.choice
-  [ Atom <$> Gen.element ["nil", "same", "a", "b", "\955"],
+  [ Atom <$> Gen.element ["nil", "same", "a", "b", "!", "\955"],
     IntLit <$> Gen.choice [Gen.integral (Range.linear (-3) 3), pure (2 ^ (80 :: Int) + 9)],
     FloatLit <$> Gen.element [-2.5, -0.0, 0.0, 1.5, -1 / 0, 1 / 0,
       castWord64ToDouble 0x7ff8000000000042, castWord64ToDouble 0x7ff8000000000043],
@@ -518,12 +521,12 @@ unreachableBody :: String
 unreachableBody = concat [", sink (future_" ++ show index ++ " (payload " ++ show index ++ ") X)"
   | index <- [0 :: Int .. 2999]]
 
-assertSmallEarlyBody :: Machine.Metrics -> PropertyT IO ()
-assertSmallEarlyBody metrics = do
+assertSmallEarlyBody :: Int -> Machine.Metrics -> PropertyT IO ()
+assertSmallEarlyBody reached metrics = do
   annotateShow metrics
   assert (Machine.metricCompiledActivations metrics > 0)
   assert (Machine.metricHeadInstructions metrics > 0)
-  Machine.metricBodyGoalsMaterialized metrics === 1
+  Machine.metricBodyGoalsMaterialized metrics === reached
   assert (Machine.metricBodyAllocationInstructions metrics <= 3)
   assert (Machine.metricMaxActivationRegisters metrics <= 3)
   assert (Machine.metricMaxHeapCells metrics <= 96)
@@ -542,7 +545,7 @@ prop_early_failure_and_error_do_not_allocate_future_body = unit $ do
     case [Reference.projectAnswer query state | Reference.Found state <- actual] of
       [answer] -> Reference.answerBindings answer === [("Result", Atom "done")]
       other -> annotateShow other >> failure
-    assertSmallEarlyBody metrics
+    assertSmallEarlyBody 1 metrics
 
 prop_foreign_cut_does_not_allocate_remaining_compiled_body :: Property
 prop_foreign_cut_does_not_allocate_remaining_compiled_body = unit $ do
@@ -556,7 +559,9 @@ prop_foreign_cut_does_not_allocate_remaining_compiled_body = unit $ do
   events query actual === events query (Machine.solveQueryWithBackend Machine.Interpreted program query)
   [owner | Reference.CutMarker owner <- actual] === [-7]
   [() | Reference.Found _ <- actual] === []
-  assertSmallEarlyBody metrics
+  -- The abort helper's fail is now compiled too; its cut allocates no graph.
+  Machine.metricCompiledCuts metrics === 1
+  assertSmallEarlyBody 2 metrics
 
 prop_future_and_earlier_live_values_survive_tail_collection :: Property
 prop_future_and_earlier_live_values_survive_tail_collection = unit $ do

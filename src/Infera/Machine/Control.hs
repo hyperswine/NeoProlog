@@ -69,6 +69,7 @@ data Task
   = Run !Heap.Address !Int Scopes
   | DirectRun !PredKey !Heap.Address !Int Scopes
   | CompiledBody !BytecodeVM.BodyFrame !Int Scopes !(Maybe Trace.ClauseSource)
+  | CompiledControl !VarId !Compile.ControlCode !Int Scopes
   | Located (Maybe SourceSpan) Task
   | Return !Call
   | Emit SearchItem
@@ -122,11 +123,15 @@ data Alternative
 -- An opaque sub-search parks its caller's entire control state, then runs an
 -- isolated choice stack on the same heap prefix. No caller cut barrier is
 -- imported. Issues that may be suppressed are buffered inside this frame.
+data Continuation
+  = SourceGoal !Term
+  | CodeGoal !VarId !Compile.ControlCode
+
 data ScopeKind
   = CallScope
   | OnceScope
   | NotScope
-  | IfScope Term (Maybe Term) !Int Scopes
+  | IfScope !Continuation !(Maybe Continuation) !Int Scopes
   | FindScope Term Term !Int Scopes [Term] [OutputEvent]
   | MinimumScope Term (Maybe (Integer, Store))
   | GoalMinimumScope Term (Maybe (Integer, SolverState))
@@ -188,12 +193,14 @@ data Metrics = Metrics
     metricHeadCellsAvoided :: !Int,
     metricMaxActivationRegisters :: !Int,
     metricBodyGoalsMaterialized :: !Int,
-    metricBodyAllocationInstructions :: !Int
+    metricBodyAllocationInstructions :: !Int,
+    metricCompiledControlInstructions :: !Int,
+    metricCompiledCuts :: !Int
   }
   deriving (Eq, Show)
 
 emptyMetrics :: Metrics
-emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 data Checkpoint = Checkpoint !Env !Heap.FrozenHeap !Running
 
@@ -357,6 +364,7 @@ driveSampled environment heap running = case runningPhase running of
                 Just definition -> callPredicate environment heap counted address fuel scopes definition
                 Nothing -> runGoal environment heap counted address fuel scopes
             CompiledBody frame fuel scopes source -> materializeBody environment heap next frame fuel scopes source
+            CompiledControl base code fuel scopes -> runCompiledControl environment heap next base code fuel scopes
             Return call -> returnCall environment heap next call
             Emit item -> emitRecorded environment heap next item
             Fail -> drive environment heap next {runningPhase = Backtracking}
@@ -369,30 +377,106 @@ driveSampled environment heap running = case runningPhase running of
 materializeBody :: Env -> Heap.Heap s -> Running -> BytecodeVM.BodyFrame -> Int
   -> Scopes -> Maybe Trace.ClauseSource -> MachineM s DriverStep
 materializeBody environment heap running frame fuel scopes source = do
-  let build = if runningMeasured running
-        then BytecodeVM.materializeNextMeasured else BytecodeVM.materializeNext
-  materialized <- checked (build heap (branchBindings (runningBranch running)) frame)
-  case materialized of
+  case BytecodeVM.nextControl frame of
     Nothing -> drive environment heap running
-    Just step -> do
-      let bodyCall = BytecodeVM.stepCall step
-          task = compiledTask environment (Compile.bodyKey bodyCall)
-            (BytecodeVM.stepRoot step) fuel scopes
-          located = if runningTraced running
-            then Located ((\site -> Trace.goalSourceSpan site (Compile.bodyTemplate bodyCall)) <$> source) task
-            else task
-          continuation = maybe [] (\pending -> [CompiledBody pending fuel scopes source])
-            (BytecodeVM.stepNextFrame step)
-          previous = runningMetrics running
-          metrics = if runningMeasured running then previous
-            {metricBodyGoalsMaterialized = metricBodyGoalsMaterialized previous + 1,
-             metricBodyAllocationInstructions = metricBodyAllocationInstructions previous
-               + BytecodeVM.stepAllocationInstructions step,
-             metricBytecodeInstructions = metricBytecodeInstructions previous
-               + BytecodeVM.stepAllocationInstructions step,
-             metricMaxActivationRegisters = max (metricMaxActivationRegisters previous)
-               (BytecodeVM.stepRegisterSlots step)} else previous
-      drive environment heap (withTasks (located : continuation) running {runningMetrics = metrics})
+    Just (base, code, remaining) -> do
+      let continuation = maybe [] (\pending -> [CompiledBody pending fuel scopes source]) remaining
+          prepared = withTasks continuation running
+          located = if runningTraced running then prepared
+            {runningSite = (\site -> Trace.goalSourceSpan site (Compile.controlTemplate code)) <$> source}
+            else prepared
+      runCompiledControl environment heap located base code fuel scopes
+
+-- Ordinary calls materialize one graph. Transparent control keeps pure code
+-- continuations in the native choice stack; opaque control uses the same
+-- scope driver and issue policies as interpreted goals.
+runCompiledControl :: Env -> Heap.Heap s -> Running -> VarId -> Compile.ControlCode
+  -> Int -> Scopes -> MachineM s DriverStep
+runCompiledControl environment heap original base code fuel scopes =
+  case Compile.controlView code of
+    Compile.Invoke plan key -> do
+      (root, allocated) <- materializeData heap original base plan
+      let previous = runningMetrics allocated
+          counted = if runningMeasured allocated then allocated {runningMetrics = previous
+            {metricBodyGoalsMaterialized = metricBodyGoalsMaterialized previous + 1}} else allocated
+          task = maybe (Run root fuel scopes)
+            (\known -> compiledTask environment known root fuel scopes) key
+      drive environment heap (withTasks [task] counted)
+    instruction -> do
+      traced <- beginCodeTrace original base code
+      let previous = runningMetrics traced
+          counted = if runningMeasured traced then traced {runningMetrics = previous
+            {metricCompiledControlInstructions = metricCompiledControlInstructions previous + 1,
+             metricBytecodeInstructions = metricBytecodeInstructions previous + 1}} else traced
+          branch = runningBranch counted
+          task child = CompiledControl base child fuel scopes
+          opaque child kind = do
+            mark <- lift (Heap.freezeHeap heap)
+            launchTasks environment heap counted mark (branchBindings branch) (branchState branch)
+              [CompiledControl base child fuel []] kind
+      case instruction of
+        Compile.Sequence children -> drive environment heap (withTasks (map task children) counted)
+        Compile.Alternative left right -> do
+          mark <- lift (Heap.freezeHeap heap)
+          withRight <- push (Choice mark branch
+            {branchTasks = task right : branchTasks branch} Tasks) counted
+          drive environment heap (withTasks [task left] withRight)
+        Compile.Cut owner -> do
+          let ownerId = case owner of
+                Compile.LocalBase -> base
+                Compile.LiteralInteger value -> fromIntegral value
+              metrics = runningMetrics counted
+              cutCounted = if runningMeasured counted then counted {runningMetrics = metrics
+                {metricCompiledCuts = metricCompiledCuts metrics + 1}} else counted
+          runCut environment heap cutCounted ownerId scopes
+        Compile.Once child -> opaque child OnceScope
+        Compile.Not child -> opaque child NotScope
+        Compile.If condition yes no -> opaque condition
+          (IfScope (CodeGoal base yes) (CodeGoal base <$> no) fuel scopes)
+        Compile.FindAll template child target -> do
+          (templateRoot, withTemplate) <- materializeData heap counted base template
+          (targetRoot, prepared) <- materializeData heap withTemplate base target
+          let ready = runningBranch prepared
+          terms <- checked (Bridge.exportRawTerms heap (branchBindings ready) [templateRoot, targetRoot])
+          case terms of
+            [templateTerm, targetTerm] -> do
+              mark <- lift (Heap.freezeHeap heap)
+              launchTasks environment heap prepared mark (branchBindings ready) (branchState ready)
+                [CompiledControl base child fuel []] (FindScope templateTerm targetTerm fuel scopes [] [])
+            _ -> throwError Heap.IncompatibleBindings
+        Compile.Call callable arguments -> do
+          (callableRoot, prepared) <- materializeData heap counted base callable
+          (roots, ready) <- materializeArguments prepared arguments
+          callGoal environment heap ready fuel callableRoot roots
+  where
+    materializeArguments running [] = pure ([], running)
+    materializeArguments running (plan : plans) = do
+      (root, prepared) <- materializeData heap running base plan
+      (remaining, ready) <- materializeArguments prepared plans
+      pure (root : remaining, ready)
+
+materializeData :: Heap.Heap s -> Running -> VarId -> Compile.DataPlan
+  -> MachineM s (Heap.Address, Running)
+materializeData heap running base plan = do
+  let build = if runningMeasured running
+        then BytecodeVM.materializeDataMeasured else BytecodeVM.materializeData
+  step <- checked (build heap (branchBindings (runningBranch running)) base plan)
+  let previous = runningMetrics running
+      metrics = if runningMeasured running then previous
+        {metricBodyAllocationInstructions = metricBodyAllocationInstructions previous
+           + BytecodeVM.dataStepAllocationInstructions step,
+         metricBytecodeInstructions = metricBytecodeInstructions previous
+           + BytecodeVM.dataStepAllocationInstructions step,
+         metricMaxActivationRegisters = max (metricMaxActivationRegisters previous)
+           (BytecodeVM.dataStepRegisterSlots step)} else previous
+  pure (BytecodeVM.dataStepRoot step, running {runningMetrics = metrics})
+
+beginCodeTrace :: Running -> VarId -> Compile.ControlCode -> MachineM s Running
+beginCodeTrace running _ _ | not (runningTraced running) = pure running
+beginCodeTrace running base code =
+  let goal = deepWalk (stSubst (ssStore (branchState (runningBranch running))))
+        (renameBody base (Compile.controlTemplate code))
+   in pure (recordTrace Trace.Call goal (runningSite running) Nothing running {runningCurrent = Just goal})
 
 beginTaskTrace :: Heap.Heap s -> Running -> Heap.Address -> MachineM s Running
 beginTaskTrace _ running _ | not (runningTraced running) = pure running
@@ -414,6 +498,7 @@ sample heap running = do
       owners (Run _ _ scopes) = length scopes
       owners (DirectRun _ _ _ scopes) = length scopes
       owners (CompiledBody _ _ scopes _) = length scopes
+      owners (CompiledControl _ _ _ scopes) = length scopes
       owners _ = 0
       scopeDepth Nothing = 0
       scopeDepth (Just scope) = 1 + scopeDepth (runningScope (scopeParent scope))
@@ -466,6 +551,8 @@ prune requested running
       DirectRun key address fuel [(owner, min barrier depth) | (owner, barrier) <- scopes]
     clampTask (CompiledBody frame fuel scopes source) =
       CompiledBody frame fuel [(owner, min barrier depth) | (owner, barrier) <- scopes] source
+    clampTask (CompiledControl base code fuel scopes) =
+      CompiledControl base code fuel [(owner, min barrier depth) | (owner, barrier) <- scopes]
     clampTask (Return call) = Return call {callEntryDepth = min (callEntryDepth call) depth}
     clampTask task = task
 
@@ -494,6 +581,18 @@ cut owner scopes running = case committingBoundary (branchTasks (runningBranch r
       Guard found _ _ _ | ident == found -> depth
       _ -> guardDepth ident fallback (depth - 1) rest
 
+-- A foreign marker travels after this goal's continuation. A later local
+-- cut or first-success commit can discard its retry before it reaches its
+-- owner. Compiled and interpreted cuts share this exact boundary policy.
+runCut :: Env -> Heap.Heap s -> Running -> Int -> Scopes -> MachineM s DriverStep
+runCut environment heap running owner scopes
+  | (local, _) : _ <- scopes, local == owner =
+      drive environment heap (traceCurrent Trace.Cut Nothing (cut local scopes running))
+  | otherwise = do
+      mark <- lift (Heap.freezeHeap heap)
+      deferred <- push (Choice mark (runningBranch running) (DeferredCut owner scopes)) running
+      drive environment heap deferred
+
 runGoal :: Env -> Heap.Heap s -> Running -> Heap.Address -> Int -> Scopes -> MachineM s DriverStep
 runGoal environment heap running address fuel scopes = do
   shape <- checked (Heap.view heap address)
@@ -505,16 +604,7 @@ runGoal environment heap running address fuel scopes = do
     Heap.CompoundView "$cut" [ownerAddress] -> do
       ownerShape <- checked (Heap.viewRaw heap ownerAddress)
       case ownerShape of
-        Heap.IntegerView owner
-          | (local, _) : _ <- scopes, local == fromIntegral owner ->
-              drive environment heap (traceCurrent Trace.Cut Nothing (cut local scopes running))
-        -- A foreign marker travels after this goal's continuation. A later
-        -- local cut or first-success commit can discard its retry before it
-        -- reaches its owner, matching the reference's [Found, CutMarker].
-        Heap.IntegerView owner -> do
-          mark <- lift (Heap.freezeHeap heap)
-          deferred <- push (Choice mark branch (DeferredCut (fromIntegral owner) scopes)) running
-          drive environment heap deferred
+        Heap.IntegerView owner -> runCut environment heap running (fromIntegral owner) scopes
         _ -> adapted
     Heap.CompoundView "," [left, right] ->
       drive environment heap running
@@ -529,7 +619,8 @@ runGoal environment heap running address fuel scopes = do
           do
             terms <- rawTerms heap running [yes, right]
             case terms of
-              [yesTerm, noTerm] -> enterScope environment heap running fuel condition (IfScope yesTerm (Just noTerm) fuel scopes)
+              [yesTerm, noTerm] -> enterScope environment heap running fuel condition
+                (IfScope (SourceGoal yesTerm) (Just (SourceGoal noTerm)) fuel scopes)
               _ -> throwError Heap.IncompatibleBindings
         _ -> do
           mark <- lift (Heap.freezeHeap heap)
@@ -539,7 +630,7 @@ runGoal environment heap running address fuel scopes = do
             { runningBranch = branch {branchTasks = Run left fuel scopes : branchTasks branch} }
     Heap.CompoundView "->" [condition, yes] -> do
       yesTerm <- rawTerms heap running [yes] >>= single
-      enterScope environment heap running fuel condition (IfScope yesTerm Nothing fuel scopes)
+      enterScope environment heap running fuel condition (IfScope (SourceGoal yesTerm) Nothing fuel scopes)
     Heap.CompoundView "call" (callable : arguments) ->
       callGoal environment heap running fuel callable arguments
     Heap.CompoundView "once" [goal] -> enterScope environment heap running fuel goal OnceScope
@@ -948,12 +1039,13 @@ collectLive heap running = do
         variables (Label pending) = pending
         variables (Optimize pending cost) = pending ++ termVars cost
         variables (CompiledBody frame _ _ _) = BytecodeVM.frameVariables frame
+        variables (CompiledControl base code _ _) = map (+ base) (IS.toAscList (Compile.controlVariables code))
         variables _ = []
         scopeVariables = case runningScope running of
           Nothing -> []
           Just scope -> case scopeKind scope of
             FindScope template target _ _ results _ -> concatMap termVars (template : target : results)
-            IfScope yes no _ _ -> termVars yes ++ maybe [] termVars no
+            IfScope yes no _ _ -> continuationVariables yes ++ maybe [] continuationVariables no
             EmitScope text -> termVars text
             MinimumScope cost _ -> termVars cost
             GoalMinimumScope cost _ -> termVars cost
@@ -1230,10 +1322,8 @@ scopeEvent environment heap running scope item = case item of
       resumeRetained environment heap scope running state (map Emit (reverse (scopeIssues scope)))
     IfScope yes _ fuel scopes -> do
       parent <- restoreSelected heap scope running state
-      (bindings, addresses) <- checked (Bridge.importTerms heap (branchBindings (runningBranch parent)) [yes])
-      address <- single addresses
-      drive environment heap (withTasks (map Emit (reverse (scopeIssues scope)) ++ [Run address fuel scopes])
-        parent {runningBranch = (runningBranch parent) {branchBindings = bindings}})
+      prepared <- withContinuation heap parent yes fuel scopes
+      drive environment heap (withTasks (map Emit (reverse (scopeIssues scope))) prepared)
     NotScope -> do
       parent <- restoreScope heap scope running
       let dependencies = [issue | issue@(ConsumedIncomplete _) <- reverse (scopeIssues scope)]
@@ -1330,6 +1420,19 @@ withTasks :: [Task] -> Running -> Running
 withTasks tasks running = running
   {runningBranch = (runningBranch running) {branchTasks = tasks ++ branchTasks (runningBranch running)}}
 
+continuationVariables :: Continuation -> [VarId]
+continuationVariables (SourceGoal goal) = termVars goal
+continuationVariables (CodeGoal base code) = map (+ base) (IS.toAscList (Compile.controlVariables code))
+
+withContinuation :: Heap.Heap s -> Running -> Continuation -> Int -> Scopes -> MachineM s Running
+withContinuation _ running (CodeGoal base code) fuel scopes =
+  pure (withTasks [CompiledControl base code fuel scopes] running)
+withContinuation heap running (SourceGoal goal) fuel scopes = do
+  let branch = runningBranch running
+  (bindings, addresses) <- checked (Bridge.importTerms heap (branchBindings branch) [goal])
+  address <- single addresses
+  pure (withTasks [Run address fuel scopes] running {runningBranch = branch {branchBindings = bindings}})
+
 finish :: Env -> Heap.Heap s -> Running -> MachineM s DriverStep
 finish environment heap child = case runningScope child of
   Nothing -> pure (Done child)
@@ -1357,10 +1460,8 @@ finish environment heap child = case runningScope child of
       NotScope -> queued [Fail | blocked]
       IfScope _ no fuel scopes -> case (blocked, no) of
         (False, Just goal) -> do
-          (bindings, addresses) <- checked (Bridge.importTerms heap (branchBindings (runningBranch parent)) [goal])
-          address <- single addresses
-          drive environment heap (withTasks (map Emit issues ++ [Run address fuel scopes])
-            parent {runningBranch = (runningBranch parent) {branchBindings = bindings}})
+          prepared <- withContinuation heap parent goal fuel scopes
+          drive environment heap (withTasks (map Emit issues) prepared)
         _ -> queued [Fail]
       FindScope _ target fuel scopes results outputs -> case [issue | issue@(BranchError _) <- issues] of
         firstError : _ ->

@@ -45,6 +45,10 @@ def main():
         matrix.append((case, 1000000, True, 1))
     for case in (["helper"] if args.quick else ["helper", "structured", "clp", "cached", "dynamic"]):
         matrix.extend((case, 1000000, measured, 1) for measured in [False, True])
+    if args.backend == "bytecode":
+        # Keep a selected-arm continuation and nested opaque scope parked
+        # across the million-call helper, with both earlier/future locals live.
+        matrix.extend(("compiled-control", 1000000, measured, 1) for measured in [False, True])
     fingerprint = source_hash()
     prefix_rss = prefix_live = 0
     with args.output.open("w") as destination:

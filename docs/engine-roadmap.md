@@ -78,7 +78,8 @@ signatures and result types. The original resolver lives in
 parity oracle for both roadmap steps. No machine resolution path calls the
 reference interpreter. **Step 1's historical local exit gates passed on
 2026-10-16; Step 2 now has opt-in compiled activation, specialized head matching,
-temporary register reuse, per-goal body allocation and direct calls.**
+temporary register reuse, per-goal body allocation, compiled core control and
+cut barriers, and direct calls.**
 The [Step 1 acceptance report](engine-step1-acceptance-2026-10-16.md) records
 that snapshot's checks and measurements. The
 [Step 2 foundation report](engine-step2-foundation-2026-10-16.md) records the
@@ -588,8 +589,8 @@ and the `startWithBackend`, `startMeasuredWithBackend`,
 existing machine entry points still use the interpreted native driver.
 
 [`Infera.Compile`](../src/Infera/Compile.hs) emits a flat, postorder register
-program for facts and first-order clauses: `UseVariable`, `PutConstant` and
-`PutCompound`. It also emits preorder `HeadVariable`, `HeadConstant` and
+program for facts and clause bodies: `UseVariable`, `PutConstant`, `PutOwner`
+and `PutCompound`. It also emits preorder `HeadVariable`, `HeadConstant` and
 `HeadCompound` matching instructions. [`Machine.Bytecode`](../src/Infera/Machine/Bytecode.hs)
 reserves stable local roots and matches known caller shapes directly, avoiding
 duplicate head constructors. When a caller target is free, it constructs only
@@ -602,6 +603,25 @@ match succeeds. A later mismatch therefore suppresses earlier delayed CLP
 errors exactly as whole-head unification does. An outer head checkpoint
 rolls back roots, head nodes, trail and interning on rejection; each later
 body materialization owns its allocation transaction.
+
+Core body control now uses immutable `ControlCode` nodes for conjunction,
+disjunction, cuts, `call`, `once`, negation, if-then-else and `findall`.
+Conjunction schedules code children; disjunction parks its right code branch
+in the existing frozen choice stack. Opaque nodes launch code through native
+scope handling, preserving its error/output policies. If branches remain pure
+code continuations until selected. `call` materializes callable/argument data
+and uses the existing shallow callable expansion. Invocation plans and data
+operands alone need heap graphs; untaken branches and core control wrappers remain
+unallocated. No auxiliary predicate activation changes fresh IDs or fuel.
+
+Compiled and interpreted cuts share one local/deferred-foreign cut helper and
+the same choice barriers. Bare cuts are rewritten recursively, including
+inside ordinary body data, through an activation-owner operand; head cuts stay
+literal data. Literal if syntax and literal `$cut` owners are recognized from
+raw source shape. A bound variable containing `->` or an integer owner retains
+the native shallow runtime behavior. Trace mode reconstructs source terms
+for events while preserving every syntactic control node and source location;
+ordinary execution does not walk source templates.
 
 Body construction begins after accepted head matching and propagation.
 Variable/scalar registers share values using exact scalar bits, retaining
@@ -629,9 +649,12 @@ counters distinguish accepted-head work from reached body materializations;
 rejected heads return no activation statistics. Normal execution performs no
 instruction-statistic writes.
 
-Clauses containing control/meta calls, variable or noncallable goals,
-malformed local IDs, or recursively nested body cuts use the interpreter.
-Original body templates remain source metadata for trace locations. Registers
+Malformed local IDs or uncallable heads retain the interpreted fallback.
+Dynamic/noncallable leaves and malformed control arities compile as generic
+invocations whose native runtime checks decide their behavior. Less-common
+meta/DCG operations (`forall`, `minimize`, `phrase`, `emit`, file phrases) still
+use their native handler through invocation plans. Original body templates
+remain source metadata for trace locations. Registers
 are private to activation; immutable checkpoints retain heap handles with their
 matching branch snapshots and the exact program/code version.
 
@@ -646,7 +669,9 @@ throughput gain over the interpreted driver. The
 [head/register report](engine-step2-head-register-2026-10-16.md) records
 subsequent implementation and validation. The
 [lifetime report](engine-step2-lifetimes-2026-10-16.md) records incremental body
-construction, temporary register reuse and their acceptance results.
+construction, temporary register reuse and their acceptance results. The
+[control report](engine-step2-control-2026-10-16.md) records compiled control
+continuations, cut barriers and the next default-backend gates.
 
 ### Planned instruction set (WAM-lite)
 
@@ -680,8 +705,9 @@ The full compiler will classify variables as temporary or permanent, assign
 argument/environment registers, emit `get_*` for the head,
 `put_*` and `call`/`execute` for the body, and surround bodies with permanent
 variables with `allocate`/`deallocate`. Environment trimming follows the last
-use of each permanent variable. Control constructs (`,`, `;`, `->`, `not`,
-`once`, `findall`) will compile to auxiliary predicates with cut barriers.
+use of each permanent variable. Core control constructs (`,`, `;`, `->`, `not`,
+`once`, `findall`) now compile to code continuations with the existing cut
+barriers, preserving fresh IDs, resolution fuel and trace frames.
 DCG rules are already plain clauses by the time they reach the compiler.
 
 Declarations and inference feed the compiler subject to runtime guards. A
@@ -706,13 +732,32 @@ behaviour; inference alone is not that proof.
 The machine from step 1 gains an instruction loop; frames become environments
 with `Y` registers; builtins, CLP, tabling, output and dynamic facts are
 unchanged because they already sit behind the machine interface. Source maps
-and trace events must survive instruction fusion and auxiliary predicates.
+and trace events must survive instruction fusion and compiled continuations.
 Load-time code generation and per-predicate caching remain future work. The
 current startup cache uses the exact immutable program attached to the query;
 a subsequent REPL edit creates a new program/cache without changing existing
 checkpoints. Persistent caches will need to recompile changed predicates and
 invalidate dependent specialisations or table caches whose proof depended on
 the old program.
+
+### Making bytecode the public default
+
+Bytecode is the intended eventual default. This control slice keeps the public
+facade on `Interpreted` while that migration is prepared. The next performance
+work is to profile reached invocation/operand dispatch and remove repeated
+per-query compilation with immutable predicate caches and correct edit
+invalidation. Generic native services can remain shared behind compiled
+instructions; changing the default does not require duplicating CLP, tables
+or dynamic-fact algorithms.
+
+Before switching, require the complete generated/API/stdlib suite and exact
+source traces under both backends, cross-platform CI, real breadboard/minefield
+acceptance, retained-checkpoint and million-iteration residency gates, and
+checked serial cold/warm timings without material representative regressions.
+Then route public `Infera.Engine` entry points to bytecode, retain explicit
+`Interpreted` selection for differential checks and troubleshooting, and run
+the full default-facing CLI/editor suite again. The reference remains an
+oracle through the planned parity release.
 
 ### Milestones
 
@@ -724,7 +769,11 @@ the old program.
    and immutable repeated/interleaved resumes. Table producer heads retain
    their template path. Broader stdlib acceptance and the remaining compiled
    paths must pass before declaring the full first-order milestone complete.
-2. Control constructs and cut barriers; the full suite.
+2. **Core control implemented:** direct code continuations for conjunction,
+   alternatives, cuts, `call`, `once`, negation, conditionals and `findall`,
+   using native choices/scopes/contracts. Less-common meta/DCG handlers and
+   dynamically expanded call targets retain native dispatch. Full acceptance
+   and performance evidence are recorded in the control report.
 3. Indexing instructions; full argument/environment registers and trimming; LCO in
    `execute`; load-time predicate caches with REPL invalidation.
 4. Determinism-directed code generation from declarations and inference.

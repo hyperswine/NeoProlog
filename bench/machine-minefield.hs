@@ -159,7 +159,9 @@ metricFields metrics =
    ("head_cells_avoided", show (Machine.metricHeadCellsAvoided metrics)),
    ("max_activation_registers", show (Machine.metricMaxActivationRegisters metrics)),
    ("body_goals_materialized", show (Machine.metricBodyGoalsMaterialized metrics)),
-   ("body_allocation_instructions", show (Machine.metricBodyAllocationInstructions metrics))]
+   ("body_allocation_instructions", show (Machine.metricBodyAllocationInstructions metrics)),
+   ("compiled_control_instructions", show (Machine.metricCompiledControlInstructions metrics)),
+   ("compiled_cuts", show (Machine.metricCompiledCuts metrics))]
 
 main :: IO ()
 main = do

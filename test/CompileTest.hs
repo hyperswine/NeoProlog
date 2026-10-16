@@ -17,6 +17,7 @@ import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Infera.Compile
 import Infera.Syntax
+import Infera.Unify (renameBody, replaceCuts)
 
 data Observed
   = OAtom String | OVar VarId | OInt Integer | OFloat Word64
@@ -37,12 +38,16 @@ destination :: Instruction -> Slot
 destination instruction = case instruction of
   UseVariable slot _ -> slot
   PutConstant slot _ -> slot
+  PutOwner slot -> slot
   PutCompound slot _ _ -> slot
 
 -- This decoder uses only the documented instruction/register interface.
 -- Forward references, repeated destinations and non-scalar constants fail.
 decode :: ClauseCode -> Maybe [Term]
-decode code = do
+decode = decodeWithOwner 0
+
+decodeWithOwner :: Integer -> ClauseCode -> Maybe [Term]
+decodeWithOwner owner code = do
   registers <- foldM step IM.empty (codeInstructions code)
   mapM (\slot -> IM.lookup slot registers) (codeHead code : map bodySlot (codeBody code))
   where
@@ -57,6 +62,7 @@ decode code = do
               Var _ -> Nothing
               Compound _ _ -> Nothing
               scalar -> Just scalar
+            PutOwner _ -> Just (IntLit owner)
             PutCompound slot name children
               | all (< slot) children -> Compound name <$> mapM (\child -> IM.lookup child registers) children
               | otherwise -> Nothing
@@ -101,14 +107,30 @@ nodeCount :: Term -> Int
 nodeCount (Compound _ arguments) = 1 + sum (map nodeCount arguments)
 nodeCount _ = 1
 
+bodyNodeCount :: Term -> Int
+bodyNodeCount (Atom "!") = 2
+bodyNodeCount (Compound _ arguments) = 1 + sum (map bodyNodeCount arguments)
+bodyNodeCount _ = 1
+
 -- Physical registers may be overwritten. Resolve all child values from the
 -- old register map before installing a constructor into a recycled slot.
 decodeGoal :: GoalCode -> Maybe Term
-decodeGoal goal = do
-  registers <- foldM step IM.empty (goalInstructions goal)
-  operand registers (goalRoot goal)
+decodeGoal = decodeGoalWithOwner 0
+
+decodeGoalWithOwner :: Integer -> GoalCode -> Maybe Term
+decodeGoalWithOwner owner goal =
+  decodeConstruction owner (goalRegisterCount goal) (goalInstructions goal) (goalRoot goal)
+
+decodeData :: Integer -> DataPlan -> Maybe Term
+decodeData owner plan =
+  decodeConstruction owner (dataRegisterCount plan) (dataInstructions plan) (dataRoot plan)
+
+decodeConstruction :: Integer -> Int -> [GoalInstruction] -> GoalOperand -> Maybe Term
+decodeConstruction owner count instructions root = do
+  registers <- foldM step IM.empty instructions
+  operand registers root
   where
-    valid register = register >= 0 && register < goalRegisterCount goal
+    valid register = register >= 0 && register < count
     operand _ (Local variable) = Just (Var variable)
     operand registers (Temporary register)
       | valid register = IM.lookup register registers
@@ -119,6 +141,7 @@ decodeGoal goal = do
           Var _ -> Nothing
           Compound _ _ -> Nothing
           _ -> Just (register, scalar)
+        GoalOwner register -> Just (register, IntLit owner)
         GoalCompound register name children -> do
           values <- mapM (operand registers) children
           pure (register, Compound name values)
@@ -126,7 +149,7 @@ decodeGoal goal = do
 
 genScalar :: Gen Term
 genScalar = Gen.choice
-  [ Atom <$> Gen.element ["nil", "leaf", "true", "\955"],
+  [ Atom <$> Gen.element ["nil", "leaf", "true", "!", "\955"],
     IntLit <$> Gen.integral (Range.linear (-100) 100),
     FloatLit <$> Gen.element
       [-1 / 0, -2.5, -0.0, 0.0, 1.5, 1 / 0, castWord64ToDouble 0x7ff8000000000042],
@@ -166,11 +189,11 @@ prop_generated_register_program_preserves_raw_clause = withTests 250 . property 
   code <- evalMaybe (compileClause clause)
   decoded <- evalMaybe (decode code)
   headTerm <- evalMaybe (decodeHead code)
-  map observe decoded === map observe (clauseHead clause : clauseBody clause)
+  map observe decoded === map observe (clauseHead clause : map (renameBody 0) (clauseBody clause))
   observe headTerm === observe (clauseHead clause)
   codeVariableCount code === max 1 (clauseNVars clause)
   codeSlotCount code === length (codeInstructions code)
-  codeUnsharedSlotCount code === sum (map nodeCount (clauseHead clause : clauseBody clause))
+  codeUnsharedSlotCount code === nodeCount (clauseHead clause) + sum (map bodyNodeCount (clauseBody clause))
   length (codeHeadInstructions code) === nodeCount (clauseHead clause)
   assert (codeSlotCount code <= codeUnsharedSlotCount code)
   map destination (codeInstructions code) === [0 .. codeSlotCount code - 1]
@@ -179,7 +202,7 @@ prop_generated_register_program_preserves_raw_clause = withTests 250 . property 
   let goals = codeGoals code
       variables = map (IS.fromList . termVarIds) (clauseBody clause)
   physical <- evalMaybe (mapM decodeGoal goals)
-  map observe physical === map observe (clauseBody clause)
+  map observe physical === map observe (map (renameBody 0) (clauseBody clause))
   map (observe . bodyTemplate . goalCall) goals === map observe (clauseBody clause)
   map (Just . bodyKey . goalCall) goals === map functorOf (clauseBody clause)
   map goalVariables goals === variables
@@ -190,19 +213,56 @@ prop_generated_register_program_preserves_raw_clause = withTests 250 . property 
 unit :: PropertyT IO () -> Property
 unit = withTests 1 . property
 
-prop_control_and_nested_cuts_fall_back :: Property
-prop_control_and_nested_cuts_fall_back = unit $ do
+prop_control_and_recursive_cut_lowering :: Property
+prop_control_and_recursive_cut_lowering = unit $ do
   forM_
     [ ",", ";", "->", "call", "once", "not", "findall", "forall", "minimize",
       "phrase", "emit", "phrase_from_file", "!", "$cut"
-    ] $ \name ->
-      assert (isNothing (compileClause (Clause (Atom "p") [Compound name []] 0)))
+    ] $ \name -> do
+      code <- evalMaybe (compileClause (Clause (Atom "p") [Compound name []] 0))
+      length (codeControls code) === 1
   forM_ [Atom "!", Compound "$cut" [IntLit 42]] $ \cut ->
     forM_ [cut, Compound "helper" [Compound "box" [cut]], Compound "unify" [Var 0, cut]] $ \goal ->
-      assert (isNothing (compileClause (Clause (Compound "p" [Var 0]) [goal] 1)))
+      do
+        let clause = Clause (Compound "p" [Var 0, Atom "!"]) [goal] 1
+        code <- evalMaybe (compileClause clause)
+        raw <- evalMaybe (decodeWithOwner 77 code)
+        physical <- evalMaybe (mapM (decodeGoalWithOwner 77) (codeGoals code))
+        -- This source-plan decoder keeps local variable numbers unchanged;
+        -- only the dynamic cut-owner operand receives the supplied value.
+        map observe raw === map observe [clauseHead clause, replaceCuts 77 goal]
+        map observe physical === map observe [replaceCuts 77 goal]
+  forM_
+    [ (Compound "," [Atom "true", Atom "fail"], "sequence"),
+      (Compound ";" [Atom "true", Atom "fail"], "alternative"),
+      (Compound ";" [Compound "->" [Atom "true", Atom "fail"], Atom "true"], "if"),
+      (Compound ";" [Var 0, Atom "true"], "alternative"),
+      (Atom "!", "cut-local"),
+      (Compound "$cut" [IntLit (-7)], "cut-literal"),
+      (Compound "$cut" [Var 0], "invoke"),
+      (Compound "once" [Atom "true"], "once"),
+      (Compound "not" [Atom "true"], "not"),
+      (Compound "findall" [Var 0, Atom "true", Var 1], "findall"),
+      (Compound "call" [Var 0, Atom "a"], "call")
+    ] $ \(template, expected) -> do
+      code <- evalMaybe (compileClause (Clause (Atom "p") [template] 2))
+      control <- evalMaybe (listToMaybe (codeControls code))
+      controlKind control === expected
+  where
+    controlKind code = case controlView code of
+      Invoke _ _ -> "invoke" :: String
+      Sequence _ -> "sequence"
+      Alternative _ _ -> "alternative"
+      Cut LocalBase -> "cut-local"
+      Cut (LiteralInteger _) -> "cut-literal"
+      Once _ -> "once"
+      Not _ -> "not"
+      If _ _ _ -> "if"
+      FindAll _ _ _ -> "findall"
+      Call _ _ -> "call"
 
-prop_malformed_variables_and_uncallable_goals_fall_back :: Property
-prop_malformed_variables_and_uncallable_goals_fall_back = unit $ do
+prop_malformed_variables_reject_and_dynamic_leaves_compile :: Property
+prop_malformed_variables_reject_and_dynamic_leaves_compile = unit $ do
   forM_
     [ Clause (Atom "p") [] (-1),
       Clause (Compound "p" [Var (-1)]) [] 1,
@@ -212,7 +272,14 @@ prop_malformed_variables_and_uncallable_goals_fall_back = unit $ do
       Clause (IntLit 1) [] 0
     ] $ \clause -> assert (isNothing (compileClause clause))
   forM_ [Var 0, IntLit 1, FloatLit 1.5, StrLit "helper", CharLit 'x'] $ \goal ->
-    assert (isNothing (compileClause (Clause (Compound "p" [Var 0]) [goal] 1)))
+    do
+      code <- evalMaybe (compileClause (Clause (Compound "p" [Var 0]) [goal] 1))
+      control <- evalMaybe (listToMaybe (codeControls code))
+      case controlView control of
+        Invoke plan Nothing -> do
+          raw <- evalMaybe (decodeData 0 plan)
+          observe raw === observe goal
+        _ -> failure
 
 prop_first_order_data_and_scalar_identities_remain_distinct :: Property
 prop_first_order_data_and_scalar_identities_remain_distinct = unit $ do
@@ -285,12 +352,13 @@ prop_per_goal_register_lifetimes_and_future_local_roots = unit $ do
   forM_ (goalInstructions first) $ \instruction -> case instruction of
     GoalCompound destination' _ _ -> destination' === 0
     GoalConstant _ _ -> failure
+    GoalOwner _ -> failure
 
 compileGroup :: Group
 compileGroup = Group "clause compiler"
   [ ("generated_register_program_preserves_raw_clause", prop_generated_register_program_preserves_raw_clause),
-    ("control_and_nested_cuts_fall_back", prop_control_and_nested_cuts_fall_back),
-    ("malformed_variables_and_uncallable_goals_fall_back", prop_malformed_variables_and_uncallable_goals_fall_back),
+    ("control_and_recursive_cut_lowering", prop_control_and_recursive_cut_lowering),
+    ("malformed_variables_reject_and_dynamic_leaves_compile", prop_malformed_variables_reject_and_dynamic_leaves_compile),
     ("first_order_data_and_scalar_identities_remain_distinct", prop_first_order_data_and_scalar_identities_remain_distinct),
     ("register_sharing_retains_scalar_bits_and_distinct_constructors", prop_register_sharing_retains_scalar_bits_and_distinct_constructors),
     ("per_goal_register_lifetimes_and_future_local_roots", prop_per_goal_register_lifetimes_and_future_local_roots)

@@ -1,0 +1,23 @@
+# runtime-source-sha256=20348e7e06deb452216945db5fb38f9c38e5f6381017f0cd01ab66d6fd7434c1
+# source-fingerprint=4942f66d5e0ed47a8b0fb9b468f35e96
+# compiler=ghc-9.8 platform=aarch64-darwin
+# scope=loaded checked program; execution+projection+validation; no parsing or CLI startup
+# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)
+# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 no_timing_threshold
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples
+# compiled_probe case=rc compiled_activations=111 head_instructions=764 body_goals_materialized=181 body_allocation_instructions=287 max_activation_registers=22 fully_drained=true timed=false
+reference	rc	9.94e-4	9.94e-4	[1.221e-3,9.63e-4,9.94e-4]	[1.162e-3,9.63e-4,9.94e-4]
+machine	rc	3.222e-3	3.213e-3	[3.222e-3,3.15e-3,3.263e-3]	[3.213e-3,3.154e-3,3.257e-3]
+bytecode	rc	5.275e-3	5.275e-3	[5.946e-3,5.275e-3,4.984e-3]	[5.847e-3,5.275e-3,4.975e-3]
+# compiled_probe case=div compiled_activations=163 head_instructions=1212 body_goals_materialized=289 body_allocation_instructions=464 max_activation_registers=22 fully_drained=true timed=false
+reference	div	1.597e-3	1.596e-3	[1.524e-3,1.652e-3,1.597e-3]	[1.524e-3,1.608e-3,1.596e-3]
+machine	div	5.289e-3	5.277e-3	[6.091e-3,5.164e-3,5.289e-3]	[5.918e-3,5.159e-3,5.277e-3]
+bytecode	div	7.937e-3	7.824e-3	[8.271e-3,7.746e-3,7.937e-3]	[8.154e-3,7.686e-3,7.824e-3]
+# compiled_probe case=tri compiled_activations=318 head_instructions=2652 body_goals_materialized=641 body_allocation_instructions=1102 max_activation_registers=22 fully_drained=true timed=false
+reference	tri	3.907e-3	3.906e-3	[3.844e-3,3.907e-3,4.189e-3]	[3.849e-3,3.906e-3,4.114e-3]
+machine	tri	1.29e-2	1.2822e-2	[1.2617e-2,1.29e-2,1.3519e-2]	[1.2527e-2,1.2822e-2,1.3414e-2]
+bytecode	tri	1.4823e-2	1.4728e-2	[1.4823e-2,1.4543e-2,1.4832e-2]	[1.4728e-2,1.4477e-2,1.473e-2]
+# compiled_probe case=wide-disconnected compiled_activations=75 head_instructions=725 body_goals_materialized=180 body_allocation_instructions=334 max_activation_registers=22 fully_drained=true timed=false
+reference	wide-disconnected	1.0449e-2	1.0315e-2	[1.0428e-2,1.0803e-2,1.0449e-2]	[1.0313e-2,1.063e-2,1.0315e-2]
+machine	wide-disconnected	1.345e-2	1.3195e-2	[1.4709e-2,1.345e-2,1.2774e-2]	[1.377e-2,1.3195e-2,1.2579e-2]
+bytecode	wide-disconnected	1.547e-2	1.5085e-2	[1.547e-2,1.4126e-2,1.5782e-2]	[1.5085e-2,1.4079e-2,1.5466e-2]

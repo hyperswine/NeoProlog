@@ -20,7 +20,7 @@ import System.Mem (performGC)
 import Text.Read (readMaybe)
 
 data Case = Ground | Result | Structured | Mutual | Helper | Choice | Once
-  | Call | Conditional | Collected | Constrained | Cached | Dynamic
+  | Call | Conditional | Collected | Constrained | Cached | Dynamic | CompiledControl
   deriving (Eq)
 
 data Options = Options Int Bool Case Machine.ExecutionBackend
@@ -59,6 +59,9 @@ fixture Cached count = ("tail-with-completed-table", resultSource ++ unlines
 fixture Dynamic count = ("tail-with-dynamic-state", resultSource ++ "fact : dynamic.\n",
   "assert (fact seed), down_result " ++ show count ++ " R, fact Saved?",
   ["R = done, Saved = seed"])
+fixture CompiledControl count = ("tail-with-compiled-if-once-continuations", resultSource ++ unlines
+    ["controlled N R <- Shared = ready, (once (down_result N _) -> R = (pair Shared Shared) ; R = failed)."],
+  "controlled " ++ show count ++ " R?", ["R = pair ready ready"])
 
 groundSource :: String
 groundSource = unlines
@@ -99,7 +102,7 @@ helperSource = unlines
   ]
 
 usage :: String
-usage = "Usage: machine-tail [iterations] [--case ground|result|structured|mutual|helper|choice|once|call|if|findall|clp|cached|dynamic] [--backend interpreted|bytecode] [--unmeasured] +RTS -T -s"
+usage = "Usage: machine-tail [iterations] [--case ground|result|structured|mutual|helper|choice|once|call|if|findall|clp|cached|dynamic|compiled-control] [--backend interpreted|bytecode] [--unmeasured] +RTS -T -s"
 
 -- Flags and the single positional count can occur in any order. Rejecting
 -- duplicate or unknown inputs avoids silently measuring a different fixture.
@@ -134,6 +137,7 @@ parseOptions = parse Nothing Nothing Nothing Nothing
         "clp" -> Right Constrained
         "cached" -> Right Cached
         "dynamic" -> Right Dynamic
+        "compiled-control" -> Right CompiledControl
         _ -> Left ("Unknown tail case: " ++ name)
       parse count measured (Just selected) backend rest
     parse _ _ (Just _) _ ("--case" : _) = Left "Duplicate --case flag"
@@ -186,7 +190,9 @@ metricFields metrics =
     ("head_cells_avoided", show (Machine.metricHeadCellsAvoided metrics)),
     ("max_activation_registers", show (Machine.metricMaxActivationRegisters metrics)),
     ("body_goals_materialized", show (Machine.metricBodyGoalsMaterialized metrics)),
-    ("body_allocation_instructions", show (Machine.metricBodyAllocationInstructions metrics))
+    ("body_allocation_instructions", show (Machine.metricBodyAllocationInstructions metrics)),
+    ("compiled_control_instructions", show (Machine.metricCompiledControlInstructions metrics)),
+    ("compiled_cuts", show (Machine.metricCompiledCuts metrics))
   ]
 
 main :: IO ()
@@ -223,6 +229,9 @@ main = do
     (fail "Call counter missed a loop activation")
   unless (not measured || backend /= Machine.Bytecode || Machine.metricCompiledActivations metrics > 0)
     (fail "Bytecode tail loop did not exercise compiled activation")
+  unless (not measured || backend /= Machine.Bytecode || selected /= CompiledControl
+    || Machine.metricCompiledControlInstructions metrics >= 2)
+    (fail "Compiled if/once continuations were not exercised")
   unless (measured || all ((== "0") . snd) (metricFields metrics))
     (fail "Unmeasured tail execution retained metric counters")
   if measured && count >= 10000

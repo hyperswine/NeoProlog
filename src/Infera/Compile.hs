@@ -1,11 +1,11 @@
--- | Clause allocation bytecode for first-order rules. Compilation preserves
+-- | Clause and control bytecode. Compilation preserves
 -- source variable numbers and body order; activation adds its fresh-ID base
 -- only when a 'UseVariable' instruction executes. No renamed 'Term' tree is
 -- built by the VM.
 --
--- Unsupported clauses retain the interpreted path. In particular, body cuts
--- must fall back even inside data: the interpreter's body renamer replaces
--- bare cuts recursively, rather than only when they are called.
+-- Body cuts are rewritten recursively, including ordinary data. Control nodes
+-- carry immutable code and local-variable sets; only reached invocation leaves
+-- and operands have construction plans.
 module Infera.Compile
   ( Slot,
     Instruction (..),
@@ -20,6 +20,19 @@ module Infera.Compile
     goalRegisterCount,
     goalVariables,
     goalSuffixVariables,
+    DataPlan,
+    dataTemplate,
+    dataVariables,
+    dataInstructions,
+    dataRoot,
+    dataRegisterCount,
+    ControlCode,
+    ControlInstruction (..),
+    CutOwner (..),
+    controlTemplate,
+    controlVariables,
+    controlSuffixVariables,
+    controlView,
     ClauseCode,
     codeVariableCount,
     codeSlotCount,
@@ -30,6 +43,7 @@ module Infera.Compile
     codeHeadInstructions,
     codeBody,
     codeGoals,
+    codeControls,
     compileClause,
   )
 where
@@ -50,6 +64,7 @@ type Slot = Int
 data Instruction
   = UseVariable !Slot !Int
   | PutConstant !Slot !Term
+  | PutOwner !Slot
   | PutCompound !Slot !String [Slot]
   deriving (Eq, Show)
 
@@ -80,6 +95,7 @@ data GoalOperand = Local !Int | Temporary !Int
 
 data GoalInstruction
   = GoalConstant !Int !Term
+  | GoalOwner !Int
   | GoalCompound !Int !String [GoalOperand]
   deriving (Eq, Show)
 
@@ -107,50 +123,103 @@ goalVariables (GoalCode _ _ _ _ variables _) = variables
 goalSuffixVariables :: GoalCode -> IS.IntSet
 goalSuffixVariables (GoalCode _ _ _ _ _ variables) = variables
 
+-- Data operands and ordinary invocation leaves have physical construction
+-- plans. Control ancestors carry no constructor plan or heap address.
+data DataPlan = DataPlan !Term [GoalInstruction] !GoalOperand !Int !IS.IntSet
+  deriving (Eq, Show)
+
+dataTemplate :: DataPlan -> Term
+dataTemplate (DataPlan template _ _ _ _) = template
+
+dataInstructions :: DataPlan -> [GoalInstruction]
+dataInstructions (DataPlan _ instructions _ _ _) = instructions
+
+dataRoot :: DataPlan -> GoalOperand
+dataRoot (DataPlan _ _ root _ _) = root
+
+dataRegisterCount :: DataPlan -> Int
+dataRegisterCount (DataPlan _ _ _ registers _) = registers
+
+dataVariables :: DataPlan -> IS.IntSet
+dataVariables (DataPlan _ _ _ _ variables) = variables
+
+data CutOwner = LocalBase | LiteralInteger !Integer
+  deriving (Eq, Show)
+
+data ControlInstruction
+  = Invoke !DataPlan !(Maybe (String, Int))
+  | Sequence [ControlCode]
+  | Alternative !ControlCode !ControlCode
+  | Cut !CutOwner
+  | Once !ControlCode
+  | Not !ControlCode
+  | If !ControlCode !ControlCode !(Maybe ControlCode)
+  | FindAll !DataPlan !ControlCode !DataPlan
+  | Call !DataPlan [DataPlan]
+  deriving (Eq, Show)
+
+data ControlCode = ControlCode !Term !IS.IntSet !IS.IntSet !ControlInstruction
+  deriving (Eq, Show)
+
+controlTemplate :: ControlCode -> Term
+controlTemplate (ControlCode template _ _ _) = template
+
+controlVariables :: ControlCode -> IS.IntSet
+controlVariables (ControlCode _ variables _ _) = variables
+
+controlSuffixVariables :: ControlCode -> IS.IntSet
+controlSuffixVariables (ControlCode _ _ variables _) = variables
+
+controlView :: ControlCode -> ControlInstruction
+controlView (ControlCode _ _ _ instruction) = instruction
+
 -- Keep both the constructor and record-update syntax private: an instruction
 -- operand cannot refer forward, use an invalid local variable, or smuggle a
 -- compound into PutConstant.
 data ClauseCode = ClauseCode !Int !Int !Int [Instruction]
-  (Array Slot Instruction) !Slot [HeadInstruction] [BodyCall] [GoalCode]
+  (Array Slot Instruction) !Slot [HeadInstruction] [BodyCall] [GoalCode] [ControlCode]
   deriving (Eq, Show)
 
 codeVariableCount :: ClauseCode -> Int
-codeVariableCount (ClauseCode count _ _ _ _ _ _ _ _) = count
+codeVariableCount (ClauseCode count _ _ _ _ _ _ _ _ _) = count
 
 codeSlotCount :: ClauseCode -> Int
-codeSlotCount (ClauseCode _ count _ _ _ _ _ _ _) = count
+codeSlotCount (ClauseCode _ count _ _ _ _ _ _ _ _) = count
 
 -- | Source-node count before variable/scalar register sharing.
 codeUnsharedSlotCount :: ClauseCode -> Int
-codeUnsharedSlotCount (ClauseCode _ _ count _ _ _ _ _ _) = count
+codeUnsharedSlotCount (ClauseCode _ _ count _ _ _ _ _ _ _) = count
 
 codeInstructions :: ClauseCode -> [Instruction]
-codeInstructions (ClauseCode _ _ _ instructions _ _ _ _ _) = instructions
+codeInstructions (ClauseCode _ _ _ instructions _ _ _ _ _ _) = instructions
 
 -- | Constant-time access to the immutable construction plan, shared across
 -- activations rather than rebuilding its instruction array for each call.
 codeInstructionAt :: ClauseCode -> Slot -> Maybe Instruction
-codeInstructionAt (ClauseCode _ count _ _ instructions _ _ _ _) slot
+codeInstructionAt (ClauseCode _ count _ _ instructions _ _ _ _ _) slot
   | slot < 0 || slot >= count = Nothing
   | otherwise = Just (instructions ! slot)
 
 codeHead :: ClauseCode -> Slot
-codeHead (ClauseCode _ _ _ _ _ slot _ _ _) = slot
+codeHead (ClauseCode _ _ _ _ _ slot _ _ _ _) = slot
 
 codeHeadInstructions :: ClauseCode -> [HeadInstruction]
-codeHeadInstructions (ClauseCode _ _ _ _ _ _ instructions _ _) = instructions
+codeHeadInstructions (ClauseCode _ _ _ _ _ _ instructions _ _ _) = instructions
 
 codeBody :: ClauseCode -> [BodyCall]
-codeBody (ClauseCode _ _ _ _ _ _ _ body _) = body
+codeBody (ClauseCode _ _ _ _ _ _ _ body _ _) = body
 
 codeGoals :: ClauseCode -> [GoalCode]
-codeGoals (ClauseCode _ _ _ _ _ _ _ _ goals) = goals
+codeGoals (ClauseCode _ _ _ _ _ _ _ _ goals _) = goals
+
+codeControls :: ClauseCode -> [ControlCode]
+codeControls (ClauseCode _ _ _ _ _ _ _ _ _ controls) = controls
 
 -- Reverse instructions avoid quadratic list appends during compilation.
 -- Share only local roots and immutable scalars, preserving float bits. Source
 -- compounds keep distinct slots even when their printed forms are equal.
 data CommonKey
-  = VariableKey !Int | AtomKey !String | IntegerKey !Integer | FloatKey !Word64
+  = VariableKey !Int | OwnerKey | AtomKey !String | IntegerKey !Integer | FloatKey !Word64
   | CharacterKey !Char | StringKey !String
   deriving (Eq, Ord)
 
@@ -161,10 +230,10 @@ data HeadNode
   | ConstantNode !Slot !Term
   | CompoundNode !Slot !String [HeadNode]
 
--- | Compile facts and first-order bodies, preserving all scalar types and
--- nested data constructors. Ordinary builtins remain eligible; the machine
--- dispatches them through its existing builtin interface. Control and meta
--- calls, uncallable goals and malformed local IDs use the interpreter.
+-- | Compile facts, ordinary bodies and native control nodes, preserving
+-- scalar types and raw local IDs. Dynamic/uncallable leaves remain native
+-- invocation nodes, so their existing runtime checks decide their behavior.
+-- Malformed local IDs and uncallable heads retain the interpreter fallback.
 --
 -- At least one fresh logical ID is reserved even for ground clauses, matching
 -- the native interpreter's activation owner and fresh-counter convention.
@@ -173,41 +242,54 @@ compileClause clause
   | count < 0 || not (all validVariable variables) = Nothing
   | otherwise = do
       _ <- functorOf (clauseHead clause)
-      if all firstOrderGoal (clauseBody clause) then pure () else Nothing
       (headSlot, headNode, afterHead) <- compileTerm (Builder 0 0 [] Map.empty) (clauseHead clause)
       (body, Builder slots unshared instructions _) <- compileBody afterHead (clauseBody clause)
-      goals <- mapM compileGoal (clauseBody clause)
+      controls <- mapM compileControl (clauseBody clause)
       let (_, headInstructions) = flattenHead headNode
           allocation = reverse instructions
       pure (ClauseCode (max 1 count) slots unshared allocation
         (listArray (0, slots - 1) allocation) headSlot (headInstructions []) body
-        (suffixGoals goals))
+        (suffixGoals (map compatibilityGoal controls)) (suffixControls controls))
   where
     count = clauseNVars clause
     variables = concatMap termVarIds (clauseHead clause : clauseBody clause)
     validVariable variable = variable >= 0 && variable < count
 
-firstOrderGoal :: Term -> Bool
-firstOrderGoal goal = case functorOf goal of
-  Just (name, _) -> name `notElem` controlNames && withoutCuts goal
-  Nothing -> False
-  where
-    controlNames =
-      [ ",", ";", "->", "call", "once", "not", "findall", "forall",
-        "minimize", "phrase", "emit", "phrase_from_file", "!", "$cut"
-      ]
-    withoutCuts (Atom "!") = False
-    withoutCuts (Compound "$cut" _) = False
-    withoutCuts (Compound _ arguments) = all withoutCuts arguments
-    withoutCuts _ = True
-
 compileBody :: Builder -> [Term] -> Maybe ([BodyCall], Builder)
 compileBody builder [] = Just ([], builder)
 compileBody builder (goal : rest) = do
-  key <- functorOf goal
-  (slot, _, next) <- compileTerm builder goal
+  let key = compatibilityKey goal
+  (slot, next) <- compileBodyTerm builder goal
   (calls, final) <- compileBody next rest
   pure (BodyCall slot key goal : calls, final)
+
+compatibilityKey :: Term -> (String, Int)
+compatibilityKey = maybe ("$dynamic", -1) id . functorOf
+
+-- Body rewriting is recursive even in data. Owner is a dynamic scalar, kept
+-- separate from source literals so its activation base cannot be guessed or
+-- accidentally shared with an integer literal at compile time.
+compileBodyTerm :: Builder -> Term -> Maybe (Slot, Builder)
+compileBodyTerm builder term = do
+  visited <- visit builder
+  case term of
+    Atom "!" -> do
+      ownerVisited <- visit visited
+      (owner, next) <- common ownerVisited OwnerKey PutOwner
+      emit next (\slot -> PutCompound slot "$cut" [owner])
+    Var variable -> common visited (VariableKey variable) (\slot -> UseVariable slot variable)
+    Compound name arguments -> do
+      (children, next) <- bodyArguments visited arguments
+      emit next (\slot -> PutCompound slot name children)
+    scalar -> do
+      key <- scalarKey scalar
+      common visited key (\slot -> PutConstant slot scalar)
+  where
+    bodyArguments current [] = Just ([], current)
+    bodyArguments current (argument : rest) = do
+      (slot, next) <- compileBodyTerm current argument
+      (slots, final) <- bodyArguments next rest
+      pure (slot : slots, final)
 
 compileTerm :: Builder -> Term -> Maybe (Slot, HeadNode, Builder)
 compileTerm builder term = do
@@ -270,16 +352,35 @@ flattenHead node = case node of
         totalWidth = 1 + childrenWidth
      in (totalWidth, (HeadCompound slot name (length children) totalWidth :) . instructions)
 
-compileGoal :: Term -> Maybe GoalCode
-compileGoal template = do
-  key <- functorOf template
-  (rootSlot, _, Builder _ _ reversed _) <- compileTerm (Builder 0 0 [] Map.empty) template
+goalFromPlan :: DataPlan -> GoalCode
+goalFromPlan plan =
+  let template = dataTemplate plan
+      key = compatibilityKey template
+      physicalRoot = dataRoot plan
+      rootRegister = case physicalRoot of Local local -> local; Temporary register -> register
+   in GoalCode (BodyCall rootRegister key template) (dataInstructions plan)
+        physicalRoot (dataRegisterCount plan) (dataVariables plan) IS.empty
+
+-- Ordinary top-level leaves share their already compiled data plan. Full
+-- control-wrapper plans are compatibility oracles only and are compiled
+-- lazily when codeGoals/materializeNext is requested. The checked whole-body
+-- construction plan bounds every individual goal's nodes/registers, and the
+-- private lowering preserves defined SSA operands, so failure here indicates
+-- an internal compiler invariant violation rather than unsupported input.
+compatibilityGoal :: ControlCode -> GoalCode
+compatibilityGoal control = case controlView control of
+  Invoke plan _ -> goalFromPlan plan
+  _ -> case compileDataPlan (controlTemplate control) of
+    Just plan -> goalFromPlan plan
+    Nothing -> error "Infera.Compile: validated compatibility plan failed"
+
+compileDataPlan :: Term -> Maybe DataPlan
+compileDataPlan template = do
+  (rootSlot, Builder _ _ reversed _) <- compileBodyTerm (Builder 0 0 [] Map.empty) template
   (virtual, roots) <- virtualGoal (reverse reversed)
   root <- IM.lookup rootSlot roots
   (instructions, physicalRoot, registers) <- allocateGoal virtual root
-  let rootRegister = case physicalRoot of Local local -> local; Temporary register -> register
-      variables = IS.fromList (termVarIds template)
-  pure (GoalCode (BodyCall rootRegister key template) instructions physicalRoot registers variables IS.empty)
+  pure (DataPlan template instructions physicalRoot registers (IS.fromList (termVarIds template)))
 
 -- Erase variable move instructions before physical allocation. Source locals
 -- are resolved through their stable IDs only when this goal materializes.
@@ -290,6 +391,8 @@ virtualGoal = go [] IM.empty
     go instructions roots (instruction : rest) = case instruction of
       UseVariable slot local -> go instructions (IM.insert slot (Local local) roots) rest
       PutConstant slot scalar -> go (GoalConstant slot scalar : instructions)
+        (IM.insert slot (Temporary slot) roots) rest
+      PutOwner slot -> go (GoalOwner slot : instructions)
         (IM.insert slot (Temporary slot) roots) rest
       PutCompound slot name children -> do
         operands <- mapM (\child -> IM.lookup child roots) children
@@ -305,6 +408,7 @@ allocateGoal instructions root = do
   let countOperand counts (Local _) = counts
       countOperand counts (Temporary temporary) = IM.insertWith (+) temporary (1 :: Int) counts
       operands (GoalConstant _ _) = []
+      operands (GoalOwner _) = []
       operands (GoalCompound _ _ children) = children
       uses = foldl' countOperand IM.empty (root : concatMap operands instructions)
       resolve _ local@(Local _) = Just local
@@ -328,6 +432,7 @@ allocateGoal instructions root = do
         (destination, following, pool) <- claim next available
         let (virtualDestination, physical) = case instruction of
               GoalConstant temporary scalar -> (temporary, GoalConstant destination scalar)
+              GoalOwner temporary -> (temporary, GoalOwner destination)
               GoalCompound temporary name _ -> (temporary, GoalCompound destination name physicalChildren)
         pure (physical : built, IM.insert virtualDestination destination retained, usesLeft, pool, following)
   (reversed, assignments, _, _, registers) <- foldMaybe step ([], IM.empty, uses, IS.empty, 0) instructions
@@ -344,3 +449,54 @@ suffixGoals = snd . foldr add (IS.empty, [])
     add (GoalCode call instructions root registers variables _) (following, goals) =
       let live = IS.union variables following
        in (live, GoalCode call instructions root registers variables live : goals)
+
+compileControl :: Term -> Maybe ControlCode
+compileControl template = do
+  (instruction, variables) <- case template of
+    Compound "," [left, right] -> do
+      a <- compileControl left
+      b <- compileControl right
+      pure (Sequence [a, b], IS.union (controlVariables a) (controlVariables b))
+    Compound ";" [Compound "->" [condition, yes], no] -> do
+      c <- compileControl condition
+      y <- compileControl yes
+      n <- compileControl no
+      pure (If c y (Just n), IS.unions (map controlVariables [c, y, n]))
+    Compound ";" [left, right] -> do
+      a <- compileControl left
+      b <- compileControl right
+      pure (Alternative a b, IS.union (controlVariables a) (controlVariables b))
+    Compound "->" [condition, yes] -> do
+      c <- compileControl condition
+      y <- compileControl yes
+      pure (If c y Nothing, IS.union (controlVariables c) (controlVariables y))
+    Atom "!" -> pure (Cut LocalBase, IS.empty)
+    Compound "$cut" [IntLit owner] -> pure (Cut (LiteralInteger owner), IS.empty)
+    Compound "once" [child] -> do
+      code <- compileControl child
+      pure (Once code, controlVariables code)
+    Compound "not" [child] -> do
+      code <- compileControl child
+      pure (Not code, controlVariables code)
+    Compound "findall" [value, child, target] -> do
+      valuePlan <- compileDataPlan value
+      code <- compileControl child
+      targetPlan <- compileDataPlan target
+      pure (FindAll valuePlan code targetPlan,
+        IS.unions [dataVariables valuePlan, controlVariables code, dataVariables targetPlan])
+    Compound "call" (callable : arguments) -> do
+      callablePlan <- compileDataPlan callable
+      argumentPlans <- mapM compileDataPlan arguments
+      pure (Call callablePlan argumentPlans,
+        IS.unions (map dataVariables (callablePlan : argumentPlans)))
+    _ -> do
+      plan <- compileDataPlan template
+      pure (Invoke plan (functorOf template), dataVariables plan)
+  pure (ControlCode template variables variables instruction)
+
+suffixControls :: [ControlCode] -> [ControlCode]
+suffixControls = snd . foldr add (IS.empty, [])
+  where
+    add (ControlCode template variables _ instruction) (following, controls) =
+      let live = IS.union variables following
+       in (live, ControlCode template variables live instruction : controls)

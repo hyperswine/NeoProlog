@@ -35,6 +35,7 @@ import MachineBytecodeTest (machineBytecodeGroup)
 import MachineBytecodeHeapTest (machineBytecodeHeapGroup)
 import MachineHeadTest (machineHeadGroup)
 import MachineLifetimeTest (machineLifetimeGroup)
+import MachineCompiledControlTest (machineCompiledControlGroup)
 import System.Environment (getArgs)
 import Data.List (isPrefixOf)
 import System.Exit (exitFailure)
@@ -59,7 +60,8 @@ groups =
     ("machine-bytecode", machineBytecodeGroup),
     ("machine-bytecode-heap", machineBytecodeHeapGroup),
     ("machine-head", machineHeadGroup),
-    ("machine-lifetime", machineLifetimeGroup)
+    ("machine-lifetime", machineLifetimeGroup),
+    ("machine-compiled-control", machineCompiledControlGroup)
   ]
 
 main :: IO ()

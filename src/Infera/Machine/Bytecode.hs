@@ -9,6 +9,7 @@ module Infera.Machine.Bytecode
     HeadActivation (..),
     BodyFrame,
     BodyStep (..),
+    DataStep (..),
     activate,
     activateMeasured,
     activateHead,
@@ -16,6 +17,9 @@ module Infera.Machine.Bytecode
     materializeNext,
     materializeNextMeasured,
     frameVariables,
+    nextControl,
+    materializeData,
+    materializeDataMeasured,
     instantiate,
   )
 where
@@ -64,7 +68,7 @@ data Activation = Activation
 -- | This continuation contains code and logical IDs only. Mutable construction
 -- arrays and heap handles never survive materialization or a public resume.
 -- The suffix list/set is shared with the immutable clause code.
-data BodyFrame = BodyFrame !VarId ![GoalCode]
+data BodyFrame = BodyFrame !VarId !Int !ClauseCode ![ControlCode]
 
 data HeadActivation = HeadActivation
   { headBindings :: !Bridge.Bindings,
@@ -84,17 +88,30 @@ data BodyStep = BodyStep
     stepRegisterSlots :: !Int
   }
 
+data DataStep = DataStep
+  { dataStepRoot :: !Address,
+    dataStepAllocationInstructions :: !Int,
+    dataStepRegisterSlots :: !Int
+  }
+
 -- | All source-local occurrences in the remaining body are live, including
 -- output-only variables and variables nested in data. Convert the persistent
 -- suffix set only at a collection boundary; no source AST is walked.
 frameVariables :: BodyFrame -> [VarId]
-frameVariables (BodyFrame base goals) = case goals of
+frameVariables (BodyFrame base _ _ goals) = case goals of
   [] -> []
-  goal : _ -> map (+ base) (IS.toAscList (goalSuffixVariables goal))
+  goal : _ -> map (+ base) (IS.toAscList (controlSuffixVariables goal))
 
-bodyFrame :: VarId -> [GoalCode] -> Maybe BodyFrame
-bodyFrame _ [] = Nothing
-bodyFrame base goals = Just (BodyFrame base goals)
+bodyFrame :: VarId -> Int -> ClauseCode -> [ControlCode] -> Maybe BodyFrame
+bodyFrame _ _ _ [] = Nothing
+bodyFrame base cursor code goals = Just (BodyFrame base cursor code goals)
+
+-- | Select a compiled body root without allocating a control wrapper or
+-- touching the heap. The final node has no empty frame before its return.
+nextControl :: BodyFrame -> Maybe (VarId, ControlCode, Maybe BodyFrame)
+nextControl (BodyFrame _ _ _ []) = Nothing
+nextControl (BodyFrame base cursor code (control : remaining)) =
+  Just (base, control, bodyFrame base (cursor + 1) code remaining)
 
 data Construction s = Construction
   { constructionHeap :: !(Heap s),
@@ -193,7 +210,7 @@ activateHeadWithMetrics measured heap bindings store goal base code = do
         (matched, avoided) <- lift (maybe (pure (0, 0)) readSTRef matching)
         allocationCount <- lift (maybe (pure 0) readSTRef instructions)
         registers <- lift (if measured then readSTRef slots else pure Nothing)
-        pure (Right (Just (HeadActivation updated propagated (bodyFrame base (codeGoals code))
+        pure (Right (Just (HeadActivation updated propagated (bodyFrame base 0 code (codeControls code))
           matched allocationCount avoided (maybe 0 (const registerLimit) registers))))
   restoreRejected heap mark result
 
@@ -222,12 +239,40 @@ materializeNextMeasured = materializeNextWithMetrics True
 
 materializeNextWithMetrics :: Bool -> Heap s -> Bridge.Bindings -> BodyFrame
   -> ST s (Either HeapError (Maybe BodyStep))
-materializeNextWithMetrics _ _ _ (BodyFrame _ []) = pure (Right Nothing)
-materializeNextWithMetrics measured heap bindings (BodyFrame base (goal : remaining)) = do
+materializeNextWithMetrics _ _ _ (BodyFrame _ _ _ []) = pure (Right Nothing)
+materializeNextWithMetrics measured heap bindings (BodyFrame base cursor code controls) =
+  case drop cursor (codeGoals code) of
+    [] -> pure (Left IncompatibleBindings)
+    goal : _ -> do
+      result <- materializePlanWithMetrics measured heap bindings base
+        (goalVariables goal) (goalRegisterCount goal) (goalInstructions goal) (goalRoot goal)
+      pure $ fmap (\built -> Just (BodyStep (dataStepRoot built) (goalCall goal)
+        (bodyFrame base (cursor + 1) code (drop 1 controls))
+        (dataStepAllocationInstructions built) (dataStepRegisterSlots built))) result
+
+-- | Materialize a control operand or invocation leaf. No control ancestor
+-- constructor is allocated, and ordinary data recursively rewrites bare cuts
+-- to this source activation's owner. Registers remain private to this call.
+materializeData :: Heap s -> Bridge.Bindings -> VarId -> DataPlan
+  -> ST s (Either HeapError DataStep)
+materializeData = materializeDataWithMetrics False
+
+materializeDataMeasured :: Heap s -> Bridge.Bindings -> VarId -> DataPlan
+  -> ST s (Either HeapError DataStep)
+materializeDataMeasured = materializeDataWithMetrics True
+
+materializeDataWithMetrics :: Bool -> Heap s -> Bridge.Bindings -> VarId -> DataPlan
+  -> ST s (Either HeapError DataStep)
+materializeDataWithMetrics measured heap bindings base plan =
+  materializePlanWithMetrics measured heap bindings base (dataVariables plan)
+    (dataRegisterCount plan) (dataInstructions plan) (dataRoot plan)
+
+materializePlanWithMetrics :: Bool -> Heap s -> Bridge.Bindings -> VarId
+  -> IS.IntSet -> Int -> [GoalInstruction] -> GoalOperand -> ST s (Either HeapError DataStep)
+materializePlanWithMetrics measured heap bindings base variables count instructions rootOperand = do
   mark <- Heap.checkpoint heap
   result <- runExceptT $ do
-    let localIds = IS.toAscList (goalVariables goal)
-        count = goalRegisterCount goal
+    let localIds = IS.toAscList variables
     addresses <- checked (Bridge.lookupVariables heap bindings (map (+ base) localIds))
     let locals = IM.fromDistinctAscList (zip localIds addresses)
     when (count < 0) (throwError IncompatibleBindings)
@@ -242,17 +287,19 @@ materializeNextWithMetrics measured heap bindings (BodyFrame base (goal : remain
               _ -> pure ()
             address <- checked (Heap.importTerm heap scalar)
             overwriteSlot slots count destination address
+          GoalOwner destination -> do
+            address <- checked (Heap.importTerm heap (IntLit (toInteger base)))
+            overwriteSlot slots count destination address
           GoalCompound destination name children -> do
             -- A destination may recycle a child's final-use register. Capture
             -- every child address before the destination overwrites any slot.
             childrenAddresses <- mapM operand children
             address <- checked (Heap.newCompound heap name childrenAddresses)
             overwriteSlot slots count destination address
-    mapM_ executeGoal (goalInstructions goal)
-    root <- operand (goalRoot goal)
-    pure (Just (BodyStep root (goalCall goal) (bodyFrame base remaining)
-      (if measured then length (goalInstructions goal) else 0)
-      (if measured then count else 0)))
+    mapM_ executeGoal instructions
+    root <- operand rootOperand
+    pure (DataStep root (if measured then length instructions else 0)
+      (if measured then count else 0))
   case result of
     Right _ -> pure result
     Left problem -> do
@@ -292,6 +339,7 @@ constructSlot construction slot = do
             Var _ -> throwError IncompatibleBindings
             Compound _ _ -> throwError IncompatibleBindings
             _ -> checked (Heap.importTerm heap scalar)
+        PutOwner _ -> throwError IncompatibleBindings -- Head plans never own body cuts.
         PutCompound destination name children -> do
           unless (destination == slot && all (\child -> child >= 0 && child < slot) children)
             (throwError IncompatibleBindings)
@@ -378,7 +426,7 @@ instantiate heap bindings base code = do
     (allocated, roots) <- checked (Bridge.allocateActivation heap bindings base variableCount)
     let variables = listArray (0, variableCount - 1) roots
     slots <- lift (newSlots slotCount)
-    forM_ (codeInstructions code) (execute heap variables variableCount slots slotCount)
+    forM_ (codeInstructions code) (execute heap base variables variableCount slots slotCount)
     headAddress <- readSlot slots slotCount (codeHead code)
     bodyAddresses <- mapM (readSlot slots slotCount . bodySlot) (codeBody code)
     pure (allocated, headAddress, bodyAddresses)
@@ -409,9 +457,9 @@ overwriteSlot slots count slot address = do
   when (slot < 0 || slot >= count) (throwError IncompatibleBindings)
   lift (writeArray slots slot (Just address))
 
-execute :: Heap s -> Array Int Address -> Int -> STArray s Int (Maybe Address) -> Int
+execute :: Heap s -> VarId -> Array Int Address -> Int -> STArray s Int (Maybe Address) -> Int
   -> Instruction -> ActivationM s ()
-execute heap variables variableCount slots slotCount instruction = case instruction of
+execute heap base variables variableCount slots slotCount instruction = case instruction of
   UseVariable destination local -> do
     when (local < 0 || local >= variableCount) (throwError IncompatibleBindings)
     writeSlot slots slotCount destination (variables ! local)
@@ -421,6 +469,9 @@ execute heap variables variableCount slots slotCount instruction = case instruct
       Compound _ _ -> throwError IncompatibleBindings
       _ -> pure ()
     address <- checked (Heap.importTerm heap scalar)
+    writeSlot slots slotCount destination address
+  PutOwner destination -> do
+    address <- checked (Heap.importTerm heap (IntLit (toInteger base)))
     writeSlot slots slotCount destination address
   PutCompound destination name children -> do
     addresses <- mapM (readSlot slots slotCount) children

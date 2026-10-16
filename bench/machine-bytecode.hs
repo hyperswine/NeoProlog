@@ -4,7 +4,7 @@
 module Main (main) where
 
 import Control.Exception (evaluate)
-import Control.Monad (forM, forM_, unless)
+import Control.Monad (forM, forM_, unless, when)
 import Data.List (intercalate, sort)
 import Data.Version (showVersion)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -19,6 +19,8 @@ import System.Info (arch, compilerName, compilerVersion, os)
 import System.Timeout (timeout)
 
 data Model = SumTo Integer | Entries Int | Done
+  | OrderedResults [Integer] | ControlSumTo Integer | CollectedTriples Int
+  | CutSumTo Integer | UntakenDone
 data Case = Case String String String Model
 
 cases :: [Case]
@@ -26,7 +28,12 @@ cases =
   [ Case "helper-dispatch-10000" fixture "loop 10000 0 Result?" (SumTo 10000),
     Case "structured-list-300" fixture "build 300 [] Result?" (Entries 300),
     Case "structured-head-10000" fixture "head_loop 10000 0 Result?" (SumTo 10000),
-    Case "early-fail-body-2000" failureFixture "(huge _ ; Result = done)?" Done
+    Case "early-fail-body-2000" failureFixture "(huge _ ; Result = done)?" Done,
+    Case "control-ordered-disjunction" choiceFixture "ordered Result?" (OrderedResults [3, 1, 4]),
+    Case "control-once-not-if-300" scopeFixture "loop 300 0 Result?" (ControlSumTo 300),
+    Case "control-findall-100" collectionFixture "collect 100 Result?" (CollectedTriples 100),
+    Case "control-cut-1000" cutFixture "loop 1000 0 Result?" (CutSumTo 1000),
+    Case "control-untaken-else-2000" untakenFixture "huge Result?" UntakenDone
   ]
 
 -- A separate program avoids adding this large cold compiler workload to the
@@ -39,6 +46,48 @@ failureFixture = unlines
       ["sink (entry " ++ show n ++ " (pair " ++ show n ++ " " ++ show n
         ++ ") [" ++ intercalate ", " (replicate 3 (show n)) ++ "]) Result"
       | n <- [1 .. 2000 :: Int]] ++ "."
+  ]
+
+-- Keep control programs separate from the historical first-order fixture and
+-- from one another, so cold per-query compilation covers only that case.
+choiceFixture :: String
+choiceFixture = unlines
+  [ "<- notable.",
+    "ordered Result <- (Result = 3 ; Result = 1 ; Result = 4)."
+  ]
+
+scopeFixture :: String
+scopeFixture = unlines
+  [ "<- notable.",
+    "loop 0 Acc Acc.",
+    "loop N Acc Result <- N > 0, once ((Picked = N ; Picked = 0)), not (Picked < 0), (Picked > 0 -> Next is Acc + Picked ; Next = Acc), M is N - 1, loop M Next Result."
+  ]
+
+collectionFixture :: String
+collectionFixture = unlines
+  [ "<- notable.",
+    "collect 0 [].",
+    "collect N [Values | Rest] <- N > 0, findall X (X = N ; X is N + 1 ; X is N + 2) Values, M is N - 1, collect M Rest."
+  ]
+
+cutFixture :: String
+cutFixture = unlines
+  [ "<- notable.",
+    "pick : unsafe.",
+    "loop : unsafe.",
+    "pick N Value <- (Value = N ; Value = 0), !.",
+    "loop 0 Acc Acc.",
+    "loop N Acc Result <- N > 0, pick N Value, Next is Acc + Value, M is N - 1, loop M Next Result."
+  ]
+
+untakenFixture :: String
+untakenFixture = unlines
+  [ "<- notable.",
+    "sink _ _.",
+    "huge Result <- (true -> Result = done ; (" ++ intercalate ", "
+      ["sink (entry " ++ show n ++ " (pair " ++ show n ++ " " ++ show n
+        ++ ") [" ++ intercalate ", " (replicate 3 (show n)) ++ "]) Result"
+      | n <- [1 .. 2000 :: Int]] ++ "))."
   ]
 
 fixture :: String
@@ -78,16 +127,33 @@ observe query = map item
     item (ConsumedIncomplete key) = IncompleteObservation key
 
 independent :: Model -> [Observation]
-independent model = [AnswerObservation [("Result", result)] [] []]
+independent model = [AnswerObservation [("Result", result)] [] [] | result <- results]
   where
-    result = case model of
-      SumTo count -> IntLit (div (count * (count + 1)) 2)
-      Entries count -> mkList
+    sumTo count = IntLit (div (count * (count + 1)) 2)
+    results = case model of
+      SumTo count -> [sumTo count]
+      ControlSumTo count -> [sumTo count]
+      CutSumTo count -> [sumTo count]
+      OrderedResults values -> map IntLit values
+      CollectedTriples count -> [mkList
+        [mkList (map IntLit [value, value + 1, value + 2]) Nothing
+        | value <- map toInteger [count, count - 1 .. 1]] Nothing]
+      Entries count -> [mkList
         [ Compound "entry" [IntLit value, Compound "pair" [IntLit value, IntLit value],
             mkList (replicate 3 (IntLit value)) Nothing]
         | value <- map toInteger [1 .. count]
-        ] Nothing
-      Done -> Atom "done"
+        ] Nothing]
+      Done -> [Atom "done"]
+      UntakenDone -> [Atom "done"]
+
+controlModel :: Model -> Bool
+controlModel model = case model of
+  OrderedResults _ -> True
+  ControlSumTo _ -> True
+  CollectedTriples _ -> True
+  CutSumTo _ -> True
+  UntakenDone -> True
+  _ -> False
 
 -- Distinct unused logical-variable bases prevent pure applications from
 -- sharing an already evaluated search across samples. Named variables stay
@@ -158,8 +224,22 @@ compiledProbe program query testCase@(Case name _ _ model) expected = do
         && Machine.metricMaxTasks metrics <= 4
         && Machine.metricMaxActivationRegisters metrics <= 2)
           (fail (name ++ ": unreachable body goals were allocated"))
+      UntakenDone -> unless (Machine.metricBodyGoalsMaterialized metrics <= 3
+        && Machine.metricBodyAllocationInstructions metrics <= 5
+        && Machine.metricMaxHeapCells metrics < 64
+        && Machine.metricMaxTasks metrics <= 8
+        && Machine.metricMaxActivationRegisters metrics <= 3)
+          (fail (name ++ ": untaken control branch was allocated or scheduled"))
+      OrderedResults _ -> pure ()
       _ -> unless (Machine.metricDirectCalls metrics > 0)
         (fail (name ++ ": direct dispatch was not exercised"))
+    when (controlModel model) $
+      unless (Machine.metricCompiledControlInstructions metrics > 0)
+        (fail (name ++ ": compiled control was not exercised"))
+    case model of
+      CutSumTo _ -> unless (Machine.metricCompiledCuts metrics > 0)
+        (fail (name ++ ": compiled cut was not exercised"))
+      _ -> pure ()
     _ <- evaluate (length (show metrics))
     pure metrics
   case completed of
@@ -174,6 +254,8 @@ compiledProbe program query testCase@(Case name _ _ model) expected = do
         "max_activation_registers=" ++ show (Machine.metricMaxActivationRegisters metrics),
         "body_goals_materialized=" ++ show (Machine.metricBodyGoalsMaterialized metrics),
         "body_allocation_instructions=" ++ show (Machine.metricBodyAllocationInstructions metrics),
+        "compiled_control_instructions=" ++ show (Machine.metricCompiledControlInstructions metrics),
+        "compiled_cuts=" ++ show (Machine.metricCompiledCuts metrics),
         "max_heap_cells=" ++ show (Machine.metricMaxHeapCells metrics),
         "max_tasks=" ++ show (Machine.metricMaxTasks metrics),
         "fully_drained=true", "timed=false"
@@ -181,6 +263,24 @@ compiledProbe program query testCase@(Case name _ _ model) expected = do
 
 median :: [Double] -> Double
 median values = sort values !! div (length values) 2
+
+-- Count the arrays that normal execution may actually allocate. Legacy
+-- whole-goal plans also exist for independent decoders, but control wrappers
+-- are not constructed by the compiled scheduler.
+controlRegisterPeak :: Compile.ControlCode -> Int
+controlRegisterPeak code = case Compile.controlView code of
+  Compile.Invoke plan _ -> Compile.dataRegisterCount plan
+  Compile.Sequence children -> maximum (0 : map controlRegisterPeak children)
+  Compile.Alternative left right -> max (controlRegisterPeak left) (controlRegisterPeak right)
+  Compile.Cut _ -> 0
+  Compile.Once child -> controlRegisterPeak child
+  Compile.Not child -> controlRegisterPeak child
+  Compile.If condition yes no -> maximum
+    (controlRegisterPeak condition : controlRegisterPeak yes : maybe [] (pure . controlRegisterPeak) no)
+  Compile.FindAll template child target -> maximum
+    [Compile.dataRegisterCount template, controlRegisterPeak child, Compile.dataRegisterCount target]
+  Compile.Call callable arguments -> maximum
+    (Compile.dataRegisterCount callable : map Compile.dataRegisterCount arguments)
 
 main :: IO ()
 main = do
@@ -239,6 +339,8 @@ main = do
         "unshared_slots=" ++ show (sum (map Compile.codeUnsharedSlotCount plans)),
         "pooled_slots=" ++ show (sum (map Compile.codeSlotCount plans)),
         "max_body_temporary_registers=" ++ show
+          (maximum (0 : [controlRegisterPeak code | plan <- plans, code <- Compile.codeControls plan])),
+        "legacy_max_body_temporary_registers=" ++ show
           (maximum (0 : [Compile.goalRegisterCount goal | code <- plans, goal <- Compile.codeGoals code])),
         "timed=false"
       ])

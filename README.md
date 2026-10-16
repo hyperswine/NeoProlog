@@ -378,17 +378,22 @@ The public `Infera.Engine` now runs an explicit abstract machine with a trail,
 choice-point stacks, last-call optimisation, heap reclamation and tracing.
 `Infera.Engine.Reference` retains the previous resolver for comparisons through
 the bytecode transition. Step 2 now has opt-in compiled clause activation,
-specialized head matching, per-goal body allocation, temporary register reuse
-and direct ordinary user calls; the public solver still selects the
+specialized head matching, per-goal body allocation, temporary register reuse,
+compiled core controls/cut barriers and direct ordinary user calls; the public
+solver still selects the
 interpreted native driver. [docs/engine-roadmap.md](docs/engine-roadmap.md)
-tracks the remaining argument/environment register design, control/indexing
+tracks the remaining argument/environment register design, indexing
 instructions and persistent load-time caches. The
 [foundation report](docs/engine-step2-foundation-2026-10-16.md) records the
 minefield regression repair and initial compiler slice; the
 [head/register report](docs/engine-step2-head-register-2026-10-16.md) covers the
 subsequent matcher and allocation changes. The
 [lifetime report](docs/engine-step2-lifetimes-2026-10-16.md) covers temporary
-register reuse and pending body continuations. Proved tail transfers
+register reuse and pending body continuations. The
+[control report](docs/engine-step2-control-2026-10-16.md) covers compiled
+branches, opaque searches and cut barriers. Bytecode is the intended eventual
+default; the roadmap records its correctness and performance migration gates.
+Proved tail transfers
 reuse their depth budget; other nested calls
 retain the 100 000 activation limit and explicit exhaustion reporting.
 `bench/run.sh` runs checked engine benchmarks. Earlier relative-speed numbers
@@ -401,7 +406,7 @@ samples; current changes need source/profile-matched measurements.
 ```
 src/Infera/Syntax.hs    terms, declarations, parser, printer
 src/Infera/Unify.hs     substitutions, unification, renaming
-src/Infera/Compile.hs   head matching, per-goal allocation and temporary register lifetimes
+src/Infera/Compile.hs   head matching, allocation plans and pure control instructions
 src/Infera/Machine/Heap.hs paged heap/trail and immutable snapshots
 src/Infera/Machine/Bridge.hs logical variables and complete solver-state adapters
 src/Infera/Machine/Control.hs native task/choice stacks, scopes and immutable resume
@@ -444,6 +449,7 @@ test/CompileTest.hs     generated compiler register contracts and fallback bound
 test/MachineBytecodeTest.hs interpreted/bytecode/reference parity and immutable resumes
 test/MachineHeadTest.hs whole-head CLP transactions, raw IDs, register sharing and snapshots
 test/MachineLifetimeTest.hs pending body roots, register reuse and incremental allocation parity
+test/MachineCompiledControlTest.hs generated control trees, cut barriers, scopes and trace parity
 test/MachineEnvironmentTest.hs branch-owned environments and graph relocation models
 test/MachineGeneralReclaimTest.hs non-tail collection with contracts, cuts and effects
 test/PerformanceDiagnosticTest.hs generated performance-advice models and precise source locations
@@ -457,6 +463,7 @@ docs/engine-roadmap.md  plan for the abstract machine and bytecode engine
 docs/engine-step2-foundation-2026-10-16.md regression repair and opt-in compiler evidence
 docs/engine-step2-head-register-2026-10-16.md specialized head matching and register allocation
 docs/engine-step2-lifetimes-2026-10-16.md per-goal body construction and logical root lifetimes
+docs/engine-step2-control-2026-10-16.md compiled controls/cuts and default-backend migration gates
 lsp/                    VS Code extension and language server
 ```
 
@@ -573,7 +580,7 @@ opaque scopes. The historical
 [breadboard recheck](docs/engine-structured-tail-breadboard-2026-10-16.tsv)
 also predates the public facade switch and places the machine behind the
 reference on these small cases. Later Step 1 samples are tracked in the
-roadmap; current compiler evidence is in the lifetime report. These
+roadmap; current compiler evidence is in the control report. These
 historical results establish no general performance improvement.
 
 The historical Step 1 gate passed 278 Haskell properties (20,698 property test
@@ -602,12 +609,16 @@ IDs so collection can retire completed locals without losing future uses.
 No mutable register or heap address escapes into a pending body frame. Body
 syntax retains original local IDs. Known user calls dispatch directly, while
 contracts, tables and backtracking retain the native driver's semantics.
-Control/meta
-clauses and recursively nested body cuts use the interpreter. Code caches
+Conjunction, disjunction, cuts, `call`, `once`, negation, if-then-else and
+`findall` use pure compiled control continuations and the native choice/scope
+driver. Untaken branches allocate no control wrappers or leaf graphs. Body
+cuts rewrite recursively, including inside data; head data stays literal.
+Dynamic/noncallable leaves and less-common meta/DCG operations use native
+runtime handlers through invocation plans. Code caches
 belong to each query or table-producer startup; persistent load-time caches and
 the full argument/environment register design remain future work. Table
-producer heads still use their existing template path; native producer bodies select the requested
-backend. Compiler and
+producer heads still use their existing template path; native producer bodies
+select the requested backend. Compiler and
 backend tests compare raw scalar bits, ordered observations, source frames and
 repeated/interleaved resumes. The
 [foundation report](docs/engine-step2-foundation-2026-10-16.md) records the
@@ -616,13 +627,14 @@ cases), 37 editor/LSP tests, 20 harness tests and CLI acceptance passed. Its
 initial comparison established working compiled dispatch and parity without
 establishing a throughput gain. Subsequent implementation and validation are
 recorded separately in the
-[head/register report](docs/engine-step2-head-register-2026-10-16.md) and
-[lifetime report](docs/engine-step2-lifetimes-2026-10-16.md).
-The current local gate passed 335 Haskell properties (23,198 cases), 37 LSP
-tests, 20 harness tests and CLI acceptance. Ordinary compiled execution skips
+[head/register report](docs/engine-step2-head-register-2026-10-16.md),
+[lifetime report](docs/engine-step2-lifetimes-2026-10-16.md) and
+[control report](docs/engine-step2-control-2026-10-16.md).
+The current gate passed 344 Haskell properties (23,805 cases), 37 LSP tests,
+20 harness tests and CLI acceptance. Ordinary compiled execution skips
 instruction statistics; measured variants distinguish accepted-head work from
 reached body construction. The allocation changes establish smaller temporary
-arrays and skipped future graphs; throughput results remain mixed. All 28
+arrays and skipped future graphs; throughput results remain mixed. All 30
 compiled residency samples and the six-sample interpreted recheck pass.
 
 The historical Step 1 [fresh-process residency gate](docs/engine-step1-tail-2026-10-16.jsonl)
