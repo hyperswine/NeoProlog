@@ -1,6 +1,7 @@
 -- Compare the opt-in first-order compiler with both existing execution paths.
 -- All samples drain and validate the complete ordered search stream. Programs
--- are parsed/checked before timing; per-query compilation stays inside timing.
+-- are parsed/checked before timing. An untimed compiled probe warms the reached
+-- immutable predicate plans; per-query dispatch setup stays inside timing.
 module Main (main) where
 
 import Control.Exception (evaluate)
@@ -49,7 +50,7 @@ failureFixture = unlines
   ]
 
 -- Keep control programs separate from the historical first-order fixture and
--- from one another, so cold per-query compilation covers only that case.
+-- from one another, so preparing each case cannot warm another case's plans.
 choiceFixture :: String
 choiceFixture = unlines
   [ "<- notable.",
@@ -256,6 +257,9 @@ compiledProbe program query testCase@(Case name _ _ model) expected = do
         "body_allocation_instructions=" ++ show (Machine.metricBodyAllocationInstructions metrics),
         "compiled_control_instructions=" ++ show (Machine.metricCompiledControlInstructions metrics),
         "compiled_cuts=" ++ show (Machine.metricCompiledCuts metrics),
+        "code_cache_hits=" ++ show (Machine.metricCodeCacheHits metrics),
+        "predicate_cache_hits=" ++ show (Machine.metricPredicateCacheHits metrics),
+        "predicate_cache_misses=" ++ show (Machine.metricPredicateCacheMisses metrics),
         "max_heap_cells=" ++ show (Machine.metricMaxHeapCells metrics),
         "max_tasks=" ++ show (Machine.metricMaxTasks metrics),
         "fully_drained=true", "timed=false"
@@ -285,7 +289,7 @@ controlRegisterPeak code = case Compile.controlView code of
 main :: IO ()
 main = do
   let paths =
-        [ "src/Infera/Compile.hs", "src/Infera/Machine/Bytecode.hs",
+        [ "src/Infera/Compile.hs", "src/Infera/Compile/Cache.hs", "src/Infera/Machine/Bytecode.hs",
           "src/Infera/Machine/Control.hs", "src/Infera/Machine/Heap.hs",
           "src/Infera/Machine/Bridge.hs", "src/Infera/Machine/CLP.hs",
           "src/Infera/Machine/Builtins.hs", "src/Infera/Machine/Tail.hs",
@@ -301,10 +305,11 @@ main = do
   _ <- evaluate (length fingerprint)
   putStrLn ("# source-fingerprint=" ++ fingerprint)
   putStrLn ("# compiler=" ++ compilerName ++ "-" ++ showVersion compilerVersion ++ " platform=" ++ arch ++ "-" ++ os)
-  putStrLn "# scope=loaded case-specific checked program; cold per-query compilation/cache construction+execution+projection+validation; no parsing or CLI startup"
+  putStrLn "# scope=loaded case-specific checked program; reached immutable predicate plans warmed by untimed compiled probe; per-query dispatch/tail setup+execution+projection+validation; no parsing or CLI startup"
   putStrLn "# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)"
   putStrLn "# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 measured_probe=5 normal_counters=false no_timing_threshold"
   putStrLn "# head counters describe accepted heads; failed head work is excluded; body counters count reached materializations"
+  putStrLn "# predicate_code_cache=warm reached plans; each timed query has fresh heap/Store/tables/dynamic state; cold samples use machine-cache"
   putStrLn "engine\tcase\tmedian_wall_seconds\tmedian_cpu_seconds\twall_samples\tcpu_samples"
   forM_ cases $ \testCase@(Case name source text model) -> do
     items <- either fail pure (parseFile source)

@@ -8,7 +8,7 @@ This is the plan for replacing the resolution core of Infera in two steps:
    for tracing. Same source language and observable query behaviour.
 2. **Bytecode compilation** (`Infera.Compile`, `Infera.Machine.Bytecode`):
    progressively replace clause-template traversal with instructions executed
-   by the machine from step 1, then cache code at load time.
+   by the machine from step 1, caching lazy plans with immutable predicate versions.
 
 Everything above the engine keeps its public behaviour: the parser,
 declarations and inference
@@ -79,7 +79,7 @@ parity oracle for both roadmap steps. No machine resolution path calls the
 reference interpreter. **Step 1's historical local exit gates passed on
 2026-10-16; Step 2 now has opt-in compiled activation, specialized head matching,
 temporary register reuse, per-goal body allocation, compiled core control and
-cut barriers, and direct calls.**
+cut barriers, immutable predicate caches and resolved direct calls.**
 The [Step 1 acceptance report](engine-step1-acceptance-2026-10-16.md) records
 that snapshot's checks and measurements. The
 [Step 2 foundation report](engine-step2-foundation-2026-10-16.md) records the
@@ -658,10 +658,17 @@ remain source metadata for trace locations. Registers
 are private to activation; immutable checkpoints retain heap handles with their
 matching branch snapshots and the exact program/code version.
 
-Code is cached once per query or table-producer startup, rather than at load
-time. Table producers retain their existing head/template path, with their
-native body callbacks selecting the requested backend. Persistent load-time
-predicate caching and invalidation are still planned. The historical
+Code now belongs to immutable predicate versions. Loading attaches lazy
+source-only plans; the first selected clause forces its plan and subsequent
+queries/producers share it. An exact source witness protects public record
+edits, including local counts, constructor distinctions and floating-point
+bits. Each query memoizes the selected result, including unsupported clauses,
+so retries and opaque returns need no repeated witness walk. Unchanged clause
+entries survive normal incremental edits; retained checkpoints keep their
+original program and plans. Direct `predClauses` edits safely recompile stale
+entries once per query; rebuilding `predClauseCache` restores cross-query reuse.
+Table producers retain their existing head/template path, with their native
+body callbacks selecting the requested backend. The historical
 [foundation report](engine-step2-foundation-2026-10-16.md) distinguishes this
 initial slice from the remaining WAM-style design. Its initial validated
 samples established compiled execution and parity without establishing a
@@ -671,7 +678,9 @@ subsequent implementation and validation. The
 [lifetime report](engine-step2-lifetimes-2026-10-16.md) records incremental body
 construction, temporary register reuse and their acceptance results. The
 [control report](engine-step2-control-2026-10-16.md) records compiled control
-continuations, cut barriers and the next default-backend gates.
+continuations, cut barriers and the next default-backend gates. The
+[cache/dispatch report](engine-step2-cache-2026-10-16.md) records the subsequent
+implementation, cold/warm measurements and remaining migration gates.
 
 ### Planned instruction set (WAM-lite)
 
@@ -733,20 +742,23 @@ The machine from step 1 gains an instruction loop; frames become environments
 with `Y` registers; builtins, CLP, tabling, output and dynamic facts are
 unchanged because they already sit behind the machine interface. Source maps
 and trace events must survive instruction fusion and compiled continuations.
-Load-time code generation and per-predicate caching remain future work. The
-current startup cache uses the exact immutable program attached to the query;
-a subsequent REPL edit creates a new program/cache without changing existing
-checkpoints. Persistent caches will need to recompile changed predicates and
-invalidate dependent specialisations or table caches whose proof depended on
-the old program.
+Predicate code caches depend only on exact source syntax. Runtime dispatch,
+table/index flags and tail proofs belong to the exact immutable program
+attached to a query, so metadata and REPL edits cannot reuse stale proofs.
+Known ordinary calls carry their resolved predicate and metadata through
+dispatch; a query-wide dynamic-name set preserves cross-arity declarations
+without scanning the program on every compiled call. Builtins retain
+precedence and dynamic calls consult branch-local facts. Future dependent
+specialisations must invalidate when their assumptions change; syntax-only
+plans need no invalidation for unrelated signatures, files or source maps.
 
 ### Making bytecode the public default
 
-Bytecode is the intended eventual default. This control slice keeps the public
-facade on `Interpreted` while that migration is prepared. The next performance
-work is to profile reached invocation/operand dispatch and remove repeated
-per-query compilation with immutable predicate caches and correct edit
-invalidation. Generic native services can remain shared behind compiled
+Bytecode is the intended eventual default. The public facade remains on
+`Interpreted` while that migration is prepared. Predicate caches and resolved
+dispatch remove repeated whole-program compilation and per-call dynamic-name
+scans. Reached invocation/operand dispatch remains a performance target.
+Generic native services can remain shared behind compiled
 instructions; changing the default does not require duplicating CLP, tables
 or dynamic-fact algorithms.
 
@@ -758,6 +770,15 @@ Then route public `Infera.Engine` entry points to bytecode, retain explicit
 `Interpreted` selection for differential checks and troubleshooting, and run
 the full default-facing CLI/editor suite again. The reference remains an
 oracle through the planned parity release.
+
+The cache/dispatch recheck removes the unused-predicate scaling regression,
+but cold structured-head and control workloads and some warm breadboard cases
+still trail the interpreted driver. The next narrow target is reached data
+operand dispatch: precompute dense local layouts rather than rebuilding a
+local `IntMap` for each materialized leaf. Keep source logical IDs, strict
+branch-owned root lookup, error ordering and private construction arrays.
+Profile and remeasure before extending this to builtin/argument-register
+specialisation. A default switch remains a separate validated migration.
 
 ### Milestones
 
@@ -774,8 +795,10 @@ oracle through the planned parity release.
    using native choices/scopes/contracts. Less-common meta/DCG handlers and
    dynamically expanded call targets retain native dispatch. Full acceptance
    and performance evidence are recorded in the control report.
-3. Indexing instructions; full argument/environment registers and trimming; LCO in
-   `execute`; load-time predicate caches with REPL invalidation.
+3. **Predicate caching and resolved dispatch implemented:** lazy immutable
+   clause plans, exact edit witnesses, per-query runtime metadata and direct
+   resolved calls. Remaining: indexing instructions; full argument/environment
+   registers and trimming; LCO in `execute`; reached operand dispatch costs.
 4. Determinism-directed code generation from declarations and inference.
 5. Full differential and API-lifetime suite against both the step 1 machine
    and reference; validated benchmarks on a controlled runner. Retire the

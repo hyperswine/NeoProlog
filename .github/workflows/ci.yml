@@ -113,5 +113,13 @@ jobs:
       - run: '"$(cabal list-bin bench:machine-minefield --enable-optimization=2)" --engine native --phase ordinary --size 16 --bombs 50 --timeout 120'
       - run: '"$(cabal list-bin bench:machine-minefield --enable-optimization=2)" --engine bytecode --phase ordinary --size 16 --bombs 50 --timeout 120 --measured'
       - run: '"$(cabal list-bin bench:machine-bytecode --enable-optimization=2)"'
+      - name: Check cold and warm predicate caches
+        shell: bash
+        run: |
+          infera_cache_runner="$(cabal list-bin bench:machine-cache --enable-optimization=2)"
+          "$infera_cache_runner" --engine bytecode --phase cold --case helper-1000
+          "$infera_cache_runner" --engine bytecode --phase warm --case helper-1000
+          "$infera_cache_runner" --engine bytecode --phase cold --case controls
+          "$infera_cache_runner" --engine bytecode --phase warm --case controls
       - run: '"$(cabal list-bin bench:machine-breadboard --enable-optimization=2)"'
       - run: INFERA_BIN="$(cabal list-bin exe:infera --enable-optimization=2)" sh bench/run.sh --engine infera --case fib --runs 1 --warmup 0 --timeout 30 --json

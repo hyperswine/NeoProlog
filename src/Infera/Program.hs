@@ -36,6 +36,8 @@ import qualified Data.IntSet as IS
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Infera.Compile.Cache (ClauseCache, emptyClauseCache)
+import qualified Infera.Compile.Cache as ClauseCache
 import Infera.Error (PredKey)
 import Infera.Machine.Trace.Types (SourceMap, emptySourceMap)
 import Infera.Syntax
@@ -115,6 +117,9 @@ defaultSignature arity = Signature Nondet (replicate arity (ArgSpec SAny ModeInO
 data Pred = Pred
   { predKey :: PredKey,
     predClauses :: IntMap Clause,
+    -- | Lazy source-only plans, shared by immutable predicate versions.
+    -- Cache lookup validates the source even after direct record edits.
+    predClauseCache :: ClauseCache,
     predIndex :: [ArgIndex],
     -- | Declared mode signatures (alternatives), in declaration order.
     predDecls :: [Signature],
@@ -138,6 +143,7 @@ newPred k@(_, arity) =
   Pred
     { predKey = k,
       predClauses = IM.empty,
+      predClauseCache = emptyClauseCache,
       predIndex = replicate arity (ArgIndex Map.empty IS.empty),
       predDecls = [],
       predFlags = [],
@@ -196,7 +202,11 @@ addClause c prog = case clauseKey c of
       add p =
         let n = IM.size (predClauses p)
             clauses' = IM.insert n c (predClauses p)
-         in p {predClauses = clauses', predIndex = buildIndex arity clauses'}
+         in p
+              { predClauses = clauses',
+                predClauseCache = ClauseCache.insertClause n c (predClauseCache p),
+                predIndex = buildIndex arity clauses'
+              }
 
 addDecl :: Decl -> Program -> Program
 addDecl d prog

@@ -192,7 +192,10 @@ metricFields metrics =
     ("body_goals_materialized", show (Machine.metricBodyGoalsMaterialized metrics)),
     ("body_allocation_instructions", show (Machine.metricBodyAllocationInstructions metrics)),
     ("compiled_control_instructions", show (Machine.metricCompiledControlInstructions metrics)),
-    ("compiled_cuts", show (Machine.metricCompiledCuts metrics))
+    ("compiled_cuts", show (Machine.metricCompiledCuts metrics)),
+    ("code_cache_hits", show (Machine.metricCodeCacheHits metrics)),
+    ("predicate_cache_hits", show (Machine.metricPredicateCacheHits metrics)),
+    ("predicate_cache_misses", show (Machine.metricPredicateCacheMisses metrics))
   ]
 
 main :: IO ()
@@ -205,7 +208,7 @@ main = do
   program <- either fail pure (Reference.loadProgramText source)
   query <- either fail pure (parseQuery querySource)
   _ <- evaluate (length (show program) + length (show query))
-  let paths = ["src/Infera/Compile.hs", "src/Infera/Machine/Bytecode.hs",
+  let paths = ["src/Infera/Compile.hs", "src/Infera/Compile/Cache.hs", "src/Infera/Machine/Bytecode.hs",
         "src/Infera/Machine/Control.hs", "src/Infera/Machine/Heap.hs",
         "src/Infera/Machine/Bridge.hs", "src/Infera/Machine/CLP.hs",
         "src/Infera/Machine/Builtins.hs", "src/Infera/Machine/Tail.hs",

@@ -17,6 +17,12 @@ copyright:          2025 Jasen Qin
 category:           Language
 build-type:         Simple
 extra-doc-files:    README.md docs/engine-roadmap.md
+                    docs/engine-step2-cache-2026-10-16.md
+                    docs/engine-step2-cache-2026-10-16.jsonl
+                    docs/engine-step2-cache-bytecode-2026-10-16.tsv
+                    docs/engine-step2-cache-breadboard-2026-10-16.tsv
+                    docs/engine-step2-cache-tail-2026-10-16.jsonl
+                    docs/engine-step2-cache-native-tail-2026-10-16.jsonl
                     docs/performance.md docs/performance-2026-10-15.jsonl
                     docs/performance-step1-2026-10-16.jsonl
                     docs/engine-baseline-2026-10-16.jsonl
@@ -84,6 +90,7 @@ library
         Infera
         Infera.Syntax
         Infera.Compile
+        Infera.Compile.Cache
         Infera.Error
         Infera.Diagnostic
         Infera.Unify
@@ -155,6 +162,7 @@ test-suite infera-test
                       CompileTest MachineBytecodeTest MachineBytecodeHeapTest MachineHeadTest
                       MachineLifetimeTest
                       MachineCompiledControlTest
+                      MachineCacheTest
     default-language: Haskell2010
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1"
     build-depends:
@@ -200,3 +208,12 @@ benchmark machine-bytecode
     default-language: Haskell2010
     ghc-options:      -O2 -rtsopts
     build-depends:    base, infera
+
+benchmark machine-cache
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   bench
+    main-is:          machine-cache.hs
+    default-language: Haskell2010
+    ghc-options:      -O2 -rtsopts
+    build-depends:    base, directory, filepath, infera

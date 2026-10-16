@@ -36,7 +36,9 @@ import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import Data.List (nub, sortOn)
 import qualified Data.Map.Lazy as Map
+import qualified Data.Set as Set
 import qualified Infera.Compile as Compile
+import qualified Infera.Compile.Cache as CodeCache
 import Infera.Arith (arithOps, evalIntExpr, normArithTerm)
 import Infera.CLP (Store (..))
 import qualified Infera.CLP as CLP
@@ -67,7 +69,7 @@ data ExecutionBackend = Interpreted | Bytecode deriving (Eq, Show)
 
 data Task
   = Run !Heap.Address !Int Scopes
-  | DirectRun !PredKey !Heap.Address !Int Scopes
+  | DirectRun !PredicateRoute !Heap.Address !Int Scopes
   | CompiledBody !BytecodeVM.BodyFrame !Int Scopes !(Maybe Trace.ClauseSource)
   | CompiledControl !VarId !Compile.ControlCode !Int Scopes
   | Located (Maybe SourceSpan) Task
@@ -77,11 +79,22 @@ data Task
   | Label [VarId]
   | Optimize [VarId] Term
 
+-- These values belong to one exact immutable Program snapshot. Keep proofs
+-- lazy: a query need not inspect the call graph of untouched predicates.
+data PredicateRoute = PredicateRoute
+  { routeDefinition :: !Pred,
+    routeDirect :: Bool,
+    routeTabled :: Bool,
+    routeIndexed :: Bool,
+    routeTail :: Bool
+  }
+
 data Call = Call
   { callId :: !Int,
     callOwner :: !Int,
     callEntryDepth :: !Int,
     callKey :: !PredKey,
+    callDefinition :: !Pred,
     callSignature :: !(Maybe Signature),
     callArguments :: ![Heap.Address],
     callCommits :: !Bool,
@@ -154,7 +167,8 @@ data Running = Running
     runningPhase :: !Phase,
     runningScope :: Maybe Scope,
     runningTailReuse :: !Bool,
-    runningTailProof :: Map.Map PredKey Bool,
+    runningRoutes :: Map.Map PredKey PredicateRoute,
+    runningDynamicNames :: Set.Set String,
     runningProtected :: [VarId],
     runningMeasured :: !Bool,
     runningMetrics :: !Metrics,
@@ -165,7 +179,9 @@ data Running = Running
     runningCurrent :: !(Maybe Term),
     runningExternalFrames :: [Trace.TraceFrame],
     runningBackend :: !ExecutionBackend,
-    runningCode :: Map.Map (PredKey, Int) Compile.ClauseCode
+    -- Force the map spine when crossing an opaque boundary, so a lazy field
+    -- selector cannot retain the completed child Running. Values stay lazy.
+    runningCode :: !(Map.Map (PredKey, Int) (Maybe Compile.ClauseCode))
   }
 
 -- | Opt-in execution high-water counts, independent of process RTS memory.
@@ -195,12 +211,18 @@ data Metrics = Metrics
     metricBodyGoalsMaterialized :: !Int,
     metricBodyAllocationInstructions :: !Int,
     metricCompiledControlInstructions :: !Int,
-    metricCompiledCuts :: !Int
+    metricCompiledCuts :: !Int,
+    -- Query-local reuse avoids repeating the exact source-witness check.
+    metricCodeCacheHits :: !Int,
+    -- A predicate hit means its witness matched, not that its lazy plan was
+    -- already evaluated by an earlier query.
+    metricPredicateCacheHits :: !Int,
+    metricPredicateCacheMisses :: !Int
   }
   deriving (Eq, Show)
 
 emptyMetrics :: Metrics
-emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 data Checkpoint = Checkpoint !Env !Heap.FrozenHeap !Running
 
@@ -267,15 +289,16 @@ startWithRoots backend dense tailReuse measured scopes environment fuel state go
   frozen <- lift (Heap.freezeHeap heap)
   let branch = Branch imported state [Run address fuel scopes | address <- addresses] Nothing Nothing
       protected = IS.toAscList (IS.fromList (Bridge.bindingVariables imported ++ concatMap termVars goals))
-      proof = Map.fromList [(predKey definition, Tail.eligiblePredicate (envProg environment) definition)
-        | definition <- programPreds (envProg environment)]
-      code = case backend of
-        Interpreted -> Map.empty
-        Bytecode -> Map.fromList [((predKey definition, ordinal), compiled)
-          | definition <- programPreds (envProg environment),
-            (ordinal, clause) <- IM.toAscList (predClauses definition),
-            Just compiled <- [Compile.compileClause clause]]
-      running = Running branch [] 0 0 Seeking Nothing tailReuse proof protected measured emptyMetrics 1024 False [] Nothing Nothing [] backend code
+      program = envProg environment
+      dynamic = Set.fromList
+        ([name | (name, flags) <- Map.toList (progNameFlags program), FlagDynamic `elem` flags]
+          ++ [fst (predKey definition) | definition <- programPreds program,
+            FlagDynamic `elem` predFlags definition])
+      routes = Map.mapWithKey (\(name, arity) definition ->
+        PredicateRoute definition (builtinDet name arity == Nothing && Set.notMember name dynamic)
+          (predIsTabled program definition) (predIsIndexed program definition)
+          (Tail.eligiblePredicate program definition)) (progPreds program)
+      running = Running branch [] 0 0 Seeking Nothing tailReuse routes dynamic protected measured emptyMetrics 1024 False [] Nothing Nothing [] backend Map.empty
   sampled <- sample heap running
   pure (Checkpoint environment frozen sampled)
 
@@ -355,14 +378,12 @@ driveSampled environment heap running = case runningPhase running of
             Run address fuel scopes -> do
               traced <- beginTaskTrace heap next address
               runGoal environment heap traced address fuel scopes
-            DirectRun key address fuel scopes -> do
+            DirectRun route address fuel scopes -> do
               traced <- beginTaskTrace heap next address
               let previous = runningMetrics traced
                   counted = if runningMeasured traced then traced {runningMetrics = previous
                     {metricDirectCalls = metricDirectCalls previous + 1}} else traced
-              case lookupPred key (envProg environment) of
-                Just definition -> callPredicate environment heap counted address fuel scopes definition
-                Nothing -> runGoal environment heap counted address fuel scopes
+              callPredicate environment heap counted address fuel scopes route
             CompiledBody frame fuel scopes source -> materializeBody environment heap next frame fuel scopes source
             CompiledControl base code fuel scopes -> runCompiledControl environment heap next base code fuel scopes
             Return call -> returnCall environment heap next call
@@ -400,7 +421,7 @@ runCompiledControl environment heap original base code fuel scopes =
           counted = if runningMeasured allocated then allocated {runningMetrics = previous
             {metricBodyGoalsMaterialized = metricBodyGoalsMaterialized previous + 1}} else allocated
           task = maybe (Run root fuel scopes)
-            (\known -> compiledTask environment known root fuel scopes) key
+            (\known -> compiledTask counted known root fuel scopes) key
       drive environment heap (withTasks [task] counted)
     instruction -> do
       traced <- beginCodeTrace original base code
@@ -694,10 +715,10 @@ runGoal environment heap running address fuel scopes = do
             mark <- lift (Heap.freezeHeap heap)
             iteratorStep False environment heap running mark scopes (map Right items)
         action -> performBuiltin environment heap running action
-    predicate name arity = case lookupPred (name, arity) (envProg environment) of
-      Just definition -> callPredicate environment heap running address fuel scopes definition
+    predicate name arity = case Map.lookup (name, arity) (runningRoutes running) of
+      Just route -> callPredicate environment heap running address fuel scopes route
       Nothing
-        | nameHasFlag (envProg environment) name FlagDynamic -> do
+        | Set.member name (runningDynamicNames running) -> do
             terms <- rawTerms heap running [address]
             goal <- single terms
             mark <- lift (Heap.freezeHeap heap)
@@ -893,10 +914,11 @@ beginEmit environment heap running fuel nonterminal = do
       [Run goal fuel []] (EmitScope (Var fresh))
     _ -> throwError Heap.IncompatibleBindings
 
-callPredicate :: Env -> Heap.Heap s -> Running -> Heap.Address -> Int -> Scopes -> Pred -> MachineM s DriverStep
-callPredicate environment heap running address fuel scopes definition = do
+callPredicate :: Env -> Heap.Heap s -> Running -> Heap.Address -> Int -> Scopes -> PredicateRoute -> MachineM s DriverStep
+callPredicate environment heap running address fuel scopes route = do
   let branch = runningBranch running
       state = branchState branch
+      definition = routeDefinition route
   syntax <- checked (Bridge.exportRawTerms heap (branchBindings branch) [address])
   goal <- single syntax
   let normalized = normArithTerm (stSubst (ssStore state)) goal
@@ -907,7 +929,7 @@ callPredicate environment heap running address fuel scopes definition = do
     Left err -> emit environment heap running {runningPhase = Backtracking} (BranchError err)
     Right signature -> do
       let commits = Contracts.commitsAfterSuccess definition signature argsW
-          eligible = Map.findWithDefault False key (runningTailProof running)
+          eligible = routeTail route
             && Tail.eligibleArguments signature argsW
             && Contracts.requiredSuccess signature == Nothing
           reusable = runningTailReuse running && eligible && quiet running
@@ -961,7 +983,7 @@ callPredicate environment heap running address fuel scopes definition = do
           checkedArguments = case signature of
             Nothing -> []
             Just _ -> arguments
-          call = Call ident (ssFresh activeState) (runningDepth active) key signature checkedArguments commits eligible
+          call = Call ident (ssFresh activeState) (runningDepth active) key definition signature checkedArguments commits eligible
             (if runningTraced active then normalized else Atom "") (runningSite active) Nothing Nothing inherited
           entryBranch = activeBranch {branchBindings = bindings}
           entry = active {runningBranch = entryBranch, runningNextId = ident + 1}
@@ -979,7 +1001,7 @@ callPredicate environment heap running address fuel scopes definition = do
           constrainedCall = not (IS.null (stWatched activeStore))
             && any (CLP.isConstrained activeStore)
               (termVarIds (deepWalk (stSubst activeStore) normalized))
-      if predIsTabled (envProg environment) definition && not constrainedCall
+      if routeTabled route && not constrainedCall
         then do
           mark <- lift (Heap.freezeHeap activeHeap)
           let tableBranch = (runningBranch guarded)
@@ -992,7 +1014,7 @@ callPredicate environment heap running address fuel scopes definition = do
         else if nextFuel <= 0
           then emit environment activeHeap guarded {runningPhase = Backtracking} BranchExhausted
           else do
-          let keys = if predIsIndexed (envProg environment) definition then map indexKey argsW else []
+          let keys = if routeIndexed route then map indexKey argsW else []
               clauses = [(index, predClauses definition IM.! index) | index <- candidateClauses definition keys]
           tryClauses environment activeHeap guarded normalizedAddress nextFuel
             ((ssFresh activeState, runningDepth guarded) : liveScopes) call clauses
@@ -1112,8 +1134,9 @@ tryClauses environment heap running goal fuel scopes call ((ordinal, clause) : r
       located template task
         | not (runningTraced running) = task
         | otherwise = Located ((\site -> Trace.goalSourceSpan site template) <$> source) task
+      (compiled, cached) = resolveClause withRetry call ordinal clause
   (bindings, result, tasks, activation, acceptedFresh) <-
-    case Map.lookup (callKey call, ordinal) (runningCode running) of
+    case compiled of
       Just code -> do
         let activate = if runningMeasured running then BytecodeVM.activateHeadMeasured else BytecodeVM.activateHead
         matched <- checked (activate heap (branchBindings branch)
@@ -1139,9 +1162,9 @@ tryClauses environment heap running goal fuel scopes call ((ordinal, clause) : r
               zipWith (\template bodyRoot -> located template (Run bodyRoot (fuel - 1) scopes))
                 (clauseBody clause) bodyRoots, Nothing, fresh)
           _ -> throwError Heap.IncompatibleBindings
-  let previous = runningMetrics withRetry
+  let previous = runningMetrics cached
       metrics = case activation of
-        Just accepted | runningMeasured withRetry -> previous
+        Just accepted | runningMeasured cached -> previous
           {metricCompiledActivations = metricCompiledActivations previous + 1,
            metricBytecodeInstructions = metricBytecodeInstructions previous
              + BytecodeVM.headInstructions accepted
@@ -1155,21 +1178,44 @@ tryClauses environment heap running goal fuel scopes call ((ordinal, clause) : r
         { branchBindings = bindings,
           branchState = (branchState branch) {ssFresh = acceptedFresh},
           branchTasks = tasks ++ Return selected : branchTasks branch }
-      selectedRunning = withRetry {runningBranch = nextBranch, runningMetrics = metrics}
+      selectedRunning = cached {runningBranch = nextBranch, runningMetrics = metrics}
       locatedHead = case result of
         Left _ | runningTraced selectedRunning -> selectedRunning
           {runningSite = (Trace.sourceHeadSpan <$> source) `orSite` runningSite selectedRunning}
         _ -> selectedRunning
   acceptStore environment heap locatedHead result (drive environment heap)
 
--- Resolve only known ordinary user calls directly. Builtins retain precedence,
--- and dynamic names must consult their branch-local fact version at execution.
-compiledTask :: Env -> PredKey -> Heap.Address -> Int -> Scopes -> Task
-compiledTask environment key@(name, arity) address fuel scopes
-  | builtinDet name arity == Nothing,
-    not (nameHasFlag (envProg environment) name FlagDynamic),
-    Just _ <- lookupPred key (envProg environment) = DirectRun key address fuel scopes
-  | otherwise = Run address fuel scopes
+-- Plans carry no heap addresses or logical state, so retain this memo across
+-- retries and opaque returns. Cache unsupported clauses too. Public record
+-- updates can leave a predicate's cache stale; validate its selected source
+-- once per query before sharing the lazy plan.
+resolveClause :: Running -> Call -> Int -> Clause -> (Maybe Compile.ClauseCode, Running)
+resolveClause running call ordinal clause
+  | runningBackend running == Interpreted = (Nothing, running)
+  | otherwise = case Map.lookup key (runningCode running) of
+      Just code -> (code, counted previous
+        {metricCodeCacheHits = metricCodeCacheHits previous + 1})
+      Nothing ->
+        let (hit, code) = CodeCache.lookupClauseCode ordinal clause
+              (predClauseCache (callDefinition call))
+            metrics = if hit
+              then previous {metricPredicateCacheHits = metricPredicateCacheHits previous + 1}
+              else previous {metricPredicateCacheMisses = metricPredicateCacheMisses previous + 1}
+            cached = counted metrics
+         in (code, cached {runningCode = Map.insert key code (runningCode running)})
+  where
+    key = (callKey call, ordinal)
+    previous = runningMetrics running
+    counted metrics
+      | runningMeasured running = running {runningMetrics = metrics}
+      | otherwise = running
+
+-- A route is resolved once for this Program version. Builtins retain
+-- precedence; dynamic names still enter the generic branch-local dispatcher.
+compiledTask :: Running -> PredKey -> Heap.Address -> Int -> Scopes -> Task
+compiledTask running key address fuel scopes = case Map.lookup key (runningRoutes running) of
+  Just route | routeDirect route -> DirectRun route address fuel scopes
+  _ -> Run address fuel scopes
 
 returnCall :: Env -> Heap.Heap s -> Running -> Call -> MachineM s DriverStep
 returnCall environment heap running call = do
@@ -1254,6 +1300,7 @@ backtrack environment heap running = case runningChoices running of
               { runningNextId = max (runningNextId saved) (runningNextId restored),
                 runningMetrics = runningMetrics restored,
                 runningEvents = runningEvents restored,
+                runningCode = Map.union (runningCode restored) (runningCode saved),
                 runningScope = fmap (\scope -> scope {scopeParent = restored}) (runningScope saved)
               }
         drive environment heap rebased
@@ -1397,7 +1444,8 @@ advanced :: Scope -> Running -> Running
 advanced scope child = (scopeParent scope)
   {runningNextId = max (runningNextId (scopeParent scope)) (runningNextId child),
    runningMetrics = runningMetrics child,
-   runningEvents = runningEvents child}
+   runningEvents = runningEvents child,
+   runningCode = runningCode child}
 
 restoreSelected :: Heap.Heap s -> Scope -> Running -> SolverState -> MachineM s Running
 restoreSelected heap scope child state = do

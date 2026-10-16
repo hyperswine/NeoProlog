@@ -379,11 +379,12 @@ choice-point stacks, last-call optimisation, heap reclamation and tracing.
 `Infera.Engine.Reference` retains the previous resolver for comparisons through
 the bytecode transition. Step 2 now has opt-in compiled clause activation,
 specialized head matching, per-goal body allocation, temporary register reuse,
-compiled core controls/cut barriers and direct ordinary user calls; the public
+compiled core controls/cut barriers, lazy predicate-owned plans and resolved
+ordinary user calls; the public
 solver still selects the
 interpreted native driver. [docs/engine-roadmap.md](docs/engine-roadmap.md)
 tracks the remaining argument/environment register design, indexing
-instructions and persistent load-time caches. The
+instructions and operand dispatch work. The
 [foundation report](docs/engine-step2-foundation-2026-10-16.md) records the
 minefield regression repair and initial compiler slice; the
 [head/register report](docs/engine-step2-head-register-2026-10-16.md) covers the
@@ -391,7 +392,9 @@ subsequent matcher and allocation changes. The
 [lifetime report](docs/engine-step2-lifetimes-2026-10-16.md) covers temporary
 register reuse and pending body continuations. The
 [control report](docs/engine-step2-control-2026-10-16.md) covers compiled
-branches, opaque searches and cut barriers. Bytecode is the intended eventual
+branches, opaque searches and cut barriers. The
+[cache/dispatch report](docs/engine-step2-cache-2026-10-16.md) covers immutable
+code reuse, edit correctness and cold/warm scaling. Bytecode is the intended eventual
 default; the roadmap records its correctness and performance migration gates.
 Proved tail transfers
 reuse their depth budget; other nested calls
@@ -407,6 +410,7 @@ samples; current changes need source/profile-matched measurements.
 src/Infera/Syntax.hs    terms, declarations, parser, printer
 src/Infera/Unify.hs     substitutions, unification, renaming
 src/Infera/Compile.hs   head matching, allocation plans and pure control instructions
+src/Infera/Compile/Cache.hs lazy clause plans with exact source witnesses
 src/Infera/Machine/Heap.hs paged heap/trail and immutable snapshots
 src/Infera/Machine/Bridge.hs logical variables and complete solver-state adapters
 src/Infera/Machine/Control.hs native task/choice stacks, scopes and immutable resume
@@ -459,11 +463,13 @@ bench/                  engine benchmarks (infera vs swipl vs scryer)
 bench/check-tail-memory.py fresh-process residency gate, including CI quick mode
 bench/machine-minefield.hs validated larger minefield setup/generation regression runner
 bench/machine-bytecode.hs serial checked reference/interpreted/bytecode comparison
+bench/machine-cache.hs fresh-process cold/warm predicate-cache comparison
 docs/engine-roadmap.md  plan for the abstract machine and bytecode engine
 docs/engine-step2-foundation-2026-10-16.md regression repair and opt-in compiler evidence
 docs/engine-step2-head-register-2026-10-16.md specialized head matching and register allocation
 docs/engine-step2-lifetimes-2026-10-16.md per-goal body construction and logical root lifetimes
 docs/engine-step2-control-2026-10-16.md compiled controls/cuts and default-backend migration gates
+docs/engine-step2-cache-2026-10-16.md predicate caching, dispatch and cold/warm evidence
 lsp/                    VS Code extension and language server
 ```
 
@@ -614,9 +620,12 @@ Conjunction, disjunction, cuts, `call`, `once`, negation, if-then-else and
 driver. Untaken branches allocate no control wrappers or leaf graphs. Body
 cuts rewrite recursively, including inside data; head data stays literal.
 Dynamic/noncallable leaves and less-common meta/DCG operations use native
-runtime handlers through invocation plans. Code caches
-belong to each query or table-producer startup; persistent load-time caches and
-the full argument/environment register design remain future work. Table
+runtime handlers through invocation plans. Lazy clause plans now belong to
+immutable predicate versions and are shared across queries. Exact source
+witnesses prevent stale plans after public record edits; selected results are
+memoized per query. Resolved calls carry their predicate and runtime metadata,
+avoiding repeated lookups and dynamic-name scans. The full argument/environment
+register design remains future work. Table
 producer heads still use their existing template path; native producer bodies
 select the requested backend. Compiler and
 backend tests compare raw scalar bits, ordered observations, source frames and
@@ -629,8 +638,9 @@ establishing a throughput gain. Subsequent implementation and validation are
 recorded separately in the
 [head/register report](docs/engine-step2-head-register-2026-10-16.md),
 [lifetime report](docs/engine-step2-lifetimes-2026-10-16.md) and
-[control report](docs/engine-step2-control-2026-10-16.md).
-The current gate passed 344 Haskell properties (23,805 cases), 37 LSP tests,
+[control report](docs/engine-step2-control-2026-10-16.md) and
+[cache/dispatch report](docs/engine-step2-cache-2026-10-16.md).
+The current gate passed 353 Haskell properties (24,412 cases), 37 LSP tests,
 20 harness tests and CLI acceptance. Ordinary compiled execution skips
 instruction statistics; measured variants distinguish accepted-head work from
 reached body construction. The allocation changes establish smaller temporary
@@ -712,10 +722,24 @@ An untimed measured probe requires positive compiled-activation, instruction and
 direct-call counters and reports head-constructor avoidance and register usage.
 These VM counters describe accepted activations only; rejected head attempts
 return no activation statistics. Ordinary timed runs disable counter sampling.
-Timing includes
-per-query code-cache construction, execution, projection and validation,
+The untimed compiled probe warms reached immutable predicate plans. Timing
+includes fresh per-query dispatch/tail setup, execution, projection and validation,
 excluding program parsing/checking and CLI startup. The runner records its
 source fingerprint, compiler, platform and build scope, with no speed threshold.
+
+`machine-cache` separates the first compiled query from a query after one
+checked warmup. Each invocation emits one checked sample and runs its measured
+path probe after timing; every search has fresh logical state. Run each sample
+in a fresh process, for example:
+
+```sh
+cabal bench machine-cache --offline --enable-optimization=2 --benchmark-options='--engine bytecode --phase cold --case helper-1000'
+cabal bench machine-cache --offline --enable-optimization=2 --benchmark-options='--engine bytecode --phase warm --case minefield-16'
+```
+
+Cases cover helper dispatch with 0/100/1,000 unused predicates, structured heads,
+compiled opaque control and the 16x16 minefield acceptance grid. Reference and
+explicit Interpreted selection remain available for comparisons.
 
 The separate tail runner verifies and fully drains one query per fresh process:
 

@@ -1,0 +1,22 @@
+# source-fingerprint=38285b36147053c798f5982e0881ade3
+# compiler=ghc-9.8 platform=aarch64-darwin
+# scope=loaded checked program; reached immutable predicate plans warmed by untimed compiled probe; per-query dispatch/tail setup+execution+projection+validation; no parsing or CLI startup
+# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)
+# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 no_timing_threshold
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples
+# compiled_probe case=rc compiled_activations=111 head_instructions=764 body_goals_materialized=181 body_allocation_instructions=287 max_activation_registers=22 code_cache_hits=68 predicate_cache_hits=47 predicate_cache_misses=0 fully_drained=true timed=false
+reference	rc	1.096e-3	1.086e-3	[1.159e-3,1.011e-3,1.096e-3]	[1.142e-3,1.003e-3,1.086e-3]
+machine	rc	3.711e-3	3.668e-3	[4.238e-3,3.711e-3,3.693e-3]	[4.121e-3,3.668e-3,3.633e-3]
+bytecode	rc	3.878e-3	3.817e-3	[3.837e-3,3.878e-3,5.835e-3]	[3.817e-3,3.802e-3,5.568e-3]
+# compiled_probe case=div compiled_activations=163 head_instructions=1212 body_goals_materialized=289 body_allocation_instructions=464 max_activation_registers=22 code_cache_hits=123 predicate_cache_hits=48 predicate_cache_misses=0 fully_drained=true timed=false
+reference	div	2.34e-3	2.14e-3	[2.458e-3,2.304e-3,2.34e-3]	[2.267e-3,2.113e-3,2.14e-3]
+machine	div	1.0973e-2	1.0024e-2	[1.2743e-2,1.0746e-2,1.0973e-2]	[1.1025e-2,9.223e-3,1.0024e-2]
+bytecode	div	6.536e-3	6.425e-3	[6.857e-3,6.536e-3,5.539e-3]	[6.75e-3,6.425e-3,5.514e-3]
+# compiled_probe case=tri compiled_activations=318 head_instructions=2652 body_goals_materialized=641 body_allocation_instructions=1102 max_activation_registers=22 code_cache_hits=277 predicate_cache_hits=51 predicate_cache_misses=0 fully_drained=true timed=false
+reference	tri	4.759e-3	4.705e-3	[4.759e-3,4.894e-3,4.309e-3]	[4.705e-3,4.78e-3,4.283e-3]
+machine	tri	1.4997e-2	1.4859e-2	[1.3842e-2,1.4997e-2,1.8209e-2]	[1.3784e-2,1.4859e-2,1.772e-2]
+bytecode	tri	2.2791e-2	2.1097e-2	[2.2791e-2,2.9309e-2,1.7066e-2]	[2.1097e-2,2.3899e-2,1.6502e-2]
+# compiled_probe case=wide-disconnected compiled_activations=75 head_instructions=725 body_goals_materialized=180 body_allocation_instructions=334 max_activation_registers=22 code_cache_hits=48 predicate_cache_hits=27 predicate_cache_misses=0 fully_drained=true timed=false
+reference	wide-disconnected	1.23e-2	1.2004e-2	[1.2288e-2,1.23e-2,1.4441e-2]	[1.2004e-2,1.1981e-2,1.4113e-2]
+machine	wide-disconnected	1.981e-2	1.9242e-2	[2.0546e-2,1.952e-2,1.981e-2]	[1.9737e-2,1.8935e-2,1.9242e-2]
+bytecode	wide-disconnected	1.9656e-2	1.9109e-2	[1.9656e-2,2.077e-2,1.7626e-2]	[1.9109e-2,2.02e-2,1.7081e-2]

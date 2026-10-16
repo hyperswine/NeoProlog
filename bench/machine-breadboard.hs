@@ -155,6 +155,9 @@ compiledProbe program query testCase@(Case name _ _ _ _) optimum expected = do
        "body_goals_materialized=" ++ show (Machine.metricBodyGoalsMaterialized metrics),
        "body_allocation_instructions=" ++ show (Machine.metricBodyAllocationInstructions metrics),
        "max_activation_registers=" ++ show (Machine.metricMaxActivationRegisters metrics),
+       "code_cache_hits=" ++ show (Machine.metricCodeCacheHits metrics),
+       "predicate_cache_hits=" ++ show (Machine.metricPredicateCacheHits metrics),
+       "predicate_cache_misses=" ++ show (Machine.metricPredicateCacheMisses metrics),
        "fully_drained=true", "timed=false"])
   where
     drain checkpoint = case Machine.resume checkpoint of
@@ -171,7 +174,7 @@ main = do
   program <- either fail pure (buildChecked [item | item <- items, case item of TLQuery _ -> False; _ -> True])
   -- Force the parsed/checked program before the first timed execution.
   _ <- evaluate (length (show program))
-  let sourcePaths = ["src/Infera/Compile.hs", "src/Infera/Machine/Bytecode.hs",
+  let sourcePaths = ["src/Infera/Compile.hs", "src/Infera/Compile/Cache.hs", "src/Infera/Machine/Bytecode.hs",
         "src/Infera/Machine/Control.hs", "src/Infera/Machine/Tail.hs", "src/Infera/Machine/CLP.hs",
         "src/Infera/Machine/Bridge.hs", "src/Infera/Machine/Heap.hs", "src/Infera/Engine.hs", "src/Infera/Engine/Reference.hs",
         "src/Infera/Machine/Builtins.hs", "src/Infera/Machine/Table.hs", "src/Infera/Machine/Trace/Types.hs",
@@ -182,7 +185,7 @@ main = do
   sources <- mapM (\path -> readFile path >>= \contents -> pure (path, contents)) sourcePaths
   putStrLn ("# source-fingerprint=" ++ show (fingerprintString (concatMap (\(path, contents) -> path ++ "\n" ++ contents) sources)))
   putStrLn ("# compiler=" ++ compilerName ++ "-" ++ showVersion compilerVersion ++ " platform=" ++ arch ++ "-" ++ os)
-  putStrLn "# scope=loaded checked program; execution+projection+validation; no parsing or CLI startup"
+  putStrLn "# scope=loaded checked program; reached immutable predicate plans warmed by untimed compiled probe; per-query dispatch/tail setup+execution+projection+validation; no parsing or CLI startup"
   putStrLn "# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)"
   putStrLn "# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 no_timing_threshold"
   putStrLn "engine\tcase\tmedian_wall_seconds\tmedian_cpu_seconds\twall_samples\tcpu_samples"
