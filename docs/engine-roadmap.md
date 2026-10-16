@@ -6,9 +6,9 @@ This is the plan for replacing the resolution core of Infera in two steps:
    trail, an explicit goal stack and choice-point stack, last-call
    optimisation, bounded live memory for deterministic tail calls, and hooks
    for tracing. Same source language and observable query behaviour.
-2. **Bytecode compilation** (`Infera.Compile`, `Infera.VM`): clauses compiled
-   at load time to a small WAM-style instruction set executed by the machine
-   from step 1.
+2. **Bytecode compilation** (`Infera.Compile`, `Infera.Machine.Bytecode`):
+   progressively replace clause-template traversal with instructions executed
+   by the machine from step 1, then cache code at load time.
 
 Everything above the engine keeps its public behaviour: the parser,
 declarations and inference
@@ -76,16 +76,22 @@ The local implementation now routes the existing public
 signatures and result types. The original resolver lives in
 [`Infera.Engine.Reference`](../src/Infera/Engine/Reference.hs) as the independent
 parity oracle for both roadmap steps. No machine resolution path calls the
-reference interpreter. **Step 1's local exit gates passed on 2026-10-16;
-step 2 has not started.** The [acceptance report](engine-step1-acceptance-2026-10-16.md)
-records checks, current measurements and the remaining throughput costs.
+reference interpreter. **Step 1's historical local exit gates passed on
+2026-10-16; Step 2 now has an opt-in compiled activation/direct-call slice.**
+The [Step 1 acceptance report](engine-step1-acceptance-2026-10-16.md) records
+that snapshot's checks and measurements. The
+[Step 2 foundation report](engine-step2-foundation-2026-10-16.md) records the
+subsequent regression repair, compiler work and validation.
 
 The subsequent [application recheck](performance.md#current-native-engine-recheck---2026-10-16)
-found a material native regression: 16x16 ordinary minefield generation exceeds
-30 seconds, versus 0.116s at the optimized reference stage. The architectural
-exit gates passed, but they do not establish throughput acceptance. Profile and
-resolve this regression before starting Step 2 bytecode implementation, then
-retain the larger minefield in performance checks.
+found a material native regression: 16x16 ordinary minefield generation exceeded
+30 seconds, versus 0.116s at the optimized reference stage. The regression is
+fixed: accepted binding extensions avoid repeatedly validating old graphs,
+call normalization retains shared heap graphs, and constrained calls stay on
+the active driver. The larger setup/generation workload now has its own
+validated runner and CI coverage. Current evidence and measurement scope are
+in the [foundation report](engine-step2-foundation-2026-10-16.md); historical
+timings remain provenance, rather than current-source throughput acceptance.
 
 [`Heap`](../src/Infera/Machine/Heap.hs) supplies paged mutable cells, a trail,
 occurs-checked unification, typed constant/functor interning and immutable
@@ -202,7 +208,8 @@ context/arity, finite bounds, indexing and precise locations. The editor can
 hide performance hints independently and underlines resolved `unsafe` and
 `dynamic` predicates through semantic-token settings.
 
-Final validation passed 278 Haskell properties (20,698 property test cases),
+The historical Step 1 validation passed 278 Haskell properties (20,698 property
+test cases),
 37 LSP tests, 20 benchmark-harness tests and CLI acceptance including trace mode. The expanded
 checks cover ordered reference parity, independent models, complete metadata
 rollback, immutable prefix/repeated/interleaved resumes, seeded table states,
@@ -231,7 +238,7 @@ source fingerprints and build profiles:
   the reference.
 
 These files precede the public-engine switch and general live-checkpoint
-collection. Current [residency samples](engine-step1-tail-2026-10-16.jsonl)
+collection. The historical Step 1 [residency samples](engine-step1-tail-2026-10-16.jsonl)
 record 28 checked fresh processes: repeated million-call mutual recursion,
 live choices and findall, plus helpers, structured arguments, CLP, completed
 tables and dynamic facts. Peak RSS stays between 126.8 and 127.9 MiB; measured
@@ -243,18 +250,19 @@ smaller historical fingerprint inputs.
 The residency gate caught disabled trace metadata retaining retired callers,
 lazy success-guard updates and repeated unchanged cut-barrier clamps. Strict
 optional trace fields, eager owned-guard updates and no-op commits remove those
-histories. The [fresh breadboard comparison](engine-step1-breadboard-2026-10-16.tsv)
-validates exact answers and independent optima; native medians remain roughly
+histories. The historical Step 1 [breadboard comparison](engine-step1-breadboard-2026-10-16.tsv)
+validates exact answers and independent optima; native medians were roughly
 1.3–4.6 times the reference on these small cases. No general throughput gain
 is established. These costs remain the target of step 2.
 
-The [final CLI matrix](engine-step1-cli-2026-10-16.jsonl) validates reverse,
+The historical Step 1 [CLI matrix](engine-step1-cli-2026-10-16.jsonl) validates reverse,
 loop, Fibonacci and queens with one warmup and three timed runs each, using
 an explicit 60-second per-process budget. Reverse's median is 32.551 seconds;
 the earlier 30-second and 120-second timeouts are preserved in the acceptance
 report's linked data. Allowing pure noncommitting tail retirement with parked
-internal retries fixes growing active return stacks, but reverse still exceeds
-the old 30-second budget. This is measured throughput work for step 2.
+internal retries fixed growing active return stacks, but reverse still exceeded
+the old 30-second budget in that snapshot. Fresh source/profile-matched samples
+are needed to assess subsequent throughput changes.
 
 Retaining old answers or continuations deliberately
 retains their immutable pages; that caller-owned memory is distinct from
@@ -520,8 +528,9 @@ src/Infera/Engine/Reference.hs  today's engine, retained through both steps and 
    checks, unsafe/dynamic/tabled callees, effects, control/meta goals and cut
    markers retain the conservative fallback. Eligible calls reuse their depth
    budget; explicit-fuel and other ineligible calls retain the original limit.
-   Current-source repeated million-call measurements confirm frame and
-   process residency bounds, including ordinary execution without counters.
+   The Step 1 acceptance snapshot's repeated million-call measurements confirm
+   frame and process residency bounds, including ordinary execution without
+   counters.
 4. **Implemented:** CLP binding transactions, complete checkpoints, native
    labeling/minimum choices and breadboard acceptance against independent
    placement/propagation models.
@@ -532,14 +541,15 @@ src/Infera/Engine/Reference.hs  today's engine, retained through both steps and 
 6. **Implemented and CLI/trace-validated:** loader source maps,
    opt-in frame/event hook, REPL `:trace`, CLI `--trace`, and located errors
    with imported/DCG clause fallbacks. Table producers also relay native trace
-   events. Interactive stepping is a separate future feature.
-7. **Passed locally:** the complete 278-property suite, 37 LSP tests, 20 harness
-   tests, CLI/trace acceptance, exact breadboard comparisons and repeated
-   current-source residency measurements. Observable reference parity,
+  events. Interactive stepping is a separate future feature.
+7. **Historical local gate passed:** the complete 278-property suite, 37 LSP
+   tests, 20 harness tests, CLI/trace acceptance, exact breadboard comparisons and repeated
+   that snapshot's residency measurements. Observable reference parity,
    immutable lazy answers and bounded eligible-tail residency pass. CI now
-   builds both measurement runners and checks mutual/helper residency in fresh
-   processes. These local changes have not run on remote CI. Retain the
-   reference throughout step 2 and its parity release. **Step 2 has not started.**
+   builds the measurement runners and checks mutual/helper residency in fresh
+   processes. Those counts and samples describe the Step 1 acceptance snapshot;
+   the foundation report records checks for the subsequent changes. Retain the
+   reference throughout step 2 and its parity release.
 
 **Provisional performance target**: naive reverse at 2 million verified
 inferences per second. This is an aspiration to revisit after profiling and
@@ -561,10 +571,45 @@ loops and bounded live residency when callers do not retain old answers.
 ## Step 2: bytecode
 
 With the machine in place, compiling clauses targets two major remaining costs:
-building clause bodies on the heap per activation, and interpreting head
-unification one `Term` node at a time.
+traversing clause templates to build head/body graphs per activation, and
+general head matching where specialized instructions could avoid building the
+whole head graph.
 
-### Instruction set (WAM-lite)
+### Implementation status
+
+The first slice is opt-in through
+`Infera.Machine.Control.ExecutionBackend` (`Interpreted` or `Bytecode`)
+and the `startWithBackend`, `startMeasuredWithBackend`,
+`startTracedWithBackend`, `startGoalsWithBackend` and
+`solveQueryWithBackend` entry points. Public `Infera.Engine` calls and the
+existing machine entry points still use the interpreted native driver.
+
+[`Infera.Compile`](../src/Infera/Compile.hs) emits a flat, postorder register
+program for facts and first-order clauses: `UseVariable`, `PutConstant` and
+`PutCompound`. [`Machine.Bytecode`](../src/Infera/Machine/Bytecode.hs)
+allocates stable local roots and executes those instructions directly on the
+heap, preserving sharing without constructing renamed source trees. Known
+ordinary user calls use `DirectRun`; builtins retain their existing dispatch
+precedence. Head matching still uses native heap/CLP unification, and the
+driver retains clause selection, contracts, success guards, tail eligibility
+and backtracking.
+
+Clauses containing control/meta calls, variable or noncallable goals,
+malformed local IDs, or recursively nested body cuts use the interpreter.
+Original body templates remain source metadata for trace locations. Registers
+are private to activation; immutable checkpoints retain heap handles with their
+matching branch snapshots and the exact program/code version.
+
+Code is cached once per query or table-producer startup, rather than at load
+time. Table producers retain their existing head/template path, with their
+native body callbacks selecting the requested backend. Persistent load-time
+predicate caching and invalidation are still planned. The
+[foundation report](engine-step2-foundation-2026-10-16.md) distinguishes this
+slice from the remaining WAM-style design and records its validation. Initial
+validated samples establish compiled execution and parity, without establishing
+a throughput gain over the interpreted driver.
+
+### Planned instruction set (WAM-lite)
 
 Registers `A1..An` for arguments, `X` temporaries, `Y` permanent variables in
 an environment frame.
@@ -592,14 +637,13 @@ for the others (keeping the current behaviour that any bound argument prunes).
 
 ### Compiler
 
-`Infera.Compile` turns a `Clause` into instructions: classify variables as
-temporary or permanent, assign registers, emit `get_*` for the head,
-`put_*` and `call`/`execute` for the body, `allocate`/`deallocate` around
-bodies with permanent variables, environment trimming after the last use of
-each permanent variable.  Control constructs (`,`, `;`, `->`, `not`, `once`,
-`findall`) compile to auxiliary predicates with cut barriers, the standard
-transformation.  DCG rules are already plain clauses by the time they reach
-the compiler.
+The compiler will classify variables as temporary or permanent, assign
+argument/environment registers, emit `get_*` for the head,
+`put_*` and `call`/`execute` for the body, and surround bodies with permanent
+variables with `allocate`/`deallocate`. Environment trimming follows the last
+use of each permanent variable. Control constructs (`,`, `;`, `->`, `not`,
+`once`, `findall`) will compile to auxiliary predicates with cut barriers.
+DCG rules are already plain clauses by the time they reach the compiler.
 
 Declarations and inference feed the compiler subject to runtime guards. A
 declared `det`/`semidet` or eligible inferred `semidet` call commits remaining
@@ -624,18 +668,25 @@ The machine from step 1 gains an instruction loop; frames become environments
 with `Y` registers; builtins, CLP, tabling, output and dynamic facts are
 unchanged because they already sit behind the machine interface. Source maps
 and trace events must survive instruction fusion and auxiliary predicates.
-Bytecode is produced at load time and cached per predicate. REPL clause
-additions recompile the changed predicate and invalidate any dependent
-specialisations or table caches whose proof depended on the old program.
+Load-time code generation and per-predicate caching remain future work. The
+current startup cache uses the exact immutable program attached to the query;
+a subsequent REPL edit creates a new program/cache without changing existing
+checkpoints. Persistent caches will need to recompile changed predicates and
+invalidate dependent specialisations or table caches whose proof depended on
+the old program.
 
 ### Milestones
 
-1. Compiler and VM for facts and first-order rules (no control constructs);
-   differential tests against both the step 1 machine and Reference on
-   generated programs and the stdlib. Preserve ordered errors, contracts,
-   source frames and immutable repeated/interleaved resumes from the outset.
+1. **Started:** flat compiled activation and direct ordinary user calls for
+   facts/first-order rules, with opt-in backend selection and interpreter
+   fallback. Generated tests compare both native backends with Reference,
+   including ordered errors, contracts, source frames and immutable
+   repeated/interleaved resumes. Complete this milestone with specialized
+   head-unification instructions and broader stdlib acceptance; flat
+   allocation instructions alone do not complete the planned compiler/VM.
 2. Control constructs and cut barriers; the full suite.
-3. Indexing instructions; environment trimming; LCO in `execute`.
+3. Indexing instructions; register/environment lifetimes and trimming; LCO in
+   `execute`; load-time predicate caches with REPL invalidation.
 4. Determinism-directed code generation from declarations and inference.
 5. Full differential and API-lifetime suite against both the step 1 machine
    and reference; validated benchmarks on a controlled runner. Retire the

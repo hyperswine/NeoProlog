@@ -9,15 +9,21 @@
 module Infera.Machine.Control
   ( Checkpoint,
     Step (..),
+    ExecutionBackend (..),
     start,
+    startWithBackend,
     startMeasured,
+    startMeasuredWithBackend,
     startTraced,
+    startTracedWithBackend,
     resumeTraced,
     startGoals,
+    startGoalsWithBackend,
     Metrics (..),
     checkpointMetrics,
     resume,
     solveQuery,
+    solveQueryWithBackend,
     solveGoals,
   )
 where
@@ -27,8 +33,10 @@ import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Control.Monad.ST (ST, runST)
 import Control.Monad.Trans.Class (lift)
 import qualified Data.IntMap.Strict as IM
+import qualified Data.IntSet as IS
 import Data.List (nub, sortOn)
 import qualified Data.Map.Lazy as Map
+import qualified Infera.Compile as Compile
 import Infera.Arith (arithOps, evalIntExpr, normArithTerm)
 import Infera.CLP (Store (..))
 import qualified Infera.CLP as CLP
@@ -36,8 +44,10 @@ import Infera.Engine.Reference (Env (..), OutputEvent (..), Search, SearchItem (
 import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Engine.Contracts as Contracts
 import Infera.Error
+import Infera.Infer (builtinDet)
 import qualified Infera.Machine.Bridge as Bridge
 import qualified Infera.Machine.Builtins as Builtins
+import qualified Infera.Machine.Bytecode as BytecodeVM
 import qualified Infera.Machine.CLP as NativeCLP
 import qualified Infera.Machine.Heap as Heap
 import qualified Infera.Machine.Tail as Tail
@@ -51,8 +61,13 @@ import Infera.Unify (deepWalk, renameBody, renameTerm, replaceCuts, termVars, wa
 -- resolver. The second component is the current choice-stack barrier.
 type Scopes = [(Int, Int)]
 
+-- The first compiler slice is opt-in; the interpreted native driver remains
+-- an independent execution path for differential tests and unsupported clauses.
+data ExecutionBackend = Interpreted | Bytecode deriving (Eq, Show)
+
 data Task
   = Run !Heap.Address !Int Scopes
+  | DirectRun !PredKey !Heap.Address !Int Scopes
   | Located (Maybe SourceSpan) Task
   | Return !Call
   | Emit SearchItem
@@ -142,7 +157,9 @@ data Running = Running
     runningEvents :: [Trace.TraceEvent],
     runningSite :: !(Maybe SourceSpan),
     runningCurrent :: !(Maybe Term),
-    runningExternalFrames :: [Trace.TraceFrame]
+    runningExternalFrames :: [Trace.TraceFrame],
+    runningBackend :: !ExecutionBackend,
+    runningCode :: Map.Map (PredKey, Int) Compile.ClauseCode
   }
 
 -- | Opt-in execution high-water counts, independent of process RTS memory.
@@ -160,12 +177,15 @@ data Metrics = Metrics
     metricMaxBindings :: !Int,
     metricMaxSubstitutions :: !Int,
     metricMaxConstants :: !Int,
-    metricMaxFunctors :: !Int
+    metricMaxFunctors :: !Int,
+    metricCompiledActivations :: !Int,
+    metricBytecodeInstructions :: !Int,
+    metricDirectCalls :: !Int
   }
   deriving (Eq, Show)
 
 emptyMetrics :: Metrics
-emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0
+emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 data Checkpoint = Checkpoint !Env !Heap.FrozenHeap !Running
 
@@ -184,21 +204,30 @@ checked action = lift action >>= either throwError pure
 -- | Start a query with the reference root cut barrier. Eligible native tail
 -- transfers reuse their depth budget; other calls keep the existing limit.
 start :: Program -> Query -> Either Heap.HeapError Checkpoint
-start = startQuery False
+start = startWithBackend Interpreted
+
+startWithBackend :: ExecutionBackend -> Program -> Query -> Either Heap.HeapError Checkpoint
+startWithBackend backend = startQuery backend False
 
 -- | As 'start', recording execution counters for testing and measurement.
 startMeasured :: Program -> Query -> Either Heap.HeapError Checkpoint
-startMeasured = startQuery True
+startMeasured = startMeasuredWithBackend Interpreted
+
+startMeasuredWithBackend :: ExecutionBackend -> Program -> Query -> Either Heap.HeapError Checkpoint
+startMeasuredWithBackend backend = startQuery backend True
 
 startTraced :: Program -> Query -> Either Heap.HeapError Checkpoint
-startTraced program query = do
-  Checkpoint environment frozen running <- start program query
+startTraced = startTracedWithBackend Interpreted
+
+startTracedWithBackend :: ExecutionBackend -> Program -> Query -> Either Heap.HeapError Checkpoint
+startTracedWithBackend backend program query = do
+  Checkpoint environment frozen running <- startWithBackend backend program query
   let branch = runningBranch running
   pure (Checkpoint environment frozen running {runningTraced = True,
     runningBranch = branch {branchTasks = map (Located Nothing) (branchTasks branch)}})
 
-startQuery :: Bool -> Program -> Query -> Either Heap.HeapError Checkpoint
-startQuery measured program query = startWith True measured [(-1, 0)] (Reference.mkEnv program)
+startQuery :: ExecutionBackend -> Bool -> Program -> Query -> Either Heap.HeapError Checkpoint
+startQuery backend measured program query = startWithRoots backend True True measured [(-1, 0)] (Reference.mkEnv program)
   Reference.maxResolutionDepth (Reference.initialState (queryNVars query))
   (map (replaceCuts (-1)) (queryGoals query))
 
@@ -206,26 +235,32 @@ startQuery measured program query = startWith True measured [(-1, 0)] (Reference
 -- keep the reference solveGoals behavior; unowned internal cut markers are
 -- propagated. Resolution fuel counts predicate nesting, not machine steps.
 startGoals :: Env -> Int -> SolverState -> [Term] -> Either Heap.HeapError Checkpoint
-startGoals = startWith False False []
+startGoals = startGoalsWithBackend Interpreted
 
-startWith :: Bool -> Bool -> Scopes -> Env -> Int -> SolverState -> [Term] -> Either Heap.HeapError Checkpoint
-startWith = startWithRoots True
+startGoalsWithBackend :: ExecutionBackend -> Env -> Int -> SolverState -> [Term] -> Either Heap.HeapError Checkpoint
+startGoalsWithBackend backend = startWithRoots backend True False False []
 
 -- Internal table producers preserve referenced logical roots, rather than
 -- resurrecting every retired activation ID below the monotone fresh counter.
-startWithRoots :: Bool -> Bool -> Bool -> Scopes -> Env -> Int -> SolverState -> [Term]
+startWithRoots :: ExecutionBackend -> Bool -> Bool -> Bool -> Scopes -> Env -> Int -> SolverState -> [Term]
   -> Either Heap.HeapError Checkpoint
-startWithRoots dense tailReuse measured scopes environment fuel state goals = runST $ runExceptT $ do
+startWithRoots backend dense tailReuse measured scopes environment fuel state goals = runST $ runExceptT $ do
   heap <- lift Heap.newHeap
   bindings <- checked (Bridge.newBindings heap (if dense then [0 .. ssFresh state - 1] else []))
   synchronized <- checked (Bridge.syncState heap bindings (if dense then state else state {ssFresh = 0}))
   (imported, addresses) <- checked (Bridge.importTerms heap synchronized goals)
   frozen <- lift (Heap.freezeHeap heap)
   let branch = Branch imported state [Run address fuel scopes | address <- addresses] Nothing Nothing
-      protected = nub (Bridge.bindingVariables imported ++ concatMap termVars goals)
+      protected = IS.toAscList (IS.fromList (Bridge.bindingVariables imported ++ concatMap termVars goals))
       proof = Map.fromList [(predKey definition, Tail.eligiblePredicate (envProg environment) definition)
         | definition <- programPreds (envProg environment)]
-      running = Running branch [] 0 0 Seeking Nothing tailReuse proof protected measured emptyMetrics 1024 False [] Nothing Nothing []
+      code = case backend of
+        Interpreted -> Map.empty
+        Bytecode -> Map.fromList [((predKey definition, ordinal), compiled)
+          | definition <- programPreds (envProg environment),
+            (ordinal, clause) <- IM.toAscList (predClauses definition),
+            Just compiled <- [Compile.compileClause clause]]
+      running = Running branch [] 0 0 Seeking Nothing tailReuse proof protected measured emptyMetrics 1024 False [] Nothing Nothing [] backend code
   sampled <- sample heap running
   pure (Checkpoint environment frozen sampled)
 
@@ -244,7 +279,10 @@ resumeTraced (Checkpoint environment frozen running) = runST $ runExceptT $ do
       (reverse (runningEvents final), Yield item (Checkpoint environment saved final {runningEvents = []}))
 
 solveQuery :: Program -> Query -> Search
-solveQuery program query = unfold (start program query)
+solveQuery = solveQueryWithBackend Interpreted
+
+solveQueryWithBackend :: ExecutionBackend -> Program -> Query -> Search
+solveQueryWithBackend backend program query = unfold (startWithBackend backend program query)
 
 solveGoals :: Env -> Int -> SolverState -> [Term] -> Search
 solveGoals environment fuel state goals = unfold (startGoals environment fuel state goals)
@@ -300,18 +338,28 @@ driveSampled environment heap running = case runningPhase running of
        in case task of
             Located site inner -> drive environment heap (withTasks [inner] next {runningSite = site})
             Run address fuel scopes -> do
-              traced <- if runningTraced next then do
-                terms <- rawTerms heap next [address]
-                goal <- single terms
-                let actual = deepWalk (stSubst (ssStore (branchState branch))) goal
-                pure (recordTrace Trace.Call actual (runningSite next) Nothing next {runningCurrent = Just actual})
-                else pure next
+              traced <- beginTaskTrace heap next address
               runGoal environment heap traced address fuel scopes
+            DirectRun key address fuel scopes -> do
+              traced <- beginTaskTrace heap next address
+              let previous = runningMetrics traced
+                  counted = if runningMeasured traced then traced {runningMetrics = previous
+                    {metricDirectCalls = metricDirectCalls previous + 1}} else traced
+              case lookupPred key (envProg environment) of
+                Just definition -> callPredicate environment heap counted address fuel scopes definition
+                Nothing -> runGoal environment heap counted address fuel scopes
             Return call -> returnCall environment heap next call
             Emit item -> emitRecorded environment heap next item
             Fail -> drive environment heap next {runningPhase = Backtracking}
             Label variables -> label environment heap next variables
             Optimize variables cost -> optimize environment heap next variables cost
+
+beginTaskTrace :: Heap.Heap s -> Running -> Heap.Address -> MachineM s Running
+beginTaskTrace _ running _ | not (runningTraced running) = pure running
+beginTaskTrace heap running address = do
+  goal <- rawTerms heap running [address] >>= single
+  let actual = deepWalk (stSubst (ssStore (branchState (runningBranch running)))) goal
+  pure (recordTrace Trace.Call actual (runningSite running) Nothing running {runningCurrent = Just actual})
 
 sample :: Heap.Heap s -> Running -> MachineM s Running
 sample _ running | not (runningMeasured running) = pure running
@@ -324,6 +372,7 @@ sample heap running = do
       previous = runningMetrics running
       owners (Located _ task) = owners task
       owners (Run _ _ scopes) = length scopes
+      owners (DirectRun _ _ _ scopes) = length scopes
       owners _ = 0
       scopeDepth Nothing = 0
       scopeDepth (Just scope) = 1 + scopeDepth (runningScope (scopeParent scope))
@@ -372,6 +421,8 @@ prune requested running
     clampTask (Located site task) = Located site (clampTask task)
     clampTask (Run address fuel scopes) =
       Run address fuel [(owner, min barrier depth) | (owner, barrier) <- scopes]
+    clampTask (DirectRun key address fuel scopes) =
+      DirectRun key address fuel [(owner, min barrier depth) | (owner, barrier) <- scopes]
     clampTask (Return call) = Return call {callEntryDepth = min (callEntryDepth call) depth}
     clampTask task = task
 
@@ -539,7 +590,7 @@ performBuiltin environment heap running action = case action of
   Builtins.Reject -> drive environment heap (traceCurrent Trace.Fail Nothing running) {runningPhase = Backtracking}
   Builtins.Raise err -> emit environment heap running {runningPhase = Backtracking} (BranchError err)
   Builtins.Post operation -> do
-    result <- checked (NativeCLP.apply heap bindings store operation)
+    result <- checked (NativeCLP.applyAccepted heap bindings store operation)
     acceptGoalStore environment heap running result
   Builtins.Unify left right -> do
     (imported, addresses) <- checked (Bridge.importTerms heap bindings [left, right])
@@ -632,7 +683,7 @@ minimumBound running cost store = case runningScope running of
 optimize :: Env -> Heap.Heap s -> Running -> [VarId] -> Term -> MachineM s DriverStep
 optimize environment heap running variables cost = do
   let branch = runningBranch running
-  result <- checked (NativeCLP.apply heap (branchBindings branch) (ssStore (branchState branch)) (minimumBound running cost))
+  result <- checked (NativeCLP.applyAccepted heap (branchBindings branch) (ssStore (branchState branch)) (minimumBound running cost))
   acceptStore environment heap running result $ \bounded ->
     let store = ssStore (branchState (runningBranch bounded))
         pending = nub [w | v <- variables, Var w <- [walk (stSubst store) (Var v)]]
@@ -656,7 +707,7 @@ optimizeValues environment heap running variables cost variable lower = do
   let branch = runningBranch running
       operation store = CLP.addDomain (Var variable) (CLP.Fin lower) CLP.PosInf store
         >>= maybe (Right Nothing) (minimumBound running cost)
-  result <- checked (NativeCLP.apply heap (branchBindings branch) (ssStore (branchState branch)) operation)
+  result <- checked (NativeCLP.applyAccepted heap (branchBindings branch) (ssStore (branchState branch)) operation)
   acceptStore environment heap running result $ \bounded ->
     let current = runningBranch bounded
         store = ssStore (branchState current)
@@ -750,18 +801,17 @@ callPredicate environment heap running address fuel scopes definition = do
       -- Force both retired tails even in unmeasured execution. Otherwise a
       -- chain of lazy drop/filter thunks retains the supposedly dead frames.
       when reusable (retiredTasks `seq` liveScopes `seq` pure ())
-      (activeHeap, active) <- if reusable then collectLive heap counted else pure (heap, counted)
+      (activeHeap, active, activeGoal) <- if reusable
+        then collectCallGoal heap counted address
+        else pure (heap, counted, address)
       let activeBranch = runningBranch active
           activeState = branchState activeBranch
-      -- Ordinary heap arguments already have the required dereferencing.
-      -- Reuse their graph unless arithmetic changes syntax or a tail collection
-      -- may have relocated it. Copying a ground list at every call is quadratic.
-      (bindings, normalizedAddress) <- if not reusable && not (requiresNormalization (stSubst (ssStore state)) goal)
-        then pure (branchBindings activeBranch, address)
-        else do
-          (imported, addresses) <- checked (Bridge.importTerms activeHeap (branchBindings activeBranch) [normalized])
-          importedAddress <- single addresses
-          pure (imported, importedAddress)
+      -- Normalize the shared graph itself. Exporting and importing a fully
+      -- expanded term duplicates unchanged grid/list suffixes at every call.
+      normalizedAddress <- if requiresNormalization (stSubst (ssStore state)) goal
+        then checked (Bridge.normalizeTermGraph activeHeap (branchBindings activeBranch) activeGoal)
+        else pure activeGoal
+      let bindings = branchBindings activeBranch
       normalizedShape <- checked (Heap.view activeHeap normalizedAddress)
       let arguments = case normalizedShape of Heap.CompoundView _ as -> as; _ -> []
           ident = runningNextId active
@@ -788,15 +838,22 @@ callPredicate environment heap running address fuel scopes definition = do
         required -> do
           mark <- lift (Heap.freezeHeap activeHeap)
           push (Choice mark entryBranch (Guard ident key required False)) entry
-      if predIsTabled (envProg environment) definition
+      -- Constrained calls cannot use variant tables. Keep their plain fallback
+      -- on the active driver; entering the table callback would reconstruct
+      -- the entire caller heap for each body even though no table is used.
+      let activeStore = ssStore activeState
+          constrainedCall = not (IS.null (stWatched activeStore))
+            && any (CLP.isConstrained activeStore)
+              (termVarIds (deepWalk (stSubst activeStore) normalized))
+      if predIsTabled (envProg environment) definition && not constrainedCall
         then do
           mark <- lift (Heap.freezeHeap activeHeap)
           let tableBranch = (runningBranch guarded)
                 {branchTasks = Return call : branchTasks (runningBranch guarded)}
           let callers = [parent | (_, _, parent) <- callTraceParents call] ++ executionFrames guarded
               stream = if runningTraced guarded
-                then Table.evalTabledTracedWithContext callers (solveLocatedGoals (runningTailReuse guarded) callers) environment nextFuel activeState definition normalized
-                else map Right (Table.evalTabled (solveNativeGoals (runningTailReuse guarded)) environment nextFuel activeState definition normalized)
+                then Table.evalTabledTracedWithContext callers (solveLocatedGoals (runningBackend guarded) (runningTailReuse guarded) callers) environment nextFuel activeState definition normalized
+                else map Right (Table.evalTabled (solveNativeGoals (runningBackend guarded) (runningTailReuse guarded)) environment nextFuel activeState definition normalized)
           iteratorStep True environment activeHeap guarded {runningBranch = tableBranch} mark liveScopes stream
         else if nextFuel <= 0
           then emit environment activeHeap guarded {runningPhase = Backtracking} BranchExhausted
@@ -812,6 +869,21 @@ quiet running = case branchMarker (runningBranch running) of
   Nothing -> True
   Just _ -> False
 
+-- A tail call's Run task has already been popped. Keep its goal as a temporary
+-- control root while retiring the caller and relocating the active heap. The
+-- synthetic task is removed before any execution, sampling or snapshot.
+collectCallGoal :: Heap.Heap s -> Running -> Heap.Address
+  -> MachineM s (Heap.Heap s, Running, Heap.Address)
+collectCallGoal heap running goal = do
+  let branch = runningBranch running
+      rooted = running {runningBranch = branch
+        {branchTasks = Run goal 0 [] : branchTasks branch}}
+  (activeHeap, active) <- collectLive heap rooted
+  case branchTasks (runningBranch active) of
+    Run relocated _ _ : rest -> pure (activeHeap,
+      active {runningBranch = (runningBranch active) {branchTasks = rest}}, relocated)
+    _ -> throwError Heap.IncompatibleBindings
+
 -- Rebuild at seeking boundaries before popping control roots, and after a
 -- proved tail transfer. Parked retries own independent frozen heaps. All active
 -- control addresses, scope terms and caller logical IDs are roots; Bridge follows
@@ -824,6 +896,7 @@ collectLive heap running = do
         tasks = branchTasks branch
         roots (Located _ task) = roots task
         roots (Run address _ _) = [address]
+        roots (DirectRun _ address _ _) = [address]
         roots (Return call) = callArguments call
         roots _ = []
         variables (Located _ task) = variables task
@@ -863,6 +936,8 @@ collectLive heap running = do
       pure (Located site first : relocated)
     relocate (Run _ fuel scopes : rest) (address : addresses) =
       (Run address fuel scopes :) <$> relocate rest addresses
+    relocate (DirectRun key _ fuel scopes : rest) (address : addresses) =
+      (DirectRun key address fuel scopes :) <$> relocate rest addresses
     relocate (Return call : rest) addresses =
       let count = length (callArguments call)
           (arguments, remaining) = splitAt count addresses
@@ -870,11 +945,13 @@ collectLive heap running = do
             (Return call {callArguments = arguments} :) <$> relocate rest remaining
     relocate (task : rest) addresses = case task of
       Run _ _ _ -> throwError Heap.IncompatibleBindings
+      DirectRun _ _ _ _ -> throwError Heap.IncompatibleBindings
       _ -> (task :) <$> relocate rest addresses
     relocate _ _ = throwError Heap.IncompatibleBindings
     splitAtTask task addresses = do
       let count (Located _ inner) = count inner
           count (Run _ _ _) = 1
+          count (DirectRun _ _ _ _) = 1
           count (Return call) = length (callArguments call)
           count _ = 0
           (first, remaining) = splitAt (count task) addresses
@@ -893,28 +970,57 @@ tryClauses environment heap running goal fuel scopes call ((ordinal, clause) : r
   let base = ssFresh (branchState branch)
       fresh = base + max 1 (clauseNVars clause)
   when (fresh < base) (throwError Heap.HeapCapacityExceeded)
-  let headTerm = renameTerm base (clauseHead clause)
-      body = map (renameBody base) (clauseBody clause)
-      source = if runningTraced running then
+  let source = if runningTraced running then
         Trace.lookupClauseSource (progSources (envProg environment)) (callKey call) ordinal else Nothing
       selected = call {callClause = Just ordinal, callClauseSite = Trace.sourceClauseSpan <$> source}
       located template task
         | not (runningTraced running) = task
         | otherwise = Located ((\site -> Trace.goalSourceSpan site template) <$> source) task
-  (bindings, addresses) <- checked (Bridge.importTerms heap (branchBindings branch)
-    (map Var [base .. fresh - 1] ++ headTerm : body))
-  let activation = drop (fresh - base) addresses
-  case activation of
-    headAddress : bodyAddresses -> do
-      result <- checked (NativeCLP.unify heap bindings (ssStore (branchState branch)) goal headAddress)
-      let nextBranch = branch
-            { branchBindings = bindings,
-              branchState = (branchState branch) {ssFresh = fresh},
-              branchTasks = zipWith (\template bodyAddress -> located template (Run bodyAddress (fuel - 1) scopes))
-                (clauseBody clause) bodyAddresses ++ Return selected : branchTasks branch
-            }
-      acceptStore environment heap withRetry {runningBranch = nextBranch} result (drive environment heap)
-    _ -> throwError Heap.IncompatibleBindings
+  (bindings, headAddress, tasks, instructionCount) <-
+    case Map.lookup (callKey call, ordinal) (runningCode running) of
+      Just code -> do
+        (allocated, headRoot, bodyRoots) <- checked
+          (BytecodeVM.instantiate heap (branchBindings branch) base code)
+        let task bodyCall bodyRoot = located (Compile.bodyTemplate bodyCall)
+              (compiledTask environment (Compile.bodyKey bodyCall) bodyRoot (fuel - 1) scopes)
+        pure (allocated, headRoot, zipWith task (Compile.codeBody code) bodyRoots,
+          Just (length (Compile.codeInstructions code)))
+      Nothing -> do
+        let headTerm = renameTerm base (clauseHead clause)
+            body = map (renameBody base) (clauseBody clause)
+        (allocated, addresses) <- checked (Bridge.importTerms heap (branchBindings branch)
+          (map Var [base .. fresh - 1] ++ headTerm : body))
+        case drop (fresh - base) addresses of
+          headRoot : bodyRoots -> pure (allocated, headRoot,
+            zipWith (\template bodyRoot -> located template (Run bodyRoot (fuel - 1) scopes))
+              (clauseBody clause) bodyRoots, Nothing)
+          _ -> throwError Heap.IncompatibleBindings
+  result <- checked (NativeCLP.unify heap bindings (ssStore (branchState branch)) goal headAddress)
+  let previous = runningMetrics withRetry
+      metrics = case instructionCount of
+        Just count | runningMeasured withRetry -> previous
+          {metricCompiledActivations = metricCompiledActivations previous + 1,
+           metricBytecodeInstructions = metricBytecodeInstructions previous + count}
+        _ -> previous
+      nextBranch = branch
+        { branchBindings = bindings,
+          branchState = (branchState branch) {ssFresh = fresh},
+          branchTasks = tasks ++ Return selected : branchTasks branch }
+      selectedRunning = withRetry {runningBranch = nextBranch, runningMetrics = metrics}
+      locatedHead = case result of
+        Left _ | runningTraced selectedRunning -> selectedRunning
+          {runningSite = (Trace.sourceHeadSpan <$> source) `orSite` runningSite selectedRunning}
+        _ -> selectedRunning
+  acceptStore environment heap locatedHead result (drive environment heap)
+
+-- Resolve only known ordinary user calls directly. Builtins retain precedence,
+-- and dynamic names must consult their branch-local fact version at execution.
+compiledTask :: Env -> PredKey -> Heap.Address -> Int -> Scopes -> Task
+compiledTask environment key@(name, arity) address fuel scopes
+  | builtinDet name arity == Nothing,
+    not (nameHasFlag (envProg environment) name FlagDynamic),
+    Just _ <- lookupPred key (envProg environment) = DirectRun key address fuel scopes
+  | otherwise = Run address fuel scopes
 
 returnCall :: Env -> Heap.Heap s -> Running -> Call -> MachineM s DriverStep
 returnCall environment heap running call = do
@@ -1052,7 +1158,10 @@ launchTasks environment heap parent mark bindings state tasks kind =
       scope = Scope parent mark kind []
       child = parent {runningBranch = branch, runningChoices = [], runningDepth = 0,
         runningPhase = Seeking, runningScope = Just scope,
-        runningProtected = nub (runningProtected parent ++ Bridge.bindingVariables (branchBindings (runningBranch parent)))}
+        -- Protected roots have set semantics. Quadratic list deduplication
+        -- here rescans thousands of activation IDs for each window condition.
+        runningProtected = IS.toAscList (IS.fromList
+          (runningProtected parent ++ Bridge.bindingVariables (branchBindings (runningBranch parent))))}
    in drive environment heap child
 
 scopeEvent :: Env -> Heap.Heap s -> Running -> Scope -> SearchItem -> MachineM s DriverStep
@@ -1179,7 +1288,7 @@ finish environment heap child = case runningScope child of
       MinimumScope _ best -> case (issues, best) of
         ([], Just (_, store)) -> do
           let branch = runningBranch parent
-          result <- checked (NativeCLP.apply heap (branchBindings branch) (ssStore (branchState branch)) (const (Right (Just store))))
+          result <- checked (NativeCLP.applyAccepted heap (branchBindings branch) (ssStore (branchState branch)) (const (Right (Just store))))
           acceptStore environment heap parent result (drive environment heap)
         _ -> queued [Fail]
       GoalMinimumScope _ best -> case (issues, best) of
@@ -1274,12 +1383,12 @@ executionFrames running = frames running
 
 -- Native table producer bodies enter their own immutable machine checkpoint.
 -- Source identities are stamped before renaming; outer frames are pure metadata.
-solveLocatedGoals :: Bool -> [Trace.TraceFrame] -> Env -> Int -> SolverState
+solveLocatedGoals :: ExecutionBackend -> Bool -> [Trace.TraceFrame] -> Env -> Int -> SolverState
   -> [(Term, Maybe SourceSpan)] -> [Trace.TraceFrame] -> Table.InstrumentedSearch
-solveLocatedGoals tailReuse callers environment fuel state goals frames = unfoldTraced prepared
+solveLocatedGoals backend tailReuse callers environment fuel state goals frames = unfoldTraced prepared
   where
     prepared = do
-      Checkpoint _ frozen running <- startWithRoots False tailReuse False [] environment fuel state (map fst goals)
+      Checkpoint _ frozen running <- startWithRoots backend False tailReuse False [] environment fuel state (map fst goals)
       let stamp (_, site) (Located _ inner) = Located site inner
           stamp (_, site) task = Located site task
           located = zipWith stamp goals (branchTasks (runningBranch running))
@@ -1294,9 +1403,9 @@ solveLocatedGoals tailReuse callers environment fuel state goals frames = unfold
         Yield item next -> Right item : unfoldTraced (Right next)
 
 
-solveNativeGoals :: Bool -> Env -> Int -> SolverState -> [Term] -> Search
-solveNativeGoals tailReuse environment fuel state goals =
-  unfold (startWithRoots False tailReuse False [] environment fuel state goals)
+solveNativeGoals :: ExecutionBackend -> Bool -> Env -> Int -> SolverState -> [Term] -> Search
+solveNativeGoals backend tailReuse environment fuel state goals =
+  unfold (startWithRoots backend False tailReuse False [] environment fuel state goals)
 
 
 requiresNormalization :: IM.IntMap Term -> Term -> Bool

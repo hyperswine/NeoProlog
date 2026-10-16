@@ -5,6 +5,7 @@
 module Infera.Machine.CLP
   ( unify,
     apply,
+    applyAccepted,
     bindInteger,
   )
 where
@@ -55,13 +56,31 @@ unify heap bindings store left right = transaction heap $ do
       changes <- checked (Bridge.bindingChanges heap bindings written)
       let mirrored = foldl' (\substitution (variable, term) -> IM.insert variable term substitution)
             (stSubst store) changes
-      reconcile heap bindings mirrored (CLP.applyBindings changes store)
+          propagated = CLP.applyBindings changes store
+      -- The heap already contains every write in changes. Without a watched
+      -- write, applyBindings cannot propagate any additional bindings, so the
+      -- complete returned store already mirrors this heap. Comparing its
+      -- entire substitution again makes ordinary clause calls quadratic in
+      -- the number of preceding activations.
+      if any (CLP.isConstrained store . fst) changes
+        then reconcileAdded heap bindings mirrored propagated
+        else pure (fmap (fmap (\updated -> (bindings, updated))) propagated)
 
 -- | Post/narrow constraints using the existing persistent algorithms, then
--- install newly propagated singleton bindings on the native heap.
+-- install newly propagated singleton bindings on the native heap. Arbitrary
+-- callbacks retain strict reconciliation of changed existing bindings.
 apply :: Heap s -> Bridge.Bindings -> Store -> (Store -> Either SolveError (Maybe Store)) -> ST s (Either HeapError Result)
 apply heap bindings store operation = transaction heap $
   reconcile heap bindings (stSubst store) (operation store)
+
+-- | Internal operation whose accepted substitution is known to extend the
+-- previous raw bindings without replacement. The driver supplies the CLP
+-- posting algorithms, or a selected minimum state descended from this store.
+-- Propagation binds only still-free representatives. Callers without that
+-- proof must use 'apply', which validates arbitrary accepted callbacks.
+applyAccepted :: Heap s -> Bridge.Bindings -> Store -> (Store -> Either SolveError (Maybe Store)) -> ST s (Either HeapError Result)
+applyAccepted heap bindings store operation = transaction heap $
+  reconcileAdded heap bindings (stSubst store) (operation store)
 
 -- | Label one stable logical variable with an integer. Imports are covered
 -- by the same transaction as unification and propagation.
@@ -77,4 +96,14 @@ reconcile _ _ _ (Left err) = pure (Left err)
 reconcile _ _ _ (Right Nothing) = pure (Right Nothing)
 reconcile heap bindings previous (Right (Just store)) = do
   synchronized <- checked (Bridge.syncBindings heap bindings previous (stSubst store))
+  pure (Right (Just (synchronized, store)))
+
+reconcileAdded :: Heap s -> Bridge.Bindings -> IM.IntMap Term -> Either SolveError (Maybe Store) -> BindingM s Result
+reconcileAdded _ _ _ (Left err) = pure (Left err)
+reconcileAdded _ _ _ (Right Nothing) = pure (Right Nothing)
+reconcileAdded heap bindings previous (Right (Just store)) = do
+  -- Native heap writes and the persistent propagator bind only previously
+  -- free representatives, so accepted stores extend raw substitution entries
+  -- without replacing old terms. Avoid revalidating every shared old graph.
+  synchronized <- checked (Bridge.syncAddedBindings heap bindings previous (stSubst store))
   pure (Right (Just (synchronized, store)))

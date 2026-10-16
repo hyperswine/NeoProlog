@@ -29,6 +29,10 @@ import MachineGraphReuseTest (machineGraphReuseGroup)
 import MachineEnvironmentTest (machineEnvironmentGroup)
 import MachineGeneralReclaimTest (machineGeneralReclaimGroup)
 import MachineInternalTailTest (machineInternalTailGroup)
+import MachineNormalizeTest (machineNormalizeGroup)
+import CompileTest (compileGroup)
+import MachineBytecodeTest (machineBytecodeGroup)
+import MachineBytecodeHeapTest (machineBytecodeHeapGroup)
 import System.Environment (getArgs)
 import Data.List (isPrefixOf)
 import System.Exit (exitFailure)
@@ -47,7 +51,11 @@ groups =
     ("machine-tail-proof", machineTailProofGroup), ("machine-trace", machineTraceGroup),
     ("machine-graph-reuse", machineGraphReuseGroup), ("machine-environment", machineEnvironmentGroup),
     ("machine-general-reclaim", machineGeneralReclaimGroup),
-    ("machine-internal-tail", machineInternalTailGroup)
+    ("machine-internal-tail", machineInternalTailGroup),
+    ("machine-normalize", machineNormalizeGroup),
+    ("compile", compileGroup),
+    ("machine-bytecode", machineBytecodeGroup),
+    ("machine-bytecode-heap", machineBytecodeHeapGroup)
   ]
 
 main :: IO ()

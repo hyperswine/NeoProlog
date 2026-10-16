@@ -34,6 +34,7 @@ module Infera.Machine.Heap
     environmentFromRoots,
     copyReachable,
     newVariable,
+    newCompound,
     importTerm,
     importWithEnvironment,
     exportTerm,
@@ -418,6 +419,20 @@ allocate heap makeCell = do
 
 newVariable :: Heap s -> ST s (Either HeapError Address)
 newVariable heap = runExceptT (allocate heap Ref)
+
+-- | Construct one immutable node from branch-owned child handles without
+-- exporting or copying their graphs. Every child is validated before the
+-- node becomes visible. The constructor cannot create a cycle because its
+-- destination has not yet been allocated. Existing references remain dynamic
+-- even when currently bound; rollback may expose their free variables again.
+newCompound :: Heap s -> String -> [Address] -> ST s (Either HeapError Address)
+newCompound heap name children = atomic heap $ do
+  cells <- mapM (readCell heap) children
+  let staticGround (Ref _) = False
+      staticGround (Con _) = True
+      staticGround (Structure _ ground _) = ground
+  ident <- lift (internFunctor heap name (length children))
+  allocate heap (const (Structure ident (all staticGround cells) children))
 
 readCell :: Heap s -> Address -> HeapM s Cell
 readCell heap address@(Address index generation) = do

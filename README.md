@@ -377,25 +377,33 @@ cd lsp && npm install && npm run install-extension
 The public `Infera.Engine` now runs an explicit abstract machine with a trail,
 choice-point stacks, last-call optimisation, heap reclamation and tracing.
 `Infera.Engine.Reference` retains the previous resolver for comparisons through
-the bytecode transition. [docs/engine-roadmap.md](docs/engine-roadmap.md) tracks
-the step 1 validation gates and the next step: compiling clause templates to
-bytecode. Proved tail transfers reuse their depth budget; other nested calls
+the bytecode transition. Step 2 has started with opt-in compiled clause
+activation and direct ordinary user calls; the public solver still selects the
+interpreted native driver. [docs/engine-roadmap.md](docs/engine-roadmap.md)
+tracks the remaining specialized head instructions, register lifetimes,
+control/indexing instructions and persistent load-time caches. The
+[foundation report](docs/engine-step2-foundation-2026-10-16.md) records the
+minefield regression repair and first compiler slice. Proved tail transfers
+reuse their depth budget; other nested calls
 retain the 100 000 activation limit and explicit exhaustion reporting.
 `bench/run.sh` runs checked engine benchmarks. Earlier relative-speed numbers
 from the unchecked harness are historical observations, not validated baselines.
-The roadmap records a fresh local baseline with checked warmups and samples.
+The roadmap preserves historical local baselines with checked warmups and
+samples; current changes need source/profile-matched measurements.
 
 ## Layout
 
 ```
 src/Infera/Syntax.hs    terms, declarations, parser, printer
 src/Infera/Unify.hs     substitutions, unification, renaming
+src/Infera/Compile.hs   flat first-order clause allocation instructions and source identities
 src/Infera/Machine/Heap.hs paged heap/trail and immutable snapshots
 src/Infera/Machine/Bridge.hs logical variables and complete solver-state adapters
 src/Infera/Machine/Control.hs native task/choice stacks, scopes and immutable resume
 src/Infera/Machine/CLP.hs native binding transactions over persistent propagation
 src/Infera/Machine/Tail.hs closed first-order call-graph proof for tail reuse
 src/Infera/Machine/Builtins.hs native builtin dispatch and dynamic fact operations
+src/Infera/Machine/Bytecode.hs opt-in clause activation VM with private local registers
 src/Infera/Machine/Table.hs native variant-table producers and fixedpoint iteration
 src/Infera/Machine/Trace.hs opt-in execution events and source metadata
 src/Infera/Arith.hs     numeric evaluation
@@ -426,6 +434,9 @@ test/MachineTableTest.hs native tabling and producer parity
 test/MachineTailProofTest.hs closed call-graph proof and tail-reuse exclusions
 test/MachineTraceTest.hs trace parity, source locations, frames and cut boundaries
 test/MachineGraphReuseTest.hs shared argument graphs and normalization compatibility
+test/MachineNormalizeTest.hs generated raw graph normalization, alias and scalar-bit parity
+test/CompileTest.hs     generated compiler register contracts and fallback boundaries
+test/MachineBytecodeTest.hs interpreted/bytecode/reference parity and immutable resumes
 test/MachineEnvironmentTest.hs branch-owned environments and graph relocation models
 test/MachineGeneralReclaimTest.hs non-tail collection with contracts, cuts and effects
 test/PerformanceDiagnosticTest.hs generated performance-advice models and precise source locations
@@ -433,13 +444,16 @@ examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP pl
 Formula/infera.rb       Homebrew formula
 bench/                  engine benchmarks (infera vs swipl vs scryer)
 bench/check-tail-memory.py fresh-process residency gate, including CI quick mode
+bench/machine-minefield.hs validated larger minefield setup/generation regression runner
+bench/machine-bytecode.hs serial checked reference/interpreted/bytecode comparison
 docs/engine-roadmap.md  plan for the abstract machine and bytecode engine
+docs/engine-step2-foundation-2026-10-16.md regression repair and opt-in compiler evidence
 lsp/                    VS Code extension and language server
 ```
 
 ## Validation
 
-CI builds and tests on Linux and macOS with GHC 9.8.2 and Node 22. It runs the
+CI is configured to build and test on Linux and macOS with GHC 9.8.2 and Node 22. It runs the
 Haskell properties, editor and language-server integration tests, and real CLI
 diagnostic checks. Optimisation properties compare generated finite problems
 against exhaustive search; breadboard acceptance compares complete placements
@@ -549,25 +563,43 @@ substantial work. Those samples predate collection with live alternatives and
 opaque scopes. The historical
 [breadboard recheck](docs/engine-structured-tail-breadboard-2026-10-16.tsv)
 also predates the public facade switch and places the machine behind the
-reference on these small cases. Current residency and breadboard measurements
-are tracked in the roadmap; these historical results establish no general
-performance improvement.
+reference on these small cases. Later Step 1 samples are tracked in the
+roadmap; current compiler evidence is in the foundation report. These
+historical results establish no general performance improvement.
 
-The suite now passes 278 Haskell properties (20,698 property test cases),
-37 editor/LSP tests, 20 harness tests and CLI/trace acceptance. The
+The historical Step 1 gate passed 278 Haskell properties (20,698 property test
+cases), 37 editor/LSP tests, 20 harness tests and CLI/trace acceptance. The
 [step 1 acceptance report](docs/engine-step1-acceptance-2026-10-16.md) records
-the local exit gates and remaining step 2 throughput work. New generated comparisons cover native
-builtins, table producers, mutual/helper tail calls, collection with live
+that snapshot's local exit gates and remaining step 2 throughput work. Its
+generated comparisons cover native builtins, table producers, mutual/helper
+tail calls, collection with live
 choices and nested scopes, retained snapshots and trace source/frame metadata.
 Existing independent models, breadboard optima/report checks, contract errors,
 ordered answers, duplicate preservation, residual constraints and output
 remain acceptance criteria.
 
-The current [fresh-process residency gate](docs/engine-step1-tail-2026-10-16.jsonl)
-passes 28 checked samples, including repeated million-call mutual recursion,
+The first Step 2 slice is available through
+`Infera.Machine.Control.solveQueryWithBackend Bytecode` and the corresponding
+`start*WithBackend` checkpoint APIs. Existing entry points default to
+`Interpreted`. Compiled activations execute flat allocation instructions and
+known user calls dispatch directly, while head matching, contracts, CLP,
+tables and backtracking retain the native driver's semantics. Control/meta
+clauses and recursively nested body cuts use the interpreter. Code caches
+belong to each query or table-producer startup; persistent load-time caches and
+specialized head-unification instructions remain future work. Compiler and
+backend tests compare raw scalar bits, ordered observations, source frames and
+repeated/interleaved resumes. The
+[foundation report](docs/engine-step2-foundation-2026-10-16.md) records the
+current checks and benchmark scope: 315 Haskell properties (22,180 property
+test cases), 37 editor/LSP tests, 20 harness tests and CLI acceptance passed.
+The initial compiler comparison establishes working compiled dispatch and
+parity; its timings do not establish a throughput gain.
+
+The historical Step 1 [fresh-process residency gate](docs/engine-step1-tail-2026-10-16.jsonl)
+passed 28 checked samples, including repeated million-call mutual recursion,
 live choices/findall, helpers, structured inputs and live CLP/table/dynamic
-state. Peak RSS stays around 127–128 MiB, including startup and source
-fingerprinting; measured active heaps stay at or below 1,037 cells. CI runs a
+state. Peak RSS stayed around 127–128 MiB, including startup and source
+fingerprinting; measured active heaps stayed at or below 1,037 cells. CI runs a
 mutual/helper subset through `bench/check-tail-memory.py --quick` to catch
 retained host-language history as well as growing machine state.
 
@@ -621,6 +653,23 @@ The measured work includes execution, projection and result validation, and
 excludes parsing, loading and inference. This scope differs from CLI startup
 benchmarks. Failed, exhausted or invalid results do not produce a timing row;
 there is no CI timing threshold or bounded-residency claim.
+
+The opt-in compiler comparison runs first-order helper-dispatch and structured
+list/constructor workloads serially through Reference, Interpreted and Bytecode:
+
+```sh
+cabal bench machine-bytecode --offline --enable-optimization=2 --benchmark-options='+RTS -T -RTS'
+```
+
+It checks an independent result model and the complete ordered
+answer/residual/output/error/exhaustion stream, with one warmup and three
+validated samples per engine/case under explicit 30-second budgets. Distinct
+unused variable bases prevent sharing an evaluated pure search across samples.
+An untimed measured probe requires positive compiled-activation, instruction and
+direct-call counters; ordinary timed runs disable those counters. Timing includes
+per-query code-cache construction, execution, projection and validation,
+excluding program parsing/checking and CLI startup. The runner records its
+source fingerprint, compiler, platform and build scope, with no speed threshold.
 
 The separate tail runner verifies and fully drains one query per fresh process:
 

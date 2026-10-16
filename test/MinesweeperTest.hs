@@ -8,6 +8,7 @@ import Hedgehog hiding (Var)
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Infera
+import qualified Infera.Engine.Reference as Reference
 import System.Timeout (timeout)
 
 data Window = Window Int Int Int deriving Show
@@ -118,6 +119,39 @@ prop_dense_acceptance = withTests 1 $ property $ do
       length (filter (== '*') (concat rows)) === 50
     other -> annotateShow other >> failure
 
+-- The ordinary 16x16 workload exercises a larger constraint setup than the
+-- dense seeded fixture. Its generous deadline is a runaway safety limit;
+-- elapsed-time comparisons belong to the benchmark runner.
+prop_large_ordinary_acceptance :: Property
+prop_large_ordinary_acceptance = withTests 1 $ property $ do
+  prog <- loadExample
+  query <- evalEither (parseQuery "once (minefield 16 16 50 [window 2 2 2] Grid)?")
+  let native = solveAll prog query
+      reference = Reference.solveAll prog query
+      checked stageName result = do
+        annotate stageName
+        -- Force bindings, residuals, errors and exhaustion before validation.
+        completed <- evalIO (timeout 120000000 (evaluate (length (show result))))
+        case completed of
+          Nothing -> annotate "Ordinary 16x16 minefield exceeded the 120s safety budget" >> failure
+          Just _ -> success
+        summaryErrors result === []
+        summaryExhausted result === False
+        answer <- case summaryAnswers result of
+          [one] -> pure one
+          other -> annotateShow other >> failure
+        grid <- gridFrom answer
+        length grid === 16
+        map length grid === replicate 16 16
+        sum (concat grid) === 50
+        -- All 15x15 overlapping windows are checked, without using CLP.
+        assert (validWindows [Window 2 2 2] grid)
+        answerResiduals answer === []
+        pure grid
+  actual <- checked "public native solver" native
+  expected <- checked "reference oracle" reference
+  actual === expected
+
 prop_boundaries_and_invalid_inputs :: Property
 prop_boundaries_and_invalid_inputs = withTests 1 $ property $ do
   prog <- loadExample
@@ -149,4 +183,5 @@ minesweeperGroup :: Group
 minesweeperGroup = Group "Minesweeper example"
   [("all small grids vs independent window model", prop_finite_model),
    ("50 bombs, 2x2 cap, seeded repeatability and rendering", prop_dense_acceptance),
+   ("ordinary 16x16 first grid vs independent model and reference", prop_large_ordinary_acceptance),
    ("boundaries, impossible rules and combined windows", prop_boundaries_and_invalid_inputs)]

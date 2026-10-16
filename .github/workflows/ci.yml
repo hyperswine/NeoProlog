@@ -14,10 +14,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-26]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # The image's Command Line Tools 27 SDK has arm64e.x1 .tbd targets
+      # rejected by the GHC 9.8 linker. Select the installed Xcode 26 SDK
+      # before configuring GHC, rather than inheriting the newer CLT SDK.
+      - name: Select macOS SDK for GHC 9.8
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          infera_developer_dir=/Applications/Xcode_26.6.app/Contents/Developer
+          test -d "$infera_developer_dir"
+          echo "DEVELOPER_DIR=$infera_developer_dir" >> "$GITHUB_ENV"
+          infera_sdk_root="$(DEVELOPER_DIR="$infera_developer_dir" xcrun --sdk macosx --show-sdk-path)"
+          echo "SDKROOT=$infera_sdk_root" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$infera_developer_dir" xcrun --sdk macosx --show-sdk-version
       - uses: haskell-actions/setup@v2
         with:
           ghc-version: '9.8.2'
@@ -39,4 +52,6 @@ jobs:
       - run: python3 test/cli.py "$(cabal list-bin exe:infera --enable-optimization=2)"
       - run: python3 -m unittest discover -s test -p bench_harness_test.py
       - run: python3 bench/check-tail-memory.py "$(cabal list-bin bench:machine-tail --enable-optimization=2)" --quick --output /tmp/infera-tail-memory.jsonl
+      - run: '"$(cabal list-bin bench:machine-minefield --enable-optimization=2)" --engine native --phase ordinary --size 16 --bombs 50 --timeout 120'
+      - run: '"$(cabal list-bin bench:machine-bytecode --enable-optimization=2)"'
       - run: INFERA_BIN="$(cabal list-bin exe:infera --enable-optimization=2)" sh bench/run.sh --engine infera --case fib --runs 1 --warmup 0 --timeout 30 --json

@@ -1,15 +1,63 @@
-# Performance changes - 2026-10-15
+# Performance measurements
 
-## Current native engine recheck - 2026-10-16
+## Native follow-up and first bytecode slice - 2026-10-16
+
+The large-minefield regression is fixed. Constrained table calls now evaluate
+their plain fallback on the active driver. Monotone native-store synchronization
+avoids revalidating unchanged historical substitutions, and graph normalization
+preserves shared grid/list suffixes. The
+[foundation report](engine-step2-foundation-2026-10-16.md) records the contracts,
+correctness tests, bounded-residency recheck and first opt-in bytecode slice.
+
+Fresh CLI measurements use the same local GHC 9.8.2 `-O2` library/executable
+profile and RTS `-N1`, one checked warmup and three checked timed processes.
+They include startup, parsing, loading, solving and output. Timings remain local
+reports rather than portable CI thresholds.
+
+| Workload | Native before follow-up | Native after follow-up |
+| --- | ---: | ---: |
+| 16x16 ordinary first minefield | >30 s, timeout | 0.476 s |
+| 16x16 minefield setup | not recorded | 0.451 s |
+| 16x16 seeded minefield, seed 42 | not recorded | 5.844 s |
+| 100-edge chain, all 5,050 pairs | 0.099 s | 0.091 s |
+| Three disconnected parts, 1..16 window | 0.053 s | 0.044 s |
+| Reverse 30-element list 3,000 times | 32.551 s | 19.369 s |
+| Counting loop to 90,000 | 0.752 s | 0.485 s |
+| Untabled fib 25 | 4.168 s | 2.694 s |
+| First valid 8-queens placement | 1.311 s | 0.578 s |
+
+Raw current samples: [applications](performance-step2-2026-10-16.jsonl) and
+[CLI matrix](engine-step2-cli-2026-10-16.jsonl). The previous raw files below
+remain historical provenance. Despite the recovery, general native execution
+still trails the pre-migration baseline on reverse, loop, Fibonacci and queens;
+that baseline used a different library optimization profile.
+
+The separate loaded-program minefield benchmark records native setup at
+0.388 s and ordinary generation at 0.432 s, versus current Reference medians
+0.060 s and 0.067 s with the same `-O2` profile. It fully drains the search and
+checks exact Reference parity; ordinary generation additionally checks the
+bomb count and every overlapping window independently. These timings exclude
+startup/parsing/loading and must not be compared directly to CLI samples.
+[Raw loaded-program samples](engine-step2-minefield-2026-10-16.jsonl).
+
+The first Step 2 compiler/VM slice preserves results but establishes no
+measurable throughput gain over the interpreted native driver. It remains
+opt-in while specialized head instructions, registers, control/indexing code
+and load-time caches are developed.
+[Three-engine samples](engine-step2-bytecode-2026-10-16.tsv).
+
+<a id="current-native-engine-recheck---2026-10-16"></a>
+
+## Native engine recheck before follow-up - 2026-10-16
 
 After the public solver switched to the Step 1 native machine, three of these
 application workloads were rerun with the current `-O2` library and executable,
 RTS `-N1`, three requested fresh CLI samples and a 30-second process budget.
 The ordinary minefield timed out on its first sample; no timing is inferred
-from that failure. [Current raw results](performance-step1-2026-10-16.jsonl)
+from that failure. [Raw results for that snapshot](performance-step1-2026-10-16.jsonl)
 record the runtime source hash and build profile.
 
-| Workload | Before the earlier optimizations (s) | Optimized reference (s) | Current native (s) |
+| Workload | Before the earlier optimizations (s) | Optimized reference (s) | Native before follow-up (s) |
 | --- | ---: | ---: | ---: |
 | 16x16 ordinary first minefield | 2.163 | 0.116 | >30, timeout |
 | 100-edge chain, all 5,050 reachable pairs | 0.595 | 0.032 | 0.099 |
@@ -20,16 +68,15 @@ wide placement, but the native engine gives some of them back and introduces
 a major large-minefield regression. General execution also regresses against
 the [pre-migration CLI baseline](engine-baseline-2026-10-16.jsonl): reverse
 6.188s -> 32.551s, loop 0.268s -> 0.752s, Fibonacci 0.463s -> 4.168s and queens
-0.111s -> 1.311s. [Current CLI results](engine-step1-cli-2026-10-16.jsonl)
+0.111s -> 1.311s. [CLI results for that snapshot](engine-step1-cli-2026-10-16.jsonl)
 validate all four workloads. The historical baseline used a different library
 optimization profile, so these are recorded local observations, not controlled
 portable regression ratios.
 
-Step 1's correctness and bounded-residency gates do not establish throughput
-acceptance. Profile and resolve the large-minefield regression before beginning
-Step 2 bytecode implementation; preserve this workload in future performance
-checks. The historical results below describe the optimized reference stage,
-not the performance of today's public native solver.
+Step 1's correctness and bounded-residency gates did not establish throughput
+acceptance. This regression blocked Step 2 until the follow-up above resolved
+it; the larger minefield is now retained in acceptance tests and CI. The
+historical results below describe the optimized reference stage.
 
 ## Earlier CLP and tabling measurements
 

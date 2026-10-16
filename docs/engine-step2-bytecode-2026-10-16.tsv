@@ -1,0 +1,14 @@
+# source-fingerprint=67235f9bec0d2a467c79fb6c1cb75568
+# compiler=ghc-9.8 platform=aarch64-darwin
+# scope=loaded checked program; cold per-query compilation/cache construction+execution+projection+validation; no parsing or CLI startup
+# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)
+# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 measured_probe=5 normal_counters=false no_timing_threshold
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples
+# compiled_probe case=helper-dispatch-10000 compiled_activations=20001 bytecode_instructions=310004 direct_calls=20000 fully_drained=true timed=false
+reference	helper-dispatch-10000	4.9944e-2	4.9752e-2	[4.9944e-2,4.7212e-2,5.0595e-2]	[4.9752e-2,4.7166e-2,5.0446e-2]
+interpreted	helper-dispatch-10000	0.140003	0.13986	[0.139815,0.140072,0.140003]	[0.139724,0.139973,0.13986]
+bytecode	helper-dispatch-10000	0.143158	0.142936	[0.143241,0.142389,0.143158]	[0.143099,0.142274,0.142936]
+# compiled_probe case=structured-list-300 compiled_activations=601 bytecode_instructions=11104 direct_calls=600 fully_drained=true timed=false
+reference	structured-list-300	8.3537e-2	8.347e-2	[9.1799e-2,8.3537e-2,8.1136e-2]	[9.1745e-2,8.347e-2,8.1049e-2]
+interpreted	structured-list-300	0.285744	0.285596	[0.285605,0.285744,0.287676]	[0.285399,0.285596,0.287459]
+bytecode	structured-list-300	0.285225	0.28465	[0.285225,0.280025,0.289601]	[0.28465,0.279888,0.28888]

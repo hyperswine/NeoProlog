@@ -258,7 +258,7 @@ applyNative heap bindings store operation addresses = case operation of
   Unify _ _ -> case addresses of
     [a, b] -> Native.unify heap bindings store a b
     _ -> error "import changed the number of roots"
-  _ -> Native.apply heap bindings store (applyPure operation)
+  _ -> Native.applyAccepted heap bindings store (applyPure operation)
 
 genOperation :: Gen Operation
 genOperation = Gen.choice
@@ -420,6 +420,204 @@ prop_backend_unchanged_nan_and_singletons = unit $ do
       afterSize === beforeSize
       assert rejected
 
+-- Unwatched writes must not run suspended propagation or lose any scheduler
+-- metadata. An unwatched alias may point at a watched variable without itself
+-- becoming a propagation trigger. Non-reflexive NaNs also remain exact values.
+prop_backend_unwatched_writes_preserve_pending_store :: Property
+prop_backend_unwatched_writes_preserve_pending_store = unit $ do
+  posted <- evalEither $ addDomains [Var 0, Var 1] (Fin 1) (Fin 3) emptyStore
+    >>= maybe (Right Nothing) (addRelation RelEq (Var 1) (app "plus" [Var 0, IntLit 1]))
+  initial <- evalMaybe posted
+  let suspended = initial
+        { stPending = IM.keysSet (stConstraintMap initial),
+          stDirtyVars = IS.fromList [0, 1],
+          stNextConstraint = stNextConstraint initial + 11
+        }
+      nan = 0 / 0
+      negativeZero = -0.0
+      changes = [(Var 2, Var 0), (Var 3, FloatLit nan), (Var 4, FloatLit negativeZero)]
+      actual = runST $ do
+        heap <- Heap.newHeap
+        bindings <- must (Bridge.newBindings heap [0 .. 4])
+        synchronized <- must (Bridge.syncState heap bindings
+          ((Reference.initialState 5) {Reference.ssStore = suspended}))
+        let run current store [] = do
+              (ready, roots) <- must (Bridge.importTerms heap current (map Var [0 .. 4]))
+              terms <- must (Bridge.exportTerms heap ready roots)
+              pure (store, terms)
+            run current store ((left, right) : rest) = do
+              (ready, roots) <- must (Bridge.importTerms heap current [left, right])
+              case roots of
+                [a, b] -> do
+                  result <- must (Native.unify heap ready store a b)
+                  case result of
+                    Right (Just (next, accepted)) -> run next accepted rest
+                    _ -> error "unwatched binding unexpectedly failed"
+                _ -> error "import changed the number of roots"
+        run synchronized suspended changes
+      expected = foldl (\result (left, right) -> result
+        >>= maybe (Right Nothing) (\store -> storeUnify store left right)) (Right (Just suspended)) changes
+      -- Derived Term/Store Eq intentionally gives NaN its numeric semantics;
+      -- compare all other metadata normally and its payload separately.
+      scrub store = store {stSubst = IM.map scrubTerm (stSubst store)}
+      scrubTerm (FloatLit value) | isNaN value = Atom "$nan_payload_checked_below"
+      scrubTerm (Compound name terms) = Compound name (map scrubTerm terms)
+      scrubTerm term = term
+  assert (not (isConstrained suspended 2))
+  assert (isConstrained suspended 0)
+  fmap (fmap scrub) expected === Right (Just (scrub (fst actual)))
+  stPending (fst actual) === stPending suspended
+  stDirtyVars (fst actual) === stDirtyVars suspended
+  case snd actual of
+    [Var 0, Var 1, Var 0, FloatLit actualNaN, FloatLit actualZero] -> do
+      castDoubleToWord64 actualNaN === castDoubleToWord64 nan
+      castDoubleToWord64 actualZero === castDoubleToWord64 negativeZero
+    terms -> annotateShow terms >> failure
+
+-- A watched write still reconciles propagated singletons, and a later
+-- contradiction must roll back every earlier heap write in that transaction.
+prop_backend_watched_wakeup_and_rollback :: Property
+prop_backend_watched_wakeup_and_rollback = unit $ do
+  posted <- evalEither $ addDomains [Var 0, Var 1] (Fin 1) (Fin 3) emptyStore
+    >>= maybe (Right Nothing) (addRelation RelEq (Var 1) (app "plus" [Var 0, IntLit 1]))
+  initial <- evalMaybe posted
+  let observed = runST $ do
+        heap <- Heap.newHeap
+        bindings <- must (Bridge.newBindings heap [0 .. 2])
+        synchronized <- must (Bridge.syncState heap bindings
+          ((Reference.initialState 3) {Reference.ssStore = initial}))
+        frozen <- Heap.freezeHeap heap
+        accepted <- must (Native.bindInteger heap synchronized initial 0 2)
+        (acceptedStore, acceptedTerms) <- case accepted of
+          Right (Just (ready, store)) -> do
+            (_, roots) <- must (Bridge.importTerms heap ready (map Var [0 .. 2]))
+            terms <- must (Bridge.exportTerms heap ready roots)
+            pure (store, terms)
+          _ -> error "watched binding unexpectedly failed"
+        Heap.restoreHeap heap frozen
+        (ready, pairRoots) <- must (Bridge.importTerms heap synchronized
+          [app "pair" [Var 2, Var 0], app "pair" [IntLit 7, IntLit 9]])
+        (_, roots) <- must (Bridge.importTerms heap ready (map Var [0 .. 2]))
+        before <- must (Bridge.exportTerms heap ready roots)
+        beforeSizes <- (,) <$> Heap.heapSize heap <*> Heap.trailSize heap
+        rejected <- case pairRoots of
+          [left, right] -> must (Native.unify heap ready initial left right)
+          _ -> error "import changed the number of roots"
+        after <- must (Bridge.exportTerms heap ready roots)
+        afterSizes <- (,) <$> Heap.heapSize heap <*> Heap.trailSize heap
+        pure (acceptedStore, acceptedTerms, case rejected of Right Nothing -> True; _ -> False,
+          before, after, beforeSizes, afterSizes)
+  case observed of
+    (store, terms, rejected, before, after, beforeSizes, afterSizes) -> do
+      Right (Just store) === storeBind initial 0 2
+      terms === [IntLit 2, IntLit 3, Var 2]
+      assert rejected
+      after === before
+      afterSizes === beforeSizes
+
+-- The trusted extension path keeps its removal guard, while the arbitrary
+-- binding API still rejects replacements and rolls back other new writes.
+prop_backend_trusted_extension_keeps_strict_boundary :: Property
+prop_backend_trusted_extension_keeps_strict_boundary = unit $ do
+  let result = runST $ do
+        heap <- Heap.newHeap
+        bindings <- must (Bridge.newBindings heap [0 .. 2])
+        let previous = IM.singleton 0 (Atom "seed")
+            state = (Reference.initialState 3) {Reference.ssStore = emptyStore {stSubst = previous}}
+        synchronized <- must (Bridge.syncState heap bindings state)
+        (_, roots) <- must (Bridge.importTerms heap synchronized (map Var [0 .. 2]))
+        before <- must (Bridge.exportTerms heap synchronized roots)
+        beforeSizes <- (,) <$> Heap.heapSize heap <*> Heap.trailSize heap
+        removed <- Bridge.syncAddedBindings heap synchronized previous IM.empty
+        afterRemoval <- must (Bridge.exportTerms heap synchronized roots)
+        removalSizes <- (,) <$> Heap.heapSize heap <*> Heap.trailSize heap
+        replacement <- Bridge.syncBindings heap synchronized previous
+          (IM.fromList [(0, Atom "changed"), (1, IntLit 7)])
+        afterReplacement <- must (Bridge.exportTerms heap synchronized roots)
+        replacementSizes <- (,) <$> Heap.heapSize heap <*> Heap.trailSize heap
+        let rejected outcome = case outcome of Left Heap.IncompatibleBindings -> True; _ -> False
+        pure (rejected removed, rejected replacement, before, afterRemoval, afterReplacement,
+          beforeSizes, removalSizes, replacementSizes)
+  case result of
+    (removed, replaced, before, afterRemoval, afterReplacement, beforeSizes, removalSizes, replacementSizes) -> do
+      assert removed
+      assert replaced
+      before === [Atom "seed", Var 1, Var 2]
+      afterRemoval === before
+      afterReplacement === before
+      removalSizes === beforeSizes
+      replacementSizes === beforeSizes
+
+prop_backend_arbitrary_apply_replacement_is_atomic :: Property
+prop_backend_arbitrary_apply_replacement_is_atomic = unit $ do
+  let result = runST $ do
+        heap <- Heap.newHeap
+        bindings <- must (Bridge.newBindings heap [0, 1])
+        let store = emptyStore {stSubst = IM.singleton 0 (Atom "seed")}
+            state = (Reference.initialState 2) {Reference.ssStore = store}
+        synchronized <- must (Bridge.syncState heap bindings state)
+        (_, roots) <- must (Bridge.importTerms heap synchronized [Var 0, Var 1])
+        before <- must (Bridge.exportTerms heap synchronized roots)
+        beforeSizes <- (,) <$> Heap.heapSize heap <*> Heap.trailSize heap
+        rejected <- Native.apply heap synchronized store $ \current ->
+          Right (Just current {stSubst = IM.fromList [(0, Atom "changed"), (1, IntLit 7)]})
+        after <- must (Bridge.exportTerms heap synchronized roots)
+        afterSizes <- (,) <$> Heap.heapSize heap <*> Heap.trailSize heap
+        pure (case rejected of Left Heap.IncompatibleBindings -> True; _ -> False,
+          before, after, beforeSizes, afterSizes)
+  case result of
+    (rejected, before, after, beforeSizes, afterSizes) -> do
+      assert rejected
+      before === [Atom "seed", Var 1]
+      after === before
+      afterSizes === beforeSizes
+
+-- Accepted scopes can introduce free metadata roots without binding them,
+-- plus aliases nested inside new compounds. Existing compound substitutions
+-- need no rescan: new-key import and metadata extension cover every new ID.
+prop_backend_sparse_scope_extends_metadata_and_new_aliases :: Property
+prop_backend_sparse_scope_extends_metadata_and_new_aliases = unit $ do
+  posted <- evalEither $ addDomain (Var 50000) (Fin 1) (Fin 3) emptyStore
+    >>= maybe (Right Nothing) (addRelation RelLe (Var 60000) (Var 60001))
+  metadata <- evalMaybe posted
+  let previousStore = emptyStore {stSubst = IM.singleton 0 (Atom "seed")}
+      previous = (Reference.initialState 1) {Reference.ssStore = previousStore}
+      incomingStore = metadata
+        { stSubst = IM.fromList
+            [(0, Atom "seed"), (10, app "node" [Var 12, Var 50000]),
+              (12, Var 11), (13, app "box" [Var 14]), (14, Var 11)],
+          stDirtyVars = IS.singleton 70000,
+          stPending = IM.keysSet (stConstraintMap metadata),
+          stNextConstraint = stNextConstraint metadata + 9
+        }
+      incoming = previous {Reference.ssStore = incomingStore, Reference.ssFresh = 100000}
+      variables = [0, 10, 11, 12, 13, 14, 50000, 60000, 60001, 70000]
+      observed = runST $ do
+        heap <- Heap.newHeap
+        bindings <- must (Bridge.newBindings heap [0])
+        synchronized <- must (Bridge.syncState heap bindings previous)
+        accepted <- must (Bridge.syncAcceptedState heap synchronized previous incoming)
+        let importedVariables = Bridge.bindingVariables accepted
+        (ready, roots) <- must (Bridge.importTerms heap accepted (map Var variables))
+        terms <- must (Bridge.exportTerms heap ready roots)
+        let expectedTerms = map (deepWalk (stSubst incomingStore) . Var) variables
+        -- Rebuilding forces all free CLP metadata roots to be present. Its
+        -- raw alias and scheduler state must remain exactly the accepted one.
+        (rebuilt, compact, state, relocated) <- must
+          (Bridge.rebuild heap ready variables incoming roots)
+        retained <- must (Bridge.exportTerms rebuilt compact relocated)
+        pure (importedVariables, Bridge.bindingCount accepted,
+          terms, retained, expectedTerms, Reference.ssStore state)
+  case observed of
+    (importedVariables, count, terms, retained, expectedTerms, store) -> do
+      importedVariables === variables
+      count === length variables
+      terms === expectedTerms
+      retained === expectedTerms
+      store === incomingStore
+      terms === [Atom "seed", app "node" [Var 11, Var 50000], Var 11, Var 11,
+        app "box" [Var 11], Var 11, Var 50000, Var 60000, Var 60001, Var 70000]
+
 drain :: Machine.Checkpoint -> Either Heap.HeapError Reference.Search
 drain checkpoint = do
   step <- Machine.resume checkpoint
@@ -519,6 +717,11 @@ machineCLPGroup = Group "machine CLP"
     ("backend_logical_alias_order_and_wakeup", prop_backend_logical_alias_order_and_wakeup),
     ("backend_checkpoint_and_frozen_store", prop_backend_checkpoint_and_frozen_store),
     ("backend_unchanged_nan_and_singletons", prop_backend_unchanged_nan_and_singletons),
+    ("backend_unwatched_writes_preserve_pending_store", prop_backend_unwatched_writes_preserve_pending_store),
+    ("backend_watched_wakeup_and_rollback", prop_backend_watched_wakeup_and_rollback),
+    ("backend_trusted_extension_keeps_strict_boundary", prop_backend_trusted_extension_keeps_strict_boundary),
+    ("backend_arbitrary_apply_replacement_is_atomic", prop_backend_arbitrary_apply_replacement_is_atomic),
+    ("backend_sparse_scope_extends_metadata_and_new_aliases", prop_backend_sparse_scope_extends_metadata_and_new_aliases),
     ("native_interleaved_label_resumes", prop_native_interleaved_label_resumes),
     ("noncanonical_start_goals_identity", prop_noncanonical_start_goals_identity),
     ("backend_sync_preserves_input_alias_identity", prop_backend_sync_preserves_input_alias_identity)

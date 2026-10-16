@@ -5,10 +5,12 @@
 module Infera.Machine.Bridge
   ( Bindings,
     newBindings,
+    allocateActivation,
     bindingCount,
     bindingVariables,
     rebuild,
     importTerms,
+    normalizeTermGraph,
     exportTerms,
     exportRawTerms,
     exportState,
@@ -17,6 +19,7 @@ module Infera.Machine.Bridge
     compareVariables,
     bindingChanges,
     syncBindings,
+    syncAddedBindings,
   )
 where
 
@@ -29,6 +32,7 @@ import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as Map
 import GHC.Float (castDoubleToWord64)
+import Infera.Arith (arithOps, evalArithSafe)
 import Infera.CLP (Store (..), constraintVars)
 import Infera.Engine.Reference (SolverState (..))
 import Infera.Machine.Heap (Address, Heap, HeapError (..))
@@ -67,6 +71,18 @@ atomic heap action = do
 newBindings :: Heap s -> [VarId] -> ST s (Either HeapError Bindings)
 newBindings heap variables = atomic heap $
   extend heap (Bindings IM.empty Map.empty Heap.emptyEnvironment) variables
+
+-- | Reserve one clause's local logical roots in ascending local-ID order.
+-- Existing sparse IDs retain their identity, as in ordinary term import.
+-- Only the local range is inspected; the environment's allocation-prefix
+-- witness validates prior roots without rescanning historical activations.
+-- The temporary wrapper contains variables only, never clause source terms.
+allocateActivation :: Heap s -> Bindings -> VarId -> Int
+  -> ST s (Either HeapError (Bindings, [Address]))
+allocateActivation heap bindings base count
+  | count <= 0 = pure (Left IncompatibleBindings)
+  | base > maxBound - count = pure (Left HeapCapacityExceeded)
+  | otherwise = importTerms heap bindings (map Var [base .. base + count - 1])
 
 -- | Rebuild at a deterministic collection safe point. The caller must prove
 -- that every surviving rollback owner has its own immutable frozen heap;
@@ -136,7 +152,7 @@ extend heap bindings@(Bindings roots names environment) variables
             (Map.union names (Map.fromList (zip addresses missing))) nextEnvironment
         _ -> throwError IncompatibleBindings
   where
-    missing = IS.toAscList (IS.difference (IS.fromList variables) (IM.keysSet roots))
+    missing = IS.toAscList (IS.filter (\variable -> IM.notMember variable roots) (IS.fromList variables))
 
 importTerms :: Heap s -> Bindings -> [Term] -> ST s (Either HeapError (Bindings, [Address]))
 importTerms _ bindings [] = pure (Right (bindings, []))
@@ -155,8 +171,61 @@ importTerms heap (Bindings roots names environment) terms = atomic heap $ do
       pure (Bindings nextRoots nextNames nextEnvironment, imported)
     _ -> throwError IncompatibleBindings
   where
-    missing = IS.toAscList (IS.difference
-      (IS.fromList (concatMap termVarIds terms)) (IM.keysSet roots))
+    missing = IS.toAscList (IS.filter (\variable -> IM.notMember variable roots)
+      (IS.fromList (concatMap termVarIds terms)))
+
+-- | Match 'Infera.Arith.normArithTerm' on a raw term graph without expanding
+-- shared suffixes into independent imported trees. Bound reference chains
+-- collapse to their normalized targets; free references keep their exact
+-- accepted logical identities. Unchanged constructors and scalar handles are
+-- reused, and each unique raw address is visited once in this transaction.
+--
+-- Children are normalized before arithmetic is folded. A child that remains
+-- a variable or symbolic constructor cannot yield a numeric value, so its
+-- parent also stays symbolic; arithmetic errors likewise remain syntax.
+-- Folding numeric scalar children uses the same evaluator as normArithTerm.
+-- The complete operation rolls back allocations if any handle is invalid.
+normalizeTermGraph :: Heap s -> Bindings -> Address -> ST s (Either HeapError Address)
+normalizeTermGraph heap (Bindings _ names _) root = atomic heap $
+  fst . fst <$> normalize Map.empty root
+  where
+    normalize memo address = case Map.lookup address memo of
+      Just result -> pure (result, memo)
+      Nothing -> do
+        shape <- checked (Heap.viewRaw heap address)
+        (result, next) <- case shape of
+          Heap.VariableView original -> do
+            unless (Map.member original names) (throwError IncompatibleBindings)
+            target <- checked (Heap.referenceTarget heap address)
+            case target of
+              Just bound | bound /= address -> normalize memo bound
+              Just _ -> pure ((address, Nothing), memo)
+              Nothing -> throwError IncompatibleBindings
+          Heap.IntegerView value -> pure ((address, Just (IntLit value)), memo)
+          Heap.FloatView value -> pure ((address, Just (FloatLit value)), memo)
+          Heap.CompoundView name children -> do
+            (values, normalizedMemo) <- normalizeChildren memo children
+            let normalized = map fst values
+                numeric = if name `elem` arithOps then traverse snd values else Nothing
+                folded = numeric >>= \arguments -> case evalArithSafe Unify.emptySubst (Compound name arguments) of
+                  Right (Just value) -> Just value
+                  _ -> Nothing
+            case folded of
+              Just value -> do
+                scalar <- checked (Heap.importTerm heap value)
+                pure ((scalar, Just value), normalizedMemo)
+              Nothing -> do
+                constructor <- if normalized == children then pure address
+                  else checked (Heap.newCompound heap name normalized)
+                pure ((constructor, Nothing), normalizedMemo)
+          _ -> pure ((address, Nothing), memo)
+        let updated = Map.insert address result next
+        updated `seq` pure (result, updated)
+    normalizeChildren memo [] = pure ([], memo)
+    normalizeChildren memo (address : rest) = do
+      (value, next) <- normalize memo address
+      (values, final) <- normalizeChildren next rest
+      pure (value : values, final)
 
 -- Every free heap variable has a stable logical root in Bindings. Export its
 -- actual identity, including an accepted startup alias directed at a larger
@@ -277,16 +346,25 @@ syncState heap bindings state = atomic heap $ do
   pure final
 
 -- | Fast internal boundary for a state already accepted by the reference
--- resolver. The supplied previous state must mirror this heap. Retain the
--- complete new persistent store, extend all of its logical variable roots,
--- and reconcile only its substitution delta; public/untrusted startup states
+-- resolver. The supplied previous state must mirror this heap, and incoming
+-- must extend its substitution without replacing existing raw bindings.
+-- Occurs-checked unification binds only free representatives; propagation
+-- likewise inserts singleton bindings only for still-free roots. Native
+-- scopes protect all caller IDs during collection, so their accepted child
+-- states retain the caller's bindings. Retain the complete new persistent
+-- store and extend its logical roots; public/untrusted startup states
 -- continue to use 'syncState' and its whole-state validation.
 syncAcceptedState :: Heap s -> Bindings -> SolverState -> SolverState -> ST s (Either HeapError Bindings)
 syncAcceptedState heap bindings previous incoming = atomic heap $ do
   -- ssFresh records all allocations, including retired activations. Only
   -- actually referenced IDs can become live again at an accepted boundary.
-  extended <- extend heap bindings (referencedStateVariables incoming)
-  checked (syncBindings heap extended (stSubst (ssStore previous)) (stSubst (ssStore incoming)))
+  -- Existing raw substitution entries already have roots in bindings. The
+  -- monotone extension importer below installs every new key and every raw
+  -- variable in its new value, including nested aliases. Only free metadata
+  -- roots can arrive without occurring in those substitutions. Rescanning
+  -- all old compound values here repeatedly expands shared grid suffixes.
+  extended <- extend heap bindings (storeVariables (ssStore incoming))
+  checked (syncAddedBindings heap extended (stSubst (ssStore previous)) (stSubst (ssStore incoming)))
 
 synchronize :: Heap s -> Bindings -> (VarId, Term) -> BridgeM s Bindings
 synchronize heap bindings@(Bindings roots _ _) (variable, term) = do
@@ -338,17 +416,45 @@ syncBindings heap bindings previous incoming = atomic heap $ do
   unless (IM.null (IM.difference previous incoming)) (throwError IncompatibleBindings)
   let changes = IM.toAscList $ IM.differenceWith
         (\new old -> if sameTermBits new old then Nothing else Just new) incoming previous
-  case changes of
-    [] -> pure bindings
-    _ -> do
-      let variables = map fst changes
-          terms = map snd changes
-      (updated@(Bindings roots _ _), imported) <- checked $
-        importTerms heap bindings (map Var variables ++ terms)
-      let targets = drop (length variables) imported
-      zipWithM_ (bind updated roots) changes targets
-      mapM_ (validate updated roots) changes
-      pure updated
+  updated@(Bindings roots _ _) <- installBindings heap bindings changes
+  mapM_ (validate updated roots) changes
+  pure updated
+  where
+    validate updated roots (variable, _) = do
+      address <- maybe (throwError IncompatibleBindings) pure (IM.lookup variable roots)
+      actual <- exportValue heap updated address
+      let expected = Unify.deepWalk incoming (Var variable)
+      unless (sameTermBits actual expected) (throwError IncompatibleBindings)
+
+-- | Trusted internal boundary for a monotone substitution extension. The
+-- previous substitution must mirror the heap, and existing keys must retain
+-- their exact raw terms. Native occurs-checked writes and CLP singleton
+-- propagation satisfy that contract: only previously free representatives
+-- acquire entries. Accepted native child states have the same property.
+--
+-- This is not an arbitrary-state validation API. Removed keys are rejected,
+-- but retained values are not compared or deeply re-exported. Doing so would
+-- repeatedly expand every historical alias into the same shared graph.
+-- Use 'syncBindings' or 'syncState' when the extension proof is unavailable.
+syncAddedBindings :: Heap s -> Bindings -> Unify.Subst -> Unify.Subst -> ST s (Either HeapError Bindings)
+syncAddedBindings heap bindings previous incoming = atomic heap $ do
+  unless (IM.null (IM.difference previous incoming)) (throwError IncompatibleBindings)
+  installBindings heap bindings (IM.toAscList (IM.difference incoming previous))
+
+-- Import all missing variable roots before installing any new raw binding.
+-- Stable logical IDs, including noncanonical accepted aliases, remain the
+-- source of reference ordering. Heap unification retains atomic rollback and
+-- occurs checking; callers decide whether a deep validation is also needed.
+installBindings :: Heap s -> Bindings -> [(VarId, Term)] -> BridgeM s Bindings
+installBindings _ bindings [] = pure bindings
+installBindings heap bindings changes = do
+  let variables = map fst changes
+      terms = map snd changes
+  (updated@(Bindings roots _ _), imported) <- checked $
+    importTerms heap bindings (map Var variables ++ terms)
+  let targets = drop (length variables) imported
+  zipWithM_ (bind updated roots) changes targets
+  pure updated
   where
     bind updated roots (variable, _) target = do
       address <- maybe (throwError IncompatibleBindings) pure (IM.lookup variable roots)
@@ -358,11 +464,6 @@ syncBindings heap bindings previous incoming = atomic heap $ do
           (matches, _) <- checked (Heap.unifyWithChanges (compareVariables updated) heap address target)
           unless matches (throwError IncompatibleBindings)
         _ -> pure ()
-    validate updated roots (variable, _) = do
-      address <- maybe (throwError IncompatibleBindings) pure (IM.lookup variable roots)
-      actual <- exportValue heap updated address
-      let expected = Unify.deepWalk incoming (Var variable)
-      unless (sameTermBits actual expected) (throwError IncompatibleBindings)
 
 exportValue :: Heap s -> Bindings -> Address -> BridgeM s Term
 exportValue heap bindings@(Bindings _ names _) address = do

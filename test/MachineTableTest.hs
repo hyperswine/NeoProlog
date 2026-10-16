@@ -98,6 +98,42 @@ compareQuery program query = do
 compareText :: String -> String -> PropertyT IO Reference.Search
 compareText source text = load source >>= \program -> queryText text >>= compareQuery program
 
+-- Native collection may retire unreachable activation substitutions. Every
+-- other store field, fresh counter, table entry, dynamic fact and output event
+-- is still part of the complete accepted branch and must match exactly.
+compareStateMetadata :: Reference.Search -> Reference.Search -> PropertyT IO ()
+compareStateMetadata actual expected = do
+  let actualStates = [state | Reference.Found state <- actual]
+      expectedStates = [state | Reference.Found state <- expected]
+  length actualStates === length expectedStates
+  forM_ (zip actualStates expectedStates) $ \(found, original) -> do
+    (Reference.ssStore found) {stSubst = emptySubst} ===
+      (Reference.ssStore original) {stSubst = emptySubst}
+    Reference.ssFresh found === Reference.ssFresh original
+    Reference.ssOutput found === Reference.ssOutput original
+    Reference.ssOutLen found === Reference.ssOutLen original
+    tableMetadata found === tableMetadata original
+    Reference.ssDynamic found === Reference.ssDynamic original
+
+-- Exercise both the public checkpoint driver and the adapter's bounded fuel
+-- path. Constrained arguments must bypass variant tables on both paths.
+compareConstrainedDrivers :: Program -> Query -> PropertyT IO Reference.Search
+compareConstrainedDrivers program query = do
+  initial <- evalEither (Machine.start program query)
+  actual <- evalEither (drain initial)
+  let expected = Reference.solveQuery program query
+  observe query actual === observe query expected
+  compareStateMetadata actual expected
+  forM_ [0, 1, 2, 4, 8] $ \fuel -> do
+    annotateShow fuel
+    let environment = Reference.mkEnv program
+        state = Reference.initialState (queryNVars query)
+        boundedExpected = Reference.solveGoals environment fuel state (queryGoals query)
+    bounded <- evalEither (Machine.startGoals environment fuel state (queryGoals query) >>= drain)
+    observe query bounded === observe query boundedExpected
+    compareStateMetadata bounded boundedExpected
+  pure actual
+
 node :: Int -> String
 node value = "n" ++ show value
 
@@ -211,6 +247,134 @@ prop_constrained_inputs_and_answers = unit $ forM_
       forM_ (zip actualStates expectedStates) $ \(found, original) ->
         (Reference.ssStore found) {stSubst = emptySubst} ===
           (Reference.ssStore original) {stSubst = emptySubst}
+
+prop_constrained_local_cuts_and_late_errors :: Property
+prop_constrained_local_cuts_and_late_errors = unit $ do
+  let declaration = "p : table nondet unsafe (int: <=>).\n"
+      answer n output = Answer [("X", IntLit n)] [] output Map.empty Map.empty
+  forM_
+    [ ("p X <- X = 1, !.\np 2.", "X in 1..3, p X?", [answer 1 []]),
+      ("p X <- X = 1, !, fail.\np 2.",
+        "X in 1..3, (p X ; X = 3)?", [answer 3 []]),
+      ("p X <- X = 4, write poison.\np X <- X = 1, write first.\np X <- Ignored is bad.\np X <- X = 2, write second.",
+        "X in 1..3, p X?",
+        [answer 1 [Reference.WriteEvent "first"], Error (ExpectedNumber (Atom "bad")),
+         answer 2 [Reference.WriteEvent "second"]])
+    ] $ \(body, text, expected) -> do
+      program <- load (declaration ++ body)
+      query <- queryText text
+      actual <- compareConstrainedDrivers program query
+      observe query actual === expected
+
+prop_constrained_foreign_cut_delivery :: Property
+prop_constrained_foreign_cut_delivery = unit $ do
+  let cut = Compound "$cut" [IntLit (-7)]
+      bind left right = Compound "unify" [left, right]
+      query = Query
+        [ Compound "in" [Var 0, Compound "range" [IntLit 1, IntLit 2]],
+          Compound ";"
+            [ Compound "p" [cut, Var 0, Var 1],
+              Compound "," [bind (Var 0) (IntLit 2), bind (Var 1) (Atom "outer")]
+            ]
+        ] [("X", 0), ("Result", 1)] 2
+      answer n result = Answer [("X", IntLit n), ("Result", Atom result)] [] [] Map.empty Map.empty
+  forM_ ["Goal", "forward Goal"] $ \invocation ->
+    forM_
+      [ ("nondet", "", [answer 1 "first", Cut (-7)]),
+        ("nondet", ", !", [answer 1 "first", answer 2 "outer"]),
+        ("nondet", ", fail", [Cut (-7)]),
+        ("nondet", ", !, fail", [answer 2 "outer"]),
+        ("semidet", "", [answer 1 "first", answer 2 "outer"]),
+        ("semidet", ", fail", [answer 2 "outer"])
+      ] $ \(determinism, suffix, expected) -> do
+        program <- load $ unlines
+          [ "p : table " ++ determinism ++ " unsafe (any: <=>) (int: <=>) (atom: <=>).",
+            "forward : notable nondet unsafe (any: <=>).",
+            "forward Goal <- Goal.",
+            "p Goal X first <- X = 1, " ++ invocation ++ suffix ++ ".",
+            "p _ X second <- X = 2."
+          ]
+        actual <- compareConstrainedDrivers program query
+        observe query actual === expected
+
+prop_constrained_output_contract_before_success :: Property
+prop_constrained_output_contract_before_success = unit $ do
+  program <- load $ unlines
+    [ "p : table nondet (int: <=>) (any: =>).",
+      "p _ _.",
+      "p X accepted <- X = 2."
+    ]
+  query <- queryText "X in 1..3, p X Result?"
+  actual <- compareConstrainedDrivers program query
+  observe query actual ===
+    [ Error (OutputModeError ("p", 2) 2 (Var 1)),
+      Answer [("X", IntLit 2), ("Result", Atom "accepted")] [] [] Map.empty Map.empty
+    ]
+
+constrainedScopeSource :: String
+constrainedScopeSource = unlines
+  [ "cached : table.", "cached seed.", "fact : dynamic.",
+    "p : table nondet unsafe (int: <=>).",
+    "p X <- X #> 1, write checked.",
+    "p X <- X = 1."
+  ]
+
+prop_constrained_fallback_nested_scopes :: Property
+prop_constrained_fallback_nested_scopes = unit $ do
+  program <- load constrainedScopeSource
+  forM_
+    [ "cached Before, [X,Y] in 1..3, X #< Y, once (p X), label [X,Y], cached After?",
+      "cached Before, [X,Y] in 1..3, X #< Y, findall (pair X Y) (p X, label [X,Y]) List, label [X,Y], cached After?",
+      "cached Before, [X,Y] in 1..3, X #< Y, (p X -> label [X,Y] ; X = 1), cached After?",
+      "[X,Y] in 1..3, X #< Y, findall (pair X Y) (once (p X), label [X,Y]) List, label [X,Y]?",
+      "[X,Y] in 1..3, X #< Y, not (p X, X = 4), label [X,Y]?",
+      "assert (fact parent), [X,Y] in 1..3, X #< Y, once ((p X, X = 4) -> fail ; X = 1), label [X,Y], fact Saved?",
+      "[X,Y] in 1..3, X #< Y, findall (pair X Y) (once (p X), (X = 2 -> label [X,Y] ; fail)) List, label [X,Y]?"
+    ] $ \text -> do
+      query <- queryText text
+      _ <- compareConstrainedDrivers program query
+      pure ()
+
+prop_constrained_fallback_retained_interleaved_checkpoints :: Property
+prop_constrained_fallback_retained_interleaved_checkpoints = unit $ do
+  program <- load constrainedScopeSource
+  firstQuery <- queryText
+    "cached Before, assert (fact first), X in 1..3, p X, label [X], fact Saved?"
+  secondQuery <- queryText
+    "cached Before, assert (fact second), X in 2..4, p X, label [X], fact Saved?"
+  firstInitial <- evalEither (Machine.start program firstQuery)
+  secondInitial <- evalEither (Machine.start program secondQuery)
+  firstStep <- evalEither (Machine.resume firstInitial)
+  secondStep <- evalEither (Machine.resume secondInitial)
+  case (firstStep, secondStep) of
+    (Machine.Yield retainedFirst firstNext, Machine.Yield retainedSecond secondNext) -> do
+      let firstBefore = observe firstQuery [retainedFirst]
+          secondBefore = observe secondQuery [retainedSecond]
+      _ <- evalIO (evaluate (length (show firstBefore) + length (show secondBefore)))
+      firstRest <- evalEither (drain firstNext)
+      secondRest <- evalEither (drain secondNext)
+      firstRepeated <- evalEither (drain firstNext)
+      secondRepeated <- evalEither (drain secondNext)
+      firstAll <- evalEither (drain firstInitial)
+      secondAll <- evalEither (drain secondInitial)
+      observe firstQuery firstRest === observe firstQuery firstRepeated
+      observe secondQuery secondRest === observe secondQuery secondRepeated
+      firstBefore === observe firstQuery [retainedFirst]
+      secondBefore === observe secondQuery [retainedSecond]
+      firstBefore ++ observe firstQuery firstRest === observe firstQuery firstAll
+      secondBefore ++ observe secondQuery secondRest === observe secondQuery secondAll
+      let firstExpected = Reference.solveQuery program firstQuery
+          secondExpected = Reference.solveQuery program secondQuery
+      observe firstQuery firstAll === observe firstQuery firstExpected
+      observe secondQuery secondAll === observe secondQuery secondExpected
+      compareStateMetadata firstAll firstExpected
+      compareStateMetadata secondAll secondExpected
+      let xValues query items =
+            [value | Reference.Found state <- items,
+             Just value <- [lookup "X" (Reference.answerBindings (Reference.projectAnswer query state))]]
+      xValues firstQuery firstAll === map IntLit [2, 3, 1]
+      xValues secondQuery secondAll === map IntLit [2, 3, 4]
+    _ -> failure
 
 prop_scopes_restore_tables_and_dynamic_state :: Property
 prop_scopes_restore_tables_and_dynamic_state = unit $ do
@@ -387,6 +551,11 @@ machineTableGroup = Group "native variant tables"
     ("table contracts apply once at the native activation", prop_contracts_not_applied_twice),
     ("table effects errors cuts and ordered output", prop_effect_errors_cuts_and_output),
     ("constrained calls and answers retain plain native fallback", prop_constrained_inputs_and_answers),
+    ("constrained table fallback preserves local cuts and late errors", prop_constrained_local_cuts_and_late_errors),
+    ("constrained table fallback delivers foreign cuts at call boundaries", prop_constrained_foreign_cut_delivery),
+    ("constrained table output error precedes later checked success", prop_constrained_output_contract_before_success),
+    ("constrained table fallback preserves nested scopes and metadata", prop_constrained_fallback_nested_scopes),
+    ("constrained table checkpoints interleave without branch mutation", prop_constrained_fallback_retained_interleaved_checkpoints),
     ("opaque scopes restore tables and dynamic state", prop_scopes_restore_tables_and_dynamic_state),
     ("standalone native callback and immutable cache consumption", prop_raw_table_callback_and_cache),
     ("complete incomplete and truncated caches at zero fuel", prop_seeded_cache_metadata_at_zero_fuel),
