@@ -342,6 +342,15 @@ main <- mymod:greet "world".
 Imported clauses and declarations are prefixed with `mymod:`; a module's own
 imports are resolved recursively.
 
+The repository includes `infera.conf` so `examples/facts2.nprolog` can resolve
+its existing `facts#...` reference from a fresh checkout. Module IDs are exact
+keys in the selected configuration; imports do not guess a file from its name.
+`neoprolog.conf` takes precedence over `infera.conf`, and the files are not
+merged. If you maintain a local `neoprolog.conf`, copy the example mapping into
+it. A nearer map such as `examples/neoprolog.conf` also shadows the root map
+in the editor. `infera reg` generates a key from the absolute file path, so a newly
+registered or moved module can have a different key from an older example.
+
 ## Editor support
 
 [lsp/](lsp/) contains a VS Code extension with a language server: semantic
@@ -657,7 +666,7 @@ recorded separately in the
 [control report](docs/engine-step2-control-2026-10-16.md) and
 [cache/dispatch report](docs/engine-step2-cache-2026-10-16.md) and
 [operand report](docs/engine-step2-operands-2026-10-16.md).
-The current gate passed 361 Haskell properties (25,018 cases), 37 LSP tests,
+The current gate passed 361 Haskell properties (25,018 cases), 47 LSP tests,
 20 harness tests and CLI acceptance. Ordinary compiled execution skips
 instruction statistics; measured variants distinguish accepted-head work from
 reached body construction. The allocation changes establish smaller temporary

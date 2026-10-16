@@ -6,8 +6,9 @@ It reduces local-operand setup, constructor transaction overhead and ordinary
 invocation dispatch. Bytecode remains opt-in. Final-source targeted checks
 pass, including the full local suite. Representative timings remain mixed,
 with warm-control and breadboard regressions against interpreted execution.
-All 36 local residency processes passed. Cross-platform CI remains pending
-for this uncommitted follow-up; intermediate runs are preserved separately.
+All 36 local residency processes passed. This operand stage was published as
+[`a58da56`](https://github.com/hyperswine/NeoProlog/commit/a58da56f6770ff5c9cbb9ce0fab99edc673efb87).
+Cross-platform CI is a separate gate; intermediate runs are preserved separately.
 
 ## Implementation and ownership contracts
 
@@ -232,7 +233,8 @@ baseline CPU round ratios are 1.222 then 0.531, while interpreted ratios are
 1.264 then 0.620 and Reference ratios 1.154 then 0.761. Transistor favors the
 candidate in both rounds, but the second round also improves Reference and
 interpreted. The blocks cannot isolate every gain to the implementation.
-The broader fixture gate passes; final-source residency remains pending.
+The broader fixture gate and all 36 final-source residency samples pass.
+Cross-platform CI remains a separate requirement.
 Its pass does not remove the matched matrix or breadboard regressions.
 
 ## Archived refinement evidence

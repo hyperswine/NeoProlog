@@ -29,6 +29,7 @@ const { pathToFileURL, fileURLToPath } = require('url')
 
 const analysis = require('./analysis')
 const { compilerDiagnostics, visibleDiagnostics } = require('./checker')
+const { CONF_NAMES, findModuleContext, parseConf } = require('./modules')
 const { tokenize, analyzeDocument, BUILTIN_DOCS, DECL_DOCS, BUILTIN_PREDICATES, KEYWORD_ATOMS, DET_WORDS, FLAG_WORDS, SORT_WORDS, TOKEN_TYPES, TOKEN_MODIFIERS, TT, TM } = analysis
 
 const connection = createConnection(ProposedFeatures.all)
@@ -44,54 +45,15 @@ let globalSettings = { ...DEFAULT_SETTINGS }
 
 // ─── neoprolog.conf ────────────────────────────────────────────────────────────
 
-function parseConf(confPath) {
-  const map = new Map()
-  let raw
-  try { raw = fs.readFileSync(confPath, 'utf8') } catch { return map }
-  for (const line of raw.split(/\r?\n/)) {
-    const t = line.trim()
-    if (!t || t.startsWith('#')) continue
-    const sp = t.indexOf(' ')
-    if (sp < 0) continue
-    map.set(t.slice(0, sp).trim(), t.slice(sp + 1).trim())
-  }
-  return map
-}
-
-const CONF_NAMES = ['neoprolog.conf', 'infera.conf', 'nprolog.conf']
-
-function pickConfInDir(dir) {
-  for (const n of CONF_NAMES) {
-    const p = path.join(dir, n)
-    if (fs.existsSync(p)) return p
-  }
-  return null
-}
-
-function findConfFile(startDir) {
-  for (const wf of workspaceFolderPaths) {
-    const c = pickConfInDir(wf)
-    if (c) return c
-  }
-  let dir = startDir
-  const root = path.parse(dir).root
-  while (dir !== root) {
-    const c = pickConfInDir(dir)
-    if (c) return c
-    const parent = path.dirname(dir)
-    if (parent === dir) break
-    dir = parent
-  }
-  return null
-}
-
 const confCache = new Map()
 
 function getModuleConf(filePath) {
-  const confPath = findConfFile(path.dirname(filePath))
+  const { confPath, cwd } = findModuleContext(path.dirname(filePath))
   if (!confPath) return new Map()
-  if (!confCache.has(confPath)) confCache.set(confPath, parseConf(confPath))
-  return confCache.get(confPath)
+  if (!confCache.has(confPath)) confCache.set(confPath, new Map())
+  const contexts = confCache.get(confPath)
+  if (!contexts.has(cwd)) contexts.set(cwd, parseConf(confPath, cwd))
+  return contexts.get(cwd)
 }
 
 // ─── External files ────────────────────────────────────────────────────────────
@@ -215,8 +177,7 @@ async function runChecker(uri, run, reason) {
       }
     }
     if (!current()) return
-    const confPath = findConfFile(path.dirname(filePath))
-    const cwd = confPath ? path.dirname(confPath) : path.dirname(filePath)
+    const { cwd } = findModuleContext(path.dirname(filePath))
     await new Promise(resolve => {
       const child = execFile(settings.executable, args, { cwd, timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (checkerProcesses.get(uri) === child) checkerProcesses.delete(uri)
@@ -464,6 +425,14 @@ connection.onHover(({ textDocument, position }) => {
   const a = getAnalysis(textDocument.uri)
   if (!document || !a) return null
   const lines = document.getText().split(/\r?\n/)
+  const token = a.tokens.find(t => t.line === position.line && t.col <= position.character
+    && position.character < t.col + t.text.length)
+  if (token && ['op', 'bang', 'dcgneck', 'semi'].includes(token.type)) {
+    const kind = a.declWordKinds.get(`${token.line}:${token.col}`)
+    const doc = kind ? DECL_DOCS[token.text] : BUILTIN_DOCS[token.text]
+    if (doc) return { contents: { kind: MarkupKind.Markdown,
+      value: `**${kind || 'Operator'}:** \`${token.text}\`\n\n${doc}` } }
+  }
   const info = getWordAt(lines, position)
   if (!info) return null
   const filePath = uriToPath(textDocument.uri)
@@ -497,7 +466,14 @@ connection.onHover(({ textDocument, position }) => {
   if (declKind && DECL_DOCS[word]) {
     parts.push(`**${declKind}:** \`${word}\`\n\n${DECL_DOCS[word]}`)
   } else if (BUILTIN_DOCS[word]) {
-    parts.push(`**Built-in:** \`${word}\`\n\n${BUILTIN_DOCS[word]}`)
+    const ref = a.predicateRefs.get(word)?.find(r => r.line === position.line && r.col === info.start)
+    const dcgNewline = word === 'nl' && ref?.arity === 2
+    const doc = dcgNewline
+      ? '`nl` (DCG) — matches or constructs a newline in the grammar output. This helper is pure and does not need `unsafe`.'
+      : word === 'nl' && ref?.arity === 0
+        ? '`nl` — writes a newline. A predicate calling it must be declared `unsafe`; top-level queries may call it directly.'
+        : BUILTIN_DOCS[word]
+    parts.push(`**${dcgNewline ? 'DCG helper' : 'Built-in'}:** \`${word}\`\n\n${doc}`)
   }
   if (a.predicateDefs.has(word)) {
     parts.push(describeDefs(word, a.predicateDefs.get(word), a.decls.get(word), null))
@@ -579,7 +555,8 @@ connection.onDocumentSymbol(({ textDocument }) => {
   const symbols = []
   for (const [name, decls] of a.decls) {
     for (const d of decls) {
-      symbols.push({ name: `${name}/${d.arity} (declaration)`, kind: SymbolKind.Interface, location: Location.create(textDocument.uri, locToRange(d)) })
+      const label = d.arity === null ? name : `${name}/${d.arity}`
+      symbols.push({ name: `${label} (declaration)`, kind: SymbolKind.Interface, location: Location.create(textDocument.uri, locToRange(d)) })
     }
   }
   for (const [name, defs] of a.predicateDefs) {

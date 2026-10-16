@@ -38,7 +38,8 @@ async function client(t, executable, settings = {}, workspaceRoot = null) {
   })
   const notify = (method, params) => send({ jsonrpc: '2.0', method, params })
   await request('initialize', { processId: null, rootUri: null, capabilities: {},
-    workspaceFolders: workspaceRoot ? [{ uri: pathToFileURL(workspaceRoot).href, name: 'test' }] : [] })
+    workspaceFolders: workspaceRoot ? (Array.isArray(workspaceRoot) ? workspaceRoot : [workspaceRoot])
+      .map((root, i) => ({ uri: pathToFileURL(root).href, name: `test${i}` })) : [] })
   notify('initialized', {})
   notify('workspace/didChangeConfiguration', { settings: { infera: { executable, checkOnSave: true, ...settings } } })
   return { notify, request, messages }
@@ -133,6 +134,80 @@ test('unsafe and dynamic semantic tokens resolve imports and update from open bu
   assert.deepEqual(await get(), [TM.unsafe, TM.unsafe])
   notify('textDocument/didChange', { textDocument: { uri, version: 2 }, contentChanges: [{ text: text.replace('<- import "lib#test".', '# import removed') }] })
   assert.deepEqual(await get(), [0, 0], 'removing an import clears its flags')
+})
+
+test('nl hover distinguishes the pure DCG helper from the newline effect', async t => {
+  const { uri } = fixture(t)
+  const lines = ['main <- nl.', 'grid [Row | Rows] -> grid_row Row, nl, grid Rows.',
+    'escaped -> { nl }.', '> phrase nl Text?']
+  const { notify, request } = await client(t, '/missing-infera', { checkOnSave: false, checkOnChange: false })
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: lines.join('\n') } })
+  for (const [line, source] of lines.entries()) {
+    const result = await request('textDocument/hover', { textDocument: { uri }, position: { line, character: source.indexOf('nl') } })
+    const doc = result.result.contents.value
+    if (line === 1 || line === 3) {
+      assert.match(doc, /DCG helper/)
+      assert.match(doc, /pure/)
+      assert.match(doc, /does not need `unsafe`/)
+    } else {
+      assert.match(doc, /writes a newline/)
+      assert.match(doc, /must be declared `unsafe`/)
+    }
+  }
+})
+
+test('flags-only declarations have name-wide document symbols without a null arity', async t => {
+  const { uri } = fixture(t)
+  const text = 'best_so_far : dynamic.\nwalk : notable.\nwalk 1.\ntyped : det (int: <=).\ntyped 1.\n'
+  const { notify, request } = await client(t, '/missing-infera', { checkOnSave: false, checkOnChange: false })
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text } })
+  const response = await request('textDocument/documentSymbol', { textDocument: { uri } })
+  assert.deepEqual(response.result.map(symbol => symbol.name), [
+    'best_so_far (declaration)', 'walk (declaration)', 'typed/1 (declaration)', 'walk/1', 'typed/1'
+  ])
+})
+
+test('CLP comparisons, control operators and declaration modes expose their hover docs', async t => {
+  const { uri } = fixture(t)
+  const lines = ['p : (int: <=) (int: =>) (any: <=>).',
+    'p X Y Z <- X #= Y, X #!= Z, X #< Y, X #> Z, X #<= Y, X #>= Z, (true -> ! ; fail).']
+  const { notify, request } = await client(t, '/missing-infera', { checkOnSave: false, checkOnChange: false })
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: lines.join('\n') } })
+  for (const [line, operator, expected] of [
+    [0, '<=', 'Input mode'], [0, '=>', 'Output mode'], [0, '<=>', 'In/out mode'],
+    ...['#=', '#!=', '#<', '#>', '#<=', '#>='].map(op => [1, op, 'CLP(Z)']),
+    [1, '->', 'if-then-else'], [1, '!', 'cut'], [1, ';', 'disjunction']
+  ]) {
+    const response = await request('textDocument/hover', { textDocument: { uri },
+      position: { line, character: operator === '!' ? lines[line].lastIndexOf(operator) : lines[line].indexOf(operator) } })
+    assert.ok(response.result, operator)
+    assert.ok(response.result.contents.value.includes(expected), `${operator}: ${response.result.contents.value}`)
+  }
+})
+
+test('nested module navigation uses the same nearest config and relative paths as checking', {
+  skip: !process.env.INFERA_BIN, timeout: 20000
+}, async t => {
+  const { root } = fixture(t)
+  const wrong = path.join(root, 'wrong'), project = path.join(root, 'project'), nested = path.join(project, 'nested')
+  fs.mkdirSync(wrong); fs.mkdirSync(nested, { recursive: true })
+  fs.writeFileSync(path.join(wrong, 'lib.nprolog'), 'wrong.\n')
+  fs.writeFileSync(path.join(wrong, 'neoprolog.conf'), 'lib#test lib.nprolog\n')
+  fs.writeFileSync(path.join(project, 'lib.nprolog'), 'also_wrong.\n')
+  fs.writeFileSync(path.join(project, 'neoprolog.conf'), 'lib#test lib.nprolog\n')
+  const lib = path.join(nested, 'lib.nprolog')
+  fs.writeFileSync(lib, 'greet.\n')
+  fs.writeFileSync(path.join(nested, 'infera.conf'), 'lib#test\tlib.nprolog\n')
+  const file = path.join(nested, 'main.nprolog'), uri = pathToFileURL(file).href
+  const text = '<- import "lib#test".\nmain <- lib:greet.\n'
+  const { notify, request, messages } = await client(t, process.env.INFERA_BIN, {}, [wrong, project])
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text } })
+  await until(() => messages.filter(m => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri).length >= 2)
+  assert.deepEqual(messages.filter(m => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri).at(-1).params.diagnostics, [])
+  const definition = await request('textDocument/definition', { textDocument: { uri }, position: { line: 1, character: 14 } })
+  assert.equal(definition.result[0].uri, pathToFileURL(lib).href)
+  const completion = await request('textDocument/completion', { textDocument: { uri }, position: { line: 1, character: 12 } })
+  assert.deepEqual(completion.result.map(item => item.label), ['greet'])
 })
 
 test('performance hints can be toggled without suppressing correctness diagnostics', async t => {
@@ -276,14 +351,26 @@ test('unsaved editor diagnostics exactly match the compiler across a validation 
     'last X',
     'p "😀".\tbad <- missing.\n',
     'p 1.\n> p [1, ?\n',
-    'p : det (int: <=).\np 2.\n> p (1 + 1)?\n'
+    'p : det (int: <=).\np 2.\n> p (1 + 1)?\n',
+    { text: '> nl?\n', status: 0 },
+    { text: 'main : unsafe.\nmain <- nl.\n', status: 0 },
+    { text: 'main <- nl.\n', status: 1, errorCode: 'unsafe-call' },
+    { text: 'escaped -> { nl }.\n', status: 1, errorCode: 'unsafe-call' },
+    { text: 'grid [] -> [].\ngrid [Row | Rows] -> grid_row Row, nl, grid Rows.\ngrid_row Row -> seq Row.\n', status: 0 },
+    { text: 'best_so_far : dynamic.\n', status: 0 },
+    { text: 'best_so_far : dynamic.\nrecord : unsafe.\nrecord <- assert (best_so_far 1), retractall (best_so_far _).\n', status: 0 },
+    { text: 'puzzle X Y Truth <- [X, Y] in 0..9, all_different [X, Y], reify (X #<= Y) Truth, Cost #= X + Y, labeling [min Cost] [X, Y].\n', status: 0 },
+    { text: 'pick 1.\npick 2.\nrun Ys <- once (pick X), not (X = 3), findall Y (pick Y) Ys, (X = 1 -> true ; fail), forall (pick Z) (Z > 0), call pick X, minimize Best (pick Best).\n', status: 0 }
   ]
-  for (const [i, text] of corpus.entries()) {
+  for (const [i, entry] of corpus.entries()) {
+    const { text, status, errorCode } = typeof entry === 'string' ? { text: entry } : entry
     const version = i + 1
     const result = spawnSync(process.env.INFERA_BIN, ['check', '--json', '--stdin', file],
       { cwd: root, input: text, encoding: 'utf8' })
     assert.ok([0, 1].includes(result.status), result.stderr)
     const expected = compilerDiagnostics(result.stdout, file)
+    if (status !== undefined) assert.equal(result.status, status, `${text}\n${result.stdout}\n${result.stderr}`)
+    if (errorCode) assert.ok(expected.some(d => d.severity === 1 && d.code === errorCode), result.stdout)
     if (i === 0) notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version, text } })
     else notify('textDocument/didChange', { textDocument: { uri, version }, contentChanges: [{ text }] })
     await until(() => {
@@ -293,6 +380,66 @@ test('unsaved editor diagnostics exactly match the compiler across a validation 
     })
   }
   assert.equal(fs.readFileSync(file, 'utf8'), 'disk_only.\n', 'editor checks must not save the buffer')
+})
+
+test('shipped Minesweeper, IO and registered facts examples have current compiler diagnostics in the editor', {
+  skip: !process.env.INFERA_BIN, timeout: 20000
+}, async t => {
+  const repository = path.resolve(__dirname, '../..')
+  const { root } = fixture(t)
+  fs.mkdirSync(path.join(root, 'examples'))
+  fs.copyFileSync(path.join(repository, 'infera.conf'), path.join(root, 'infera.conf'))
+  for (const name of ['minesweeper', 'io', 'facts', 'facts2']) {
+    fs.copyFileSync(path.join(repository, 'examples', `${name}.nprolog`), path.join(root, 'examples', `${name}.nprolog`))
+  }
+  // A developer's ignored examples/neoprolog.conf may contain different
+  // registrations. Exercise the tracked example map in a clean checkout.
+  const { notify, request, messages } = await client(t, process.env.INFERA_BIN, {}, root)
+  for (const name of ['minesweeper', 'io', 'facts2']) {
+    const file = path.join(root, 'examples', `${name}.nprolog`), uri = pathToFileURL(file).href
+    const text = fs.readFileSync(file, 'utf8')
+    const checked = spawnSync(process.env.INFERA_BIN, ['check', '--json', '--stdin', file],
+      { cwd: root, input: text, encoding: 'utf8' })
+    assert.equal(checked.status, 0, `${name}: ${checked.stdout}\n${checked.stderr}`)
+    const expected = compilerDiagnostics(checked.stdout, file)
+    assert.ok(expected.every(d => d.severity !== 1), `${name}: ${checked.stdout}`)
+    const from = messages.length
+    notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text } })
+    try {
+      await until(() => {
+        const published = messages.slice(from).filter(m => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri)
+        return published.length >= 2 && JSON.stringify(published.at(-1).params.diagnostics) === JSON.stringify(expected)
+      })
+    } catch (failure) {
+      assert.fail(`${name}: ${failure.message}\nExpected: ${JSON.stringify(expected)}\nMessages: ${JSON.stringify(messages.slice(from))}`)
+    }
+    if (name === 'facts2') {
+      const lines = text.split('\n'), line = lines.findIndex(source => source.includes('facts:factorial'))
+      const definition = await request('textDocument/definition', { textDocument: { uri },
+        position: { line, character: lines[line].indexOf('factorial') } })
+      assert.equal(definition.result[0].uri, pathToFileURL(path.join(root, 'examples/facts.nprolog')).href)
+    }
+    notify('textDocument/didClose', { textDocument: { uri } })
+  }
+})
+
+test('an unregistered facts key remains a compiler error even when the module file exists', {
+  skip: !process.env.INFERA_BIN, timeout: 20000
+}, async t => {
+  const { root, file, uri } = fixture(t)
+  fs.writeFileSync(path.join(root, 'facts.nprolog'), 'factorial 0 1.\n')
+  fs.writeFileSync(path.join(root, 'infera.conf'), 'facts#current facts.nprolog\n')
+  const text = '<- import "facts#stale".\n> facts:factorial 0 R?\n'
+  const checked = spawnSync(process.env.INFERA_BIN, ['check', '--json', '--stdin', file],
+    { cwd: root, input: text, encoding: 'utf8' })
+  assert.equal(checked.status, 1)
+  const expected = compilerDiagnostics(checked.stdout, file)
+  assert.equal(expected[0].code, 'load-error')
+  assert.match(expected[0].message, /facts#stale/)
+  const { notify, messages } = await client(t, process.env.INFERA_BIN, {}, root)
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text } })
+  await until(() => messages.filter(m => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri)
+    .some(m => JSON.stringify(m.params.diagnostics) === JSON.stringify(expected)))
 })
 
 test('unsaved imports update diagnostics in every affected open buffer', {

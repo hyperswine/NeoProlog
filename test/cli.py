@@ -167,6 +167,13 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
         assert result.returncode == 1 and "Usage:" in result.stderr, result
     print("Trace CLI, REPL and located runtime-error acceptance passed")
 
+    # DCG newline helpers and flags-only dynamic declarations are current syntax.
+    assert not [d for d in check("grid_row _ -> [].\ngrid [] -> [].\ngrid [Row | Rows] -> grid_row Row, nl, grid Rows.\n", success=True)
+                if d["severity"] == "error"]
+    assert not [d for d in check("best_so_far : dynamic.\n", success=True) if d["severity"] == "error"]
+    rows = check("say <- nl.\n", "unsafe-call")
+    assert any("say : unsafe." in d["message"] for d in rows), rows
+
     examples = Path(__file__).resolve().parent.parent / "examples"
     (root / "neoprolog.conf").write_text(
         f"facts#f12568529f605753c20ea9210f40d00b8318ebc4 {examples / 'facts.nprolog'}\n")
@@ -181,3 +188,38 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
         else:
             assert result.returncode == 0 and not errors, (example, result, errors)
     print("Shipped-example diagnostics acceptance passed")
+
+    # A fresh checkout uses the tracked relative-path map, without a local registration.
+    project = root / "portable-project"
+    (project / "examples").mkdir(parents=True)
+    (project / "infera.conf").write_text((examples.parent / "infera.conf").read_text())
+    for name in ["facts.nprolog", "facts2.nprolog"]:
+        (project / "examples" / name).write_text((examples / name).read_text())
+    portable = project / "examples" / "facts2.nprolog"
+    result = subprocess.run([binary, "check", "--json", str(portable)], cwd=project,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0 and not [d for d in json.loads(result.stdout)
+                                          if d["severity"] == "error"], result
+    result = subprocess.run([binary, str(portable)], cwd=project, input="",
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0 and "R = 24" in result.stdout, result
+
+    # Import IDs remain exact keys; a filename match does not rescue a stale ID.
+    stale = project / "stale.nprolog"
+    stale.write_text('<- import "facts#not-registered".\n')
+    result = subprocess.run([binary, "check", "--json", str(stale)], cwd=project,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1 and any(d["code"] == "load-error" for d in json.loads(result.stdout)), result
+
+    # Registration writes its own path-derived key, which can be imported directly.
+    result = subprocess.run([binary, "reg", str(project / "examples" / "facts.nprolog")], cwd=project,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result
+    key = (project / "neoprolog.conf").read_text().split()[0]
+    assert key.startswith("facts#")
+    fresh = project / "fresh.nprolog"
+    fresh.write_text(f'<- import "{key}".\n> facts:factorial 5 Result?\n')
+    result = subprocess.run([binary, str(fresh)], cwd=project, input="",
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0 and "Result = 120" in result.stdout, result
+    print("DCG newline, dynamic declaration and portable module acceptance passed")

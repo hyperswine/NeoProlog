@@ -52,6 +52,40 @@ language, use **Change Language Mode → Configure File Association for
 '.nprolog' → Infera**, or change its `files.associations` setting to
 `"*.nprolog": "infera"`.
 
+## Current compiler and modules
+
+The extension runs the executable selected by `infera.executable`. Updating the
+extension alone does not update that compiler. If current examples flag DCG
+`nl` or a declaration such as `best_so_far : dynamic.`, check the same files
+with the executable used by the editor:
+
+```sh
+cabal build exe:infera --offline --enable-optimization=2
+cabal list-bin exe:infera --enable-optimization=2
+# Set infera.executable to the absolute path printed above, then reload VS Code.
+infera check --json examples/minesweeper.nprolog examples/io.nprolog
+```
+
+Use the printed executable path for the last command too if `infera` on PATH
+points to an older installation. The current compiler accepts both examples;
+ordinary warnings and performance hints can still appear. In a DCG, `nl`
+describes a newline in the character list and is pure. Outside a DCG, `nl`
+prints a newline and a calling predicate needs an `unsafe` declaration.
+
+Module navigation and compiler checks select the nearest ancestor's
+`neoprolog.conf` or `infera.conf`, in that order within each directory; they
+fall back to the compiler's `~/nprolog` configurations. Relative module paths
+use the same working directory as the checker. An unrelated workspace folder
+cannot override a document's nearer configuration.
+
+The repository's `infera.conf` registers the exact key used by
+`examples/facts2.nprolog`, with a relative path to `examples/facts.nprolog`.
+If a local `neoprolog.conf` exists, it takes precedence and must include that
+mapping. A nearer map such as `examples/neoprolog.conf` also shadows the root
+map. A missing registration key remains an import error. For other modules,
+run `infera reg <file>` and use the printed key in the import; moving the file
+can change this key.
+
 ## Develop
 
 ```

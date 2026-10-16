@@ -10,7 +10,7 @@ const BUILTIN_DOCS = {
   true: 'Always succeeds.',
   fail: 'Always fails.',
   false: 'Always fails.',
-  nl: 'Writes a newline.',
+  nl: '`nl` writes a newline (effect: needs `unsafe` inside predicates). In a DCG, `nl` instead matches or constructs a newline purely.',
   write: '`write Term` — writes Term (strings without quotes).',
   writeln: '`writeln Term` — writes Term followed by a newline.',
   print: '`print Term` — same as `write`.',

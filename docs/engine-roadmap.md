@@ -794,6 +794,47 @@ validated migration. Warm controls and the RC/wide breadboard cases still
 trail interpreted execution in the operand recheck; those representative
 regressions keep the performance gate open despite passing local correctness.
 
+### Next performance work
+
+Prioritize remaining builtin/operand round trips over more predicate-cache
+work: the latest probes report zero predicate-cache misses. These are
+source-grounded candidates, not established causes of the measured regressions.
+Profile normal execution on a controlled runner before claiming a speedup.
+
+1. **Typed builtin arguments.** Compiled arithmetic and CLP leaves still build
+   a callable graph, export it to `Term`, and sometimes import its operands
+   again. Start with `=`, `is` and arithmetic comparisons, then domain and CLP
+   relations. Use a fixed builtin tag and one multi-root operand plan with one
+   checked local layout and transaction. Reuse existing arithmetic/CLP helpers;
+   retain generic dispatch for dynamic goals, malformed shapes and unsupported
+   cases. Preserve builtin precedence, shallow walks, exact error order, fuel,
+   rollback and source traces. Count avoided wrapper nodes explicitly rather
+   than presenting measured queued dispatch as the normal fused path.
+2. **Opaque controls and tail transfer.** Split the combined control benchmark
+   into arithmetic-only, `once`, negation and conditional cases. Profile heap
+   snapshots, accepted-state restoration and binding replay. The current
+   300-iteration combined fixture retains up to 302 tasks because conservative
+   tail analysis excludes these controls. A successful `once`/conditional may
+   permit a checked child-state handoff when no relocation occurred; pure
+   completed control may also admit tail transfer. Prove parent-handle,
+   rollback, contract, cut and fuel compatibility before either change; retain
+   the existing path after collection or suspension.
+3. **CLP change tracking.** Separate posting, fixed labeling and full optimum
+   search on all four breadboard cases. If profiles justify it, return actual
+   newly bound IDs from trusted internal CLP operations instead of deriving
+   differences from whole substitutions, and avoid replacing dependency
+   registrations when a reduced constraint's variable membership is unchanged.
+   Keep public arbitrary-callback synchronization strict and retain search order
+   and labeling heuristics during this change.
+
+Each phase needs generated ordered-answer/error/residual/output parity,
+retained/interleaved snapshots, exact traces and strict root ownership, plus
+real minefield/breadboard acceptance and residency checks. Record paired CPU
+and wall time for both cold queries and fresh-state warm batches, retaining
+Reference and Interpreted as controls. The current three-sample variation does
+not establish a default-ready speedup; declare the material-regression tolerance
+before the next controlled comparison.
+
 ### Milestones
 
 1. **In progress:** compiled activation, specialized head matching, per-goal

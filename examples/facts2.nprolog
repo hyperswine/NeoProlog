@@ -1,3 +1,5 @@
+# Run from the repository root; infera.conf maps this example module ID.
+# A local neoprolog.conf takes precedence and must include the same mapping.
 <- import "facts#f12568529f605753c20ea9210f40d00b8318ebc4".
 
 > facts:factorial 4 R?
