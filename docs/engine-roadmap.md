@@ -85,8 +85,8 @@ decisions with the reference engine through `Infera.Engine.Contracts`.
 Output validation precedes a commitment; declared failure guards survive
 clause retries. Foreign cuts stop at committing call boundaries, preserving
 the reference's marker handling rather than pruning caller alternatives.
-Their delivery remains deferred through reference iterators so a later local
-cut can suppress an earlier foreign marker.
+Their delivery uses a native deferred choice so a later local cut can
+suppress an earlier foreign marker.
 
 `start`/`resume` expose immutable suspended execution and compatible
 `SearchItem`/`SolverState` results through an opt-in Haskell API. The
@@ -94,16 +94,35 @@ cut can suppress an earlier foreign marker.
 cross-root sharing and the complete persistent store, including propagation
 queues, output, tables and dynamic facts. It retains raw nested variable
 references in substitutions: deep expansion can change shallow matching of
-control expressions. Builtins, opaque sub-searches, tabled calls and calls
-with active constraints still use lazy reference iterators through this
-bridge. Adapter alternatives restore the heap and all branch metadata
-together; their tails are not forced before yielding the current answer.
+control expressions. Remaining builtins, tabled calls and ordinary calls with
+active constraints still use lazy reference iterators through this bridge.
+Adapter alternatives restore the heap and all branch metadata together; their
+tails are not forced before yielding the current answer.
+
+`call`, `once`, `not`, if-then-else and `findall` now execute in native scope
+frames. Each frame parks the caller's control state and starts an isolated
+choice stack over the same heap prefix, without importing caller cut barriers.
+Streaming `call` answers install a native retry that restores the child and
+rebases its parked parent onto current scope buffers and success guards.
+`once` and successful conditions retain the selected complete state; negation
+restores entry state and buffers issues until it can distinguish success from
+finite failure. `findall` collects immutable templates with the existing
+variable IDs and per-answer output, then restores the entry heap, fresh counter,
+store, tables and dynamic facts before unifying the list. Errors suppress its
+results/output, while exhaustion without an error can coexist with a list
+answer, matching the reference.
 
 Fourteen control/bridge properties include 600 generated ordered-stream
 comparisons, failure and cut regressions, declaration checks, shallow control
 syntax, complete adapter state, and repeated/interleaved/prefix consumption.
-The production resolver still uses `Infera.Engine`. Native opaque sub-search,
-CLP/table execution, last-call reuse, collection and tracing remain later
+Nine native sub-search properties add 300 generated nested-control comparisons
+and fixed tests for issue policies, constructor/cut quirks, fresh-ID reuse,
+complete state retention/rollback, output order and immutable lazy resumes.
+Real mutual recursion exercises internal incomplete-table dependencies; direct
+emitted-dependency ordering is not covered by a seeded incomplete table fixture,
+because that entry type remains private.
+The production resolver still uses `Infera.Engine`. Native CLP/table execution,
+remaining sub-search builtins, last-call reuse, collection and tracing remain later
 work; milestones 1 and 2 are not the step 1 exit gate. Initial structures hold
 child-address lists rather than packed WAM cells, and every binding is trailed.
 The opaque layout can change after profiling. No query-speed or
@@ -479,7 +498,8 @@ work through the instruction loop's event hook.
 
 * The established engine properties (including correctness models and the
   signature golden file), plus the 12 heap properties, 14 control/bridge
-  properties and subsequent machine/compiler properties, must pass
+  properties, nine native sub-search properties and subsequent
+  machine/compiler properties, must pass
   against each engine. Keep generated comparisons with independent models as
   well as the reference; agreement between two engines is not a proof.
 * Compare ordered answers, duplicates, residual constraints, output, error

@@ -12,6 +12,7 @@ import BreadboardTest (breadboardGroup)
 import TablingTest (tablingGroup)
 import MachineHeapTest (machineHeapGroup)
 import MachineControlTest (machineControlGroup)
+import MachineSubsearchTest (machineSubsearchGroup)
 import System.Exit (exitFailure)
 
 main :: IO ()
@@ -25,12 +26,13 @@ main = do
   tablingOk <- checkSequential tablingGroup
   heapOk <- checkSequential machineHeapGroup
   controlOk <- checkSequential machineControlGroup
-  unless (ok && modelsOk && minesOk && inferenceOk && clpOk && breadboardOk && tablingOk && heapOk && controlOk) exitFailure
+  subsearchOk <- checkSequential machineSubsearchGroup
+  unless (ok && modelsOk && minesOk && inferenceOk && clpOk && breadboardOk && tablingOk && heapOk && controlOk && subsearchOk) exitFailure
 
 -- Paste the property name, seed and shrink path from a failure report into
 -- GHCi to reproduce precisely the minimized counterexample.
 replay :: String -> Seed -> String -> IO ()
 replay name seed path =
-  case lookup (fromString name) (concatMap groupProperties [inferaGroup, correctnessGroup, minesweeperGroup, inferenceGroup, clpPerformanceGroup, breadboardGroup, tablingGroup, machineHeapGroup, machineControlGroup]) of
+  case lookup (fromString name) (concatMap groupProperties [inferaGroup, correctnessGroup, minesweeperGroup, inferenceGroup, clpPerformanceGroup, breadboardGroup, tablingGroup, machineHeapGroup, machineControlGroup, machineSubsearchGroup]) of
     Nothing -> fail ("Unknown property: " ++ name)
     Just prop -> recheckAt seed (fromString path) prop

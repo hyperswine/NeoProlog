@@ -1,6 +1,6 @@
 -- | Experimental explicit control and backtracking over the machine heap.
--- Ordinary clauses, conjunction, disjunction, cuts and unconstrained
--- unification run here. Other builtins, opaque sub-searches, tabled calls and
+-- Ordinary clauses, conjunction, disjunction, cuts, opaque sub-searches and
+-- unconstrained unification run here. Other builtins, tabled calls and
 -- constrained calls use the reference resolver through complete immutable
 -- state adapters. The production 'Infera.Engine.solveQuery' is unchanged.
 --
@@ -26,7 +26,7 @@ import Control.Monad.Trans.Class (lift)
 import qualified Data.IntMap.Strict as IM
 import Infera.Arith (normArithTerm)
 import Infera.CLP (Store (..))
-import Infera.Engine (Env (..), Search, SearchItem (..), SolverState (..))
+import Infera.Engine (Env (..), OutputEvent, Search, SearchItem (..), SolverState (..))
 import qualified Infera.Engine as Reference
 import qualified Infera.Engine.Contracts as Contracts
 import Infera.Error
@@ -35,7 +35,7 @@ import qualified Infera.Machine.Bridge as Bridge
 import qualified Infera.Machine.Heap as Heap
 import Infera.Program
 import Infera.Syntax
-import Infera.Unify (deepWalk, renameBody, renameTerm, replaceCuts)
+import Infera.Unify (deepWalk, renameBody, renameTerm, replaceCuts, walk)
 
 -- Source cut owners are the same fresh-variable bases used by the reference
 -- resolver. The second component is the current choice-stack barrier.
@@ -44,6 +44,8 @@ type Scopes = [(Int, Int)]
 data Task
   = Run !Heap.Address !Int Scopes
   | Return !Call
+  | Emit SearchItem
+  | Fail
 
 data Call = Call
   { callId :: !Int,
@@ -57,6 +59,8 @@ data Call = Call
 
 data Branch = Branch
   { branchBindings :: !Bridge.Bindings,
+    -- Native bindings live on the heap; stSubst is a cache until an adapter,
+    -- callable expansion or public Found boundary exports it through Bridge.
     branchState :: !SolverState,
     branchTasks :: [Task],
     branchMarker :: Maybe Int
@@ -72,6 +76,25 @@ data Alternative
   | ClauseRetry !Heap.Address !Int Scopes !Call [Clause]
   | ReferenceRetry Scopes Search
   | Guard !Int !PredKey (Maybe Det) !Bool
+  | DeferredCut !Int Scopes
+  | NativeRetry !Running
+
+-- An opaque sub-search parks its caller's entire control state, then runs an
+-- isolated choice stack on the same heap prefix. No caller cut barrier is
+-- imported. Issues that may be suppressed are buffered inside this frame.
+data ScopeKind
+  = CallScope
+  | OnceScope
+  | NotScope
+  | IfScope !Heap.Address (Maybe Heap.Address) !Int Scopes
+  | FindScope !Heap.Address !Heap.Address !Int Scopes [Term] [OutputEvent]
+
+data Scope = Scope
+  { scopeParent :: !Running,
+    scopeEntry :: !Heap.Checkpoint,
+    scopeKind :: !ScopeKind,
+    scopeIssues :: [SearchItem]
+  }
 
 data Phase = Seeking | Backtracking | Complete
 
@@ -80,7 +103,8 @@ data Running = Running
     runningChoices :: [Choice],
     runningDepth :: !Int,
     runningNextId :: !Int,
-    runningPhase :: !Phase
+    runningPhase :: !Phase,
+    runningScope :: Maybe Scope
   }
 
 data Checkpoint = Checkpoint !Env !Heap.FrozenHeap !Running
@@ -113,7 +137,7 @@ startWith scopes environment fuel state goals = runST $ runExceptT $ do
   (imported, addresses) <- checked (Bridge.importTerms heap synchronized goals)
   frozen <- lift (Heap.freezeHeap heap)
   let branch = Branch imported state [Run address fuel scopes | address <- addresses] Nothing
-  pure (Checkpoint environment frozen (Running branch [] 0 0 Seeking))
+  pure (Checkpoint environment frozen (Running branch [] 0 0 Seeking Nothing))
 
 -- | Run until the next search item or completion. Every mutable operation is
 -- contained in this fresh ST scope; only immutable pages and control remain.
@@ -140,21 +164,34 @@ yield environment heap running item = do
   frozen <- lift (Heap.freezeHeap heap)
   pure (Yield item (Checkpoint environment frozen running))
 
+-- Scope events stay internal until their construct decides what escapes.
+-- Public suspension still happens only through yield's immutable snapshot.
+emit :: Env -> Heap.Heap s -> Running -> SearchItem -> MachineM s Step
+emit environment heap running item = case runningScope running of
+  Nothing -> yield environment heap running item
+  Just scope -> scopeEvent environment heap running scope item
+
 drive :: Env -> Heap.Heap s -> Running -> MachineM s Step
 drive environment heap running = case runningPhase running of
-  Complete -> pure Finished
+  Complete -> finish environment heap running
   Backtracking -> backtrack environment heap running
   Seeking -> case branchTasks (runningBranch running) of
     [] -> do
       let branch = runningBranch running
-      state <- checked (Bridge.exportState heap (branchBindings branch) (branchState branch))
-      yield environment heap running {runningPhase = Backtracking} (Found state)
+      state <- case runningScope running of
+        Nothing -> checked (Bridge.exportState heap (branchBindings branch) (branchState branch))
+        -- Child scopes share the heap and bindings. Avoid rebuilding the
+        -- whole substitution for each internal success only to reimport it.
+        Just _ -> pure (branchState branch)
+      emit environment heap running {runningPhase = Backtracking} (Found state)
     task : rest ->
       let branch = (runningBranch running) {branchTasks = rest}
           next = running {runningBranch = branch}
        in case task of
             Run address fuel scopes -> runGoal environment heap next address fuel scopes
             Return call -> returnCall environment heap next call
+            Emit item -> emit environment heap next item
+            Fail -> drive environment heap next {runningPhase = Backtracking}
 
 push :: Choice -> Running -> MachineM s Running
 push choice running = do
@@ -179,6 +216,7 @@ prune requested running = running
     clampTask (Run address fuel scopes) =
       Run address fuel [(owner, min barrier depth) | (owner, barrier) <- scopes]
     clampTask (Return call) = Return call {callEntryDepth = min (callEntryDepth call) depth}
+    clampTask task = task
 
 cut :: Int -> Scopes -> Running -> Running
 cut owner scopes running = case committingBoundary (branchTasks (runningBranch running)) of
@@ -219,9 +257,12 @@ runGoal environment heap running address fuel scopes = do
           | (local, _) : _ <- scopes, local == fromIntegral owner ->
               drive environment heap (cut local scopes running)
         -- A foreign marker travels after this goal's continuation. A later
-        -- local cut or first-success commit can discard it before it reaches
-        -- its owner. Retain that ordering with the lazy reference iterator.
-        Heap.IntegerView _ -> adapted
+        -- local cut or first-success commit can discard its retry before it
+        -- reaches its owner, matching the reference's [Found, CutMarker].
+        Heap.IntegerView owner -> do
+          mark <- lift (Heap.checkpoint heap)
+          deferred <- push (Choice mark branch (DeferredCut (fromIntegral owner) scopes)) running
+          drive environment heap deferred
         _ -> adapted
     Heap.CompoundView "," [left, right] ->
       drive environment heap running
@@ -232,13 +273,22 @@ runGoal environment heap running address fuel scopes = do
       -- alternative here, so inspect its original cell rather than its value.
       original <- checked (Heap.viewRaw heap left)
       case original of
-        Heap.CompoundView "->" [_, _] -> adapted
+        Heap.CompoundView "->" [condition, yes] ->
+          enterScope environment heap running fuel condition (IfScope yes (Just right) fuel scopes)
         _ -> do
           mark <- lift (Heap.checkpoint heap)
           withRight <- push (Choice mark
             branch {branchTasks = Run right fuel scopes : branchTasks branch} Tasks) running
           drive environment heap withRight
             { runningBranch = branch {branchTasks = Run left fuel scopes : branchTasks branch} }
+    Heap.CompoundView "->" [condition, yes] ->
+      enterScope environment heap running fuel condition (IfScope yes Nothing fuel scopes)
+    Heap.CompoundView "call" (callable : arguments) ->
+      callGoal environment heap running fuel callable arguments
+    Heap.CompoundView "once" [goal] -> enterScope environment heap running fuel goal OnceScope
+    Heap.CompoundView "not" [goal] -> enterScope environment heap running fuel goal NotScope
+    Heap.CompoundView "findall" [template, goal, result] ->
+      enterScope environment heap running fuel goal (FindScope template result fuel scopes [] [])
     Heap.CompoundView "unify" [left, right]
       | not (constrained (branchState branch)) -> do
           accepted <- checked (Heap.unify heap left right)
@@ -277,7 +327,7 @@ callPredicate environment heap running address fuel scopes definition = do
       argsW = map (deepWalk (stSubst (ssStore state))) args
       key = predKey definition
   case Contracts.selectSignature key definition argsW of
-    Left err -> yield environment heap running {runningPhase = Backtracking} (BranchError err)
+    Left err -> emit environment heap running {runningPhase = Backtracking} (BranchError err)
     Right signature -> do
       (bindings, addresses) <- checked (Bridge.importTerms heap (branchBindings branch) [normalized])
       normalizedAddress <- single addresses
@@ -293,7 +343,7 @@ callPredicate environment heap running address fuel scopes definition = do
       guarded <- push (Choice mark entryBranch
         (Guard ident key (Contracts.requiredSuccess signature) False)) entry
       if fuel <= 0
-        then yield environment heap guarded {runningPhase = Backtracking} BranchExhausted
+        then emit environment heap guarded {runningPhase = Backtracking} BranchExhausted
         else do
           let keys = if predIsIndexed (envProg environment) definition then map indexKey argsW else []
               clauses = [predClauses definition IM.! index | index <- candidateClauses definition keys]
@@ -338,7 +388,7 @@ returnCall environment heap running call = do
   let problem = callSignature call >>= \signature ->
         Contracts.checkOutputs (callKey call) signature arguments
   case problem of
-    Just err -> yield environment heap running {runningPhase = Backtracking} (BranchError err)
+    Just err -> emit environment heap running {runningPhase = Backtracking} (BranchError err)
     Nothing ->
       let accepted = running {runningChoices = map mark (runningChoices running)}
           mark (Choice checkpoint saved (Guard ident key required seen))
@@ -376,13 +426,13 @@ referenceStep environment heap running mark scopes (item : rest) = case item of
           { runningBranch = branch {branchBindings = bindings, branchState = state},
             runningPhase = Seeking
           }
-      _ -> yield environment heap next {runningPhase = Backtracking} item
+      _ -> emit environment heap next {runningPhase = Backtracking} item
 
 backtrack :: Env -> Heap.Heap s -> Running -> MachineM s Step
 backtrack environment heap running = case runningChoices running of
   [] -> case branchMarker (runningBranch running) of
-    Nothing -> pure Finished
-    Just owner -> yield environment heap running {runningPhase = Complete} (CutMarker owner)
+    Nothing -> finish environment heap running
+    Just owner -> emit environment heap running {runningPhase = Complete} (CutMarker owner)
   Choice mark branch alternative : rest -> do
     checked (Heap.rollback heap mark)
     let restored = running
@@ -395,10 +445,157 @@ backtrack environment heap running = case runningChoices running of
       Tasks -> drive environment heap restored
       ClauseRetry goal fuel scopes call clauses -> tryClauses environment heap restored goal fuel scopes call clauses
       ReferenceRetry scopes items -> referenceStep environment heap restored mark scopes items
+      DeferredCut owner scopes -> drive environment heap (cut owner scopes restored) {runningPhase = Backtracking}
+      NativeRetry saved ->
+        let rebased = saved
+              { runningNextId = max (runningNextId saved) (runningNextId restored),
+                runningScope = fmap (\scope -> scope {scopeParent = restored}) (runningScope saved)
+              }
+         in drive environment heap rebased
       Guard _ key required seen -> case (seen, required) of
-        (False, Just det) -> yield environment heap restored {runningPhase = Backtracking}
+        (False, Just det) -> emit environment heap restored {runningPhase = Backtracking}
           (BranchError (DetError key det 0))
         _ -> drive environment heap restored {runningPhase = Backtracking}
+
+-- Shallow callable expansion deliberately retains Compound f [] rather than
+-- turning it into Atom f: even call true has that reference-language behavior.
+callGoal :: Env -> Heap.Heap s -> Running -> Int -> Heap.Address -> [Heap.Address] -> MachineM s Step
+callGoal environment heap running fuel callable arguments = do
+  let branch = runningBranch running
+  state <- checked (Bridge.exportState heap (branchBindings branch) (branchState branch))
+  syntax <- checked (Bridge.exportRawTerms heap (branchBindings branch) (callable : arguments))
+  case syntax of
+    predicate : args -> do
+      let substitution = stSubst (ssStore state)
+          goal = case walk substitution predicate of
+            Atom name -> Compound name args
+            Compound name existing -> Compound name (existing ++ args)
+            other -> other
+      if isCallable goal
+        then do
+          mark <- lift (Heap.checkpoint heap)
+          (bindings, addresses) <- checked (Bridge.importTerms heap (branchBindings branch)
+            [replaceCuts (negate (ssFresh state) - 1) goal])
+          address <- single addresses
+          launchScope environment heap running mark fuel address bindings CallScope
+        else emit environment heap running {runningPhase = Backtracking}
+          (BranchError (TypeError "callable" (deepWalk substitution goal)))
+    _ -> throwError Heap.IncompatibleBindings
+
+enterScope :: Env -> Heap.Heap s -> Running -> Int -> Heap.Address -> ScopeKind -> MachineM s Step
+enterScope environment heap running fuel goal kind = do
+  mark <- lift (Heap.checkpoint heap)
+  launchScope environment heap running mark fuel goal (branchBindings (runningBranch running)) kind
+
+launchScope :: Env -> Heap.Heap s -> Running -> Heap.Checkpoint -> Int -> Heap.Address -> Bridge.Bindings -> ScopeKind -> MachineM s Step
+launchScope environment heap parent mark fuel goal bindings kind =
+  let branch = (runningBranch parent)
+        { branchBindings = bindings,
+          branchTasks = [Run goal fuel []],
+          branchMarker = Nothing
+        }
+      scope = Scope parent mark kind []
+      child = Running branch [] 0 (runningNextId parent) Seeking (Just scope)
+   in drive environment heap child
+
+scopeEvent :: Env -> Heap.Heap s -> Running -> Scope -> SearchItem -> MachineM s Step
+scopeEvent environment heap running scope item = case item of
+  CutMarker _ -> drive environment heap running
+  Found state -> case scopeKind scope of
+    CallScope -> forwardScope environment heap running scope (Just state) Nothing
+    OnceScope ->
+      drive environment heap (retained scope running state (map Emit (reverse (scopeIssues scope))))
+    IfScope yes _ fuel scopes ->
+      drive environment heap (retained scope running state
+        (map Emit (reverse (scopeIssues scope)) ++ [Run yes fuel scopes]))
+    NotScope -> do
+      parent <- restoreScope heap scope running
+      let dependencies = [issue | issue@(ConsumedIncomplete _) <- reverse (scopeIssues scope)]
+      drive environment heap (withTasks (map Emit dependencies ++ [Fail]) parent)
+    FindScope template target fuel scopes results outputs -> do
+      terms <- checked (Bridge.exportTerms heap (branchBindings (runningBranch running)) [template])
+      result <- single terms
+      let entry = branchState (runningBranch (scopeParent scope))
+          delta = take (ssOutLen state - ssOutLen entry) (ssOutput state)
+          updated = scope {scopeKind = FindScope template target fuel scopes (result : results) (delta ++ outputs)}
+      drive environment heap running {runningScope = Just updated}
+  _ -> case scopeKind scope of
+    CallScope -> forwardScope environment heap running scope Nothing (Just item)
+    _ -> drive environment heap running
+      {runningScope = Just scope {scopeIssues = item : scopeIssues scope}}
+
+-- A streaming call parks the child at every visible item. Its caller may
+-- backtrack, commit or cut before that child resumes. Rebase the saved parent
+-- on retry so surrounding scope buffers and predicate success guards survive.
+forwardScope :: Env -> Heap.Heap s -> Running -> Scope -> Maybe SolverState -> Maybe SearchItem -> MachineM s Step
+forwardScope environment heap child scope answer issue = do
+  mark <- lift (Heap.checkpoint heap)
+  let parent = advanced scope child
+  retry <- push (Choice mark (runningBranch parent) (NativeRetry child)) parent
+  case (answer, issue) of
+    (Just state, Nothing) -> drive environment heap
+      (retainBranch child state retry) {runningPhase = Seeking}
+    (Nothing, Just item) -> emit environment heap retry {runningPhase = Backtracking} item
+    _ -> throwError Heap.IncompatibleBindings
+
+advanced :: Scope -> Running -> Running
+advanced scope child = (scopeParent scope)
+  {runningNextId = max (runningNextId (scopeParent scope)) (runningNextId child)}
+
+retainBranch :: Running -> SolverState -> Running -> Running
+retainBranch child state parent = parent
+  { runningBranch = (runningBranch parent)
+      { branchBindings = branchBindings (runningBranch child),
+        branchState = state
+      }
+  }
+
+retained :: Scope -> Running -> SolverState -> [Task] -> Running
+retained scope child state tasks = withTasks tasks
+  (retainBranch child state (advanced scope child)) {runningPhase = Seeking}
+
+restoreScope :: Heap.Heap s -> Scope -> Running -> MachineM s Running
+restoreScope heap scope child = do
+  checked (Heap.rollback heap (scopeEntry scope))
+  pure (advanced scope child) {runningPhase = Seeking}
+
+withTasks :: [Task] -> Running -> Running
+withTasks tasks running = running
+  {runningBranch = (runningBranch running) {branchTasks = tasks ++ branchTasks (runningBranch running)}}
+
+finish :: Env -> Heap.Heap s -> Running -> MachineM s Step
+finish environment heap child = case runningScope child of
+  Nothing -> pure Finished
+  Just scope -> do
+    parent <- restoreScope heap scope child
+    let issues = reverse (scopeIssues scope)
+        blocked = any blocks issues
+        queued tasks = drive environment heap (withTasks (map Emit issues ++ tasks) parent)
+    case scopeKind scope of
+      CallScope -> drive environment heap parent {runningPhase = Backtracking}
+      OnceScope -> queued [Fail]
+      NotScope -> queued [Fail | blocked]
+      IfScope _ no fuel scopes ->
+        queued (if blocked then [Fail] else maybe [Fail] (\goal -> [Run goal fuel scopes]) no)
+      FindScope _ target fuel scopes results outputs -> case [issue | issue@(BranchError _) <- issues] of
+        firstError : _ ->
+          let dependencies = [issue | issue@(ConsumedIncomplete _) <- issues]
+           in drive environment heap (withTasks (map Emit (dependencies ++ [firstError]) ++ [Fail]) parent)
+        [] -> do
+          let branch = runningBranch parent
+              entry = branchState branch
+              state = entry {ssOutput = outputs ++ ssOutput entry, ssOutLen = ssOutLen entry + length outputs}
+          terms <- checked (Bridge.exportRawTerms heap (branchBindings branch) [target])
+          targetTerm <- single terms
+          (bindings, addresses) <- checked (Bridge.importTerms heap (branchBindings branch)
+            [Compound "unify" [targetTerm, mkList (reverse results) Nothing]])
+          goal <- single addresses
+          let prepared = parent {runningBranch = branch {branchBindings = bindings, branchState = state}}
+          drive environment heap (withTasks (map Emit issues ++ [Run goal fuel scopes]) prepared)
+  where
+    blocks (BranchError _) = True
+    blocks BranchExhausted = True
+    blocks _ = False
 
 single :: [a] -> MachineM s a
 single [value] = pure value

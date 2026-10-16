@@ -359,6 +359,7 @@ test/CorrectnessTest.hs generated correctness tests with independent models
 test/InferenceTest.hs   inferred pruning compared with unpruned execution
 test/MachineHeapTest.hs heap unification, rollback and snapshots compared with the reference
 test/MachineControlTest.hs ordered control streams, adapters and retained snapshots
+test/MachineSubsearchTest.hs native call/once/not/if/findall and scoped state retention
 examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), jumpman (one rule set: verify / solve / play / generate), ...
 Formula/infera.rb       Homebrew formula
 bench/                  engine benchmarks (infera vs swipl vs scryer)
@@ -403,9 +404,13 @@ first-success commitments after output checks. Its immutable `start`/`resume`
 boundary returns the existing `SearchItem` and `SolverState` types. Fourteen
 control/bridge properties include 600 generated comparisons of ordered
 answers and issues, plus retained/interleaved snapshots and adapter state.
-Builtins, opaque sub-searches, tabling and constrained calls still use the
-reference resolver through complete state adapters. The production resolver
-is unchanged; native sub-search, last-call reuse and collection remain later
+Native scope frames now handle `call`, `once`, `not`, if-then-else and
+`findall`, including isolated cuts, ordered issue handling and complete state
+retention or rollback. Nine more properties add 300 generated nested-control
+comparisons, findall sharing/fresh-ID/output checks, retry guards and lazy
+resume checks. Remaining builtins, tabling and ordinary constrained calls
+still use the reference resolver through complete state adapters. The
+production resolver is unchanged; last-call reuse and collection remain later
 milestones. There is no CLI engine switch or measured speedup yet.
 
 ```sh
