@@ -3,6 +3,7 @@
 -- | The interactive read-eval-print loop.
 module Infera.Repl
   ( runRepl,
+    runTraceFile,
     describePred,
     showSignature,
   )
@@ -16,6 +17,7 @@ import Data.Text (unpack)
 import Infera.Engine
 import Infera.Error
 import Infera.Infer (inferProgram)
+import qualified Infera.Machine.Trace as Trace
 import Infera.Purity (describeViolation, programViolations)
 import Infera.Module
 import Infera.Program
@@ -24,7 +26,8 @@ import Prettyprinter
 import Prettyprinter.Render.Terminal
 import System.Console.Haskeline
 import System.Environment (getArgs, lookupEnv)
-import System.IO (hIsTerminalDevice, stdout)
+import System.Exit (exitFailure)
+import System.IO (hIsTerminalDevice, hPutStrLn, stderr, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- | Colour output only when stdout is a terminal and NO_COLOR is unset.
@@ -106,7 +109,7 @@ replComplete progRef input@(leftRev, _)
     left = reverse leftRev
     completeIdent word = do
       prog <- readIORef progRef
-      let names = nub (predNames prog ++ [":quit", ":q", ":load", ":reload", ":r", ":sig", ":preds", ":help"])
+      let names = nub (predNames prog ++ [":quit", ":q", ":load", ":reload", ":r", ":sig", ":preds", ":trace", ":help"])
       return [simpleCompletion n | n <- names, word `isPrefixOf` n]
 
 runRepl :: IO ()
@@ -132,7 +135,7 @@ runRepl = do
       renderDoc $
         annotate
           (colorDull White)
-          (pretty "Commands: :load <file>   :reload (:r)   :sig [pred]   :preds   :quit (:q)   Ctrl+D")
+          (pretty "Commands: :load <file>   :reload (:r)   :sig [pred]   :preds   :trace <query>   :quit (:q)   Ctrl+D")
     args <- liftIO getArgs
     case args of
       (file : _) -> handleLine progRef fileRef (":load " ++ file)
@@ -174,6 +177,19 @@ runRepl = do
           loop progRef fileRef
       | ":help" == trimmed = do
           outputStrLn "Clauses end with '.', queries with '?'.  Declarations: name : det (sort: mode) ..."
+          outputStrLn ":trace <query?> runs one query with Call/Exit/Redo/Fail/Cut/error events and source positions."
+          loop progRef fileRef
+      | ":trace " `isPrefixOf` trimmed = do
+          case parseQuery (dropWhile (== ' ') (drop 7 trimmed)) of
+            Left err -> outputStrLn (renderDoc (docErr err))
+            Right query -> do
+              prog0 <- liftIO (readIORef progRef)
+              prog <- liftIO (preloadFiles prog0 (queryGoals query))
+              items <- consumeTrace (outputStrLn . renderDoc . docInfo) (Trace.traceQuery prog query)
+              renderQuerySummary (summarizeSearch query items)
+          loop progRef fileRef
+      | trimmed == ":trace" = do
+          outputStrLn "Usage: :trace query?"
           loop progRef fileRef
       | not (null trimmed) && last trimmed == '?' = do
           case parseQuery trimmed of
@@ -189,7 +205,10 @@ runRepl = do
             Left err -> outputStrLn (renderDoc (docErr err))
             Right items -> do
               prog <- liftIO (readIORef progRef)
-              let prog' = inferProgram (foldl addItem prog items)
+              let located = either (const []) id (parseLocatedFile "<repl>" trimmed)
+                  extended = foldl addItem prog items
+                  prog' = inferProgram extended
+                    {progSources = Trace.appendSourceMap (progSources extended) located}
               case programViolations prog' of
                 ((key, g) : _) -> outputStrLn (renderDoc (docErr ("unsafe-call: " ++ describeViolation prog' key g)))
                 [] -> do
@@ -248,3 +267,44 @@ runRepl = do
       let output = concatMap renderOutputEvent (answerOutput answer)
       if null output then pure () else outputStr output
       outputStrLn (renderDoc (docAnswer answer))
+
+-- | Trace a checked file's inline queries, or an explicit query. Events and
+-- located errors go to stderr; ordinary answer/output text goes to stdout.
+runTraceFile :: FilePath -> Maybe String -> IO ()
+runTraceFile file queryText = do
+  loaded <- loadFile file
+  case loaded of
+    Left err -> die err
+    Right (program, inline) -> case traverse parseQuery queryText of
+      Left err -> die err
+      Right explicit -> do
+        let queries = maybe inline (: []) explicit
+        if null queries then die "No inline query. Usage: infera --trace FILE [\"query?\"]" else pure ()
+        summaries <- mapM (run program) queries
+        if any (\summary -> not (null (summaryErrors summary)) || summaryExhausted summary) summaries
+          then exitFailure else pure ()
+  where
+    die err = hPutStrLn stderr ("Error: " ++ err) >> exitFailure
+    run program query = do
+      loaded <- preloadFiles program (queryGoals query)
+      items <- consumeTrace (hPutStrLn stderr) (Trace.traceQuery loaded query)
+      let summary = summarizeSearch query items
+      mapM_ answer (summaryAnswers summary)
+      case summaryErrors summary of
+        err : _ -> hPutStrLn stderr ("Error: " ++ showSolveError err)
+        [] | null (summaryAnswers summary) && not (summaryExhausted summary) -> putStrLn "false."
+        [] -> pure ()
+      if summaryExhausted summary then hPutStrLn stderr "Search depth limit reached; the query is incomplete." else pure ()
+      pure summary
+    answer value = do
+      putStr (concatMap renderOutputEvent (answerOutput value))
+      putStrLn (showAnswer value)
+
+-- Consume the event stream as it is generated, retaining only the ordinary
+-- result stream required by the existing query summary renderer.
+consumeTrace :: Monad m => (String -> m ()) -> [Trace.TraceItem] -> m Search
+consumeTrace display = go []
+  where
+    go results [] = pure (reverse results)
+    go results (Trace.TraceEventItem event : rest) = display (Trace.renderTraceEvent event) >> go results rest
+    go results (Trace.TraceSearchItem item : rest) = go (item : results) rest

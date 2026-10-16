@@ -4,7 +4,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('fs')
 const path = require('path')
-const { tokenize, analyzeDocument, countArgs } = require('../server/analysis')
+const { tokenize, analyzeDocument, countArgs, predicateModifierPositions, IMPURE_BUILTIN_KEYS, TM } = require('../server/analysis')
 
 test('tokenizer: CLP operators are not comments', () => {
   const toks = tokenize('p X <- X #= 1, X #!= 2, X #< 3, X #> 0, X #<= 5, X #>= 4. # comment')
@@ -122,4 +122,91 @@ test('the shipped examples retain predicate symbols', () => {
     assert.ok(a.predicateDefs.size > 0, f)
     assert.ok(!Object.hasOwn(a, 'diagnostics'))
   }
+})
+
+test('predicate flags style resolved arities, not data atoms or another overload', () => {
+  const text = [
+    'p : unsafe (int: <=).',
+    'p : dynamic (int: <=) (int: =>).',
+    'p 1.', 'p 1 2.',
+    'both : unsafe dynamic.', 'both X.',
+    'main <- p 1, p 1 2, p, both 1, wrapper p, call p 1, call (p 1) 2.',
+    '# p 1, both 1', 'data "p both" p.',
+    'nt : unsafe (any: <=>) (any: <=>).', 'nt -> [p].',
+    'parse <- phrase nt "", emit nt.'
+  ].join('\n')
+  const a = analyzeDocument(text), mods = predicateModifierPositions(a)
+  const line = n => a.tokens.filter(t => t.line === n && t.type === 'atom')
+  const flags = t => mods.get(`${t.line}:${t.col}`) || 0
+  assert.equal(flags(line(2)[0]), TM.unsafe)
+  assert.equal(flags(line(3)[0]), TM.dynamic)
+  assert.equal(flags(line(5)[0]), TM.unsafe | TM.dynamic)
+  assert.deepEqual(line(6).filter(t => t.text === 'p').map(flags),
+    [TM.unsafe, TM.dynamic, 0, 0, TM.unsafe, TM.dynamic])
+  assert.equal(flags(line(6).find(t => t.text === 'both')), TM.unsafe | TM.dynamic)
+  assert.equal(flags(line(8).at(-1)), 0)
+  assert.equal(flags(line(10)[0]), TM.unsafe)
+  assert.deepEqual(line(11).filter(t => t.text === 'nt').map(flags), [TM.unsafe, TM.unsafe])
+  assert.equal(flags(line(11).find(t => t.text === 'emit')), TM.unsafe)
+})
+
+test('qualified and goal-taking calls preserve arity without treating templates as goals', () => {
+  const a = analyzeDocument('main <- m:p 1, call m:p 1, phrase (m:p 1) "", findall (p X) (m:p X) R.')
+  assert.deepEqual(a.qualifiedRefs.get('m').map(r => r.arity), [1, 1, 3, 1])
+  assert.equal(a.predicateRefs.has('p'), false, 'findall template is data')
+  const imported = analyzeDocument('p : unsafe (int: <=).\np : dynamic (int: <=) (any: <=>) (any: <=>).')
+  const mods = predicateModifierPositions(a, alias => alias === 'm' ? imported : null)
+  assert.deepEqual(a.qualifiedRefs.get('m').map(r => mods.get(`${r.predLoc.line}:${r.predLoc.col}`)),
+    [TM.unsafe, TM.unsafe, TM.dynamic, TM.unsafe])
+  assert.equal(predicateModifierPositions(a).size, 0)
+})
+
+test('effect styling agrees with compiler metadata and is arity aware, including DCG nl', () => {
+  const purity = fs.readFileSync(path.join(__dirname, '../../src/Infera/Purity.hs'), 'utf8')
+  const keys = [...purity.match(/impureBuiltinKeys =([\s\S]*?)\n  \]/)[1].matchAll(/\("([^"]+)", (\d+)\)/g)]
+    .map(m => `${m[1]}/${m[2]}`)
+  assert.deepEqual([...IMPURE_BUILTIN_KEYS].sort(), keys.sort())
+  const a = analyzeDocument('main <- write X, nl, !, write X Y.\nline -> nl, { nl }.')
+  const mods = predicateModifierPositions(a)
+  assert.deepEqual(a.predicateRefs.get('write').map(r => mods.get(`${r.line}:${r.col}`) || 0), [TM.unsafe, 0])
+  assert.deepEqual(a.predicateRefs.get('nl').map(r => mods.get(`${r.line}:${r.col}`) || 0), [TM.unsafe, 0, TM.unsafe])
+  const cut = a.tokens.find(t => t.type === 'bang')
+  assert.equal(mods.get(`${cut.line}:${cut.col}`), TM.unsafe)
+})
+
+test('goal-taking builtin overloads and DCG arities do not misclassify data atoms', () => {
+  const a = analyzeDocument([
+    'p : unsafe (any: <=>) (any: <=>).',
+    'main <- phrase p, emit p X, once (p X) Y, minimize X p Y.',
+    'grammar -> once p, phrase p, call p, { call p X Y }.'
+  ].join('\n'))
+  assert.deepEqual(a.predicateRefs.get('p').map(r => r.arity), [2, 2])
+  const mods = predicateModifierPositions(a)
+  for (const r of a.predicateRefs.get('p')) assert.equal(mods.get(`${r.line}:${r.col}`), TM.unsafe)
+  const data = a.tokens.filter(t => t.text === 'p' && t.line === 1)
+  assert.ok(data.every(t => !mods.has(`${t.line}:${t.col}`)))
+})
+
+test('flag styling is removed with edits and remains tolerant without producing diagnostics', () => {
+  const first = analyzeDocument('p : unsafe dynamic.\np X.\nmain <- p 1.')
+  assert.equal(predicateModifierPositions(first).size, 3)
+  for (const text of ['p X.\nmain <- p 1.', 'p : (', 'main <- call (', '# p unsafe dynamic']) {
+    const a = analyzeDocument(text)
+    assert.equal(predicateModifierPositions(a).size, 0)
+    assert.equal(Object.hasOwn(a, 'diagnostics'), false)
+  }
+})
+
+test('extension contributes overridable underline styles and visible compiler suggestions by default', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8'))
+  const lock = JSON.parse(fs.readFileSync(path.join(__dirname, '../package-lock.json'), 'utf8'))
+  assert.equal(manifest.version, '2.0.2')
+  assert.equal(lock.version, manifest.version)
+  assert.equal(lock.packages[''].version, manifest.version)
+  assert.equal(manifest.contributes.configuration.properties['infera.performanceHints'].default, true)
+  assert.deepEqual(manifest.contributes.semanticTokenModifiers.map(m => m.id), ['unsafe', 'dynamic'])
+  assert.equal(manifest.contributes.configurationDefaults['[infera]']['editor.semanticHighlighting.enabled'], true)
+  const rules = manifest.contributes.configurationDefaults['editor.semanticTokenColorCustomizations'].rules
+  assert.deepEqual(rules['*.unsafe:infera'], { underline: true })
+  assert.deepEqual(rules['*.dynamic:infera'], { underline: true })
 })

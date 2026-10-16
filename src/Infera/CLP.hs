@@ -27,6 +27,7 @@ module Infera.CLP
     Store (..),
     emptyStore,
     storeUnify,
+    applyBindings,
     storeBind,
     addRelation,
     addDiseq,
@@ -336,6 +337,21 @@ storeUnify st a b = case unify (stSubst st) a b of
      in if any (isConstrained st) bound
           then runPropagation (markDirty bound st')
           else Right (Just st')
+
+-- | Accept the actual reference writes from an external occurs-checked
+-- unifier. The caller owns binding validity and atomic rollback; this entry
+-- point preserves the persistent propagation index and wakes exactly the
+-- same changed-variable dependencies as 'storeUnify'. It deliberately does
+-- not execute a second unification or rebuild the constraint index.
+applyBindings :: [(VarId, Term)] -> Store -> Checked Store
+applyBindings changes st =
+  let bound = map fst changes
+      substitution = foldl' (\s (variable, term) -> IM.insert variable term s)
+        (stSubst st) changes
+      updated = st {stSubst = substitution}
+   in if any (isConstrained st) bound
+        then runPropagation (markDirty bound updated)
+        else Right (Just updated)
 
 -- | Bind a variable to an integer (used by labeling).
 storeBind :: Store -> VarId -> Integer -> Checked Store

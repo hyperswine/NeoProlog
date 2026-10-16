@@ -31,11 +31,12 @@ jobs:
         with:
           python-version: '3.x'
       - run: cabal update
-      - run: cabal build all --enable-tests
-      - run: cabal test all --test-show-details=direct
+      - run: cabal build all --enable-tests --enable-benchmarks --enable-optimization=2
+      - run: cabal test all --enable-benchmarks --enable-optimization=2 --test-show-details=direct
       - run: npm ci
         working-directory: lsp
-      - run: INFERA_BIN="$(cabal list-bin exe:infera)" npm test --prefix lsp
-      - run: python3 test/cli.py "$(cabal list-bin exe:infera)"
+      - run: INFERA_BIN="$(cabal list-bin exe:infera --enable-optimization=2)" npm test --prefix lsp
+      - run: python3 test/cli.py "$(cabal list-bin exe:infera --enable-optimization=2)"
       - run: python3 -m unittest discover -s test -p bench_harness_test.py
-      - run: INFERA_BIN="$(cabal list-bin exe:infera)" sh bench/run.sh --engine infera --case fib --runs 1 --warmup 0 --timeout 30 --json
+      - run: python3 bench/check-tail-memory.py "$(cabal list-bin bench:machine-tail --enable-optimization=2)" --quick --output /tmp/infera-tail-memory.jsonl
+      - run: INFERA_BIN="$(cabal list-bin exe:infera --enable-optimization=2)" sh bench/run.sh --engine infera --case fib --runs 1 --warmup 0 --timeout 30 --json

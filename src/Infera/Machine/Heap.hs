@@ -15,7 +15,8 @@
 -- opaque permits packed functor/argument cells in a later bytecode milestone.
 -- Every binding is trailed, including young variables: trail elision will need
 -- a separate proof covering all live rollback scopes. There is no untrailed
--- path compression, rational-tree unification, collector or control stack yet.
+-- path compression or rational-tree unification. Raw graph relocation lives
+-- here; the Control module owns collection safe points and live control roots.
 module Infera.Machine.Heap
   ( Heap,
     FrozenHeap,
@@ -25,9 +26,13 @@ module Infera.Machine.Heap
     HeapError (..),
     CellView (..),
     newHeap,
+    newHeapSuccessor,
     thawHeap,
     freezeHeap,
+    restoreHeap,
     emptyEnvironment,
+    environmentFromRoots,
+    copyReachable,
     newVariable,
     importTerm,
     importWithEnvironment,
@@ -37,15 +42,19 @@ module Infera.Machine.Heap
     view,
     viewRaw,
     referenceTarget,
+    rerootVariable,
     unify,
+    unifyWithChanges,
     checkpoint,
     rollback,
     heapSize,
     trailSize,
+    internSize,
+    forgetTrail,
   )
 where
 
-import Control.Monad (forM_, unless, when)
+import Control.Monad (foldM, forM_, unless, when)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.ST (ST)
@@ -86,10 +95,31 @@ data CellView
   | CompoundView !String [Address]
   deriving (Eq, Show)
 
-newtype Environment = Environment (IntMap Address)
+-- The greatest allocated root certifies the whole environment's allocation
+-- prefix. Heap cells are only appended or suffix-truncated, and a retained
+-- cell keeps its generation across bindings and rerooting. Consequently, in
+-- the same branch, an older root cannot become stale while this root survives.
+-- Keeping this witness avoids rescanning every source variable on each import.
+-- Divergent branches still obey the handle ownership contract above.
+data Environment = Environment !(IntMap Address) !(Maybe Address)
 
 emptyEnvironment :: Environment
-emptyEnvironment = Environment IM.empty
+emptyEnvironment = Environment IM.empty Nothing
+
+-- | Restore an activation environment from its existing raw variable roots.
+-- Bound variables retain a raw reference cell and are accepted. Every entry
+-- is validated before the constant-time allocation-prefix witness is made;
+-- constants and structure handles cannot serve as source variable roots.
+environmentFromRoots :: Heap s -> IntMap Address -> ST s (Either HeapError Environment)
+environmentFromRoots heap roots = runExceptT $ do
+  frontier <- foldM validate Nothing (IM.elems roots)
+  pure (Environment roots frontier)
+  where
+    validate previous address = do
+      cell <- readCell heap address
+      case cell of
+        Ref _ -> pure (Just (maybe address (max address) previous))
+        _ -> throwError IncompatibleBindings
 
 newtype ConstantId = ConstantId Int
   deriving (Eq)
@@ -117,7 +147,10 @@ data ConstantKey
 data Cell
   = Ref !Address
   | Con !ConstantId
-  | Structure !FunctorId [Address]
+  -- This flag means that the original constructor contains no variable
+  -- occurrences, not that its currently dereferenced arguments are ground.
+  -- Its immutable child graph cannot acquire a reference through a binding.
+  | Structure !FunctorId !Bool [Address]
 
 data Slot = Slot !Integer !Cell
 
@@ -251,6 +284,73 @@ truncatePaged buffer top = do
 newHeap :: ST s (Heap s)
 newHeap = Heap <$> newPaged <*> newPaged <*> newSTRef emptyInterns <*> newSTRef 1
 
+-- | Start an empty replacement heap without recycling generations allocated
+-- by its predecessor. A collector must stop using the old heap's handles and
+-- checkpoints before installing this heap. Frozen snapshots remain independent
+-- owners of the predecessor's immutable pages; this does not mutate them.
+-- Generations still do not establish ownership across divergent resumptions.
+newHeapSuccessor :: Heap s -> ST s (Heap s)
+newHeapSuccessor previous = do
+  serial <- readSTRef (nextSerial previous)
+  Heap <$> newPaged <*> newPaged <*> newSTRef emptyInterns <*> newSTRef serial
+
+-- | Copy precisely the raw graph reachable from these roots to a fresh
+-- successor heap. Repeated addresses, shared constructor suffixes, reference
+-- links and variable roots retain their identities under one relocation map.
+-- No term export or dereferencing expands the graph into a tree.
+--
+-- Copied bindings form the new heap's baseline with an empty trail. The caller
+-- must abandon active rollback checkpoints into the old heap; independently
+-- frozen owners remain valid. The old heap is never mutated, including on
+-- invalid input. Roots are returned in their supplied order, with duplicates.
+copyReachable :: Heap s -> [Address] -> ST s (Either HeapError (Heap s, [Address]))
+copyReachable previous roots = runExceptT $ do
+  next <- lift (newHeapSuccessor previous)
+  (relocation, copied) <- discover next Map.empty roots []
+  forM_ copied $ \(Address index generation, cell) -> do
+    relocated <- case cell of
+      Ref target -> Ref <$> relocate relocation target
+      Con ident -> do
+        value <- lift (getConstant previous ident)
+        ident' <- lift (internConstant next (constantKey value) value)
+        pure (Con ident')
+      Structure ident staticGround children -> do
+        (name, arity) <- lift (getFunctor previous ident)
+        ident' <- lift (internFunctor next name arity)
+        children' <- mapM (relocate relocation) children
+        pure (Structure ident' staticGround children')
+    -- Destination cells are private until the whole graph has been copied.
+    -- Initializing them directly creates no rollback history for the baseline.
+    lift (writePaged (heapCells next) index (Slot generation relocated))
+  relocatedRoots <- mapM (relocate relocation) roots
+  pure (next, relocatedRoots)
+  where
+    discover _ relocation [] copied = pure (relocation, copied)
+    discover next relocation (address : pending) copied
+      | Map.member address relocation = discover next relocation pending copied
+      | otherwise = do
+          cell <- readCell previous address
+          destination <- allocate next Ref
+          let updated = Map.insert address destination relocation
+              children = case cell of
+                Ref target -> [target]
+                Structure _ _ arguments -> arguments
+                Con _ -> []
+          updated `seq` discover next updated (children ++ pending)
+            ((destination, cell) : copied)
+    relocate :: Map Address Address -> Address -> HeapM s Address
+    relocate relocation address = case Map.lookup address relocation of
+      Just destination -> pure destination
+      Nothing -> throwError (InvalidAddress address)
+
+constantKey :: Constant -> ConstantKey
+constantKey value = case value of
+  AtomConstant scalar -> AtomKey scalar
+  IntegerConstant scalar -> IntegerKey scalar
+  FloatConstant scalar -> FloatKey (castDoubleToWord64 scalar)
+  CharConstant scalar -> CharKey scalar
+  StringConstant scalar -> StringKey scalar
+
 thawHeap :: FrozenHeap -> ST s (Heap s)
 thawHeap (FrozenHeap cells trail interns serial) =
   Heap <$> thawPaged cells <*> thawPaged trail <*> newSTRef interns <*> newSTRef serial
@@ -260,11 +360,46 @@ freezeHeap heap =
   FrozenHeap <$> freezePaged (heapCells heap) <*> freezePaged (heapTrail heap)
     <*> readSTRef (heapInterns heap) <*> readSTRef (nextSerial heap)
 
+-- | Install an immutable branch snapshot into an existing mutable heap.
+-- Every page is shared until its first subsequent write, exactly as for
+-- 'thawHeap'; no mutable array is retained by or aliases the snapshot. Cells,
+-- trail, interning tables and frontiers are replaced together, so checkpoints
+-- retained with this snapshot regain their original rollback lineage.
+--
+-- The caller must replace all active handles and checkpoints with the ones
+-- owned by the installed snapshot. Handles into the displaced branch remain
+-- valid only in a snapshot of that branch. Allocation serials never rewind:
+-- a later allocation cannot revive a discarded handle after repeated restores.
+-- As with 'thawHeap', independent snapshots do not establish global ownership.
+restoreHeap :: Heap s -> FrozenHeap -> ST s ()
+restoreHeap heap (FrozenHeap cells trail interns snapshotSerial) = do
+  previousSerial <- readSTRef (nextSerial heap)
+  restorePaged (heapCells heap) cells
+  restorePaged (heapTrail heap) trail
+  writeSTRef (heapInterns heap) interns
+  writeSTRef (nextSerial heap) (max previousSerial snapshotSerial)
+
+restorePaged :: Paged s a -> FrozenPaged a -> ST s ()
+restorePaged buffer (FrozenPaged top saved) = do
+  writeSTRef (pages buffer) (IM.map Shared saved)
+  writeSTRef (pagedTop buffer) top
+
 heapSize :: Heap s -> ST s Int
 heapSize = readSTRef . pagedTop . heapCells
 
 trailSize :: Heap s -> ST s Int
 trailSize = readSTRef . pagedTop . heapTrail
+
+internSize :: Heap s -> ST s (Int, Int)
+internSize heap = do
+  interns <- readSTRef (heapInterns heap)
+  pure (IM.size (constants interns), IM.size (functors interns))
+
+-- | Forget binding history when no surviving rollback checkpoint refers to
+-- this heap. This operation leaves current cells untouched. In particular,
+-- callers must not retain a checkpoint made before the history was dropped.
+forgetTrail :: Heap s -> ST s ()
+forgetTrail heap = truncatePaged (heapTrail heap) 0
 
 freshSerial :: Heap s -> ST s Integer
 freshSerial heap = do
@@ -332,6 +467,23 @@ referenceTarget heap address = runExceptT $ do
     Ref target -> Just target
     _ -> Nothing
 
+-- | Make a member of an existing free-variable class its representative.
+-- Startup substitutions may intentionally point a lower logical ID at a
+-- higher one. Reconciliation must preserve that identity rather than apply
+-- the normal unifier's ordering to an already accepted substitution. Both
+-- writes are trailed: breaking the desired member's link first prevents a
+-- cycle, and linking the old root then redirects every class member.
+rerootVariable :: Heap s -> Address -> ST s (Either HeapError ())
+rerootVariable heap address = atomic heap $ do
+  (root, cell) <- deref heap address
+  case cell of
+    Ref _
+      | root == address -> pure ()
+      | otherwise -> do
+          writeCell heap address (Ref address)
+          writeCell heap root (Ref address)
+    _ -> throwError IncompatibleBindings
+
 viewCell :: Heap s -> Address -> Cell -> HeapM s CellView
 viewCell heap target cell =
   case cell of
@@ -344,7 +496,7 @@ viewCell heap target cell =
         FloatConstant scalar -> FloatView scalar
         CharConstant scalar -> CharacterView scalar
         StringConstant scalar -> StringView scalar
-    Structure ident children -> do
+    Structure ident _ children -> do
       (name, _) <- lift (getFunctor heap ident)
       pure (CompoundView name children)
 
@@ -442,23 +594,26 @@ importTerm heap term = fmap (fmap fst) (importWithEnvironment heap emptyEnvironm
 -- | Instantiate into an explicit activation environment. Share the returned
 -- environment when importing a clause head and its body or several roots.
 importWithEnvironment :: Heap s -> Environment -> Term -> ST s (Either HeapError (Address, Environment))
-importWithEnvironment heap (Environment initial) term = atomic heap $ do
+importWithEnvironment heap initial@(Environment _ frontier) term = atomic heap $ do
   -- Validate even unused entries, so a discarded environment cannot appear
   -- to work until one particular source variable happens to be encountered.
-  forM_ (IM.elems initial) (readCell heap)
-  (address, environment) <- importInto initial term
-  pure (address, Environment environment)
+  -- Under branch ownership, the newest root validates every earlier root.
+  forM_ frontier (readCell heap)
+  (address, environment, _) <- importInto initial term
+  pure (address, environment)
   where
-    importInto environment (Var variable) = case IM.lookup variable environment of
-      Just address -> pure (address, environment)
+    importInto environment@(Environment bindings _) (Var variable) = case IM.lookup variable bindings of
+      -- A source variable remains dynamic even if it is bound right now:
+      -- rollback can expose it again after this structure has been imported.
+      Just address -> pure (address, environment, False)
       Nothing -> do
         address <- allocate heap Ref
-        pure (address, IM.insert variable address environment)
+        pure (address, Environment (IM.insert variable address bindings) (Just address), False)
     importInto environment (Compound name arguments) = do
-      (addresses, final) <- importArguments environment arguments
+      (addresses, final, staticGround) <- importArguments environment arguments
       ident <- lift (internFunctor heap name (length addresses))
-      address <- allocate heap (const (Structure ident addresses))
-      pure (address, final)
+      address <- allocate heap (const (Structure ident staticGround addresses))
+      pure (address, final, staticGround)
     importInto environment scalar = do
       (key, value) <- case scalar of
         Atom value -> pure (AtomKey value, AtomConstant value)
@@ -468,12 +623,12 @@ importWithEnvironment heap (Environment initial) term = atomic heap $ do
         StrLit value -> pure (StringKey value, StringConstant value)
       ident <- lift (internConstant heap key value)
       address <- allocate heap (const (Con ident))
-      pure (address, environment)
-    importArguments environment [] = pure ([], environment)
+      pure (address, environment, True)
+    importArguments environment [] = pure ([], environment, True)
     importArguments environment (argument : rest) = do
-      (address, next) <- importInto environment argument
-      (addresses, final) <- importArguments next rest
-      pure (address : addresses, final)
+      (address, next, staticArgument) <- importInto environment argument
+      (addresses, final, staticRest) <- importArguments next rest
+      pure (address : addresses, final, staticArgument && staticRest)
 
 getConstant :: Heap s -> ConstantId -> ST s Constant
 getConstant heap (ConstantId ident) = do
@@ -508,7 +663,8 @@ occursIn heap variable root = visit IS.empty [root]
         else if IS.member index seen
           then visit seen rest
           else case cell of
-            Structure _ arguments -> visit (IS.insert index seen) (arguments ++ rest)
+            Structure _ True _ -> visit (IS.insert index seen) rest
+            Structure _ False arguments -> visit (IS.insert index seen) (arguments ++ rest)
             _ -> visit (IS.insert index seen) rest
 
 -- | Occurs-checked unification, atomic on mismatch and invalid handles.
@@ -516,40 +672,51 @@ occursIn heap variable root = visit IS.empty [root]
 -- No same-address shortcut applies to constants or structures: NaN does not
 -- unify with itself, even when nested in a shared structure.
 unify :: Heap s -> Address -> Address -> ST s (Either HeapError Bool)
-unify heap left right = do
+unify heap left right = fmap (fmap fst) (unifyWithChanges compare heap left right)
+
+-- | Unify using the caller's stable variable ordering, returning every
+-- reference written by a successful operation. Logical IDs can be allocated
+-- out of order after an opaque sub-search, so an embedding must not assume
+-- allocation age is always its variable order. Failed operations return no
+-- changes and restore the heap and trail atomically.
+unifyWithChanges :: (Address -> Address -> Ordering) -> Heap s -> Address -> Address -> ST s (Either HeapError (Bool, [Address]))
+unifyWithChanges order heap left right = do
   mark <- checkpoint heap
-  result <- runExceptT (loop [(left, right)])
+  result <- runExceptT (loop [] [(left, right)])
   case result of
-    Right True -> pure result
+    Right (True, _) -> pure result
     _ -> do
       restored <- rollback heap mark
       pure $ case restored of
         Left err -> Left err
         Right () -> result
   where
-    loop [] = pure True
-    loop ((a, b) : rest) = do
+    loop changed [] = pure (True, reverse changed)
+    loop changed ((a, b) : rest) = do
       (a', ac) <- deref heap a
       (b', bc) <- deref heap b
       case (ac, bc) of
         (Ref _, Ref _)
-          | a' == b' -> loop rest
-          | a' > b' -> writeCell heap a' (Ref b') >> loop rest
-          | otherwise -> writeCell heap b' (Ref a') >> loop rest
-        (Ref _, _) -> bind a' b' rest
-        (_, Ref _) -> bind b' a' rest
+          | a' == b' -> loop changed rest
+          | order a' b' == GT -> writeCell heap a' (Ref b') >> loop (a' : changed) rest
+          | otherwise -> writeCell heap b' (Ref a') >> loop (b' : changed) rest
+        (Ref _, _) -> bind changed a' b' bc rest
+        (_, Ref _) -> bind changed b' a' ac rest
         (Con ai, Con bi) -> do
           av <- lift (getConstant heap ai)
           bv <- lift (getConstant heap bi)
-          if constantEqual av bv then loop rest else pure False
-        (Structure af as, Structure bf bs)
-          | af == bf -> loop (zip as bs ++ rest)
-        _ -> pure False
-    bind variable target rest = do
-      cyclic <- occursIn heap variable target
+          if constantEqual av bv then loop changed rest else pure (False, [])
+        (Structure af _ as, Structure bf _ bs)
+          | af == bf -> loop changed (zip as bs ++ rest)
+        _ -> pure (False, [])
+    bind changed variable target cell rest = do
+      cyclic <- case cell of
+        Con _ -> pure False
+        Structure _ True _ -> pure False
+        _ -> occursIn heap variable target
       if cyclic
-        then pure False
-        else writeCell heap variable (Ref target) >> loop rest
+        then pure (False, [])
+        else writeCell heap variable (Ref target) >> loop (variable : changed) rest
 
 -- | Export roots as ordinary immutable terms. Free variables are numbered in
 -- first-occurrence order across the entire root list, preserving all aliases.
@@ -579,7 +746,7 @@ exportTerms heap roots = runExceptT $ fst <$> exportMany Map.empty roots
                 CharConstant value -> CharLit value
                 StringConstant value -> StrLit value
           pure (term, variables)
-        Structure ident arguments -> do
+        Structure ident _ arguments -> do
           (name, _) <- lift (getFunctor heap ident)
           (terms, next) <- exportMany variables arguments
           pure (Compound name terms, next)

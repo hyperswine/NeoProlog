@@ -27,6 +27,7 @@ import qualified Data.IntMap.Strict as IM
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Infera.Infer (inferProgram)
+import Infera.Machine.Trace.Types (sourceMap)
 import Infera.Purity (describeViolation, programViolations)
 import Infera.Program
 import Infera.Syntax
@@ -188,26 +189,41 @@ programGoals prog = concat [clauseBody cl | p <- programPreds prog, cl <- IM.ele
 
 -- | Load program source text (with imports) into an inferred program.
 loadSource :: ModuleConf -> String -> IO (Either String (Program, [Query]))
-loadSource conf src = case parseFile src of
-  Left err -> return (Left err)
+loadSource conf src = case parseLocatedFile "<source>" src of
+  Left (_, err) -> pure (Left err)
   Right items -> do
-    res <- processTopLevels conf items
-    case res of
-      Left err -> return (Left err)
-      Right (progItems, qs) -> case buildChecked progItems of
-        Left err -> return (Left err)
+    expanded <- CE.try (expandLocatedItems readItems conf [] items)
+    case expanded of
+      Left err -> pure (Left (show (err :: CE.IOException)))
+      Right (Left (_, err)) -> pure (Left err)
+      Right (Right located) -> case buildChecked (map locatedItem located) of
+        Left err -> pure (Left err)
         Right prog -> do
-          prog' <- preloadFiles prog (programGoals prog ++ concatMap queryGoals qs)
-          return (Right (prog', qs))
+          let queries = [query | item <- located, TLQuery query <- [locatedItem item]]
+              sourced = prog {progSources = sourceMap located}
+          loaded <- preloadFiles sourced (programGoals sourced ++ concatMap queryGoals queries)
+          pure (Right (loaded, queries))
+  where
+    readItems visited file = do
+      result <- CE.try (readFile file >>= \text -> length text `seq` pure text)
+      case result of
+        Left err -> pure (Left (SourceSpan file 1 1 1 2, show (err :: CE.IOException)))
+        Right text -> case parseLocatedFile file text of
+          Left err -> pure (Left err)
+          Right located -> expandLocatedItems readItems conf visited located
 
 loadFile :: FilePath -> IO (Either String (Program, [Query]))
 loadFile path = do
-  result <- CE.try (readFile path) :: IO (Either CE.SomeException String)
+  result <- loadLocatedFile path
   case result of
-    Left ex -> return (Left (show ex))
-    Right contents -> do
-      conf <- loadConf
-      loadSource conf contents
+    Left (_, err) -> pure (Left err)
+    Right located -> case buildChecked (map locatedItem located) of
+      Left err -> pure (Left err)
+      Right program -> do
+        let queries = [query | item <- located, TLQuery query <- [locatedItem item]]
+            sourced = program {progSources = sourceMap located}
+        loaded <- preloadFiles sourced (programGoals sourced ++ concatMap queryGoals queries)
+        pure (Right (loaded, queries))
 
 -- | Resolve imports while retaining the owning file and item range. Import
 -- queries are ignored, just as they are by 'loadSource'.
@@ -238,9 +254,17 @@ loadLocatedWithSources sources path = do
         Left ex -> pure (Left (SourceSpan file 1 1 1 2, show (ex :: CE.IOException)))
         Right src -> case parseLocatedFile file src of
           Left err -> pure (Left err)
-          Right items -> foldM (step overrides conf visited) (Right []) items
-    step _ _ _ (Left err) _ = pure (Left err)
-    step overrides conf visited (Right acc) item = case locatedItem item of
+          Right items -> expandLocatedItems (expand overrides conf) conf visited items
+
+-- The ordinary loader and editor snapshots share the same expansion order
+-- and qualification. Clause source ordinals must describe that exact order.
+expandLocatedItems :: ([String] -> FilePath -> IO (Either (SourceSpan, String) [LocatedTopLevel]))
+  -> ModuleConf -> [String] -> [LocatedTopLevel]
+  -> IO (Either (SourceSpan, String) [LocatedTopLevel])
+expandLocatedItems readItems conf visited = foldM step (Right [])
+  where
+    step (Left err) _ = pure (Left err)
+    step (Right acc) item = case locatedItem item of
       TLDirective [Compound "import" [StrLit ref]] ->
         case parseModRef ref of
           Nothing -> pure (Left (locatedSpan item, "Invalid module reference: " ++ ref))
@@ -250,12 +274,16 @@ loadLocatedWithSources sources path = do
               | ref `elem` visited -> pure (Right acc)
               | otherwise -> do
                   absolute <- canonicalizePath file
-                  nested <- expand overrides conf (ref : visited) absolute
+                  nested <- readItems (ref : visited) absolute
                   pure $ do
                     imported <- nested
                     let own = [i | i <- imported, case locatedItem i of TLQuery _ -> False; _ -> True]
                         known = definedNames (map locatedItem own)
-                    pure (acc ++ [i {locatedItem = qualifyItem name known (locatedItem i)} | i <- own])
+                    pure (acc ++ [i
+                      { locatedItem = qualifyItem name known (locatedItem i),
+                        locatedGoalSpans = [(qualifyTerm name known term, loc)
+                          | (term, loc) <- locatedGoalSpans i]
+                      } | i <- own])
       TLDirective goals
         | Nothing <- addDirective goals emptyProgram ->
             pure (Left (locatedSpan item, "Unknown directive: " ++ show goals))

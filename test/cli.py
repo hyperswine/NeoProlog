@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
         if expected_code:
             assert any(d["code"] == expected_code for d in rows), rows
         for d in rows:
-            assert d["severity"] in ("error", "warning")
+            assert d["severity"] in ("error", "warning", "information")
             assert d["range"]["start"]["line"] >= 0
             assert d["range"]["start"]["character"] >= 0
         return rows
@@ -38,6 +38,17 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     check("p X.\n", "singleton-variable", success=True)
     check("p : det (int: <=).\np 2.\n> p (1 + 1)?\n", success=True)
     check("p X <- call X.\n", success=True)
+    rows = check("walk X <- walk X, true.\n", "perf-non-tail-recursion", success=True)
+    suggestion = next(d for d in rows if d["code"] == "perf-non-tail-recursion")
+    assert suggestion["severity"] == "information", rows
+    assert suggestion["range"] == {"start": {"line": 0, "character": 10},
+                                   "end": {"line": 0, "character": 14}}, rows
+    target = root / "main.nprolog"
+    text_check = subprocess.run([binary, "check", str(target)], cwd=root,
+                                capture_output=True, text=True, timeout=20)
+    assert text_check.returncode == 0 and "information [perf-non-tail-recursion]" in text_check.stderr
+    assert ": ok" in text_check.stdout, text_check
+    check("fresh <- label [X].\n", "perf-unbounded-labeling", success=True)
     for goal in ["once missing", "not missing", "findall X (missing X) _",
                  "forall true missing", "call missing", "phrase missing []", "minimize C (missing C)"]:
         check(f"bad <- {goal}.\n", "undefined-predicate")
@@ -50,6 +61,11 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     assert rows[0]["file"] == str(imported), rows
     imported.write_text("greet.\n")
     check('<- import "lib#test".\n> lib:greet?\n', success=True)
+    imported.write_text("walk X <- walk X, true.\n")
+    rows = check('<- import "lib#test".\n> lib:walk 1?\n', "perf-non-tail-recursion", success=True)
+    suggestion = next(d for d in rows if d["code"] == "perf-non-tail-recursion")
+    assert suggestion["file"] == str(imported), rows
+    assert suggestion["range"]["start"] == {"line": 0, "character": 10}, rows
     imported.write_text("greet <- .\n")
     rows = check('<- import "lib#test".\n', "load-error")
     assert rows[0]["file"] == str(imported), rows
@@ -95,6 +111,61 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
                                 capture_output=True, text=True)
         assert result.returncode == 1 and "Usage:" in result.stderr, result
     print("Live-buffer diagnostics acceptance passed")
+
+    # The tracing consumer uses the same answer stream. Events are opt-in and
+    # CLI tracing leaves ordinary answer/output text on stdout.
+    traced_file = root / "trace.infera"
+    traced_source = "<- notable.\nroot X <- choose X.\nchoose a.\nchoose b.\n"
+    traced_file.write_text(traced_source + "> root X?\n")
+    for arguments in [["--trace", str(traced_file), "root X?"],
+                      ["--trace", str(traced_file)]]:
+        result = subprocess.run([binary, *arguments], cwd=root, capture_output=True,
+                                text=True, timeout=20)
+        assert result.returncode == 0, result
+        assert result.stdout.splitlines() == ["X = a", "X = b"], result
+        for port in ["Call", "Exit", "Redo"]:
+            assert port in result.stderr, result
+        assert str(traced_file) in result.stderr and "root/1" in result.stderr, result
+        assert "Call" not in result.stdout, result
+
+    result = subprocess.run([binary], cwd=root,
+                            input=f":load {traced_file}\n:trace root X?\n:quit\n",
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0 and "Call root" in result.stdout, result
+    assert "Exit root" in result.stdout and "X = a" in result.stdout and "X = b" in result.stdout, result
+    result = subprocess.run([binary], cwd=root,
+                            input="p a.\np b.\n:trace p X?\n:quit\n",
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0 and "<repl>:" in result.stdout, result
+    assert "X = a" in result.stdout and "X = b" in result.stdout, result
+
+    traced_file.write_text("<- notable.\nouter <- inner.\ninner <-\n  X is 1 / 0.\n")
+    result = subprocess.run([binary, "--trace", str(traced_file), "outer?"], cwd=root,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1 and "Exception" in result.stderr, result
+    assert "division by zero" in result.stderr and f"{traced_file}:4:" in result.stderr, result
+    assert "outer/0" in result.stderr and "inner/0" in result.stderr, result
+    assert result.stdout == "", result
+    imported.write_text("greet <-\n  X is 1 / 0.\n")
+    traced_file.write_text('<- import "lib#test".\n> lib:greet?\n')
+    result = subprocess.run([binary, "--trace", str(traced_file)], cwd=root,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1 and f"{imported}:2:" in result.stderr, result
+    imported.write_text("greet : table.\ngreet <- helper.\nhelper <-\n  X is 1 / 0.\n")
+    result = subprocess.run([binary, "--trace", str(traced_file)], cwd=root,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1 and f"{imported}:4:" in result.stderr, result
+    assert "lib:helper/0" in result.stderr and "lib:greet/0" in result.stderr, result
+
+    traced_file.write_text("p a.\n")
+    result = subprocess.run([binary, "--trace", str(traced_file)], cwd=root,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1 and "No inline query" in result.stderr, result
+    for arguments in [["--trace"], ["--trace", str(traced_file), "p X?", "extra"]]:
+        result = subprocess.run([binary, *arguments], cwd=root, capture_output=True,
+                                text=True, timeout=20)
+        assert result.returncode == 1 and "Usage:" in result.stderr, result
+    print("Trace CLI, REPL and located runtime-error acceptance passed")
 
     examples = Path(__file__).resolve().parent.parent / "examples"
     (root / "neoprolog.conf").write_text(

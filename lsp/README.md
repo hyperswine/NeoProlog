@@ -4,7 +4,11 @@ Language support for [Infera v2](https://github.com/hyperswine/NeoProlog)
 (`.nprolog`, `.infera`).
 
 - Syntax highlighting (TextMate grammar plus semantic tokens: clause heads,
-  declarations, sorts, modes, module namespaces, queries).
+  declarations, sorts, modes, module namespaces, queries). Declared `unsafe`
+  and `dynamic` predicate names are underlined at declarations, heads and
+  resolved calls, including imported predicates and statically known `call` or
+  `phrase` targets. Effectful built-in calls are also underlined. Overloads are
+  distinguished by arity; strings, comments and ordinary data atoms are excluded.
 - Hover: built-in docs, predicate clause counts and declared signatures,
   declaration keywords, imported modules.
 - Go to definition / find references / document symbols, including
@@ -19,6 +23,11 @@ Language support for [Infera v2](https://github.com/hyperswine/NeoProlog)
   Messages, codes, severities and source ranges match command-line checks.
   Imported errors link to their owning file, and superseded checks are cancelled.
   Untitled buffers use the workspace as their import context.
+- Compiler performance suggestions use informational diagnostics, with the
+  editor's blue styling. They suggest opportunities such as tail recursion,
+  posting constraints before labeling, and useful clause indexing; they do not
+  change whether a program passes checking. `infera.performanceHints` hides
+  these suggestions independently of correctness diagnostics.
 - A missing, incompatible or failing compiler produces an explicit availability
   warning. JavaScript supplies navigation and highlighting, with no independent
   validation or fallback diagnostic rules.
@@ -66,7 +75,17 @@ entire Minesweeper example against both grammar scopes and LSP semantic tokens.
 | `infera.executable` | `infera` | binary used for `infera check` |
 | `infera.checkOnSave` | `true` | run the compiler check on save |
 | `infera.checkOnChange` | `true` | run the compiler check on unsaved edits, after a short debounce |
+| `infera.performanceHints` | `true` | show compiler suggestions whose code begins with `perf-` |
 
 Opening a document checks it when either setting is enabled. Both can be
 disabled to turn off diagnostics without changing highlighting or navigation.
 The compiler must support `check --json --stdin` and `--buffer` source snapshots.
+
+The extension enables semantic highlighting for Infera and contributes underline
+defaults for `*.unsafe:infera` and `*.dynamic:infera`. Themes and user settings can
+override these styles through `editor.semanticTokenColorCustomizations`; turning
+off `editor.semanticHighlighting.enabled` also removes semantic underlines.
+These markers describe declarations and effects, without adding warnings for
+intentional use of `unsafe` or `dynamic`. Diagnostic colors follow the active
+theme and editor settings. See VS Code's [semantic highlighting guide](https://code.visualstudio.com/api/language-extensions/semantic-highlight-guide#theming)
+for supported style overrides.

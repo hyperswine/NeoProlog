@@ -28,7 +28,7 @@ const { execFile } = require('child_process')
 const { pathToFileURL, fileURLToPath } = require('url')
 
 const analysis = require('./analysis')
-const { compilerDiagnostics } = require('./checker')
+const { compilerDiagnostics, visibleDiagnostics } = require('./checker')
 const { tokenize, analyzeDocument, BUILTIN_DOCS, DECL_DOCS, BUILTIN_PREDICATES, KEYWORD_ATOMS, DET_WORDS, FLAG_WORDS, SORT_WORDS, TOKEN_TYPES, TOKEN_MODIFIERS, TT, TM } = analysis
 
 const connection = createConnection(ProposedFeatures.all)
@@ -36,9 +36,10 @@ const documents = new TextDocuments(TextDocument)
 
 let hasConfigurationCapability = false
 let hasWorkspaceFolderCapability = false
+let hasSemanticTokenRefreshCapability = false
 const workspaceFolderPaths = []
 
-const DEFAULT_SETTINGS = { executable: 'infera', checkOnSave: true, checkOnChange: true }
+const DEFAULT_SETTINGS = { executable: 'infera', checkOnSave: true, checkOnChange: true, performanceHints: true }
 let globalSettings = { ...DEFAULT_SETTINGS }
 
 // ─── neoprolog.conf ────────────────────────────────────────────────────────────
@@ -98,6 +99,8 @@ function getModuleConf(filePath) {
 const externalCache = new Map()
 
 function getExternalAnalysis(absPath) {
+  const open = documents.get(pathToUri(absPath))
+  if (open) return getAnalysis(open.uri) || refreshDocument(open)
   if (externalCache.has(absPath)) return externalCache.get(absPath)
   let text
   try { text = fs.readFileSync(absPath, 'utf8') } catch { return null }
@@ -222,7 +225,7 @@ async function runChecker(uri, run, reason) {
           if (err && (err.killed || typeof err.code !== 'number')) throw err
           const diags = compilerDiagnostics(stdout, filePath)
           if (err && !diags.some(d => d.severity === DiagnosticSeverity.Error)) throw err
-          checkerDiagnostics.set(uri, diags)
+          checkerDiagnostics.set(uri, visibleDiagnostics(diags, settings))
           publish(uri)
         } catch (failure) {
           connection.console.error(`infera check --json failed: ${stderr || failure.message}`)
@@ -284,9 +287,13 @@ function describeDefs(name, defs, decls, fileLabel) {
 
 // ─── Semantic tokens ───────────────────────────────────────────────────────────
 
-function buildSemanticTokens(a) {
+function buildSemanticTokens(a, filePath) {
   const { tokens, headPositions, queryPositions, namespacePositions, qualColonPositions, importKeyPositions, declNamePositions, declWordKinds, directivePositions } = a
   const data = []
+  const predicateMods = analysis.predicateModifierPositions(a, alias => {
+    const resolved = resolveModuleFile(alias, a.imports, filePath)
+    return resolved ? getExternalAnalysis(resolved) : null
+  })
   let prevLine = 0, prevCol = 0
   function push(line, col, length, type, mods) {
     const dl = line - prevLine
@@ -313,7 +320,7 @@ function buildSemanticTokens(a) {
       case 'anon': push(tok.line, tok.col, len, TT.parameter, 0); break
       case 'neck':
       case 'dcgneck':
-      case 'bang': push(tok.line, tok.col, len, TT.keyword, 0); break
+      case 'bang': push(tok.line, tok.col, len, TT.keyword, predicateMods.get(key) || 0); break
       case 'colon':
         push(tok.line, tok.col, len, qualColonPositions.has(key) ? TT.operator : TT.keyword, 0)
         break
@@ -329,13 +336,13 @@ function buildSemanticTokens(a) {
         break
       case 'atom':
         if (importKeyPositions.has(key) || directivePositions.has(key) || KEYWORD_ATOMS.has(tok.text)) {
-          push(tok.line, tok.col, len, TT.keyword, 0)
+          push(tok.line, tok.col, len, TT.keyword, predicateMods.get(key) || 0)
         } else if (namespacePositions.has(key)) {
           push(tok.line, tok.col, len, TT.namespace, 0)
         } else if (headPositions.has(key) || declNamePositions.has(key)) {
-          push(tok.line, tok.col, len, TT.function, TM.declaration)
+          push(tok.line, tok.col, len, TT.function, TM.declaration | (predicateMods.get(key) || 0))
         } else {
-          push(tok.line, tok.col, len, TT.function, 0)
+          push(tok.line, tok.col, len, TT.function, predicateMods.get(key) || 0)
         }
         break
       default: break
@@ -350,6 +357,7 @@ connection.onInitialize(params => {
   const caps = params.capabilities
   hasConfigurationCapability = !!(caps.workspace && caps.workspace.configuration)
   hasWorkspaceFolderCapability = !!(caps.workspace && caps.workspace.workspaceFolders)
+  hasSemanticTokenRefreshCapability = !!caps.workspace?.semanticTokens?.refreshSupport
   if (params.workspaceFolders) {
     for (const f of params.workspaceFolders) {
       const p = uriToPath(f.uri)
@@ -409,6 +417,7 @@ documents.onDidChangeContent(change => {
   const p = uriToPath(change.document.uri)
   if (p) externalCache.delete(p)
   refreshDocument(change.document)
+  refreshSemanticTokens()
   const initial = !documentVersions.has(change.document.uri)
   documentVersions.set(change.document.uri, change.document.version)
   queueCheck(change.document.uri, initial ? 'open' : 'change')
@@ -434,6 +443,7 @@ documents.onDidClose(e => {
   invalidateCheck(e.document.uri)
   checkerRuns.delete(e.document.uri)
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] })
+  refreshSemanticTokens()
   for (const doc of documents.all()) queueCheck(doc.uri, 'open')
 })
 
@@ -441,7 +451,9 @@ connection.onDidChangeWatchedFiles(event => {
   for (const change of event.changes) {
     const p = uriToPath(change.uri)
     if (p && CONF_NAMES.includes(path.basename(p))) confCache.delete(p)
+    if (p) externalCache.delete(p)
   }
+  refreshSemanticTokens()
   for (const doc of documents.all()) queueCheck(doc.uri, 'open')
 })
 
@@ -653,8 +665,14 @@ connection.languages.semanticTokens.on(({ textDocument }) => {
   if (!document) return { data: [] }
   let a = getAnalysis(textDocument.uri)
   if (!a) a = refreshDocument(document)
-  return { data: buildSemanticTokens(a) }
+  return { data: buildSemanticTokens(a, uriToPath(textDocument.uri)) }
 })
+
+function refreshSemanticTokens() {
+  if (hasSemanticTokenRefreshCapability) {
+    connection.languages.semanticTokens.refresh().catch(() => {})
+  }
+}
 
 documents.listen(connection)
 connection.listen()

@@ -37,6 +37,7 @@ import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Infera.Error (PredKey)
+import Infera.Machine.Trace.Types (SourceMap, emptySourceMap)
 import Infera.Syntax
 
 -- ─── INDEXING ────────────────────────────────────────────────────────────────
@@ -158,12 +159,15 @@ data Program = Program
     progFiles :: Map String String,
     -- | Global defaults set by @<- table.@ / @<- notable.@ etc.
     progTableDefault :: Bool,
-    progIndexDefault :: Bool
+    progIndexDefault :: Bool,
+    -- | Original clause/goal identities. Runtime tracing keeps this metadata
+    -- separate from the term templates and never changes public errors.
+    progSources :: SourceMap
   }
   deriving (Show)
 
 emptyProgram :: Program
-emptyProgram = Program Map.empty [] Map.empty Map.empty True True
+emptyProgram = Program Map.empty [] Map.empty Map.empty True True emptySourceMap
 
 lookupPred :: PredKey -> Program -> Maybe Pred
 lookupPred k = Map.lookup k . progPreds

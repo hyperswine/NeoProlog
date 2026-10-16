@@ -41,6 +41,9 @@ main = do
   args <- getArgs
   case args of
     ("reg" : paths) -> mapM_ registerModule paths
+    ["--trace", file] -> runTraceFile file Nothing
+    ["--trace", file, query] -> runTraceFile file (Just query)
+    ("--trace" : _) -> hPutStrLn stderr "Usage: infera --trace FILE [\"query?\"]" >> exitFailure
     ("check" : "--json" : "--stdin" : path : buffers) -> checkBuffer True path buffers
     ("check" : "--stdin" : path : buffers) -> checkBuffer False path buffers
     ["check", "--json", "--stdin"] -> checkUsage

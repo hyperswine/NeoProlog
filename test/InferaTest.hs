@@ -322,8 +322,15 @@ prop_engine_strings = unit $ do
 
 prop_engine_depth_limit :: Property
 prop_engine_depth_limit = unit $ do
-  let prog = "loop : notable.\nloop X <- loop X."
-  assertAnswers prog "loop 1?" ["Search depth limit reached; the query was not proven false."]
+  -- Eligible tail calls deliberately have no artificial nesting bound at the
+  -- query facade. Explicit-fuel clients still observe incomplete execution.
+  program <- evalEither (loadProgramText "loop : notable.\nloop X <- loop X.")
+  query <- evalEither (parseQuery "loop 1?")
+  let summary = summarizeSearch query (solveGoals (mkEnv program) 8
+        (initialState (queryNVars query)) (queryGoals query))
+  summaryAnswers summary === []
+  summaryErrors summary === []
+  assert (summaryExhausted summary)
 
 -- ---------------------------------------------------------------------------
 -- Declarations: modes, sorts, determinism

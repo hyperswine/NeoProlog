@@ -17,10 +17,23 @@ copyright:          2025 Jasen Qin
 category:           Language
 build-type:         Simple
 extra-doc-files:    README.md docs/engine-roadmap.md
+                    docs/performance.md docs/performance-2026-10-15.jsonl
+                    docs/performance-step1-2026-10-16.jsonl
                     docs/engine-baseline-2026-10-16.jsonl
+                    docs/engine-native-clp-2026-10-16.tsv
+                    docs/engine-tail-2026-10-16.jsonl
+                    docs/engine-tail-breadboard-2026-10-16.tsv
+                    docs/engine-tail-structured-2026-10-16.jsonl
+                    docs/engine-structured-tail-breadboard-2026-10-16.tsv
+                    docs/engine-step1-acceptance-2026-10-16.md
+                    docs/engine-step1-tail-2026-10-16.jsonl
+                    docs/engine-step1-breadboard-2026-10-16.tsv
+                    docs/engine-step1-cli-2026-10-16.jsonl
+                    docs/engine-step1-cli-before-tail-retries-2026-10-16.jsonl
+                    docs/engine-step1-nrev-before-tail-retries-2026-10-16.jsonl
 extra-source-files: examples/*.nprolog test/cli.py test/bench.py
                     test/bench_harness_test.py bench/run.sh bench/run.py
-                    bench/bench.nprolog bench/bench.pl
+                    bench/bench.nprolog bench/bench.pl bench/check-tail-memory.py
 tested-with:        GHC == 9.8.2
 
 source-repository head
@@ -51,12 +64,19 @@ library
         Infera.Machine.Heap
         Infera.Machine.Bridge
         Infera.Machine.Control
+        Infera.Machine.CLP
+        Infera.Machine.Table
+        Infera.Machine.Tail
+        Infera.Machine.Builtins
+        Infera.Machine.Trace
+        Infera.Machine.Trace.Types
         Infera.Arith
         Infera.CLP
         Infera.Program
         Infera.Infer
         Infera.Purity
         Infera.Engine
+        Infera.Engine.Reference
         Infera.Module
         Infera.Repl
     other-modules:    Infera.Engine.Contracts
@@ -95,8 +115,17 @@ test-suite infera-test
     other-modules:    InferaTest CorrectnessTest MinesweeperTest InferenceTest
                       CLPPerformanceTest ReferenceCLP BreadboardTest TablingTest
                       MachineHeapTest MachineControlTest MachineSubsearchTest
+                      MachineCLPTest MachineBreadboardTest
+                      MachineTailTest
+                      MachineReclaimTest
+                      PerformanceDiagnosticTest
+                      MachineStructuredTailTest
+                      MachineBuiltinTest MachineTableTest MachineSnapshotTest
+                      MachineGeneralTailTest MachineTailProofTest MachineTraceTest
+                      MachineGraphReuseTest MachineEnvironmentTest MachineGeneralReclaimTest
+                      MachineInternalTailTest
     default-language: Haskell2010
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1"
     build-depends:
         base,
         containers,
@@ -104,3 +133,21 @@ test-suite infera-test
         filepath,
         hedgehog   >= 1.7,
         infera
+
+benchmark machine-breadboard
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   bench
+    main-is:          machine-breadboard.hs
+    default-language: Haskell2010
+    ghc-options:      -O2 -rtsopts
+    build-depends:    base, infera
+
+benchmark machine-tail
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   bench
+    main-is:          machine-tail.hs
+    default-language: Haskell2010
+    ghc-options:      -O2 -rtsopts
+    build-depends:    base, infera

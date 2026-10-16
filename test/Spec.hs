@@ -13,26 +13,58 @@ import TablingTest (tablingGroup)
 import MachineHeapTest (machineHeapGroup)
 import MachineControlTest (machineControlGroup)
 import MachineSubsearchTest (machineSubsearchGroup)
+import MachineCLPTest (machineCLPGroup)
+import MachineBreadboardTest (machineBreadboardGroup)
+import MachineTailTest (machineTailGroup)
+import MachineReclaimTest (machineReclaimGroup)
+import PerformanceDiagnosticTest (performanceDiagnosticGroup)
+import MachineStructuredTailTest (machineStructuredTailGroup)
+import MachineBuiltinTest (machineBuiltinGroup)
+import MachineTableTest (machineTableGroup)
+import MachineSnapshotTest (machineSnapshotGroup)
+import MachineGeneralTailTest (machineGeneralTailGroup)
+import MachineTailProofTest (machineTailProofGroup)
+import MachineTraceTest (machineTraceGroup)
+import MachineGraphReuseTest (machineGraphReuseGroup)
+import MachineEnvironmentTest (machineEnvironmentGroup)
+import MachineGeneralReclaimTest (machineGeneralReclaimGroup)
+import MachineInternalTailTest (machineInternalTailGroup)
+import System.Environment (getArgs)
+import Data.List (isPrefixOf)
 import System.Exit (exitFailure)
+
+groups :: [(String, Group)]
+groups =
+  [ ("core", inferaGroup), ("models", correctnessGroup), ("mines", minesweeperGroup),
+    ("inference", inferenceGroup), ("clp", clpPerformanceGroup), ("breadboard", breadboardGroup),
+    ("tabling", tablingGroup), ("machine-heap", machineHeapGroup),
+    ("machine-control", machineControlGroup), ("machine-subsearch", machineSubsearchGroup),
+    ("machine-clp", machineCLPGroup), ("machine-breadboard", machineBreadboardGroup),
+    ("machine-tail", machineTailGroup), ("machine-reclaim", machineReclaimGroup),
+    ("diagnostics", performanceDiagnosticGroup), ("machine-structured", machineStructuredTailGroup),
+    ("machine-builtins", machineBuiltinGroup), ("machine-tables", machineTableGroup),
+    ("machine-snapshots", machineSnapshotGroup), ("machine-general-tail", machineGeneralTailGroup),
+    ("machine-tail-proof", machineTailProofGroup), ("machine-trace", machineTraceGroup),
+    ("machine-graph-reuse", machineGraphReuseGroup), ("machine-environment", machineEnvironmentGroup),
+    ("machine-general-reclaim", machineGeneralReclaimGroup),
+    ("machine-internal-tail", machineInternalTailGroup)
+  ]
 
 main :: IO ()
 main = do
-  ok <- checkSequential inferaGroup
-  modelsOk <- checkSequential correctnessGroup
-  minesOk <- checkSequential minesweeperGroup
-  inferenceOk <- checkSequential inferenceGroup
-  clpOk <- checkSequential clpPerformanceGroup
-  breadboardOk <- checkSequential breadboardGroup
-  tablingOk <- checkSequential tablingGroup
-  heapOk <- checkSequential machineHeapGroup
-  controlOk <- checkSequential machineControlGroup
-  subsearchOk <- checkSequential machineSubsearchGroup
-  unless (ok && modelsOk && minesOk && inferenceOk && clpOk && breadboardOk && tablingOk && heapOk && controlOk && subsearchOk) exitFailure
+  arguments <- getArgs
+  selected <- case arguments of
+    [] -> pure groups
+    ["--group", prefix] | not (null prefix), let matches = filter (isPrefixOf prefix . fst) groups,
+      not (null matches) -> pure matches
+    _ -> fail "Usage: infera-test [--group NAME_PREFIX]"
+  results <- mapM (checkSequential . snd) selected
+  unless (and results) exitFailure
 
 -- Paste the property name, seed and shrink path from a failure report into
 -- GHCi to reproduce precisely the minimized counterexample.
 replay :: String -> Seed -> String -> IO ()
 replay name seed path =
-  case lookup (fromString name) (concatMap groupProperties [inferaGroup, correctnessGroup, minesweeperGroup, inferenceGroup, clpPerformanceGroup, breadboardGroup, tablingGroup, machineHeapGroup, machineControlGroup, machineSubsearchGroup]) of
+  case lookup (fromString name) (concatMap (groupProperties . snd) groups) of
     Nothing -> fail ("Unknown property: " ++ name)
     Just prop -> recheckAt seed (fromString path) prop

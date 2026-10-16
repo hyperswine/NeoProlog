@@ -2,7 +2,7 @@
   "name": "infera-lsp",
   "displayName": "Infera",
   "description": "Language support for Infera v2 (.nprolog / .infera): highlighting, hover, navigation, completion, diagnostics and module-aware go-to-definition.",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "publisher": "hyperswine",
   "license": "GPL-3.0-only",
   "repository": {
@@ -65,6 +65,11 @@
           "type": "boolean",
           "default": true,
           "description": "Run the compiler checker on unsaved edits, after a short debounce."
+        },
+        "infera.performanceHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show compiler performance suggestions (perf-* diagnostics). Correctness diagnostics and unsafe/dynamic highlighting remain enabled."
         }
       }
     },
@@ -80,7 +85,32 @@
           ]
         }
       }
-    ]
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "unsafe",
+        "description": "A predicate declared unsafe or an effectful built-in call."
+      },
+      {
+        "id": "dynamic",
+        "description": "A predicate declared dynamic."
+      }
+    ],
+    "configurationDefaults": {
+      "[infera]": {
+        "editor.semanticHighlighting.enabled": true
+      },
+      "editor.semanticTokenColorCustomizations": {
+        "rules": {
+          "*.unsafe:infera": {
+            "underline": true
+          },
+          "*.dynamic:infera": {
+            "underline": true
+          }
+        }
+      }
+    }
   },
   "scripts": {
     "test": "node --test test/*.test.js",

@@ -1,0 +1,14 @@
+# source-fingerprint=f6c757108e84f68d1a4ce9d7c73003fb
+# compiler=GHC 9.8.2 platform=aarch64-darwin library=-O2 runner=-O2
+# git-base=15eb930e89bbb242cde01b3129c287e815c75df2 plus local CLP, tail and diagnostic work
+# scope=loaded checked program; execution+projection+validation; no parsing or CLI startup
+# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 no_timing_threshold
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples
+reference	rc	9.11e-4	9.1e-4	[9.11e-4,8.81e-4,9.29e-4]	[9.1e-4,8.79e-4,9.29e-4]
+machine	rc	4.451e-3	4.451e-3	[4.503e-3,4.441e-3,4.451e-3]	[4.504e-3,4.438e-3,4.451e-3]
+reference	div	1.49e-3	1.486e-3	[1.441e-3,1.49e-3,1.493e-3]	[1.438e-3,1.486e-3,1.492e-3]
+machine	div	8.95e-3	8.954e-3	[8.888e-3,9.006e-3,8.95e-3]	[8.899e-3,9.005e-3,8.954e-3]
+reference	tri	3.749e-3	3.748e-3	[3.749e-3,3.774e-3,3.581e-3]	[3.748e-3,3.773e-3,3.581e-3]
+machine	tri	1.8874e-2	1.8878e-2	[1.8818e-2,2.0291e-2,1.8874e-2]	[1.8823e-2,2.0288e-2,1.8878e-2]
+reference	wide-disconnected	9.142e-3	9.138e-3	[9.308e-3,8.846e-3,9.142e-3]	[9.31e-3,8.846e-3,9.138e-3]
+machine	wide-disconnected	1.7524e-2	1.7527e-2	[1.7865e-2,1.7224e-2,1.7524e-2]	[1.7878e-2,1.723e-2,1.7527e-2]

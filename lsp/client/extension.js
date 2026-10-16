@@ -17,7 +17,10 @@ function activate(context) {
     documentSelector: [{ scheme: 'file', language: 'infera' }],
     synchronize: {
       configurationSection: 'infera',
-      fileEvents: workspace.createFileSystemWatcher('**/{neoprolog,infera,nprolog}.conf')
+      fileEvents: [
+        workspace.createFileSystemWatcher('**/{neoprolog,infera,nprolog}.conf'),
+        workspace.createFileSystemWatcher('**/*.{nprolog,infera}')
+      ]
     }
   }
   client = new LanguageClient('infera', 'Infera Language Server', serverOptions, clientOptions)

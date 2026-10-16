@@ -59,6 +59,19 @@ function fixture(t) {
   return { root, file, uri: pathToFileURL(file).href }
 }
 
+async function semanticTokens(request, uri) {
+  const response = await request('textDocument/semanticTokens/full', { textDocument: { uri } })
+  assert.ok(!response.error, JSON.stringify(response.error))
+  let line = 0, col = 0
+  const decoded = new Map()
+  for (let i = 0; i < response.result.data.length; i += 5) {
+    const [dl, dc, length, type, modifiers] = response.result.data.slice(i, i + 5)
+    line += dl; col = dl === 0 ? col + dc : dc
+    decoded.set(`${line}:${col}`, { length, type, modifiers })
+  }
+  return decoded
+}
+
 test('semantic tokens classify the Minesweeper CLP goals as operators, not comments', async t => {
   const { uri } = fixture(t)
   const text = fs.readFileSync(path.join(__dirname, '../../examples/minesweeper.nprolog'), 'utf8')
@@ -81,6 +94,123 @@ test('semantic tokens classify the Minesweeper CLP goals as operators, not comme
       assert.equal(decoded.get(`${token.line}:${token.col}`).type, 'comment')
     }
   }
+})
+
+test('unsafe and dynamic semantic tokens resolve imports and update from open buffers and module maps', async t => {
+  const { root, uri } = fixture(t)
+  const { analyzeDocument, TM } = require('../server/analysis')
+  const lib = path.join(root, 'lib.nprolog'), libUri = pathToFileURL(lib).href
+  const other = path.join(root, 'other.nprolog')
+  const conf = path.join(root, 'neoprolog.conf')
+  fs.writeFileSync(lib, 'p : unsafe dynamic (int: <=).\np 1.\np 1 2.\n')
+  fs.writeFileSync(other, 'p 1.\n')
+  fs.writeFileSync(conf, `lib#test ${lib}\n`)
+  const text = '<- import "lib#test".\np X.\nmain <- p 1, lib:p 1, lib:p 1 2, wrapper p, write "p".\n'
+  const { notify, request } = await client(t, '/missing-infera', { checkOnSave: false, checkOnChange: false }, root)
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text } })
+  const a = analyzeDocument(text), refs = a.qualifiedRefs.get('lib')
+  const get = async () => {
+    const decoded = await semanticTokens(request, uri)
+    return refs.map(r => decoded.get(`${r.predLoc.line}:${r.predLoc.col}`).modifiers)
+  }
+  assert.deepEqual(await get(), [TM.unsafe | TM.dynamic, 0])
+  const decoded = await semanticTokens(request, uri)
+  for (const r of a.predicateRefs.get('p')) assert.equal(decoded.get(`${r.line}:${r.col}`).modifiers, 0)
+  notify('textDocument/didOpen', { textDocument: { uri: libUri, languageId: 'infera', version: 1, text: 'p 1.\n' } })
+  assert.deepEqual(await get(), [0, 0], 'unsaved imports supersede disk metadata')
+  notify('textDocument/didChange', { textDocument: { uri: libUri, version: 2 }, contentChanges: [{ text: 'p : dynamic.\np 1.\np 1 2.\n' }] })
+  assert.deepEqual(await get(), [TM.dynamic, TM.dynamic])
+  notify('textDocument/didClose', { textDocument: { uri: libUri } })
+  assert.deepEqual(await get(), [TM.unsafe | TM.dynamic, 0], 'closing restores disk declarations')
+  fs.writeFileSync(lib, 'p : unsafe.\np 1.\np 1 2.\n')
+  notify('workspace/didChangeWatchedFiles', { changes: [{ uri: libUri, type: 2 }] })
+  assert.deepEqual(await get(), [TM.unsafe, TM.unsafe], 'file changes invalidate imported metadata')
+  fs.writeFileSync(conf, `lib#test ${other}\n`)
+  notify('workspace/didChangeWatchedFiles', { changes: [{ uri: pathToFileURL(conf).href, type: 2 }] })
+  assert.deepEqual(await get(), [0, 0], 'changed module mappings clear old flags')
+  fs.writeFileSync(conf, `lib#test ${lib}\n`)
+  notify('workspace/didChangeWatchedFiles', { changes: [{ uri: pathToFileURL(conf).href, type: 2 }] })
+  assert.deepEqual(await get(), [TM.unsafe, TM.unsafe])
+  notify('textDocument/didChange', { textDocument: { uri, version: 2 }, contentChanges: [{ text: text.replace('<- import "lib#test".', '# import removed') }] })
+  assert.deepEqual(await get(), [0, 0], 'removing an import clears its flags')
+})
+
+test('performance hints can be toggled without suppressing correctness diagnostics', async t => {
+  const { root, file, uri } = fixture(t)
+  const executable = path.join(root, 'checker')
+  const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 4 } }
+  const rows = [
+    { file, range, code: 'perf-non-tail-recursion', severity: 'information', message: 'Move remaining work before this call when possible.' },
+    { file, range, code: 'perf-label-early', severity: 'hint', message: 'Post constraints before labeling.' },
+    { file, range, code: 'singleton-variable', severity: 'warning', message: 'Singleton X' },
+    { file, range, code: 'undefined-predicate', severity: 'error', message: 'Missing predicate' }
+  ]
+  fs.writeFileSync(executable, '#!/usr/bin/env node\n'
+    + `process.stdin.resume(); process.stdin.on('end', () => { console.log(${JSON.stringify(JSON.stringify(rows))}); process.exit(1) });\n`, { mode: 0o755 })
+  const { notify, messages } = await client(t, executable)
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: 'main <- missing.\n' } })
+  const completed = from => messages.slice(from).filter(m => m.method === 'textDocument/publishDiagnostics'
+    && m.params.uri === uri && m.params.diagnostics.some(d => d.code === 'undefined-predicate')).at(-1)?.params.diagnostics
+  await until(() => completed(0)?.length === 4)
+  assert.deepEqual(completed(0).map(d => d.severity), [3, 4, 2, 1])
+  const from = messages.length
+  notify('workspace/didChangeConfiguration', { settings: { infera: { executable, performanceHints: false } } })
+  await until(() => completed(from)?.length === 2)
+  assert.deepEqual(completed(from).map(d => d.code), ['singleton-variable', 'undefined-predicate'])
+  const back = messages.length
+  notify('workspace/didChangeConfiguration', { settings: { infera: { executable, performanceHints: true } } })
+  await until(() => completed(back)?.length === 4)
+})
+
+test('real compiler performance suggestions have exact identifier ranges and follow edits and settings', {
+  skip: !process.env.INFERA_BIN, timeout: 20000
+}, async t => {
+  const { root, file, uri } = fixture(t)
+  const source = 'p "😀" X Y <- p "😀" X Z, Y = Z.\n'
+  const check = spawnSync(process.env.INFERA_BIN, ['check', '--json', '--stdin', file],
+    { cwd: root, input: source, encoding: 'utf8' })
+  assert.equal(check.status, 0, check.stderr)
+  const expected = compilerDiagnostics(check.stdout, file)
+    .find(d => d.code === 'perf-non-tail-recursion')
+  assert.ok(expected, check.stdout)
+  assert.equal(expected.severity, 3)
+  const start = source.indexOf('p', 1) // String offsets and LSP columns use UTF-16.
+  assert.deepEqual(expected.range, {
+    start: { line: 0, character: start }, end: { line: 0, character: start + 1 }
+  })
+  const { notify, messages } = await client(t, process.env.INFERA_BIN)
+  const published = from => messages.slice(from).filter(m => m.method === 'textDocument/publishDiagnostics'
+    && m.params.uri === uri).at(-1)?.params.diagnostics
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: source } })
+  await until(() => published(0)?.some(d => d.code === 'perf-non-tail-recursion'))
+  assert.deepEqual(published(0).find(d => d.code === 'perf-non-tail-recursion'), expected)
+
+  let from = messages.length
+  notify('workspace/didChangeConfiguration', { settings: { infera: {
+    executable: process.env.INFERA_BIN, performanceHints: false
+  } } })
+  await until(() => messages.slice(from).filter(m => m.method === 'textDocument/publishDiagnostics'
+    && m.params.uri === uri).length >= 2)
+  assert.deepEqual(published(from), [], 'valid source remains valid when suggestions are hidden')
+
+  from = messages.length
+  notify('textDocument/didChange', { textDocument: { uri, version: 2 }, contentChanges: [{ text: source + 'main <- missing.\n' }] })
+  await until(() => published(from)?.some(d => d.code === 'undefined-predicate'))
+  assert.ok(published(from).every(d => !String(d.code).startsWith('perf-')))
+  from = messages.length
+  notify('workspace/didChangeConfiguration', { settings: { infera: {
+    executable: process.env.INFERA_BIN, performanceHints: true
+  } } })
+  await until(() => published(from)?.some(d => d.code === 'perf-non-tail-recursion'))
+  assert.ok(published(from).some(d => d.code === 'undefined-predicate'))
+
+  from = messages.length
+  const tail = 'p "😀" X Y <- X = Y, p "😀" X Y.\nmain <- missing.\n'
+  notify('textDocument/didChange', { textDocument: { uri, version: 3 }, contentChanges: [{ text: tail }] })
+  await until(() => published(from)?.some(d => d.code === 'undefined-predicate'))
+  assert.ok(published(from).every(d => d.code !== 'perf-non-tail-recursion'),
+    'a checked live edit clears the obsolete suggestion while retaining errors')
+  assert.equal(fs.existsSync(file), false, 'checks do not save the source buffer')
 })
 
 test('real compiler diagnostics arrive on open and clear after a saved correction', {

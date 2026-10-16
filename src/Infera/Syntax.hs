@@ -304,8 +304,8 @@ data TopLevel
   | TLDecl Decl
   deriving (Show, Eq)
 
--- | One-based lines and UTF-16 columns. Semantic diagnostics refer to the containing
--- item; parser errors point at the offending character.
+-- | One-based lines and UTF-16 columns. Located parses retain identifier
+-- spans as well as item spans; parser errors point at the offending character.
 data SourceSpan = SourceSpan
   { spanFile :: FilePath,
     spanLine :: Int,
@@ -318,7 +318,10 @@ data SourceSpan = SourceSpan
 data LocatedTopLevel = LocatedTopLevel
   { locatedSpan :: SourceSpan,
     locatedItem :: TopLevel,
-    locatedNames :: [(String, VarId)]
+    locatedNames :: [(String, VarId)],
+    locatedGoalSpans :: [(Term, SourceSpan)],
+    locatedHeadSpan :: Maybe SourceSpan,
+    locatedIsDCG :: Bool
   }
   deriving (Show, Eq)
 
@@ -331,16 +334,21 @@ data ParseEnv = ParseEnv
   { peVars :: Map String VarId,
     peOrder :: [(String, VarId)],
     peTokenEnd :: !Int,
-    peNext :: !Int
+    peNext :: !Int,
+    peCapture :: !Bool,
+    peInBody :: !Bool,
+    peSites :: [(Bool, Term, Int, Int)],
+    peHeadSite :: Maybe (Int, Int),
+    peDCG :: !Bool
   }
 
 emptyEnv :: ParseEnv
-emptyEnv = ParseEnv Map.empty [] 0 0
+emptyEnv = ParseEnv Map.empty [] 0 0 False False [] Nothing False
 
 type Parser = ParsecT Void String (St.State ParseEnv)
 
 resetEnv :: Parser ()
-resetEnv = St.put emptyEnv
+resetEnv = St.modify (\env -> emptyEnv {peCapture = peCapture env})
 
 freshVar :: Parser Term
 freshVar = do
@@ -482,7 +490,20 @@ pCut :: Parser Term
 pCut = Atom "!" <$ try (symbol "!" <* notFollowedBy (char '='))
 
 pAtomicTerm :: Parser Term
-pAtomicTerm =
+pAtomicTerm = do
+  capture <- St.gets peCapture
+  if not capture then pAtomicValue else do
+    start <- getOffset
+    identifier <- option False (True <$ lookAhead lowerChar)
+    value <- pAtomicValue
+    case (identifier, functorOf value) of
+      (True, Just (name, _)) -> St.modify (\env -> env
+        {peSites = (peInBody env, value, start, start + length name) : peSites env})
+      _ -> pure ()
+    pure value
+
+pAtomicValue :: Parser Term
+pAtomicValue =
   choice
     [ try pNumber,
       pCharLit,
@@ -517,7 +538,29 @@ pArgTerm =
 
 -- | Term-level expression (no control operators).
 pExpr :: Parser Term
-pExpr = makeExprParser pAtomicTerm operatorTable
+pExpr = do
+  start <- getOffset
+  term <- makeExprParser pAtomicTerm operatorTable
+  -- Identifier sites are more precise than whole expressions. Operators
+  -- have no identifier token; retain their expression range for runtime
+  -- errors and generated source mappings without duplicating named sites.
+  env <- St.get
+  if peCapture env && operatorExpression term
+      && not (any (\(_, existing, offset, _) -> existing == term && offset >= start) (peSites env))
+    then St.modify (\current -> current
+      {peSites = (peInBody current, term, start, peTokenEnd current) : peSites current})
+    else pure ()
+  pure term
+  where
+    -- Lists share cons/2 with the :: constructor, so leave their origin at
+    -- the containing clause. Scalar, variable and control terms have no
+    -- operator-expression site to add here.
+    operatorExpression (Compound name [_, _]) = name `elem`
+      [ "^", "mul", "div", "mod", "plus", "minus", "range", "access",
+        "fd_ge", "fd_le", "fd_gt", "fd_lt", "gte", "lte", "gt", "lt",
+        "int_eq", "fd_ne", "equiv", "neq", "unify", "is", "in"
+      ]
+    operatorExpression _ = False
 
 -- | Control-level expression: adds @,@ @->@ and @;@ (used inside parentheses
 -- and in clause bodies).
@@ -572,17 +615,30 @@ flattenConj (Compound "," [a, b]) = flattenConj a ++ flattenConj b
 flattenConj t = [t]
 
 pGoals :: Parser [Term]
-pGoals = flattenConj <$> pControl
+pGoals = inBody (flattenConj <$> pControl)
+
+inBody :: Parser a -> Parser a
+inBody parser = do
+  previous <- St.gets peInBody
+  St.modify (\env -> env {peInBody = True})
+  value <- parser
+  St.modify (\env -> env {peInBody = previous})
+  pure value
 
 -- ─── CLAUSES ─────────────────────────────────────────────────────────────────
 
 pClause :: Parser Clause
 pClause = do
   hd <- pExpr
+  St.modify (\env -> env {peHeadSite = case
+    [(start, end) | (False, term, start, end) <- peSites env, term == hd] of
+      site : _ -> Just site
+      [] -> Nothing})
   choice
     [ do
         symbol "->"
-        body <- pControl
+        St.modify (\env -> env {peDCG = True})
+        body <- inBody pControl
         symbol "."
         env <- St.get
         let (hd', goals, n') = desugarDCG (peNext env) hd body
@@ -780,7 +836,7 @@ parseFile = runP pFile
 
 parseLocatedFile :: FilePath -> String -> Either (SourceSpan, String) [LocatedTopLevel]
 parseLocatedFile path input =
-  case St.evalState (runParserT parser path input) emptyEnv of
+  case St.evalState (runParserT parser path input) emptyEnv {peCapture = True} of
     Right items -> Right items
     Left bundle ->
       let (l, c) = position (errorOffset (NE.head (bundleErrors bundle)))
@@ -794,7 +850,13 @@ parseLocatedFile path input =
       let (l, c) = position start
           (el, ec) = position (peTokenEnd env)
           loc = SourceSpan path l c el ec
-      pure (LocatedTopLevel loc item (peOrder env))
+          siteSpan (startOffset, endOffset) =
+            let (sl, sc) = position startOffset
+                (el', ec') = position endOffset
+             in SourceSpan path sl sc el' ec'
+          goals = [(term, siteSpan (startOffset, endOffset))
+            | (True, term, startOffset, endOffset) <- reverse (peSites env)]
+      pure (LocatedTopLevel loc item (peOrder env) goals (siteSpan <$> peHeadSite env) (peDCG env))
     -- UTF-16 columns match the LSP protocol, including supplementary Unicode
     -- characters and literal tabs (which occupy one character).
     -- Index once so locating many items does not repeatedly scan the source.

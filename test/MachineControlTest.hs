@@ -17,7 +17,7 @@ import GHC.Float (castDoubleToWord64)
 import Hedgehog hiding (Var)
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
-import qualified Infera.Engine as Reference
+import qualified Infera.Engine.Reference as Reference
 import Infera.CLP
 import Infera.Error
 import Infera.Infer (inferProgram)

@@ -46,8 +46,8 @@ revision. Timings include startup, loading, solving and output;
 warmups are validated and excluded from the samples. Re-record on the same
 controlled runner/build configuration before judging a future regression.
 Inference counts must also be checked before reporting an inference rate;
-wall-clock timings alone do not establish one. The current engine
-([Engine.hs](../src/Infera/Engine.hs)) is a lazy list of solutions built from
+wall-clock timings alone do not establish one. The baseline reference engine
+([Engine/Reference.hs](../src/Infera/Engine/Reference.hs)) is a lazy list of solutions built from
 Haskell closures:
 
 * every call renames the clause (copies head and body), unifies into an
@@ -69,71 +69,201 @@ that contract is established.
 
 ### Implementation status
 
-The first isolated foundation is in
-[`Infera.Machine.Heap`](../src/Infera/Machine/Heap.hs): paged mutable cells and
-trail, reversible occurs-checked unification, activation-local variable
-environments, typed constant/functor interning, and immutable copy-on-write
-heap snapshots. Twelve heap properties include 1,500 generated comparisons
-with `Infera.Unify`, plus fixed failure, aliasing, scalar, rollback and
-page-boundary cases.
+The local implementation now routes the existing public
+[`Infera.Engine`](../src/Infera/Engine.hs) API through
+[`Infera.Machine.Control`](../src/Infera/Machine/Control.hs).
+`solveGoal`, `solveGoals`, `solveQuery`, `solveAll` and `runInfera` retain their
+signatures and result types. The original resolver lives in
+[`Infera.Engine.Reference`](../src/Infera/Engine/Reference.hs) as the independent
+parity oracle for both roadmap steps. No machine resolution path calls the
+reference interpreter. **Step 1's local exit gates passed on 2026-10-16;
+step 2 has not started.** The [acceptance report](engine-step1-acceptance-2026-10-16.md)
+records checks, current measurements and the remaining throughput costs.
 
-The experimental [`Infera.Machine.Control`](../src/Infera/Machine/Control.hs)
-now adds explicit task and choice-point stacks. Indexed ordinary clauses,
-conjunction, disjunction, scoped cuts and constraint-free unification run on
-the heap. Predicate mode/sort checks and first-success commitments share their
-decisions with the reference engine through `Infera.Engine.Contracts`.
-Output validation precedes a commitment; declared failure guards survive
-clause retries. Foreign cuts stop at committing call boundaries, preserving
-the reference's marker handling rather than pruning caller alternatives.
-Their delivery uses a native deferred choice so a later local cut can
-suppress an earlier foreign marker.
+The subsequent [application recheck](performance.md#current-native-engine-recheck---2026-10-16)
+found a material native regression: 16x16 ordinary minefield generation exceeds
+30 seconds, versus 0.116s at the optimized reference stage. The architectural
+exit gates passed, but they do not establish throughput acceptance. Profile and
+resolve this regression before starting Step 2 bytecode implementation, then
+retain the larger minefield in performance checks.
 
-`start`/`resume` expose immutable suspended execution and compatible
-`SearchItem`/`SolverState` results through an opt-in Haskell API. The
-[`Bridge`](../src/Infera/Machine/Bridge.hs) preserves logical variable IDs,
-cross-root sharing and the complete persistent store, including propagation
-queues, output, tables and dynamic facts. It retains raw nested variable
-references in substitutions: deep expansion can change shallow matching of
-control expressions. Remaining builtins, tabled calls and ordinary calls with
-active constraints still use lazy reference iterators through this bridge.
-Adapter alternatives restore the heap and all branch metadata together; their
-tails are not forced before yielding the current answer.
+[`Heap`](../src/Infera/Machine/Heap.hs) supplies paged mutable cells, a trail,
+occurs-checked unification, typed constant/functor interning and immutable
+copy-on-write snapshots. The driver owns explicit task and choice stacks for
+indexed clauses, conjunction, disjunction and scoped cuts. Shared
+`Infera.Engine.Contracts` decisions keep signature selection, output/sort
+validation and first-success commitment aligned with the reference. Matching
+a head never commits a failing body, and an output-check error is not a
+successful return. Declared `det`/`multi` failure obligations survive retries.
+Native deferred cuts preserve foreign-marker ordering and committing barriers.
 
-`call`, `once`, `not`, if-then-else and `findall` now execute in native scope
-frames. Each frame parks the caller's control state and starts an isolated
-choice stack over the same heap prefix, without importing caller cut barriers.
-Streaming `call` answers install a native retry that restores the child and
-rebases its parked parent onto current scope buffers and success guards.
-`once` and successful conditions retain the selected complete state; negation
-restores entry state and buffers issues until it can distinguish success from
-finite failure. `findall` collects immutable templates with the existing
-variable IDs and per-answer output, then restores the entry heap, fresh counter,
-store, tables and dynamic facts before unifying the list. Errors suppress its
-results/output, while exhaustion without an error can coexist with a list
-answer, matching the reference.
+`start`/`resume` expose immutable suspended execution. The
+[`Bridge`](../src/Infera/Machine/Bridge.hs) preserves caller logical IDs,
+cross-root sharing and the complete persistent solver state, including CLP
+queues, output, tables and dynamic facts. Raw substitution links remain raw:
+deep expansion can change shallow matching of control expressions. Every
+choice and opaque scope owns a frozen heap paired with its saved branch state.
+Restoring that snapshot replaces cells, trail, interning and frontiers together.
+Allocation serials do not rewind on an in-place restore, and handles never
+cross unrelated heaps or divergent resumptions without their matching snapshot.
 
-Fourteen control/bridge properties include 600 generated ordered-stream
-comparisons, failure and cut regressions, declaration checks, shallow control
-syntax, complete adapter state, and repeated/interleaved/prefix consumption.
-Nine native sub-search properties add 300 generated nested-control comparisons
-and fixed tests for issue policies, constructor/cut quirks, fresh-ID reuse,
-complete state retention/rollback, output order and immutable lazy resumes.
-Real mutual recursion exercises internal incomplete-table dependencies; direct
-emitted-dependency ordering is not covered by a seeded incomplete table fixture,
-because that entry type remains private.
-The production resolver still uses `Infera.Engine`. Native CLP/table execution,
-remaining sub-search builtins, last-call reuse, collection and tracing remain later
-work; milestones 1 and 2 are not the step 1 exit gate. Initial structures hold
-child-address lists rather than packed WAM cells, and every binding is trailed.
-The opaque layout can change after profiling. No query-speed or
-bounded-residency improvement is claimed for this experimental path.
+Native scope frames implement `call`, `once`, `not`, if-then-else, `findall`,
+general `minimize`, `forall`, `phrase`, `emit` and `phrase_from_file`. The
+caller is parked with its own frozen heap and isolated from the child's cut
+barrier. Streaming `call` retries restore the child's matching heap and rebase
+its parked caller onto current scope buffers and success guards. Selected
+states are synchronized back into the caller's restored heap. Negation and
+failed conditions restore entry state; errors and exhaustion cannot establish
+finite failure. `findall` retains the reference's template variable identities
+and sharing, restores entry bindings/store/dynamic state, and concatenates
+output from successful answers. `minimize` keeps the complete winning state,
+retains the first on ties, and rejects incomplete or errored searches as proofs
+of an optimum.
 
-Heap addresses, activation environments and rollback marks belong to one
-branch. They may accompany the matching frozen snapshot, but must not cross
-independent heaps or divergent resumed branches. Allocation generations reject
-discarded addresses within a branch; they are not global heap identities.
-`ST` contains mutable pages, but the address type alone does not enforce this
-ownership rule. The control driver must preserve it explicitly.
+[`Builtins`](../src/Infera/Machine/Builtins.hs) implements the remaining
+ordinary builtins and dynamic-fact operations. Finite builtin algorithms
+return native immutable result iterators; their tails are consumed only on
+retry. Output logs and canonical dynamic facts remain persistent branch-local
+values restored with the whole branch. Compact array logs or mutation journals
+are future representation optimizations, not prerequisites for correctness.
+
+[`Machine.CLP`](../src/Infera/Machine/CLP.hs) connects heap binding transactions
+to the complete persistent `Infera.CLP` store. Changed logical variables wake
+the existing propagators, and propagated singleton bindings return to the heap.
+Failure restores the heap transaction and prior variable/store version.
+Constraint posting, ordinary labeling and `labeling [min Cost]` run under
+native retry choices and incumbent scopes. The propagation algorithms remain
+the existing persistent algorithms. Breadboard acceptance checks `rc`, `div`
+and `tri` optima, byte-identical reporting, generated placements against
+independent grid and exhaustive-labeling models, and the wider disconnected
+case.
+
+[`Machine.Table`](../src/Infera/Machine/Table.hs) implements the general
+variant fixedpoint and the existing narrowly proved delta path. Clause bodies
+run through native driver callbacks; keys and answers contain immutable
+canonical terms, never heap handles. A table fixedpoint is a native immutable
+iterator boundary, rather than a producer task sharing the caller's active
+heap. Producer work completes before its answer iterator yields; incomplete
+ancestor dependencies, errors, exhaustion and truncation retain the reference's
+ordering. Completed, incomplete and truncated caches remain distinct, including
+when consumed with zero resolution fuel. Cutting or discarding an answer
+iterator cannot complete an unfinished producer. Entries are branch-local;
+there is no cross-rollback global table cache. Constrained calls and answers
+fall back to plain native clause evaluation.
+
+[`Tail`](../src/Infera/Machine/Tail.hs) proves a closed first-order call graph
+using native arithmetic, equality, guards and pure user predicates. This now
+includes mutual recursion and prefix helpers. Reachable tabled, dynamic or
+unsafe predicates, control/meta goals, effects, CLP posting and internal cut
+markers are excluded from that source proof. The runtime additionally requires
+an actual tail position, matching commit behavior, and no delayed declared
+return obligation. Committing transfers require the original choice depth.
+Pure noncommitting transfers can retire with parked internal retries because
+each retry owns its original return frame, cut scope and frozen heap.
+Undeclared calls may carry free or structured arguments; declared calls require
+ground arguments and no required-success guard. Nonground declared output/sort
+checks and `det`/`multi` obligations keep their frames.
+
+Eligible transfers retire the caller return and cut owner and reuse its depth
+budget. Allocation safe points at ordinary execution boundaries also reclaim
+completed non-tail activations, including effectful calls and cut contexts.
+They rebuild the active heap from query/caller roots,
+remaining control terms, opaque-scope terms, CLP metadata and transitive raw
+substitution links. Parked choices/scopes retain their own frozen pages, so
+collection can proceed with live caller choices, opaque scopes, constraints,
+completed tables, dynamic facts and output. Scope entry protects parent logical
+roots needed after return. A raw graph relocation copies each reachable address
+once, preserving shared suffixes and alias syntax. Undeclared return frames do
+not retain arguments without delayed checks; declared return arguments remain
+roots. Intern tables and trail history are rebuilt together;
+the threshold starts at 1,024 cells and adapts to twice retained live size.
+Fresh logical IDs remain monotone. Caller-owned entry IDs and reachable
+identities remain observable; unreachable historical activation bindings are
+retired from the returned substitution map. Explicit-fuel `startGoals` retains
+its original nesting budget and disables tail reuse/collection. Other
+ineligible calls retain the existing resolution-depth limit.
+
+Loader metadata now maps predicate/clause ordinals and original body terms to
+file/UTF-16 source spans, including qualified imports and expanded DCGs.
+Ambiguous repeated goals and generated code fall back to their owning clause
+span. The opt-in [`Trace`](../src/Infera/Machine/Trace.hs) stream and
+`resumeTraced` batches expose `Call`, `Exit`, `Redo`, `Fail`, `Cut` and
+`Exception` events with logical frame chains and located errors. Table producer
+callbacks also relay source locations and frames. Ordinary solving does not
+retain events. The REPL supports `:trace query?`; the CLI accepts
+`infera --trace FILE ["query?"]`. This is query tracing over immutable search
+steps; interactive execution paused at every port remains separate future work.
+
+Compiler-owned informational performance annotations continue to share the
+CLI/LSP diagnostic path: `perf-non-tail-recursion`,
+`perf-labeling-before-constraints`, `perf-unbounded-labeling` and
+`perf-unselective-index`. Ten properties include 1,000 generated cases for
+context/arity, finite bounds, indexing and precise locations. The editor can
+hide performance hints independently and underlines resolved `unsafe` and
+`dynamic` predicates through semantic-token settings.
+
+Final validation passed 278 Haskell properties (20,698 property test cases),
+37 LSP tests, 20 benchmark-harness tests and CLI acceptance including trace mode. The expanded
+checks cover ordered reference parity, independent models, complete metadata
+rollback, immutable prefix/repeated/interleaved resumes, seeded table states,
+mutual/helper tail calls, graph-sharing bounds, non-tail reclamation and
+collection with live choices/scopes/CLP state.
+`startMeasured` records execution high-water counters; normal solving avoids
+that sampling. Active-heap counters do not count every parked frozen heap, so
+fresh-process RTS residency and peak process RSS are separate acceptance data.
+
+Earlier measurement files remain historical provenance, with their recorded
+source fingerprints and build profiles:
+
+* The [initial native CLP comparison](engine-native-clp-2026-10-16.tsv) and
+  [initial tail/breadboard recheck](engine-tail-breadboard-2026-10-16.tsv) check
+  exact breadboard answers; the small native cases were slower than the
+  reference, without establishing a stable regression threshold.
+* The [initial scalar tail samples](engine-tail-2026-10-16.jsonl) record
+  10k, 100k and 1m calls with bounded measured machine state and approximately
+  81.5 MiB peak process RSS on the local GHC 9.8.2 `-O2` macOS arm64 build.
+* The [free/structured tail samples](engine-tail-structured-2026-10-16.jsonl)
+  extend that early gate to shared structured inputs and free results, with
+  roughly 85 MiB peak RSS at the same sizes. Those runs were single local
+  samples, rather than repeated throughput estimates.
+* The [breadboard recheck after structured tail reuse](engine-structured-tail-breadboard-2026-10-16.tsv)
+  again validates all four cases and records native medians roughly 2–6 times
+  the reference.
+
+These files precede the public-engine switch and general live-checkpoint
+collection. Current [residency samples](engine-step1-tail-2026-10-16.jsonl)
+record 28 checked fresh processes: repeated million-call mutual recursion,
+live choices and findall, plus helpers, structured arguments, CLP, completed
+tables and dynamic facts. Peak RSS stays between 126.8 and 127.9 MiB; measured
+active heaps stay at or below 1,037 cells. The gate checks ordinary execution
+and instrumented execution independently. Source fingerprinting and startup
+are included in process maxima, so absolute RSS is not comparable with the
+smaller historical fingerprint inputs.
+
+The residency gate caught disabled trace metadata retaining retired callers,
+lazy success-guard updates and repeated unchanged cut-barrier clamps. Strict
+optional trace fields, eager owned-guard updates and no-op commits remove those
+histories. The [fresh breadboard comparison](engine-step1-breadboard-2026-10-16.tsv)
+validates exact answers and independent optima; native medians remain roughly
+1.3–4.6 times the reference on these small cases. No general throughput gain
+is established. These costs remain the target of step 2.
+
+The [final CLI matrix](engine-step1-cli-2026-10-16.jsonl) validates reverse,
+loop, Fibonacci and queens with one warmup and three timed runs each, using
+an explicit 60-second per-process budget. Reverse's median is 32.551 seconds;
+the earlier 30-second and 120-second timeouts are preserved in the acceptance
+report's linked data. Allowing pure noncommitting tail retirement with parked
+internal retries fixes growing active return stacks, but reverse still exceeds
+the old 30-second budget. This is measured throughput work for step 2.
+
+Retaining old answers or continuations deliberately
+retains their immutable pages; that caller-owned memory is distinct from
+bounded execution with discarded predecessors. Growing live outputs also
+require memory proportional to their size. Heap structures still use child
+address lists rather than packed WAM cells, every binding is trailed, and
+normalization/cut inspection can revisit large terms on every call. No general
+throughput win is claimed. Those dispatch/allocation costs are the purpose of
+step 2 after this exit gate passes.
 
 ### Data model
 
@@ -149,6 +279,10 @@ data Cell
   | Con !Constant        -- atom, integer, float, char, string (interned)
   | Lst !Int             -- cons cell: two consecutive cells
 ```
+
+Step 1 uses boxed paged `Ref`, `Con` and `Structure` cells with opaque
+generation-checked addresses. Structures retain child-address lists; the
+packed functor/list representation above is an option for step 2.
 
 * `Heap`: a growable unboxed/boxed `MutableArray` of cells in `ST s`, with a
   top-of-heap pointer `H`.
@@ -225,15 +359,17 @@ data ChoicePoint = ChoicePoint
   existing per-argument index (`candidateClauses`), push a choice point if more
   than one remains, rename the chosen clause onto the heap, unify the head,
   replace the current goals with the body.
-* **Last-call optimisation**: when the current frame has no remaining goals
-  after the call and no choice point was created since it was entered, the
-  callee can reuse the frame if no surviving alternative or sub-search needs
-  it. This bounds frame growth for eligible tail calls; collection separately
+* **Last-call optimisation**: a call in actual tail position can reuse the
+  eligible caller's frame when their commit behavior and delayed obligations
+  agree. Committing calls require their entry choice depth; noncommitting pure
+  calls can leave independently frozen internal retries parked. This bounds
+  frame growth for eligible tail calls; collection separately
   bounds dead heap growth. Removing `maxResolutionDepth` must preserve
   explicit resource-exhaustion reporting rather than causing a host crash.
-* **Cut**: `!` pops the choice-point stack back to `frCutB` of its frame.  No
-  more markers in the answer stream; `call`, `not`, `once`, `findall` and the
-  if-then-else condition get a fresh cut barrier by recording the stack height.
+* **Cut**: `!` pops the choice-point stack back to `frCutB` of its frame.
+  Compatible foreign-owner markers remain observable through the public
+  search API. `call`, `not`, `once`, `findall` and the if-then-else condition
+  get a fresh cut barrier by recording the stack height.
 * **Failure**: pop a choice point, unwind the trail to `cpTrail`, reset `H`,
   restore the complete CLP and branch-local table versions, truncate the
   output log and dynamic-fact journal, then resume `cpGoals`. Restore fresh-ID
@@ -302,84 +438,108 @@ must survive candidate rollback without leaking losing candidate state.
 
 ### Feature mapping
 
-* **CLP(Z)**. Preserve the current propagation algorithms, including selective
-  wakeups, batching and global all-different. Introduce a tested binding
-  interface (`walk`, `bind`, `freshVar`) rather than assuming today's pure
-  substitution functions already operate on the heap. Give constrained
-  variables stable logical IDs with a reversible logical-ID/heap-handle map;
-  aliasing, copying and collection must update that bridge consistently.
-  Every checkpoint records the whole persistent store version: domains,
-  constraints and their index, dependency sets, watched variables, pending
-  propagators, dirty-variable sets, next constraint ID and constraint count,
-  plus the variable map. Restoring only domains and constraints is incorrect.
-  Binding/aliasing a watched variable wakes the relevant dependencies using
-  the same semantics as the current store. Keep the pure-store adapter until
-  generated rollback and propagation comparisons pass.
-* **Tabling** preserves both the general linear fixpoint evaluator and the
-  incremental path for eligible positive rules. Canonical answers and table
-  keys contain immutable terms, never live heap addresses. Incomplete
-  producers, consumers, dependency signals and retry work belong to an
-  explicit sub-search scope and are rolled back or cancelled with that scope;
-  they cannot become completed merely because a cut, `once`, error or
-  resource limit stopped their producer. Completion and truncation remain
-  distinct. Start with the current branch-local table retention. Sharing
-  completed tables across rollback is a later optimisation allowed only for
-  proven pure, complete entries with keys including the program/dynamic-fact
-  version and any other relevant context. Effectful, incomplete, truncated or
-  errored entries are never shared through that cache.
-* **Output** keeps today's semantics (each answer prints exactly the output of
-  the branch that produced it): the log is a growable array truncated on
-  backtracking through the choice point's `cpOutLen`.
-* **Dynamic facts** become a journal of assert/retract operations truncated on
-  backtracking, so the logical update view per branch is unchanged. Active
-  calls retain the fact-version snapshot used when clause selection began.
-* **Labeling and `minimize`** are rewritten as choice points with builtin
-  alternatives (`retry` entries) instead of eager lists.
-* **Errors**: preserve source spans through parsing, module loading, clause
-  expansion and compilation. Stable clause/goal IDs map frames and bytecode
-  offsets to original file spans; synthetic DCG/control code retains an
-  origin mapping. Predicate and clause numbers alone cannot recover positions
-  from today's loaded program. Add loader metadata before promising located
-  errors, and retain the existing error kind and ordering.
-* **Tracing**: the machine exposes an event hook (`Call`, `Exit`, `Redo`,
-  `Fail`, `Cut`) with the current frame chain. A future REPL `:trace` command
-  and CLI trace option are the first consumers; define their CLI syntax before
-  documenting usage. The current CLI accepts file arguments and has no
-  `infera run --trace` command. A future `:why` can replay the last failing
-  branch.
+* **CLP(Z)** keeps the existing persistent propagation algorithms, including
+  selective wakeups, batching and global all-different. `Machine.CLP` supplies
+  tested heap binding/alias transactions and returns propagated bindings to
+  stable logical variable roots. Every choice/scope retains the whole store:
+  domains, constraints and their index, dependency sets, watched variables,
+  pending propagators, dirty sets, next constraint ID and constraint count,
+  together with the variable bridge. Collection traces those logical roots;
+  restoring only domains and constraints would be incorrect.
+* **Tabling** retains the general linear fixedpoint and eligible positive-rule
+  delta algorithm in `Machine.Table`. Each clause body executes through a
+  native callback with its own immutable search boundary. Producer state and
+  dependency work remain local to that fixedpoint; the caller retains an
+  immutable answer iterator under its native choice/scope. Canonical keys and
+  answers contain no live heap handles. A producer's dependency, error or
+  exhaustion signals cannot be turned into completion by cutting its result
+  stream; completion and truncation remain distinct. Cross-rollback sharing
+  is a future optimization, restricted to proven pure, complete entries whose
+  keys include the program/dynamic version and all other relevant context.
+  Effectful, incomplete, truncated or errored entries are not shared globally.
+* **Output** retains the persistent reverse event log in `SolverState` and
+  its length. Every saved branch owns that exact version, so retry restores
+  branch output and each answer renders the events produced by that branch.
+  An array log with a saved frontier remains a possible representation change.
+* **Dynamic facts** retain canonical facts in assertion order, versioned by
+  the persistent branch-local map. Native assert/retract operations update
+  that version; restoring a choice or opaque entry restores the matching map.
+  Active result iterators retain the fact snapshot selected when the call
+  began. A compact mutation journal can replace this representation later
+  without changing the branch-local update semantics.
+* **Labeling and `minimize`** use native driver choices and opaque scopes.
+  Label retries restore the complete candidate state; branch-and-bound
+  labeling keeps the latest incumbent outside sibling retries. General
+  `minimize` enumerates its native goal search, selects the complete winning
+  state and retains the first on ties. Losing output/dynamic/store state
+  cannot escape, and an incomplete or errored search establishes no optimum.
+* **Errors** retain their existing kinds and public search ordering. Loader
+  metadata maps qualified predicate/clause ordinals and original goal terms
+  to file/UTF-16 spans. Unique goal sites get their own range; repeated equal
+  goals and generated DCG/control code use the owning clause span. Native
+  trace events carry these origins and logical frame chains, including table
+  producer callbacks. Bytecode offsets will use this metadata in step 2;
+  unavailable metadata is represented explicitly rather than a guessed site.
+* **Tracing** exposes an opt-in immutable stream and per-resume event batches
+  for `Call`, `Exit`, `Redo`, `Fail`, `Cut` and `Exception`. Discarding events
+  preserves the public query stream. REPL `:trace query?` and CLI
+  `infera --trace FILE ["query?"]` consume this hook. Events are emitted during
+  full search steps; interactive pauses at individual ports, step debugging
+  and `:why` remain future consumers.
 
 ### Module layout after step 1
 
 ```
 src/Infera/Machine/Heap.hs      cells, trail, interning, Term <-> heap
 src/Infera/Machine/Bridge.hs    logical IDs and complete reference-state adapters
+src/Infera/Machine/CLP.hs       native binding transactions over persistent propagation
 src/Infera/Machine/Control.hs   frames, choice points, driver loop, cut, LCO
 src/Infera/Machine/Builtins.hs  the current builtin table, ported
-src/Infera/Machine/Table.hs     scoped tabling and immutable canonical answers
+src/Infera/Machine/Table.hs     native fixedpoints, scoped iterators, canonical answers
+src/Infera/Machine/Tail.hs      closed first-order source and runtime eligibility gates
+src/Infera/Machine/Trace.hs     opt-in immutable event/search stream
+src/Infera/Machine/Trace/Types.hs source identities, frame chains and event values
 src/Infera/Engine.hs            thin: solveQuery / answers / runInfera over the machine
 src/Infera/Engine/Reference.hs  today's engine, retained through both steps and a parity release
 ```
 
 ### Milestones
 
-1. Heap, trail, unification, `Term` round trip; property tests against
-   `Infera.Unify` (same success/failure, occurs check and variable sharing).
-   Implement the immutable checkpoint/resume boundary and answer-lifetime
-   tests before exposing the machine through the public API.
-2. Control: facts and rules, backtracking, cut, if-then-else, negation,
-   `findall`, `once`; the whole existing suite passes against the new engine
-   with CLP and tabling still routed through adapters.
-3. LCO, root tracking and reclamation; `loop 1000000` runs without growing
-   frame depth or unbounded live heap. Remove the resolution-depth bound only
-   after resource errors and residency measurements pass.
-4. CLP binding adapter and complete checkpoints; the CLP examples,
-   propagation models, aliasing and generated rollback comparisons pass.
-5. Scoped tabling; dynamic fact versions; output log; first-success
-   determinism commits; generated sub-search and error/exhaustion comparisons.
-6. Loader source spans, tracing hook, `:trace`, located runtime errors.
-7. Step 1 exit gate: full observable parity with the reference, immutable
-   lazy answers, bounded tail-loop live memory, and validated repeated
-   measurements. Retain the reference for step 2 and its parity release.
+1. **Implemented:** heap, trail, occurs-checked unification, typed constants,
+   `Term` round trips and immutable checkpoint/resume ownership. Generated
+   comparisons use `Infera.Unify`; retained/interleaved answers exercise the
+   public lifetime contract.
+2. **Implemented:** native indexed clauses, explicit control/backtracking,
+   local and foreign cuts, contract-aware commitment, ordinary builtins and
+   opaque sub-searches. The public `Infera.Engine` facade now selects this
+   driver; `Infera.Engine.Reference` remains the parity oracle.
+3. **Implemented and residency-validated:** closed first-order tail
+   transfers include mutual recursion and prefix helpers. Active-heap
+   reclamation coexists with separately owned frozen choices/scopes and live
+   CLP/table/dynamic state. Required-success guards, nonground declared return
+   checks, unsafe/dynamic/tabled callees, effects, control/meta goals and cut
+   markers retain the conservative fallback. Eligible calls reuse their depth
+   budget; explicit-fuel and other ineligible calls retain the original limit.
+   Current-source repeated million-call measurements confirm frame and
+   process residency bounds, including ordinary execution without counters.
+4. **Implemented:** CLP binding transactions, complete checkpoints, native
+   labeling/minimum choices and breadboard acceptance against independent
+   placement/propagation models.
+5. **Implemented:** native variant fixedpoints and delta evaluation, immutable
+   table iterators, branch-local dynamic/output versions, and first-success
+   determinism guards. Generated comparisons and seeded complete/incomplete/
+   truncated caches check ordered observations, rollback and fuel behavior.
+6. **Implemented and CLI/trace-validated:** loader source maps,
+   opt-in frame/event hook, REPL `:trace`, CLI `--trace`, and located errors
+   with imported/DCG clause fallbacks. Table producers also relay native trace
+   events. Interactive stepping is a separate future feature.
+7. **Passed locally:** the complete 278-property suite, 37 LSP tests, 20 harness
+   tests, CLI/trace acceptance, exact breadboard comparisons and repeated
+   current-source residency measurements. Observable reference parity,
+   immutable lazy answers and bounded eligible-tail residency pass. CI now
+   builds both measurement runners and checks mutual/helper residency in fresh
+   processes. These local changes have not run on remote CI. Retain the
+   reference throughout step 2 and its parity release. **Step 2 has not started.**
 
 **Provisional performance target**: naive reverse at 2 million verified
 inferences per second. This is an aspiration to revisit after profiling and
@@ -400,7 +560,7 @@ loops and bounded live residency when callers do not retain old answers.
 
 ## Step 2: bytecode
 
-Once the machine exists, compiling clauses removes the two remaining costs:
+With the machine in place, compiling clauses targets two major remaining costs:
 building clause bodies on the heap per activation, and interpreting head
 unification one `Term` node at a time.
 
@@ -471,7 +631,9 @@ specialisations or table caches whose proof depended on the old program.
 ### Milestones
 
 1. Compiler and VM for facts and first-order rules (no control constructs);
-   differential test against the step 1 machine on the stdlib.
+   differential tests against both the step 1 machine and Reference on
+   generated programs and the stdlib. Preserve ordered errors, contracts,
+   source frames and immutable repeated/interleaved resumes from the outset.
 2. Control constructs and cut barriers; the full suite.
 3. Indexing instructions; environment trimming; LCO in `execute`.
 4. Determinism-directed code generation from declarations and inference.
@@ -532,8 +694,57 @@ work through the instruction loop's event hook.
   `examples/v2_clp.nprolog`; adding a validated benchmark case for it is a
   separate future gate. Measure tail-loop live residency separately from the
   CLI timing harness.
-* Ordinary CI runs correctness checks and benchmark-harness failure tests.
-  Numeric regression thresholds belong on a controlled runner with repeated
+* The optional `machine-breadboard` benchmark compares the experimental machine
+  and reference using the same already-loaded checked program. It validates
+  the three shipped circuits and wide disconnected example against physical
+  placement and independent optimum checks before reporting each sample:
+
+  ```sh
+  cabal bench machine-breadboard --offline --enable-optimization=2 --benchmark-options='+RTS -T -RTS'
+  ```
+
+  One warmup and three measured runs per engine/case use a 30-second timeout.
+  The runner records wall/CPU samples, source fingerprint, compiler/platform
+  and build scope. Timings include execution, answer projection and validation;
+  they exclude source parsing, loading and inference, so they cannot be compared
+  directly with CLI harness timings. It uses distinct unused fresh-variable
+  bases to avoid sharing evaluated pure results between samples. Failed,
+  exhausted or invalid runs do not produce a timing row. These measurements
+  have no CI timing threshold and do not establish bounded live residency.
+* The separate `machine-tail` runner verifies one checked loop per fresh
+  process and drains its continuation. Run both modes at 10k, 100k and 1m
+  iterations; the measured mode records machine counts, and the ordinary mode
+  checks that counter sampling did not hide retention:
+
+  ```sh
+  cabal bench machine-tail --offline --enable-optimization=2 --benchmark-options='1000000 +RTS -T -s -RTS'
+  cabal bench machine-tail --offline --enable-optimization=2 --benchmark-options='1000000 --unmeasured +RTS -T -s -RTS'
+  cabal bench machine-tail --offline --enable-optimization=2 --benchmark-options='1000000 --case result --unmeasured +RTS -T -s -RTS'
+  cabal bench machine-tail --offline --enable-optimization=2 --benchmark-options='1000000 --case structured --unmeasured +RTS -T -s -RTS'
+  ```
+
+  The default `ground` case preserves the original scalar fixture; `result`
+  transfers a free output, and `structured` transfers a compound with a shared
+  free leaf. Each verifies its exact projected answer. JSON distinguishes
+  cumulative allocation, process maximum live residency
+  and current final live memory. The recorded local ordinary runs also include
+  whole-process peak RSS/footprint from macOS `/usr/bin/time -l`. Startup and
+  source fingerprinting are included in process memory maxima. A retained old
+  checkpoint owns its old pages; test that case independently of the
+  unretained-loop memory measurement. General tail calls and collection with
+  surviving choices/scopes are covered by the current residency gate:
+
+  ```sh
+  cabal build bench:machine-tail --offline --enable-optimization=2
+  python3 bench/check-tail-memory.py "$(cabal list-bin bench:machine-tail --enable-optimization=2)" --output tail-memory.jsonl
+  ```
+
+  The full matrix validates all answers and requires peak RSS and RTS maximum
+  live bytes to remain within 1.5 times the prefix-process maxima. `--quick`
+  retains mutual recursion and prefix helpers for ordinary CI. The check caught
+  real history-retention bugs despite bounded active-machine counters.
+* Ordinary CI runs correctness, benchmark-harness failure and relative memory
+  checks. Elapsed-time regression thresholds belong on a controlled runner with repeated
   measurements and recorded variance, not normal shared CI. Choose thresholds
   after establishing a stable validated baseline; the former 20% threshold is
   not an acceptance requirement yet.

@@ -1,0 +1,14 @@
+# source-fingerprint=1d8c35546f4de93016265ea7df8c2436
+# compiler=ghc-9.8 platform=aarch64-darwin
+# scope=loaded checked program; execution+projection+validation; no parsing or CLI startup
+# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)
+# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 no_timing_threshold
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples
+reference	rc	9.85e-4	9.77e-4	[9.03e-4,9.85e-4,1.048e-3]	[9.03e-4,9.77e-4,1.043e-3]
+machine	rc	5.222e-3	5.171e-3	[5.371e-3,4.525e-3,5.222e-3]	[5.32e-3,4.507e-3,5.171e-3]
+reference	div	1.791e-3	1.764e-3	[2.018e-3,1.791e-3,1.508e-3]	[2.014e-3,1.764e-3,1.508e-3]
+machine	div	1.0109e-2	1.0085e-2	[1.0109e-2,9.993e-3,1.0743e-2]	[1.0085e-2,9.902e-3,1.0696e-2]
+reference	tri	3.899e-3	3.889e-3	[4.385e-3,3.899e-3,3.895e-3]	[4.329e-3,3.887e-3,3.889e-3]
+machine	tri	2.121e-2	2.1119e-2	[2.0364e-2,2.1653e-2,2.121e-2]	[2.0305e-2,2.1451e-2,2.1119e-2]
+reference	wide-disconnected	9.862e-3	9.754e-3	[9.862e-3,9.874e-3,9.438e-3]	[9.781e-3,9.754e-3,9.405e-3]
+machine	wide-disconnected	1.8747e-2	1.86e-2	[1.8747e-2,1.9865e-2,1.8435e-2]	[1.86e-2,1.9762e-2,1.8283e-2]

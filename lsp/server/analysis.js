@@ -112,14 +112,19 @@ const KEYWORD_ATOMS = new Set(['true', 'fail', 'false', 'nl', 'not', 'once', 'ca
 
 const BUILTIN_PREDICATES = new Set(Object.keys(BUILTIN_DOCS).filter(k => /^[a-z]/.test(k)))
 
-const CONTROL_BUILTINS = new Set(['not', 'once', 'forall', 'findall', 'minimize', 'call'])
+// Styling metadata, mirrored from Infera.Purity.impureBuiltinKeys. The test
+// suite checks agreement; the compiler still owns effect validation.
+const IMPURE_BUILTIN_KEYS = new Set([
+  'write/1', 'writeln/1', 'print/1', 'nl/0', 'emit/1', 'read_file/2',
+  'phrase_from_file/2', 'assert/1', 'retract/1', 'retractall/1', '!/0'
+])
 
 // ─── Semantic token legend ─────────────────────────────────────────────────────
 
 const TOKEN_TYPES = ['keyword', 'comment', 'string', 'number', 'operator', 'variable', 'function', 'parameter', 'namespace', 'type']
-const TOKEN_MODIFIERS = ['declaration']
+const TOKEN_MODIFIERS = ['declaration', 'unsafe', 'dynamic']
 const TT = { keyword: 0, comment: 1, string: 2, number: 3, operator: 4, variable: 5, function: 6, parameter: 7, namespace: 8, type: 9 }
-const TM = { declaration: 1 }
+const TM = { declaration: 1, unsafe: 2, dynamic: 4 }
 
 // ─── Tokenizer ─────────────────────────────────────────────────────────────────
 
@@ -286,6 +291,28 @@ function countArgs(tokens) {
   return n
 }
 
+/** Conservative term boundaries for the arguments of goal-taking builtins. */
+function argumentGroups(tokens) {
+  const groups = []
+  for (let i = 0; i < tokens.length; i++) {
+    const first = tokens[i]
+    if (OPENERS.has(first.type)) {
+      const end = matchingClose(tokens, i)
+      if (end < 0) return null
+      groups.push(tokens.slice(i, end + 1)); i = end
+    } else if (['atom', 'variable', 'anon', 'integer', 'float', 'string', 'charlit'].includes(first.type)) {
+      if (first.type === 'atom' && tokens[i + 1]?.type === 'colon' && tokens[i + 1].adjPrev
+        && tokens[i + 2]?.type === 'atom' && tokens[i + 2].adjPrev) {
+        groups.push(tokens.slice(i, i + 3)); i += 2
+      } else groups.push([first])
+    } else if (first.type === 'op' && ['-', '+'].includes(first.text)
+      && ['integer', 'float'].includes(tokens[i + 1]?.type) && tokens[i + 1].adjPrev) {
+      groups.push(tokens.slice(i, i + 2)); i++
+    } else return null
+  }
+  return groups
+}
+
 // ─── Declarations ──────────────────────────────────────────────────────────────
 
 function parseDeclaration(tokens, ctx) {
@@ -361,7 +388,11 @@ function collectGoal(seg, ctx, dcg) {
     collectGoals(seg.slice(1, -1), ctx, { dcg: false })
     return
   }
-  if (first.type === 'lbracket' || first.type === 'bang' || first.type === 'string') return
+  if (first.type === 'bang') {
+    ctx.effectPositions.add(`${first.line}:${first.col}`)
+    return
+  }
+  if (first.type === 'lbracket' || first.type === 'string') return
   if (first.type !== 'atom') {
     // operator goal such as `X is Y`, `A #= B`, or a variable goal
     return
@@ -370,7 +401,9 @@ function collectGoal(seg, ctx, dcg) {
   // Qualified call mod:pred
   const second = seg[1], third = seg[2]
   if (second && second.type === 'colon' && second.adjPrev && third && third.type === 'atom' && third.adjPrev) {
-    addToMap(ctx.qualifiedRefs, first.text, { pred: third.text, modLoc: loc(first), predLoc: loc(third) })
+    const arity = countArgs(seg.slice(3))
+    addToMap(ctx.qualifiedRefs, first.text, { pred: third.text, modLoc: loc(first), predLoc: loc(third),
+      arity: arity === null ? null : arity + (dcg ? 2 : 0), dcg })
     ctx.namespacePositions.add(`${first.line}:${first.col}`)
     ctx.qualColonPositions.add(`${second.line}:${second.col}`)
     return
@@ -380,22 +413,69 @@ function collectGoal(seg, ctx, dcg) {
   const arity = countArgs(args)
   addToMap(ctx.predicateRefs, first.text, { ...loc(first), arity: arity === null ? null : arity + (dcg ? 2 : 0), dcg })
 
-  if (CONTROL_BUILTINS.has(first.text)) {
-    // paren groups among the arguments are goals; `call f X` references f
-    for (let i = 0; i < args.length; i++) {
-      const t = args[i]
-      if (t.type === 'lparen') {
-        const j = matchingClose(args, i)
-        if (j < 0) break
-        collectGoals(args.slice(i + 1, j), ctx, { dcg: false })
-        i = j
-      } else if (i === 0 && first.text === 'call' && t.type === 'atom') {
-        addToMap(ctx.predicateRefs, t.text, { ...loc(t), arity: null, dcg: false })
-      }
-    }
-  } else if (first.text === 'phrase' && args[0] && args[0].type === 'atom') {
-    addToMap(ctx.predicateRefs, args[0].text, { ...loc(args[0]), arity: null, dcg: false })
+  const groups = argumentGroups(args)
+  if (!groups) return
+  const goalArgs = { not: [1, [0]], once: [1, [0]], forall: [2, [0, 1]], findall: [3, [1]], minimize: [2, [1]] }
+  const control = goalArgs[first.text]
+  for (const i of !dcg && control?.[0] === groups.length ? control[1] : []) {
+    if (groups[i]) collectGoals(groups[i], ctx, { dcg: false })
   }
+  if (first.text === 'call' && groups.length) {
+    collectCallable(groups[0], ctx, groups.length - 1 + (dcg ? 2 : 0))
+  } else if (!dcg && ((['phrase', 'phrase_from_file'].includes(first.text) && groups.length === 2)
+    || (first.text === 'emit' && groups.length === 1))) {
+    collectCallable(groups[0], ctx, 2)
+  }
+}
+
+function collectCallable(tokens, ctx, extraArity) {
+  if (tokens[0]?.type === 'lparen' && matchingClose(tokens, 0) === tokens.length - 1) {
+    tokens = tokens.slice(1, -1)
+  }
+  const [first, second, third] = tokens
+  if (first?.type !== 'atom') return
+  const qualified = second?.type === 'colon' && second.adjPrev && third?.type === 'atom' && third.adjPrev
+  const arity = countArgs(tokens.slice(qualified ? 3 : 1))
+  if (arity === null) return
+  if (qualified) {
+    addToMap(ctx.qualifiedRefs, first.text, { pred: third.text, modLoc: loc(first), predLoc: loc(third), arity: arity + extraArity })
+    ctx.namespacePositions.add(`${first.line}:${first.col}`)
+    ctx.qualColonPositions.add(`${second.line}:${second.col}`)
+  } else addToMap(ctx.predicateRefs, first.text, { ...loc(first), arity: arity + extraArity, dcg: false })
+}
+
+// This is symbol styling, not an independent validator. Ambiguous calls have
+// no modifiers; flags from another arity or an unrelated imported name do not
+// leak onto a token. Name-wide declarations apply to every resolved arity.
+function predicateModifiers(a, name, arity, declaration = false) {
+  if (arity === null && !declaration) return 0
+  const flags = new Set((a.decls.get(name) || [])
+    .filter(d => d.flagsOnly || d.arity === arity).flatMap(d => d.flags))
+  return (flags.has('unsafe') ? TM.unsafe : 0) | (flags.has('dynamic') ? TM.dynamic : 0)
+}
+
+function predicateModifierPositions(a, resolveImport = () => null) {
+  const positions = new Map()
+  const set = (where, mods) => {
+    if (mods) positions.set(`${where.line}:${where.col}`, (positions.get(`${where.line}:${where.col}`) || 0) | mods)
+  }
+  for (const [name, defs] of a.predicateDefs) {
+    for (const def of defs) set(def, predicateModifiers(a, name, def.arity))
+  }
+  for (const [name, decls] of a.decls) {
+    for (const decl of decls) set(decl, predicateModifiers(a, name, decl.arity, true))
+  }
+  for (const [name, refs] of a.predicateRefs) {
+    for (const ref of refs) set(ref, predicateModifiers(a, name, ref.arity)
+      | (IMPURE_BUILTIN_KEYS.has(`${name}/${ref.arity}`) ? TM.unsafe : 0))
+  }
+  for (const [alias, refs] of a.qualifiedRefs) {
+    const imported = resolveImport(alias)
+    if (!imported) continue
+    for (const ref of refs) set(ref.predLoc, predicateModifiers(imported, ref.pred, ref.arity))
+  }
+  for (const key of a.effectPositions) positions.set(key, TM.unsafe)
+  return positions
 }
 
 // ─── Document analysis ─────────────────────────────────────────────────────────
@@ -415,7 +495,8 @@ function analyzeDocument(text) {
     importKeyPositions: new Set(),
     directivePositions: new Set(),
     declNamePositions: new Set(),
-    declWordKinds: new Map()
+    declWordKinds: new Map(),
+    effectPositions: new Set()
   }
 
   // Split into items at depth-0 terminators.
@@ -505,6 +586,8 @@ module.exports = {
   tokenize,
   analyzeDocument,
   countArgs,
+  predicateModifierPositions,
+  IMPURE_BUILTIN_KEYS,
   BUILTIN_DOCS,
   DECL_DOCS,
   BUILTIN_PREDICATES,

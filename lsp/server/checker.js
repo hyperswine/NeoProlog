@@ -4,6 +4,8 @@ const path = require('path')
 const fs = require('fs')
 const { pathToFileURL } = require('url')
 
+const SEVERITIES = { error: 1, warning: 2, information: 3, hint: 4 }
+
 // The compiler emits LSP-compatible, zero-based ranges. Imported-file
 // diagnostics retain their location and link back from the checked document.
 function compilerDiagnostics(stdout, filePath) {
@@ -11,12 +13,12 @@ function compilerDiagnostics(stdout, filePath) {
   if (!Array.isArray(rows)) throw new Error('expected a diagnostic array')
   return rows.map(d => {
     if (!d || typeof d.file !== 'string' || !d.file || typeof d.code !== 'string'
-      || !validRange(d.range) || !['error', 'warning'].includes(d.severity) || typeof d.message !== 'string') {
+      || !validRange(d.range) || !Object.hasOwn(SEVERITIES, d.severity) || typeof d.message !== 'string') {
       throw new Error('invalid compiler diagnostic')
     }
     const diagnostic = {
       range: d.range, message: d.message, code: d.code,
-      severity: d.severity === 'error' ? 1 : 2, source: 'infera'
+      severity: SEVERITIES[d.severity], source: 'infera'
     }
     if (canonicalFile(d.file) !== canonicalFile(filePath)) {
       diagnostic.range = { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }
@@ -47,4 +49,9 @@ function canonicalFile(file) {
   }
 }
 
-module.exports = { compilerDiagnostics }
+function visibleDiagnostics(diagnostics, settings) {
+  return settings.performanceHints === false
+    ? diagnostics.filter(d => d.severity === 1 || !String(d.code).startsWith('perf-')) : diagnostics
+}
+
+module.exports = { compilerDiagnostics, visibleDiagnostics }

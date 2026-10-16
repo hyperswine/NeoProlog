@@ -1,5 +1,38 @@
 # Performance changes - 2026-10-15
 
+## Current native engine recheck - 2026-10-16
+
+After the public solver switched to the Step 1 native machine, three of these
+application workloads were rerun with the current `-O2` library and executable,
+RTS `-N1`, three requested fresh CLI samples and a 30-second process budget.
+The ordinary minefield timed out on its first sample; no timing is inferred
+from that failure. [Current raw results](performance-step1-2026-10-16.jsonl)
+record the runtime source hash and build profile.
+
+| Workload | Before the earlier optimizations (s) | Optimized reference (s) | Current native (s) |
+| --- | ---: | ---: | ---: |
+| 16x16 ordinary first minefield | 2.163 | 0.116 | >30, timeout |
+| 100-edge chain, all 5,050 reachable pairs | 0.595 | 0.032 | 0.099 |
+| Three disconnected parts, 1..16 breadboard window | 0.809 | 0.037 | 0.053 |
+
+The earlier CLP/tabling application gains remain visible for graph closure and
+wide placement, but the native engine gives some of them back and introduces
+a major large-minefield regression. General execution also regresses against
+the [pre-migration CLI baseline](engine-baseline-2026-10-16.jsonl): reverse
+6.188s -> 32.551s, loop 0.268s -> 0.752s, Fibonacci 0.463s -> 4.168s and queens
+0.111s -> 1.311s. [Current CLI results](engine-step1-cli-2026-10-16.jsonl)
+validate all four workloads. The historical baseline used a different library
+optimization profile, so these are recorded local observations, not controlled
+portable regression ratios.
+
+Step 1's correctness and bounded-residency gates do not establish throughput
+acceptance. Profile and resolve the large-minefield regression before beginning
+Step 2 bytecode implementation; preserve this workload in future performance
+checks. The historical results below describe the optimized reference stage,
+not the performance of today's public native solver.
+
+## Earlier CLP and tabling measurements
+
 Local measurements on macOS arm64 with GHC 9.8.2 and Cabal's default library
 optimisation profile (-O1). The executable uses the unchanged -O2 build options
 and each benchmark runs with +RTS -N1. Before means the saved executable and
