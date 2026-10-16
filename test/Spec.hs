@@ -37,6 +37,7 @@ import MachineHeadTest (machineHeadGroup)
 import MachineLifetimeTest (machineLifetimeGroup)
 import MachineCompiledControlTest (machineCompiledControlGroup)
 import MachineCacheTest (machineCacheGroup)
+import MachineOperandTest (machineOperandGroup)
 import System.Environment (getArgs)
 import Data.List (isPrefixOf)
 import System.Exit (exitFailure)
@@ -63,7 +64,8 @@ groups =
     ("machine-head", machineHeadGroup),
     ("machine-lifetime", machineLifetimeGroup),
     ("machine-compiled-control", machineCompiledControlGroup),
-    ("machine-cache", machineCacheGroup)
+    ("machine-cache", machineCacheGroup),
+    ("machine-operands", machineOperandGroup)
   ]
 
 main :: IO ()

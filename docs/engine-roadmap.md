@@ -79,7 +79,8 @@ parity oracle for both roadmap steps. No machine resolution path calls the
 reference interpreter. **Step 1's historical local exit gates passed on
 2026-10-16; Step 2 now has opt-in compiled activation, specialized head matching,
 temporary register reuse, per-goal body allocation, compiled core control and
-cut barriers, immutable predicate caches and resolved direct calls.**
+cut barriers, immutable predicate caches, resolved direct calls and dense operand
+dispatch.**
 The [Step 1 acceptance report](engine-step1-acceptance-2026-10-16.md) records
 that snapshot's checks and measurements. The
 [Step 2 foundation report](engine-step2-foundation-2026-10-16.md) records the
@@ -681,6 +682,9 @@ construction, temporary register reuse and their acceptance results. The
 continuations, cut barriers and the next default-backend gates. The
 [cache/dispatch report](engine-step2-cache-2026-10-16.md) records the subsequent
 implementation, cold/warm measurements and remaining migration gates.
+The [operand report](engine-step2-operands-2026-10-16.md) records subsequent
+dense local layouts, simple-plan fast paths, transaction-owned node allocation
+and guarded invocation fusion.
 
 ### Planned instruction set (WAM-lite)
 
@@ -757,7 +761,11 @@ plans need no invalidation for unrelated signatures, files or source maps.
 Bytecode is the intended eventual default. The public facade remains on
 `Interpreted` while that migration is prepared. Predicate caches and resolved
 dispatch remove repeated whole-program compilation and per-call dynamic-name
-scans. Reached invocation/operand dispatch remains a performance target.
+scans. Dense local operands remove per-leaf local maps, layouts of up to four
+locals use bounded list reads, simple plans avoid
+temporary arrays, and one materializer transaction owns all reached node
+allocations. Normal invocation fusion avoids a redundant task round trip below
+collection thresholds; tracing/measurement/collection keep their boundaries.
 Generic native services can remain shared behind compiled
 instructions; changing the default does not require duplicating CLP, tables
 or dynamic-fact algorithms.
@@ -771,14 +779,20 @@ Then route public `Infera.Engine` entry points to bytecode, retain explicit
 the full default-facing CLI/editor suite again. The reference remains an
 oracle through the planned parity release.
 
-The cache/dispatch recheck removes the unused-predicate scaling regression,
-but cold structured-head and control workloads and some warm breadboard cases
-still trail the interpreted driver. The next narrow target is reached data
-operand dispatch: precompute dense local layouts rather than rebuilding a
-local `IntMap` for each materialized leaf. Keep source logical IDs, strict
-branch-owned root lookup, error ordering and private construction arrays.
-Profile and remeasure before extending this to builtin/argument-register
-specialisation. A default switch remains a separate validated migration.
+The cache/dispatch recheck removed the unused-predicate scaling regression.
+Operand dispatch now precomputes dense local layouts while preserving source
+logical IDs, strict branch-owned root lookup, error ordering and private
+construction arrays. Opaque scopes preserve the same protected-ID union as a
+lazy set, avoiding repeated list/set/list conversion without forcing work for
+short searches that never collect. A strict outer wrapper extracts only the
+parent set and immutable bindings before deferring that union, avoiding a
+selector closure over the entire parent driver. The operand report separates
+matched cold queries and fresh-state warm batches, including intermediate
+refinements and sample variation. Profile remaining regressions before
+builtin/argument-register specialisation; a default switch remains a separate
+validated migration. Warm controls and the RC/wide breadboard cases still
+trail interpreted execution in the operand recheck; those representative
+regressions keep the performance gate open despite passing local correctness.
 
 ### Milestones
 
@@ -798,7 +812,7 @@ specialisation. A default switch remains a separate validated migration.
 3. **Predicate caching and resolved dispatch implemented:** lazy immutable
    clause plans, exact edit witnesses, per-query runtime metadata and direct
    resolved calls. Remaining: indexing instructions; full argument/environment
-   registers and trimming; LCO in `execute`; reached operand dispatch costs.
+   registers and trimming; LCO in `execute`; remaining invocation/builtin costs.
 4. Determinism-directed code generation from declarations and inference.
 5. Full differential and API-lifetime suite against both the step 1 machine
    and reference; validated benchmarks on a controlled runner. Retire the

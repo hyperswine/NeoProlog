@@ -380,7 +380,8 @@ choice-point stacks, last-call optimisation, heap reclamation and tracing.
 the bytecode transition. Step 2 now has opt-in compiled clause activation,
 specialized head matching, per-goal body allocation, temporary register reuse,
 compiled core controls/cut barriers, lazy predicate-owned plans and resolved
-ordinary user calls; the public
+ordinary user calls, dense operand layouts and transaction-owned data allocation;
+the public
 solver still selects the
 interpreted native driver. [docs/engine-roadmap.md](docs/engine-roadmap.md)
 tracks the remaining argument/environment register design, indexing
@@ -394,7 +395,10 @@ register reuse and pending body continuations. The
 [control report](docs/engine-step2-control-2026-10-16.md) covers compiled
 branches, opaque searches and cut barriers. The
 [cache/dispatch report](docs/engine-step2-cache-2026-10-16.md) covers immutable
-code reuse, edit correctness and cold/warm scaling. Bytecode is the intended eventual
+code reuse, edit correctness and cold/warm scaling. The
+[operand report](docs/engine-step2-operands-2026-10-16.md) covers dense local
+dispatch, simple operand fast paths, deferred protected-root sets and matched
+batch measurements. Bytecode is the intended eventual
 default; the roadmap records its correctness and performance migration gates.
 Proved tail transfers
 reuse their depth budget; other nested calls
@@ -470,6 +474,7 @@ docs/engine-step2-head-register-2026-10-16.md specialized head matching and regi
 docs/engine-step2-lifetimes-2026-10-16.md per-goal body construction and logical root lifetimes
 docs/engine-step2-control-2026-10-16.md compiled controls/cuts and default-backend migration gates
 docs/engine-step2-cache-2026-10-16.md predicate caching, dispatch and cold/warm evidence
+docs/engine-step2-operands-2026-10-16.md dense operands, owned allocation and performance evidence
 lsp/                    VS Code extension and language server
 ```
 
@@ -608,7 +613,15 @@ without building duplicate head graphs; free caller targets build only the
 required source subtree before ordinary occurs-checked unification. All head
 writes reach CLP together after the complete structural match succeeds.
 After head matching and propagation accept, body terms are constructed one
-reached goal at a time. Local variables are direct logical operands;
+reached goal at a time. Source locals map to compact operand positions once at
+compilation; materialization validates their original raw logical roots, then
+reads repeated operands by dense position, using bounded list reads for up to
+four locals and arrays for larger layouts. Source-facing instruction views and
+fresh IDs remain unchanged. Simple locals, scalars and all-local constructors
+avoid temporary arrays. The materializer owns one rollback transaction for its
+whole plan; checked scalar/constructor helpers avoid redundant nested marks.
+Public heap builders retain their atomic behavior. Local variables retain
+their logical identities;
 temporary constructor/scalar registers are reused after their last read.
 Scalar sharing preserves exact bits. Pending code keeps suffix-live logical
 IDs so collection can retire completed locals without losing future uses.
@@ -625,7 +638,10 @@ immutable predicate versions and are shared across queries. Exact source
 witnesses prevent stale plans after public record edits; selected results are
 memoized per query. Resolved calls carry their predicate and runtime metadata,
 avoiding repeated lookups and dynamic-name scans. The full argument/environment
-register design remains future work. Table
+register design remains future work. Ordinary untraced/unmeasured invocations
+dispatch directly below the collection threshold; collection, tracing and
+measurement retain the existing queued boundary. Opaque searches keep lazy
+protected-ID sets and convert them only when collection needs a list. Table
 producer heads still use their existing template path; native producer bodies
 select the requested backend. Compiler and
 backend tests compare raw scalar bits, ordered observations, source frames and
@@ -639,8 +655,9 @@ recorded separately in the
 [head/register report](docs/engine-step2-head-register-2026-10-16.md),
 [lifetime report](docs/engine-step2-lifetimes-2026-10-16.md) and
 [control report](docs/engine-step2-control-2026-10-16.md) and
-[cache/dispatch report](docs/engine-step2-cache-2026-10-16.md).
-The current gate passed 353 Haskell properties (24,412 cases), 37 LSP tests,
+[cache/dispatch report](docs/engine-step2-cache-2026-10-16.md) and
+[operand report](docs/engine-step2-operands-2026-10-16.md).
+The current gate passed 361 Haskell properties (25,018 cases), 37 LSP tests,
 20 harness tests and CLI acceptance. Ordinary compiled execution skips
 instruction statistics; measured variants distinguish accepted-head work from
 reached body construction. The allocation changes establish smaller temporary
@@ -740,6 +757,17 @@ cabal bench machine-cache --offline --enable-optimization=2 --benchmark-options=
 Cases cover helper dispatch with 0/100/1,000 unused predicates, structured heads,
 compiled opaque control and the 16x16 minefield acceptance grid. Reference and
 explicit Interpreted selection remain available for comparisons.
+
+Warm control and breadboard comparisons can batch fresh validated queries to
+reduce timer noise. Cold cache samples require batch size one; each warm batch
+query still starts with a fresh heap, store, tables and dynamic facts. Runners
+report both total and per-query time, using bounded unused variable bases
+behind distinct opaque nonces to avoid reusing evaluated searches:
+
+```sh
+cabal bench machine-cache --offline --enable-optimization=2 --benchmark-options='--engine bytecode --phase warm --case controls --batch 100'
+cabal bench machine-breadboard --offline --enable-optimization=2 --benchmark-options='--batch 100'
+```
 
 The separate tail runner verifies and fully drains one query per fresh process:
 

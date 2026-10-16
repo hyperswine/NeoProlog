@@ -13,8 +13,17 @@ import Infera hiding (main)
 import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Machine.Control as Machine
 import System.CPUTime (getCPUTime)
+import System.Environment (getArgs)
 import System.Info (arch, compilerName, compilerVersion, os)
 import System.Timeout (timeout)
+import Text.Read (readMaybe)
+
+parseBatch :: [String] -> Either String Int
+parseBatch [] = Right 1
+parseBatch ["--batch", value] = case readMaybe value of
+  Just count | count > 0 && count <= 1000000 -> Right count
+  _ -> Left "Batch size must be an integer between 1 and 1000000"
+parseBatch _ = Left "Usage: machine-breadboard [--batch 1..1000000]"
 
 data Case = Case String String Integer Integer Int
 
@@ -112,15 +121,24 @@ execute :: Int -> (Program -> Query -> Search) -> Program -> Query -> QuerySumma
 execute serial resolver program query =
   summarizeSearch query (resolver program (query {queryNVars = queryNVars query + serial}))
 
-checkedRun :: Int -> (Program -> Query -> Search) -> Program -> Query -> Case -> Integer -> QuerySummary -> IO (Double, Double)
-checkedRun serial resolver program query testCase optimum expected = do
+-- Only batched samples use cyclic bases. The unique nonce remains opaque to
+-- the loop, so every iteration starts a fresh query without unbounded roots.
+{-# NOINLINE executeBounded #-}
+executeBounded :: Int -> (Program -> Query -> Search) -> Program -> Query -> QuerySummary
+executeBounded nonce = execute (2 + nonce `mod` 4)
+
+checkedRun :: Int -> Int -> (Program -> Query -> Search) -> Program -> Query -> Case -> Integer -> QuerySummary -> IO (Double, Double)
+checkedRun serial batch resolver program query testCase optimum expected = do
   wallStart <- getMonotonicTimeNSec
   cpuStart <- getCPUTime
-  let result = execute serial resolver program query
   completed <- timeout 30000000 $ do
-    _ <- evaluate (length (show result))
-    either fail pure (validate testCase optimum result)
-    unless (observe result == observe expected) (fail "Result differs from reference placement/order")
+    let checkedResult result = do
+          _ <- evaluate (length (show result))
+          either fail pure (validate testCase optimum result)
+          unless (observe result == observe expected) (fail "Result differs from reference placement/order")
+    if batch == 1 then checkedResult (execute serial resolver program query) else
+      forM_ [0 .. batch - 1] $ \index ->
+        checkedResult (executeBounded (serial * batch + index) resolver program query)
   cpuEnd <- getCPUTime
   wallEnd <- getMonotonicTimeNSec
   case completed of
@@ -169,6 +187,8 @@ compiledProbe program query testCase@(Case name _ _ _ _) optimum expected = do
 
 main :: IO ()
 main = do
+  arguments <- getArgs
+  batch <- either fail pure (parseBatch arguments)
   source <- readFile "examples/breadboard.nprolog"
   items <- either fail pure (parseFile source)
   program <- either fail pure (buildChecked [item | item <- items, case item of TLQuery _ -> False; _ -> True])
@@ -187,8 +207,11 @@ main = do
   putStrLn ("# compiler=" ++ compilerName ++ "-" ++ showVersion compilerVersion ++ " platform=" ++ arch ++ "-" ++ os)
   putStrLn "# scope=loaded checked program; reached immutable predicate plans warmed by untimed compiled probe; per-query dispatch/tail setup+execution+projection+validation; no parsing or CLI startup"
   putStrLn "# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)"
-  putStrLn "# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 no_timing_threshold"
-  putStrLn "engine\tcase\tmedian_wall_seconds\tmedian_cpu_seconds\twall_samples\tcpu_samples"
+  putStrLn "# warmups=1 checked query before timing; runs=3 timeout_seconds=30 per timed batch; no_timing_threshold"
+  putStrLn ("# phase=warm batch_queries=" ++ show batch ++ " timed_instruction_counters=false query_base_policy=" ++
+    (if batch == 1 then "historical fresh_unused_variables=1..4" else "unique NOINLINE nonce; unused roots cycle 2..5"))
+  putStrLn "# existing wall/cpu columns are per-query averages; appended batch columns are total batch durations"
+  putStrLn "engine\tcase\tmedian_wall_seconds\tmedian_cpu_seconds\twall_samples\tcpu_samples\tmedian_batch_wall_seconds\tmedian_batch_cpu_seconds\tbatch_wall_samples\tbatch_cpu_samples"
   forM_ cases $ \testCase@(Case name text _ _ _) -> do
     query <- either fail pure (parseQuery text)
     let expected = execute 0 Reference.solveQuery program query
@@ -199,8 +222,11 @@ main = do
     compiledProbe program query testCase optimum expected
     forM_ [("reference", Reference.solveQuery), ("machine", Machine.solveQuery),
       ("bytecode", Machine.solveQueryWithBackend Machine.Bytecode)] $ \(engine, resolver) -> do
-      _ <- checkedRun 1 resolver program query testCase optimum expected
-      samples <- forM [2 .. 4] $ \serial -> checkedRun serial resolver program query testCase optimum expected
-      let walls = map fst samples
-          cpus = map snd samples
-      putStrLn (intercalate "\t" [engine, name, show (median walls), show (median cpus), show walls, show cpus])
+      _ <- checkedRun 1 1 resolver program query testCase optimum expected
+      samples <- forM [2 .. 4] $ \serial -> checkedRun serial batch resolver program query testCase optimum expected
+      let batchWalls = map fst samples
+          batchCpus = map snd samples
+          walls = map (/ fromIntegral batch) batchWalls
+          cpus = map (/ fromIntegral batch) batchCpus
+      putStrLn (intercalate "\t" [engine, name, show (median walls), show (median cpus), show walls, show cpus,
+        show (median batchWalls), show (median batchCpus), show batchWalls, show batchCpus])

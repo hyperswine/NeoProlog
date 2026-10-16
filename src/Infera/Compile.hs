@@ -20,9 +20,15 @@ module Infera.Compile
     goalRegisterCount,
     goalVariables,
     goalSuffixVariables,
+    DataOperand (..),
+    DataInstruction (..),
     DataPlan,
     dataTemplate,
     dataVariables,
+    dataLocalIds,
+    dataLocalCount,
+    dataRuntimeInstructions,
+    dataRuntimeRoot,
     dataInstructions,
     dataRoot,
     dataRegisterCount,
@@ -123,25 +129,64 @@ goalVariables (GoalCode _ _ _ _ variables _) = variables
 goalSuffixVariables :: GoalCode -> IS.IntSet
 goalSuffixVariables (GoalCode _ _ _ _ _ variables) = variables
 
--- Data operands and ordinary invocation leaves have physical construction
--- plans. Control ancestors carry no constructor plan or heap address.
-data DataPlan = DataPlan !Term [GoalInstruction] !GoalOperand !Int !IS.IntSet
+-- | Runtime locals index this plan's compact source-ID layout. They never
+-- contain logical IDs or heap addresses. Temporary registers retain the
+-- ordinary last-use allocation scheme.
+data DataOperand = DataLocal !Int | DataTemporary !Int
+  deriving (Eq, Show)
+
+data DataInstruction
+  = DataConstant !Int !Term
+  | DataOwner !Int
+  | DataCompound !Int !String [DataOperand]
+  deriving (Eq, Show)
+
+-- Data operands and ordinary invocation leaves store one dense construction
+-- plan. The source-ID list and array share the same immutable layout: the VM
+-- requests logical roots in list order, while compatibility accessors decode
+-- dense operands through the array. Control ancestors carry neither a plan
+-- nor a heap address.
+data DataPlan = DataPlan !Term [DataInstruction] !DataOperand !Int !IS.IntSet
+  [Int] !Int !(Array Int Int)
   deriving (Eq, Show)
 
 dataTemplate :: DataPlan -> Term
-dataTemplate (DataPlan template _ _ _ _) = template
+dataTemplate (DataPlan template _ _ _ _ _ _ _) = template
 
+dataLocalIds :: DataPlan -> [Int]
+dataLocalIds (DataPlan _ _ _ _ _ locals _ _) = locals
+
+dataLocalCount :: DataPlan -> Int
+dataLocalCount (DataPlan _ _ _ _ _ _ count _) = count
+
+dataRuntimeInstructions :: DataPlan -> [DataInstruction]
+dataRuntimeInstructions (DataPlan _ instructions _ _ _ _ _ _) = instructions
+
+dataRuntimeRoot :: DataPlan -> DataOperand
+dataRuntimeRoot (DataPlan _ _ root _ _ _ _ _) = root
+
+-- | Source-oriented compatibility view, decoded lazily from the single
+-- stored runtime plan. Normal materialization uses the dense accessors.
 dataInstructions :: DataPlan -> [GoalInstruction]
-dataInstructions (DataPlan _ instructions _ _ _) = instructions
+dataInstructions (DataPlan _ instructions _ _ _ _ _ locals) = map instruction instructions
+  where
+    instruction (DataConstant register scalar) = GoalConstant register scalar
+    instruction (DataOwner register) = GoalOwner register
+    instruction (DataCompound register name children) =
+      GoalCompound register name (map (sourceOperand locals) children)
 
 dataRoot :: DataPlan -> GoalOperand
-dataRoot (DataPlan _ _ root _ _) = root
+dataRoot (DataPlan _ _ root _ _ _ _ locals) = sourceOperand locals root
+
+sourceOperand :: Array Int Int -> DataOperand -> GoalOperand
+sourceOperand locals (DataLocal local) = Local (locals ! local)
+sourceOperand _ (DataTemporary register) = Temporary register
 
 dataRegisterCount :: DataPlan -> Int
-dataRegisterCount (DataPlan _ _ _ registers _) = registers
+dataRegisterCount (DataPlan _ _ _ registers _ _ _ _) = registers
 
 dataVariables :: DataPlan -> IS.IntSet
-dataVariables (DataPlan _ _ _ _ variables) = variables
+dataVariables (DataPlan _ _ _ _ variables _ _ _) = variables
 
 data CutOwner = LocalBase | LiteralInteger !Integer
   deriving (Eq, Show)
@@ -380,7 +425,20 @@ compileDataPlan template = do
   (virtual, roots) <- virtualGoal (reverse reversed)
   root <- IM.lookup rootSlot roots
   (instructions, physicalRoot, registers) <- allocateGoal virtual root
-  pure (DataPlan template instructions physicalRoot registers (IS.fromList (termVarIds template)))
+  let variables = IS.fromList (termVarIds template)
+      localIds = IS.toAscList variables
+      localCount = IS.size variables
+      localIndices = IM.fromDistinctAscList (zip localIds [0 ..])
+      operand (Local local) = DataLocal <$> IM.lookup local localIndices
+      operand (Temporary register) = Just (DataTemporary register)
+      instruction (GoalConstant register scalar) = Just (DataConstant register scalar)
+      instruction (GoalOwner register) = Just (DataOwner register)
+      instruction (GoalCompound register name children) =
+        DataCompound register name <$> mapM operand children
+  denseInstructions <- mapM instruction instructions
+  denseRoot <- operand physicalRoot
+  pure (DataPlan template denseInstructions denseRoot registers variables
+    localIds localCount (listArray (0, localCount - 1) localIds))
 
 -- Erase variable move instructions before physical allocation. Source locals
 -- are resolved through their stable IDs only when this goal materializes.

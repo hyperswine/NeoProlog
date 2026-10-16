@@ -263,10 +263,80 @@ materializeDataMeasured = materializeDataWithMetrics True
 
 materializeDataWithMetrics :: Bool -> Heap s -> Bridge.Bindings -> VarId -> DataPlan
   -> ST s (Either HeapError DataStep)
-materializeDataWithMetrics measured heap bindings base plan =
-  materializePlanWithMetrics measured heap bindings base (dataVariables plan)
-    (dataRegisterCount plan) (dataInstructions plan) (dataRoot plan)
+materializeDataWithMetrics measured heap bindings base plan = do
+  mark <- Heap.checkpoint heap
+  result <- runExceptT $ do
+    -- Validate the environment even for a ground/scalar plan. Every local
+    -- remains its original raw logical root; the compact layout changes only
+    -- how repeated operands find the strictly checked addresses.
+    addresses <- checked (Bridge.lookupVariables heap bindings (map (+ base) (dataLocalIds plan)))
+    let localCount = dataLocalCount plan
+        locals = listArray (0, localCount - 1) addresses
+        count = dataRegisterCount plan
+        instructions = dataRuntimeInstructions plan
+        rootOperand = dataRuntimeRoot plan
+        localAddress local
+          | localCount <= 4 = readSmallLocal addresses localCount local
+          | otherwise = readLocal locals localCount local
+        resultStep address allocations registers = DataStep address
+          (if measured then allocations else 0) (if measured then registers else 0)
+        -- This function owns the checkpoint above, including intern-table
+        -- additions on allocation failure. The trusted builders retain all
+        -- validation while avoiding a nested mark for every source node.
+        scalarAddress scalar = checked (Heap.importScalarInTransaction heap scalar)
+    when (count < 0 || localCount < 0) (throwError IncompatibleBindings)
+    case (instructions, rootOperand) of
+      -- These paths allocate no temporary array. Lookup and rollback retain
+      -- the same ownership/error contract as a constructor plan.
+      ([], DataLocal local) -> do
+        address <- localAddress local
+        pure (resultStep address 0 0)
+      ([DataConstant destination scalar], DataTemporary root) | destination == root -> do
+        address <- scalarAddress scalar
+        validateRegister count destination
+        pure (resultStep address 1 0)
+      ([DataOwner destination], DataTemporary root) | destination == root -> do
+        address <- checked (Heap.importScalarInTransaction heap (IntLit (toInteger base)))
+        validateRegister count destination
+        pure (resultStep address 1 0)
+      ([DataCompound destination name children], DataTemporary root) | destination == root -> do
+        -- With no earlier instruction a temporary child is uninitialized.
+        -- Reject it before allocation, just as the general register path does.
+        let child (DataLocal local) = localAddress local
+            child (DataTemporary _) = throwError IncompatibleBindings
+        childrenAddresses <- mapM child children
+        address <- checked (Heap.newCompoundInTransaction heap name childrenAddresses)
+        validateRegister count destination
+        pure (resultStep address 1 0)
+      _ -> do
+        slots <- lift (newSlots count)
+        let operand (DataLocal local) = localAddress local
+            operand (DataTemporary register) = readSlot slots count register
+            executeData instruction = case instruction of
+              DataConstant destination scalar -> do
+                address <- scalarAddress scalar
+                overwriteSlot slots count destination address
+              DataOwner destination -> do
+                address <- checked (Heap.importScalarInTransaction heap (IntLit (toInteger base)))
+                overwriteSlot slots count destination address
+              DataCompound destination name children -> do
+                -- Read all operands before overwriting a recycled child slot.
+                childrenAddresses <- mapM operand children
+                address <- checked (Heap.newCompoundInTransaction heap name childrenAddresses)
+                overwriteSlot slots count destination address
+        mapM_ executeData instructions
+        address <- operand rootOperand
+        pure (resultStep address (length instructions) count)
+  case result of
+    Right built -> pure (Right built)
+    Left problem -> do
+      restored <- Heap.rollback heap mark
+      pure $ case restored of
+        Left rollbackError -> Left rollbackError
+        Right () -> Left problem
 
+-- Legacy source-oriented construction remains an independent oracle for the
+-- normal dense plan. It is used by materializeNext and eager activation only.
 materializePlanWithMetrics :: Bool -> Heap s -> Bridge.Bindings -> VarId
   -> IS.IntSet -> Int -> [GoalInstruction] -> GoalOperand -> ST s (Either HeapError DataStep)
 materializePlanWithMetrics measured heap bindings base variables count instructions rootOperand = do
@@ -437,6 +507,27 @@ instantiate heap bindings base code = do
       pure $ case restored of
         Left rollbackError -> Left rollbackError
         Right () -> Left err
+
+readLocal :: Array Int Address -> Int -> Int -> ActivationM s Address
+readLocal locals count local = do
+  when (local < 0 || local >= count) (throwError IncompatibleBindings)
+  pure (locals ! local)
+
+-- Small plans reuse Bridge's checked address list instead of allocating a
+-- separate immutable array. Every read traverses at most three list tails.
+readSmallLocal :: [Address] -> Int -> Int -> ActivationM s Address
+readSmallLocal addresses count local = do
+  when (local < 0 || local >= count) (throwError IncompatibleBindings)
+  case (local, addresses) of
+    (0, address : _) -> pure address
+    (1, _ : address : _) -> pure address
+    (2, _ : _ : address : _) -> pure address
+    (3, _ : _ : _ : address : _) -> pure address
+    _ -> throwError IncompatibleBindings
+
+validateRegister :: Int -> Slot -> ActivationM s ()
+validateRegister count slot =
+  when (slot < 0 || slot >= count) (throwError IncompatibleBindings)
 
 readSlot :: STArray s Int (Maybe Address) -> Int -> Slot -> ActivationM s Address
 readSlot slots count slot = do

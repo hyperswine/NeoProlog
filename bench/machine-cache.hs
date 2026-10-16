@@ -1,10 +1,10 @@
--- One checked cold or warm query per fresh process. Loading/checking and the
+-- One checked cold query or warm query batch per fresh process. Loading and the
 -- Reference oracle stay outside timing. Cold has no native/compiled preprobe;
 -- warm drains a distinct query first, sharing only immutable program caches.
 module Main (main) where
 
 import Control.Exception (evaluate)
-import Control.Monad (forM, unless, when)
+import Control.Monad (forM, forM_, unless, when)
 import Data.List (intercalate, sort)
 import Data.Version (showVersion)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -24,32 +24,36 @@ import Text.Read (readMaybe)
 data Engine = Reference | Interpreted | Bytecode deriving (Eq)
 data Phase = Cold | Warm deriving (Eq)
 data Workload = Helper Int | StructuredHeads | Controls | Minefield deriving (Eq)
-data Options = Options Engine Phase Workload Double
+data Options = Options Engine Phase Workload Double Int
 data Model = ExactInteger Integer | BinaryGrid Int Integer
 
 usage :: String
-usage = "Usage: machine-cache --engine reference|interpreted|bytecode --phase cold|warm --case helper-0|helper-100|helper-1000|structured-head|controls|minefield-16 [--timeout seconds]"
+usage = "Usage: machine-cache --engine reference|interpreted|bytecode --phase cold|warm --case helper-0|helper-100|helper-1000|structured-head|controls|minefield-16 [--timeout seconds] [--batch 1..1000000; warm only when greater than 1]"
 
 parseOptions :: [String] -> Either String Options
-parseOptions = parse Nothing Nothing Nothing Nothing
+parseOptions = parse Nothing Nothing Nothing Nothing Nothing
   where
-    parse engine phase workload budget [] = Options
-      <$> required "--engine" engine <*> required "--phase" phase
-      <*> required "--case" workload <*> pure (maybe 30 id budget)
-    parse Nothing phase workload budget ("--engine" : value : rest) = do
+    parse engine phase workload budget batch [] = do
+      chosenEngine <- required "--engine" engine
+      chosenPhase <- required "--phase" phase
+      chosenWorkload <- required "--case" workload
+      let count = maybe 1 id batch
+      unless (chosenPhase /= Cold || count == 1) (Left "Cold samples require --batch 1")
+      pure (Options chosenEngine chosenPhase chosenWorkload (maybe 30 id budget) count)
+    parse Nothing phase workload budget batch ("--engine" : value : rest) = do
       chosen <- case value of
         "reference" -> Right Reference
         "interpreted" -> Right Interpreted
         "bytecode" -> Right Bytecode
         _ -> Left ("Unknown engine: " ++ value)
-      parse (Just chosen) phase workload budget rest
-    parse engine Nothing workload budget ("--phase" : value : rest) = do
+      parse (Just chosen) phase workload budget batch rest
+    parse engine Nothing workload budget batch ("--phase" : value : rest) = do
       chosen <- case value of
         "cold" -> Right Cold
         "warm" -> Right Warm
         _ -> Left ("Unknown phase: " ++ value)
-      parse engine (Just chosen) workload budget rest
-    parse engine phase Nothing budget ("--case" : value : rest) = do
+      parse engine (Just chosen) workload budget batch rest
+    parse engine phase Nothing budget batch ("--case" : value : rest) = do
       chosen <- case value of
         "helper-0" -> Right (Helper 0)
         "helper-100" -> Right (Helper 100)
@@ -58,14 +62,17 @@ parseOptions = parse Nothing Nothing Nothing Nothing
         "controls" -> Right Controls
         "minefield-16" -> Right Minefield
         _ -> Left ("Unknown case: " ++ value)
-      parse engine phase (Just chosen) budget rest
-    parse engine phase workload Nothing ("--timeout" : value : rest) = case readMaybe value of
+      parse engine phase (Just chosen) budget batch rest
+    parse engine phase workload Nothing batch ("--timeout" : value : rest) = case readMaybe value of
       Just chosen | chosen > 0 && chosen <= 86400 && not (isInfinite chosen) && not (isNaN chosen) ->
-        parse engine phase workload (Just chosen) rest
+        parse engine phase workload (Just chosen) batch rest
       _ -> Left "Timeout must be finite and between 0 and 86400 seconds"
-    parse _ _ _ _ [flag] | flag `elem` ["--engine", "--phase", "--case", "--timeout"] =
+    parse engine phase workload budget Nothing ("--batch" : value : rest) = case readMaybe value of
+      Just count | count > 0 && count <= 1000000 -> parse engine phase workload budget (Just count) rest
+      _ -> Left "Batch size must be an integer between 1 and 1000000"
+    parse _ _ _ _ _ [flag] | flag `elem` ["--engine", "--phase", "--case", "--timeout", "--batch"] =
       Left ("Missing value after " ++ flag)
-    parse _ _ _ _ (flag : _) = Left ("Duplicate or unknown option: " ++ flag)
+    parse _ _ _ _ _ (flag : _) = Left ("Duplicate or unknown option: " ++ flag)
     required name = maybe (Left ("Missing " ++ name)) Right
 
 workloadName :: Workload -> String
@@ -129,6 +136,13 @@ execute serial engine program query = observe query (resolver program shifted)
       Reference -> Reference.solveQuery
       Interpreted -> Machine.solveQueryWithBackend Machine.Interpreted
       Bytecode -> Machine.solveQueryWithBackend Machine.Bytecode
+
+-- The caller passes a unique opaque nonce for each batch query. Bound the
+-- unused roots inside this NOINLINE boundary, so a large batch neither grows
+-- query prefixes nor shares an evaluated search for a repeated small base.
+{-# NOINLINE executeBounded #-}
+executeBounded :: Int -> Engine -> Program -> Query -> [Observation]
+executeBounded nonce = execute (2 + nonce `mod` 4)
 
 forceObservations :: [Observation] -> IO ()
 forceObservations observations = do
@@ -229,7 +243,7 @@ metricFields metrics =
 main :: IO ()
 main = do
   arguments <- getArgs
-  Options engine phase workload seconds <- either (fail . (++ "\n" ++ usage)) pure (parseOptions arguments)
+  Options engine phase workload seconds batch <- either (fail . (++ "\n" ++ usage)) pure (parseOptions arguments)
   let budget = round (seconds * 1000000)
       engineName = case engine of Reference -> "reference"; Interpreted -> "interpreted"; Bytecode -> "bytecode"
       phaseName = if phase == Cold then "cold" else "warm"
@@ -255,11 +269,15 @@ main = do
     validate model expected warmed
   started <- getMonotonicTimeNSec
   cpuStarted <- getCPUTime
-  actual <- within budget "Timed query" $ do
-    let result = execute 2 engine program query
-    forceObservations result
-    validate model expected result
-    pure result
+  actual <- within budget "Timed query batch" $ do
+    let checkedResult result = do
+          forceObservations result
+          validate model expected result
+          pure result
+    if batch == 1 then checkedResult (execute 2 engine program query) else do
+      forM_ [0 .. batch - 2] $ \index ->
+        checkedResult (executeBounded (2 + index) engine program query)
+      checkedResult (executeBounded (batch + 1) engine program query)
   cpuEnded <- getCPUTime
   ended <- getMonotonicTimeNSec
   -- Cold's first compiled/native invocation has already completed. Only now
@@ -272,14 +290,20 @@ main = do
      ("source_fingerprint", show fingerprint), ("workload_fingerprint", show workloadFingerprint),
      ("compiler", show (compilerName ++ "-" ++ showVersion compilerVersion)),
      ("platform", show (arch ++ "-" ++ os)),
-     ("scope", show ("loaded checked program; first native/compiled query for cold or query after one checked warmup; execution+projection+validation; one sample per fresh process" :: String)),
+     ("scope", show ("loaded checked program; cold first native/compiled query or warm batch after one checked pre-query; every query executes+drains+projects+validates; one sample per fresh process" :: String)),
      ("build", show ("runner -O2; library optimization follows Cabal configuration" :: String)),
      ("warmup_queries", if phase == Cold then "0" else "1"),
+     ("batch_queries", show batch),
+     ("query_base_policy", show (if batch == 1 then "historical distinct base: timed=2" else "unique NOINLINE nonce; unused roots cycle 2..5" :: String)),
+     ("timing_unit", show ("wall_seconds/cpu_seconds are batch totals; per_query fields divide by batch_queries" :: String)),
      ("fresh_query_state", "true"), ("fully_drained", "true"),
      ("oracle_checked", "true"), ("independent_checked", "true"),
      ("verified_answers", show (length [() | AnswerObservation _ _ _ <- actual])),
+     ("verified_answers_total", show (batch * length [() | AnswerObservation _ _ _ <- actual])),
      ("answer_fingerprint", show (show (fingerprintString (show actual)))),
      ("wall_seconds", show (fromIntegral (ended - started) / 1.0e9 :: Double)),
      ("cpu_seconds", show (fromIntegral (cpuEnded - cpuStarted) / 1.0e12 :: Double)),
+     ("per_query_wall_seconds", show (fromIntegral (ended - started) / 1.0e9 / fromIntegral batch :: Double)),
+     ("per_query_cpu_seconds", show (fromIntegral (cpuEnded - cpuStarted) / 1.0e12 / fromIntegral batch :: Double)),
      ("timed_instruction_counters", "false"), ("probe_timed", "false"),
      ("post_timing_probe", maybe "null" (json . metricFields) metrics)])

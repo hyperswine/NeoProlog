@@ -159,6 +159,10 @@ data Scope = Scope
 
 data Phase = Seeking | Backtracking | Complete
 
+-- The wrapper is strict in Running, but its ID set is computed only if a
+-- collection needs it. Tiny opaque searches frequently finish without one.
+data ProtectedRoots = ProtectedRoots IS.IntSet
+
 data Running = Running
   { runningBranch :: !Branch,
     runningChoices :: ![Choice],
@@ -169,7 +173,7 @@ data Running = Running
     runningTailReuse :: !Bool,
     runningRoutes :: Map.Map PredKey PredicateRoute,
     runningDynamicNames :: Set.Set String,
-    runningProtected :: [VarId],
+    runningProtected :: !ProtectedRoots,
     runningMeasured :: !Bool,
     runningMetrics :: !Metrics,
     runningCollectionLimit :: !Int,
@@ -288,7 +292,8 @@ startWithRoots backend dense tailReuse measured scopes environment fuel state go
   (imported, addresses) <- checked (Bridge.importTerms heap synchronized goals)
   frozen <- lift (Heap.freezeHeap heap)
   let branch = Branch imported state [Run address fuel scopes | address <- addresses] Nothing Nothing
-      protected = IS.toAscList (IS.fromList (Bridge.bindingVariables imported ++ concatMap termVars goals))
+      protected = ProtectedRoots (IS.union (Bridge.bindingVariableSet imported)
+        (IS.fromList (concatMap termVars goals)))
       program = envProg environment
       dynamic = Set.fromList
         ([name | (name, flags) <- Map.toList (progNameFlags program), FlagDynamic `elem` flags]
@@ -420,9 +425,7 @@ runCompiledControl environment heap original base code fuel scopes =
       let previous = runningMetrics allocated
           counted = if runningMeasured allocated then allocated {runningMetrics = previous
             {metricBodyGoalsMaterialized = metricBodyGoalsMaterialized previous + 1}} else allocated
-          task = maybe (Run root fuel scopes)
-            (\known -> compiledTask counted known root fuel scopes) key
-      drive environment heap (withTasks [task] counted)
+      dispatchInvocation environment heap counted key root fuel scopes
     instruction -> do
       traced <- beginCodeTrace original base code
       let previous = runningMetrics traced
@@ -1073,7 +1076,8 @@ collectLive heap running = do
             GoalMinimumScope cost _ -> termVars cost
             _ -> []
         traceVariables = if runningTraced running then maybe [] termVars (runningCurrent running) else []
-        protected = runningProtected running ++ scopeVariables ++ traceVariables ++ concatMap variables tasks
+        ProtectedRoots protectedIds = runningProtected running
+        protected = IS.toAscList protectedIds ++ scopeVariables ++ traceVariables ++ concatMap variables tasks
     (rebuiltHeap, bindings, state, addresses) <- checked
       (Bridge.rebuild heap (branchBindings branch) protected (branchState branch) (concatMap roots tasks))
     relocated <- relocate tasks addresses
@@ -1212,10 +1216,31 @@ resolveClause running call ordinal clause
 
 -- A route is resolved once for this Program version. Builtins retain
 -- precedence; dynamic names still enter the generic branch-local dispatcher.
-compiledTask :: Running -> PredKey -> Heap.Address -> Int -> Scopes -> Task
-compiledTask running key address fuel scopes = case Map.lookup key (runningRoutes running) of
-  Just route | routeDirect route -> DirectRun route address fuel scopes
-  _ -> Run address fuel scopes
+compiledRoute :: Running -> PredKey -> Maybe PredicateRoute
+compiledRoute running key = case Map.lookup key (runningRoutes running) of
+  Just route | routeDirect route -> Just route
+  _ -> Nothing
+
+-- Below the collection threshold, materialization already leaves exactly the
+-- continuation that a queued Run/DirectRun would expose after being popped.
+-- Dispatch it directly instead of allocating a task and entering the driver
+-- again. At a collection boundary the queued task remains an explicit root;
+-- measured/traced execution also retains the original sampling/event boundary.
+dispatchInvocation :: Env -> Heap.Heap s -> Running -> Maybe PredKey
+  -> Heap.Address -> Int -> Scopes -> MachineM s DriverStep
+dispatchInvocation environment heap running key address fuel scopes
+  | runningMeasured running || runningTraced running = queued
+  | not (runningTailReuse running) = direct
+  | otherwise = do
+      cells <- lift (Heap.heapSize heap)
+      if cells >= runningCollectionLimit running then queued else direct
+  where
+    route = key >>= compiledRoute running
+    queued = drive environment heap (withTasks
+      [maybe (Run address fuel scopes) (\resolved -> DirectRun resolved address fuel scopes) route] running)
+    direct = case route of
+      Just resolved -> callPredicate environment heap running address fuel scopes resolved
+      Nothing -> runGoal environment heap running address fuel scopes
 
 returnCall :: Env -> Heap.Heap s -> Running -> Call -> MachineM s DriverStep
 returnCall environment heap running call = do
@@ -1354,11 +1379,19 @@ launchTasks environment heap parent mark bindings state tasks kind =
       scope = Scope parent mark kind []
       child = parent {runningBranch = branch, runningChoices = [], runningDepth = 0,
         runningPhase = Seeking, runningScope = Just scope,
-        -- Protected roots have set semantics. Quadratic list deduplication
-        -- here rescans thousands of activation IDs for each window condition.
-        runningProtected = IS.toAscList (IS.fromList
-          (runningProtected parent ++ Bridge.bindingVariables (branchBindings (runningBranch parent))))}
+        runningProtected = scopeProtectedRoots parent}
    in drive environment heap child
+
+-- Extract the lazy set and bindings before making its union thunk. The outer
+-- wrapper is forced at scope entry, so that thunk retains only ID metadata,
+-- never a selector closure over the complete parent driver. Do not inline the
+-- extraction back into that thunk or eagerly compute unused short-scope sets.
+{-# NOINLINE scopeProtectedRoots #-}
+scopeProtectedRoots :: Running -> ProtectedRoots
+scopeProtectedRoots Running
+  {runningProtected = ProtectedRoots parentIds,
+   runningBranch = Branch {branchBindings = bindings}} =
+  ProtectedRoots (IS.union parentIds (Bridge.bindingVariableSet bindings))
 
 scopeEvent :: Env -> Heap.Heap s -> Running -> Scope -> SearchItem -> MachineM s DriverStep
 scopeEvent environment heap running scope item = case item of

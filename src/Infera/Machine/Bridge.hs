@@ -9,6 +9,7 @@ module Infera.Machine.Bridge
     lookupVariables,
     bindingCount,
     bindingVariables,
+    bindingVariableSet,
     rebuild,
     importTerms,
     normalizeTermGraph,
@@ -48,6 +49,11 @@ bindingCount (Bindings roots _ _) = IM.size roots
 
 bindingVariables :: Bindings -> [VarId]
 bindingVariables (Bindings roots _ _) = IM.keys roots
+
+-- | Logical root names only, for control liveness sets. This is the same set
+-- as 'bindingVariables' without an intermediate list or any heap handles.
+bindingVariableSet :: Bindings -> IS.IntSet
+bindingVariableSet (Bindings roots _ _) = IM.keysSet roots
 
 type BridgeM s = ExceptT HeapError (ST s)
 

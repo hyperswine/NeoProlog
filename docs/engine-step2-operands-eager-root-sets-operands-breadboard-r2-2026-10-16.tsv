@@ -1,0 +1,24 @@
+# source-fingerprint=a7251e8322f4d2c48b05f41738374ba7
+# compiler=ghc-9.8 platform=aarch64-darwin
+# scope=loaded checked program; reached immutable predicate plans warmed by untimed compiled probe; per-query dispatch/tail setup+execution+projection+validation; no parsing or CLI startup
+# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)
+# warmups=1 checked query before timing; runs=3 timeout_seconds=30 per timed batch; no_timing_threshold
+# phase=warm batch_queries=100 timed_instruction_counters=false query_base_policy=unique NOINLINE nonce; unused roots cycle 2..5
+# existing wall/cpu columns are per-query averages; appended batch columns are total batch durations
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples	median_batch_wall_seconds	median_batch_cpu_seconds	batch_wall_samples	batch_cpu_samples
+# compiled_probe case=rc compiled_activations=111 head_instructions=764 body_goals_materialized=181 body_allocation_instructions=287 max_activation_registers=22 code_cache_hits=68 predicate_cache_hits=47 predicate_cache_misses=0 fully_drained=true timed=false
+reference	rc	9.5174e-4	9.469900000000001e-4	[9.5174e-4,9.4985e-4,9.581e-4]	[9.469900000000001e-4,9.436500000000001e-4,9.5239e-4]	9.5174e-2	9.4699e-2	[9.5174e-2,9.4985e-2,9.581e-2]	[9.4699e-2,9.4365e-2,9.5239e-2]
+machine	rc	3.31126e-3	3.29025e-3	[3.16362e-3,3.31126e-3,3.59931e-3]	[3.1430599999999996e-3,3.29025e-3,3.52355e-3]	0.331126	0.329025	[0.316362,0.331126,0.359931]	[0.314306,0.329025,0.352355]
+bytecode	rc	3.61881e-3	3.56925e-3	[3.8614599999999997e-3,3.61881e-3,3.5281400000000004e-3]	[3.7946800000000004e-3,3.56925e-3,3.49131e-3]	0.361881	0.356925	[0.386146,0.361881,0.352814]	[0.379468,0.356925,0.349131]
+# compiled_probe case=div compiled_activations=163 head_instructions=1212 body_goals_materialized=289 body_allocation_instructions=464 max_activation_registers=22 code_cache_hits=123 predicate_cache_hits=48 predicate_cache_misses=0 fully_drained=true timed=false
+reference	div	1.7210700000000001e-3	1.70098e-3	[1.8283099999999999e-3,1.7210700000000001e-3,1.69711e-3]	[1.7985100000000001e-3,1.70098e-3,1.6771e-3]	0.172107	0.170098	[0.182831,0.172107,0.169711]	[0.179851,0.170098,0.16771]
+machine	div	6.613560000000001e-3	6.03958e-3	[6.613560000000001e-3,6.17187e-3,7.1906999999999995e-3]	[6.018829999999999e-3,6.03958e-3,6.39784e-3]	0.661356	0.603958	[0.661356,0.617187,0.71907]	[0.601883,0.603958,0.639784]
+bytecode	div	5.427769999999999e-3	5.39946e-3	[5.67688e-3,5.427769999999999e-3,5.32368e-3]	[5.61879e-3,5.39946e-3,5.30725e-3]	0.542777	0.539946	[0.567688,0.542777,0.532368]	[0.561879,0.539946,0.530725]
+# compiled_probe case=tri compiled_activations=318 head_instructions=2652 body_goals_materialized=641 body_allocation_instructions=1102 max_activation_registers=22 code_cache_hits=277 predicate_cache_hits=51 predicate_cache_misses=0 fully_drained=true timed=false
+reference	tri	3.8873099999999997e-3	3.8793699999999996e-3	[3.92901e-3,3.86347e-3,3.8873099999999997e-3]	[3.9137e-3,3.85639e-3,3.8793699999999996e-3]	0.388731	0.387937	[0.392901,0.386347,0.388731]	[0.39137,0.385639,0.387937]
+machine	tri	1.2573579999999999e-2	1.251479e-2	[1.2573579999999999e-2,1.250624e-2,1.2949569999999999e-2]	[1.251479e-2,1.244324e-2,1.2780910000000001e-2]	1.257358	1.251479	[1.257358,1.250624,1.294957]	[1.251479,1.244324,1.278091]
+bytecode	tri	1.5389759999999999e-2	1.4326730000000001e-2	[1.548247e-2,1.5389759999999999e-2,1.4444859999999999e-2]	[1.4326730000000001e-2,1.477675e-2,1.4080470000000001e-2]	1.538976	1.432673	[1.548247,1.538976,1.444486]	[1.432673,1.477675,1.408047]
+# compiled_probe case=wide-disconnected compiled_activations=75 head_instructions=725 body_goals_materialized=180 body_allocation_instructions=334 max_activation_registers=22 code_cache_hits=48 predicate_cache_hits=27 predicate_cache_misses=0 fully_drained=true timed=false
+reference	wide-disconnected	1.1982219999999998e-2	1.145006e-2	[1.1982219999999998e-2,1.214148e-2,1.173071e-2]	[1.121904e-2,1.154993e-2,1.145006e-2]	1.198222	1.145006	[1.198222,1.214148,1.173071]	[1.121904,1.154993,1.145006]
+machine	wide-disconnected	1.323158e-2	1.3099000000000001e-2	[1.5162759999999999e-2,1.323158e-2,1.2926729999999999e-2]	[1.476914e-2,1.3099000000000001e-2,1.28189e-2]	1.323158	1.3099	[1.516276,1.323158,1.292673]	[1.476914,1.3099,1.28189]
+bytecode	wide-disconnected	1.944595e-2	1.794908e-2	[2.204168e-2,1.701379e-2,1.944595e-2]	[1.844235e-2,1.624608e-2,1.794908e-2]	1.944595	1.794908	[2.204168,1.701379,1.944595]	[1.844235,1.624608,1.794908]

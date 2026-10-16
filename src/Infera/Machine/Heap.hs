@@ -36,7 +36,9 @@ module Infera.Machine.Heap
     copyReachable,
     newVariable,
     newCompound,
+    newCompoundInTransaction,
     importTerm,
+    importScalarInTransaction,
     importWithEnvironment,
     exportTerm,
     exportTerms,
@@ -437,7 +439,19 @@ newVariable heap = runExceptT (allocate heap Ref)
 -- destination has not yet been allocated. Existing references remain dynamic
 -- even when currently bound; rollback may expose their free variables again.
 newCompound :: Heap s -> String -> [Address] -> ST s (Either HeapError Address)
-newCompound heap name children = atomic heap $ do
+newCompound heap name children = atomic heap (newCompoundAction heap name children)
+
+-- | Trusted constructor allocation inside a transaction owned by the caller.
+-- This validates every child and performs the same interning/allocation as
+-- 'newCompound', but creates no nested checkpoint and does not roll back an
+-- error. The caller must restore its checkpoint before exposing failure,
+-- including any functor interned before a failed allocation. Use 'newCompound'
+-- when that ownership proof is absent.
+newCompoundInTransaction :: Heap s -> String -> [Address] -> ST s (Either HeapError Address)
+newCompoundInTransaction heap name children = runExceptT (newCompoundAction heap name children)
+
+newCompoundAction :: Heap s -> String -> [Address] -> HeapM s Address
+newCompoundAction heap name children = do
   cells <- mapM (readCell heap) children
   let staticGround (Ref _) = False
       staticGround (Con _) = True
@@ -617,6 +631,28 @@ internFunctor heap name arity = do
 importTerm :: Heap s -> Term -> ST s (Either HeapError Address)
 importTerm heap term = fmap (fmap fst) (importWithEnvironment heap emptyEnvironment term)
 
+-- | Trusted scalar allocation inside a transaction owned by the caller.
+-- Variables and compounds are rejected. Scalar interning preserves exact
+-- floating-point bits, including signed zero and NaN payloads, as 'importTerm'
+-- does. There is no nested checkpoint or rollback: a failed allocation may
+-- leave an interned constant, which the enclosing transaction must restore
+-- before exposing failure. Use 'importTerm' without that ownership proof.
+importScalarInTransaction :: Heap s -> Term -> ST s (Either HeapError Address)
+importScalarInTransaction heap scalar = runExceptT (importScalarAction heap scalar)
+
+importScalarAction :: Heap s -> Term -> HeapM s Address
+importScalarAction heap scalar = do
+  (key, value) <- case scalar of
+    Atom value -> pure (AtomKey value, AtomConstant value)
+    IntLit value -> pure (IntegerKey value, IntegerConstant value)
+    FloatLit value -> pure (FloatKey (castDoubleToWord64 value), FloatConstant value)
+    CharLit value -> pure (CharKey value, CharConstant value)
+    StrLit value -> pure (StringKey value, StringConstant value)
+    Var _ -> throwError IncompatibleBindings
+    Compound _ _ -> throwError IncompatibleBindings
+  ident <- lift (internConstant heap key value)
+  allocate heap (const (Con ident))
+
 -- | Instantiate into an explicit activation environment. Share the returned
 -- environment when importing a clause head and its body or several roots.
 importWithEnvironment :: Heap s -> Environment -> Term -> ST s (Either HeapError (Address, Environment))
@@ -641,14 +677,7 @@ importWithEnvironment heap initial@(Environment _ frontier) term = atomic heap $
       address <- allocate heap (const (Structure ident staticGround addresses))
       pure (address, final, staticGround)
     importInto environment scalar = do
-      (key, value) <- case scalar of
-        Atom value -> pure (AtomKey value, AtomConstant value)
-        IntLit value -> pure (IntegerKey value, IntegerConstant value)
-        FloatLit value -> pure (FloatKey (castDoubleToWord64 value), FloatConstant value)
-        CharLit value -> pure (CharKey value, CharConstant value)
-        StrLit value -> pure (StringKey value, StringConstant value)
-      ident <- lift (internConstant heap key value)
-      address <- allocate heap (const (Con ident))
+      address <- importScalarAction heap scalar
       pure (address, environment, True)
     importArguments environment [] = pure ([], environment, True)
     importArguments environment (argument : rest) = do
