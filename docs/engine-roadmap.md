@@ -77,11 +77,14 @@ signatures and result types. The original resolver lives in
 [`Infera.Engine.Reference`](../src/Infera/Engine/Reference.hs) as the independent
 parity oracle for both roadmap steps. No machine resolution path calls the
 reference interpreter. **Step 1's historical local exit gates passed on
-2026-10-16; Step 2 now has an opt-in compiled activation/direct-call slice.**
+2026-10-16; Step 2 now has opt-in compiled activation, specialized head matching,
+shared construction registers and direct calls.**
 The [Step 1 acceptance report](engine-step1-acceptance-2026-10-16.md) records
 that snapshot's checks and measurements. The
 [Step 2 foundation report](engine-step2-foundation-2026-10-16.md) records the
-subsequent regression repair, compiler work and validation.
+subsequent regression repair and initial compiler gate. The
+[head/register report](engine-step2-head-register-2026-10-16.md) covers later
+specialized matching and allocation work.
 
 The subsequent [application recheck](performance.md#current-native-engine-recheck---2026-10-16)
 found a material native regression: 16x16 ordinary minefield generation exceeded
@@ -577,7 +580,7 @@ whole head graph.
 
 ### Implementation status
 
-The first slice is opt-in through
+The compiled path is opt-in through
 `Infera.Machine.Control.ExecutionBackend` (`Interpreted` or `Bytecode`)
 and the `startWithBackend`, `startMeasuredWithBackend`,
 `startTracedWithBackend`, `startGoalsWithBackend` and
@@ -586,13 +589,35 @@ existing machine entry points still use the interpreted native driver.
 
 [`Infera.Compile`](../src/Infera/Compile.hs) emits a flat, postorder register
 program for facts and first-order clauses: `UseVariable`, `PutConstant` and
-`PutCompound`. [`Machine.Bytecode`](../src/Infera/Machine/Bytecode.hs)
-allocates stable local roots and executes those instructions directly on the
-heap, preserving sharing without constructing renamed source trees. Known
-ordinary user calls use `DirectRun`; builtins retain their existing dispatch
-precedence. Head matching still uses native heap/CLP unification, and the
-driver retains clause selection, contracts, success guards, tail eligibility
-and backtracking.
+`PutCompound`. It also emits preorder `HeadVariable`, `HeadConstant` and
+`HeadCompound` matching instructions. [`Machine.Bytecode`](../src/Infera/Machine/Bytecode.hs)
+reserves stable local roots and matches known caller shapes directly, avoiding
+duplicate head constructors. When a caller target is free, it constructs only
+that source subtree and uses ordinary occurs-checked heap unification.
+Typed scalar comparison retains NaN's non-reflexive unification semantics.
+
+Head writes accumulate in the original depth-first order, and
+`Machine.CLP.unifyUsing` propagates them once after the entire structural
+match succeeds. A later mismatch therefore suppresses earlier delayed CLP
+errors exactly as whole-head unification does. An outer activation checkpoint
+rolls back roots, head/body nodes, trail and interning on any rejection.
+
+Body construction begins after accepted head matching and propagation.
+Variable/scalar registers share values using exact scalar bits, retaining
+distinct NaN payloads and signed zero; compounds retain separate source slots.
+The construction-register array is allocated lazily, separately from the head
+target stack. A known-shape fact may need no head constructors or construction
+registers, while its logical roots still reserve the same source IDs. Matched
+caller compounds are never substituted for body templates, whose raw local
+IDs remain observable. All body roots are currently built after head success;
+incremental per-goal construction and register/environment lifetimes remain
+future work.
+
+Known ordinary user calls use `DirectRun`; builtins retain their existing
+dispatch precedence. The driver retains clause selection, contracts, success
+guards, tail eligibility and backtracking. VM head/allocation/avoidance/register
+counters describe accepted activations only; rejected attempts return no
+activation statistics.
 
 Clauses containing control/meta calls, variable or noncallable goals,
 malformed local IDs, or recursively nested body cuts use the interpreter.
@@ -603,11 +628,13 @@ matching branch snapshots and the exact program/code version.
 Code is cached once per query or table-producer startup, rather than at load
 time. Table producers retain their existing head/template path, with their
 native body callbacks selecting the requested backend. Persistent load-time
-predicate caching and invalidation are still planned. The
+predicate caching and invalidation are still planned. The historical
 [foundation report](engine-step2-foundation-2026-10-16.md) distinguishes this
-slice from the remaining WAM-style design and records its validation. Initial
-validated samples establish compiled execution and parity, without establishing
-a throughput gain over the interpreted driver.
+initial slice from the remaining WAM-style design. Its initial validated
+samples established compiled execution and parity without establishing a
+throughput gain over the interpreted driver. The
+[head/register report](engine-step2-head-register-2026-10-16.md) records
+subsequent implementation and validation.
 
 ### Planned instruction set (WAM-lite)
 
@@ -637,7 +664,7 @@ for the others (keeping the current behaviour that any bound argument prunes).
 
 ### Compiler
 
-The compiler will classify variables as temporary or permanent, assign
+The full compiler will classify variables as temporary or permanent, assign
 argument/environment registers, emit `get_*` for the head,
 `put_*` and `call`/`execute` for the body, and surround bodies with permanent
 variables with `allocate`/`deallocate`. Environment trimming follows the last
@@ -677,13 +704,14 @@ the old program.
 
 ### Milestones
 
-1. **Started:** flat compiled activation and direct ordinary user calls for
+1. **In progress:** compiled activation, specialized head matching, shared
+   variable/scalar registers and direct ordinary user calls for
    facts/first-order rules, with opt-in backend selection and interpreter
    fallback. Generated tests compare both native backends with Reference,
-   including ordered errors, contracts, source frames and immutable
-   repeated/interleaved resumes. Complete this milestone with specialized
-   head-unification instructions and broader stdlib acceptance; flat
-   allocation instructions alone do not complete the planned compiler/VM.
+   including whole-head CLP error order, raw local IDs, contracts, source frames
+   and immutable repeated/interleaved resumes. Table producer heads retain
+   their template path. Broader stdlib acceptance and the remaining compiled
+   paths must pass before declaring the full first-order milestone complete.
 2. Control constructs and cut barriers; the full suite.
 3. Indexing instructions; register/environment lifetimes and trimming; LCO in
    `execute`; load-time predicate caches with REPL invalidation.

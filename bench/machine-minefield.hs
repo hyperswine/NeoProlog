@@ -19,12 +19,12 @@ import System.Info (arch, compilerName, compilerVersion, os)
 import System.Timeout (timeout)
 import Text.Read (readMaybe)
 
-data Engine = Native | Reference deriving (Eq)
+data Engine = Native | Bytecode | Reference deriving (Eq)
 data Phase = Setup | Ordinary deriving (Eq)
 data Options = Options Engine Phase Int Integer Double Bool
 
 usage :: String
-usage = "Usage: machine-minefield [--engine native|reference] [--phase setup|ordinary] [--size N] [--bombs N] [--timeout SECONDS] [--measured]"
+usage = "Usage: machine-minefield [--engine native|bytecode|reference] [--phase setup|ordinary] [--size N] [--bombs N] [--timeout SECONDS] [--measured]"
 
 parseOptions :: [String] -> Either String Options
 parseOptions = go Nothing Nothing Nothing Nothing Nothing False
@@ -34,13 +34,14 @@ parseOptions = go Nothing Nothing Nothing Nothing Nothing False
           count = maybe (min 50 (toInteger width * toInteger width `div` 2)) id bombs
           chosen = maybe Native id engine
       unless (count <= toInteger width * toInteger width) (Left "Bomb count exceeds board capacity")
-      unless (not measured || chosen == Native) (Left "--measured requires --engine native")
+      unless (not measured || chosen /= Reference) (Left "--measured requires a native engine")
       pure (Options chosen (maybe Ordinary id phase) width count (maybe 30 id budget) measured)
     go Nothing phase size bombs budget measured ("--engine" : value : rest) = do
       engine <- case value of
         "native" -> Right Native
+        "bytecode" -> Right Bytecode
         "reference" -> Right Reference
-        _ -> Left "Engine must be native or reference"
+        _ -> Left "Engine must be native, bytecode or reference"
       go (Just engine) phase size bombs budget measured rest
     go engine Nothing size bombs budget measured ("--phase" : value : rest) = do
       phase <- case value of
@@ -117,11 +118,21 @@ measuredSearch query checkpoint = case Machine.resume checkpoint of
 
 execute :: Engine -> Bool -> Program -> Query -> Either String (QuerySummary, Maybe Machine.Metrics)
 execute Reference _ program query = Right (Reference.solveAll program query, Nothing)
-execute Native False program query = Right (summarizeSearch query (Machine.solveQuery program query), Nothing)
-execute Native True program query = do
-  checkpoint <- either (Left . show) Right (Machine.startMeasured program query)
+execute engine False program query = Right
+  (summarizeSearch query (Machine.solveQueryWithBackend (backend engine) program query), Nothing)
+execute engine True program query = do
+  checkpoint <- either (Left . show) Right (Machine.startMeasuredWithBackend (backend engine) program query)
   (search, metrics) <- measuredSearch query checkpoint
   pure (summarizeSearch query search, Just metrics)
+
+backend :: Engine -> Machine.ExecutionBackend
+backend Bytecode = Machine.Bytecode
+backend _ = Machine.Interpreted
+
+engineName :: Engine -> String
+engineName Native = "native"
+engineName Bytecode = "bytecode"
+engineName Reference = "reference"
 
 json :: [(String, String)] -> String
 json fields = "{" ++ intercalate "," [show key ++ ":" ++ value | (key, value) <- fields] ++ "}"
@@ -140,7 +151,13 @@ metricFields metrics =
    ("max_bindings", show (Machine.metricMaxBindings metrics)),
    ("max_substitutions", show (Machine.metricMaxSubstitutions metrics)),
    ("max_constants", show (Machine.metricMaxConstants metrics)),
-   ("max_functors", show (Machine.metricMaxFunctors metrics))]
+   ("max_functors", show (Machine.metricMaxFunctors metrics)),
+   ("compiled_activations", show (Machine.metricCompiledActivations metrics)),
+   ("bytecode_instructions", show (Machine.metricBytecodeInstructions metrics)),
+   ("direct_calls", show (Machine.metricDirectCalls metrics)),
+   ("head_instructions", show (Machine.metricHeadInstructions metrics)),
+   ("head_cells_avoided", show (Machine.metricHeadCellsAvoided metrics)),
+   ("max_activation_registers", show (Machine.metricMaxActivationRegisters metrics))]
 
 main :: IO ()
 main = do
@@ -155,7 +172,8 @@ main = do
         Ordinary -> "minefield " ++ argumentsText ++ ")?"
   query <- either fail pure (parseQuery queryText)
   _ <- evaluate (length (show program) + length (show query))
-  let paths = ["src/Infera/Machine/Control.hs", "src/Infera/Machine/Heap.hs",
+  let paths = ["src/Infera/Compile.hs", "src/Infera/Machine/Bytecode.hs",
+        "src/Infera/Machine/Control.hs", "src/Infera/Machine/Heap.hs",
         "src/Infera/Machine/Bridge.hs", "src/Infera/Machine/CLP.hs",
         "src/Infera/Machine/Builtins.hs", "src/Infera/Machine/Tail.hs",
         "src/Infera/Machine/Table.hs", "src/Infera/Engine/Reference.hs",
@@ -166,7 +184,7 @@ main = do
   sources <- mapM (\path -> readFile path >>= \contents -> pure (path ++ "\n" ++ contents)) paths
   let fingerprint = show (fingerprintString (concat sources))
       metadata =
-        [("engine", show (if engine == Native then "native" else "reference" :: String)),
+        [("engine", show (engineName engine)),
          ("phase", show (if phase == Setup then "setup" else "ordinary" :: String)),
          ("size", show size), ("bombs", show bombs), ("measured", if measured then "true" else "false"),
          ("timeout_seconds", show budget), ("source_fingerprint", show fingerprint),
@@ -181,7 +199,7 @@ main = do
   _ <- evaluate (length fingerprint)
   -- Native samples compare the exact answer/residual order, outside timing.
   -- The oracle gets the same explicit per-execution budget as the sample.
-  oracleResult <- try $ if engine == Native then timeout limit $ do
+  oracleResult <- try $ if engine /= Reference then timeout limit $ do
       let oracle = Reference.solveAll program query
       _ <- evaluate (length (show oracle))
       either fail pure (validate phase size bombs oracle)
@@ -195,6 +213,10 @@ main = do
   attempted <- try $ timeout limit $ do
     (result, metrics) <- either fail pure (execute engine measured program query)
     _ <- evaluate (length (show result) + maybe 0 (length . show) metrics)
+    unless (engine /= Bytecode || not measured || case metrics of
+      Just counts -> Machine.metricCompiledActivations counts > 0
+        && Machine.metricHeadInstructions counts > 0 && Machine.metricHeadCellsAvoided counts > 0
+      Nothing -> False) (fail "Bytecode minefield did not exercise compiled head matching")
     either fail pure (validate phase size bombs result)
     case oracle of
       Nothing -> pure ()
@@ -205,7 +227,7 @@ main = do
     Left err -> failRun "execution" "error" (show err)
     Right Nothing -> failRun "execution" "timeout" "Execution exceeded budget; no timing emitted"
     Right (Just (result, metrics)) -> putStrLn $ json (metadata ++
-      [("status", show ("ok" :: String)), ("oracle_checked", if engine == Native then "true" else "false"),
+      [("status", show ("ok" :: String)), ("oracle_checked", if engine /= Reference then "true" else "false"),
        ("fully_drained", "true"), ("verified_answers", show (length (summaryAnswers result))),
        ("answer_fingerprint", show (show (fingerprintString (show result)))),
        ("wall_seconds", show (fromIntegral (ended - started) / 1.0e9 :: Double)),

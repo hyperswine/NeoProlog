@@ -33,6 +33,7 @@ import MachineNormalizeTest (machineNormalizeGroup)
 import CompileTest (compileGroup)
 import MachineBytecodeTest (machineBytecodeGroup)
 import MachineBytecodeHeapTest (machineBytecodeHeapGroup)
+import MachineHeadTest (machineHeadGroup)
 import System.Environment (getArgs)
 import Data.List (isPrefixOf)
 import System.Exit (exitFailure)
@@ -55,7 +56,8 @@ groups =
     ("machine-normalize", machineNormalizeGroup),
     ("compile", compileGroup),
     ("machine-bytecode", machineBytecodeGroup),
-    ("machine-bytecode-heap", machineBytecodeHeapGroup)
+    ("machine-bytecode-heap", machineBytecodeHeapGroup),
+    ("machine-head", machineHeadGroup)
   ]
 
 main :: IO ()

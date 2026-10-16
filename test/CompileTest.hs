@@ -7,6 +7,7 @@ module CompileTest (compileGroup) where
 
 import Control.Monad (foldM, forM_)
 import qualified Data.IntMap.Strict as IM
+import Data.List (nub)
 import Data.Maybe (isNothing)
 import Data.Word (Word64)
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
@@ -60,6 +61,45 @@ decode code = do
               | otherwise -> Nothing
           pure (IM.insert (destination instruction) term registers)
 
+-- Decode the independent preorder matcher, checking every subtree width and
+-- its correspondence to the separately cached construction plan.
+decodeHead :: ClauseCode -> Maybe Term
+decodeHead code = do
+  (term, slot, _, remaining) <- node (codeHeadInstructions code)
+  if null remaining && slot == codeHead code then Just term else Nothing
+  where
+    variables = IM.fromList [(variable, slot) | UseVariable slot variable <- codeInstructions code]
+    node (HeadVariable variable : rest) = do
+      slot <- IM.lookup variable variables
+      pure (Var variable, slot, 1, rest)
+    node (HeadConstant slot scalar : rest) = do
+      instruction <- codeInstructionAt code slot
+      case instruction of
+        PutConstant destination' actual
+          | destination' == slot && observe actual == observe scalar -> pure (scalar, slot, 1, rest)
+        _ -> Nothing
+    node (HeadCompound slot name arity width : rest) = do
+      (children, slots, widths, remaining) <- nodes arity rest
+      instruction <- codeInstructionAt code slot
+      case instruction of
+        PutCompound destination' actual arguments
+          | destination' == slot && actual == name && arguments == slots
+            && width == 1 + sum widths ->
+              pure (Compound name children, slot, width, remaining)
+        _ -> Nothing
+    node [] = Nothing
+    nodes 0 rest = Just ([], [], [], rest)
+    nodes count rest
+      | count < 0 = Nothing
+      | otherwise = do
+          (term, slot, width, next) <- node rest
+          (terms, slots, widths, remaining) <- nodes (count - 1) next
+          pure (term : terms, slot : slots, width : widths, remaining)
+
+nodeCount :: Term -> Int
+nodeCount (Compound _ arguments) = 1 + sum (map nodeCount arguments)
+nodeCount _ = 1
+
 genScalar :: Gen Term
 genScalar = Gen.choice
   [ Atom <$> Gen.element ["nil", "leaf", "true", "\955"],
@@ -101,9 +141,14 @@ prop_generated_register_program_preserves_raw_clause = withTests 250 . property 
   clause <- forAll genClause
   code <- evalMaybe (compileClause clause)
   decoded <- evalMaybe (decode code)
+  headTerm <- evalMaybe (decodeHead code)
   map observe decoded === map observe (clauseHead clause : clauseBody clause)
+  observe headTerm === observe (clauseHead clause)
   codeVariableCount code === max 1 (clauseNVars clause)
   codeSlotCount code === length (codeInstructions code)
+  codeUnsharedSlotCount code === sum (map nodeCount (clauseHead clause : clauseBody clause))
+  length (codeHeadInstructions code) === nodeCount (clauseHead clause)
+  assert (codeSlotCount code <= codeUnsharedSlotCount code)
   map destination (codeInstructions code) === [0 .. codeSlotCount code - 1]
   map (observe . bodyTemplate) (codeBody code) === map observe (clauseBody clause)
   map (Just . bodyKey) (codeBody code) === map functorOf (clauseBody clause)
@@ -155,10 +200,38 @@ prop_first_order_data_and_scalar_identities_remain_distinct = unit $ do
   codeBody fact === []
   codeSlotCount fact === 1
 
+prop_register_sharing_retains_scalar_bits_and_distinct_constructors :: Property
+prop_register_sharing_retains_scalar_bits_and_distinct_constructors = unit $ do
+  let nanA = FloatLit (castWord64ToDouble 0x7ff8000000000042)
+      nanB = FloatLit (castWord64ToDouble 0x7ff8000000000043)
+      zero = FloatLit 0.0
+      negativeZero = FloatLit (-0.0)
+      clause = Clause (Compound "p"
+        [Var 0, Var 0, nanA, nanA, nanB, zero, negativeZero,
+         Atom "same", Atom "same", IntLit 7, IntLit 7,
+         Compound "box" [Var 0], Compound "box" [Var 0]])
+        [Compound "helper" [Var 0, Var 0, nanA, zero, negativeZero]] 1
+  code <- evalMaybe (compileClause clause)
+  decoded <- evalMaybe (decode code)
+  decodedHead <- evalMaybe (decodeHead code)
+  map observe decoded === map observe (clauseHead clause : clauseBody clause)
+  observe decodedHead === observe (clauseHead clause)
+  let instructions = codeInstructions code
+      constants = [observe scalar | PutConstant _ scalar <- instructions]
+  length [() | UseVariable _ 0 <- instructions] === 1
+  length [() | PutCompound _ "box" _ <- instructions] === 2
+  length constants === length (nub constants)
+  forM_ [nanA, nanB, zero, negativeZero] $ \scalar ->
+    length (filter (== observe scalar) constants) === 1
+  assert (codeSlotCount code < codeUnsharedSlotCount code)
+  assert (isNothing (codeInstructionAt code (-1)))
+  assert (isNothing (codeInstructionAt code (codeSlotCount code)))
+
 compileGroup :: Group
 compileGroup = Group "clause compiler"
   [ ("generated_register_program_preserves_raw_clause", prop_generated_register_program_preserves_raw_clause),
     ("control_and_nested_cuts_fall_back", prop_control_and_nested_cuts_fall_back),
     ("malformed_variables_and_uncallable_goals_fall_back", prop_malformed_variables_and_uncallable_goals_fall_back),
-    ("first_order_data_and_scalar_identities_remain_distinct", prop_first_order_data_and_scalar_identities_remain_distinct)
+    ("first_order_data_and_scalar_identities_remain_distinct", prop_first_order_data_and_scalar_identities_remain_distinct),
+    ("register_sharing_retains_scalar_bits_and_distinct_constructors", prop_register_sharing_retains_scalar_bits_and_distinct_constructors)
   ]

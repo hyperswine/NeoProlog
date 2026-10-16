@@ -38,6 +38,12 @@ extra-doc-files:    README.md docs/engine-roadmap.md
                     docs/engine-step2-tail-2026-10-16.jsonl
                     docs/engine-step2-cli-2026-10-16.jsonl
                     docs/performance-step2-2026-10-16.jsonl
+                    docs/engine-step2-head-register-2026-10-16.md
+                    docs/engine-step2-head-register-2026-10-16.tsv
+                    docs/engine-step2-head-register-initial-2026-10-16.tsv
+                    docs/engine-step2-head-tail-2026-10-16.jsonl
+                    docs/engine-step2-head-native-tail-2026-10-16.jsonl
+                    docs/engine-step2-head-minefield-2026-10-16.jsonl
 extra-source-files: examples/*.nprolog test/cli.py test/bench.py
                     test/bench_harness_test.py bench/run.sh bench/run.py
                     bench/bench.nprolog bench/bench.pl bench/check-tail-memory.py
@@ -134,7 +140,7 @@ test-suite infera-test
                       MachineGraphReuseTest MachineEnvironmentTest MachineGeneralReclaimTest
                       MachineInternalTailTest
                       MachineNormalizeTest
-                      CompileTest MachineBytecodeTest MachineBytecodeHeapTest
+                      CompileTest MachineBytecodeTest MachineBytecodeHeapTest MachineHeadTest
     default-language: Haskell2010
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1"
     build-depends:

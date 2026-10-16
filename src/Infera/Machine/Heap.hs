@@ -46,6 +46,7 @@ module Infera.Machine.Heap
     rerootVariable,
     unify,
     unifyWithChanges,
+    unifyWithChangesInTransaction,
     checkpoint,
     rollback,
     heapSize,
@@ -697,7 +698,7 @@ unify heap left right = fmap (fmap fst) (unifyWithChanges compare heap left righ
 unifyWithChanges :: (Address -> Address -> Ordering) -> Heap s -> Address -> Address -> ST s (Either HeapError (Bool, [Address]))
 unifyWithChanges order heap left right = do
   mark <- checkpoint heap
-  result <- runExceptT (loop [] [(left, right)])
+  result <- unifyWithChangesInTransaction order heap left right
   case result of
     Right (True, _) -> pure result
     _ -> do
@@ -705,6 +706,20 @@ unifyWithChanges order heap left right = do
       pure $ case restored of
         Left err -> Left err
         Right () -> result
+
+-- | Trusted internal unification under a transaction owned by the caller.
+-- This runs exactly the ordinary occurs-checked unifier and trails every
+-- write, but does not create a nested checkpoint or roll back on failure.
+-- A mismatch or heap error can therefore leave partial writes installed.
+-- The enclosing transaction must restore its checkpoint before exposing any
+-- failed result. Use 'unifyWithChanges' when that ownership proof is absent.
+--
+-- Compiled whole-head matching calls this only inside Machine.CLP.unifyUsing,
+-- whose transaction owns every leaf write; activation also owns an outer
+-- checkpoint covering source-root and constructor allocations.
+unifyWithChangesInTransaction :: (Address -> Address -> Ordering) -> Heap s -> Address -> Address
+  -> ST s (Either HeapError (Bool, [Address]))
+unifyWithChangesInTransaction order heap left right = runExceptT (loop [] [(left, right)])
   where
     loop changed [] = pure (True, reverse changed)
     loop changed ((a, b) : rest) = do

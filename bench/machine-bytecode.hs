@@ -10,6 +10,7 @@ import Data.Version (showVersion)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Fingerprint (fingerprintString)
 import Infera hiding (main)
+import qualified Infera.Compile as Compile
 import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Machine.Control as Machine
 import qualified Infera.Machine.Heap as Heap
@@ -23,7 +24,8 @@ data Case = Case String String Model
 cases :: [Case]
 cases =
   [ Case "helper-dispatch-10000" "loop 10000 0 Result?" (SumTo 10000),
-    Case "structured-list-300" "build 300 [] Result?" (Entries 300)
+    Case "structured-list-300" "build 300 [] Result?" (Entries 300),
+    Case "structured-head-10000" "head_loop 10000 0 Result?" (SumTo 10000)
   ]
 
 fixture :: String
@@ -34,7 +36,10 @@ fixture = unlines
     "loop N Acc Result <- N > 0, step N Acc M Next, loop M Next Result.",
     "prepend N Acc [entry N (pair N N) [N, N, N] | Acc].",
     "build 0 Acc Acc.",
-    "build N Acc Result <- N > 0, M is N - 1, prepend N Acc Next, build M Next Result."
+    "build N Acc Result <- N > 0, M is N - 1, prepend N Acc Next, build M Next Result.",
+    "read_node (node (pair X X) [X, X, X] (tag X X X)) X.",
+    "head_loop 0 Acc Acc.",
+    "head_loop N Acc Result <- N > 0, read_node (node (pair N N) [N, N, N] (tag N N N)) Value, M is N - 1, Next is Acc + Value, head_loop M Next Result."
   ]
 
 -- Keep errors, exhaustion and non-answer items in their original positions.
@@ -130,7 +135,9 @@ compiledProbe program query testCase@(Case name _ _) expected = do
     validate testCase expected actual
     unless (Machine.metricCompiledActivations metrics > 0
       && Machine.metricBytecodeInstructions metrics > 0
-      && Machine.metricDirectCalls metrics > 0)
+      && Machine.metricDirectCalls metrics > 0
+      && Machine.metricHeadInstructions metrics > 0
+      && Machine.metricHeadCellsAvoided metrics > 0)
       (fail (name ++ ": compiled/direct dispatch was not exercised"))
     _ <- evaluate (length (show metrics))
     pure metrics
@@ -141,6 +148,9 @@ compiledProbe program query testCase@(Case name _ _) expected = do
         "compiled_activations=" ++ show (Machine.metricCompiledActivations metrics),
         "bytecode_instructions=" ++ show (Machine.metricBytecodeInstructions metrics),
         "direct_calls=" ++ show (Machine.metricDirectCalls metrics),
+        "head_instructions=" ++ show (Machine.metricHeadInstructions metrics),
+        "head_cells_avoided=" ++ show (Machine.metricHeadCellsAvoided metrics),
+        "max_activation_registers=" ++ show (Machine.metricMaxActivationRegisters metrics),
         "fully_drained=true", "timed=false"
       ])
 
@@ -172,6 +182,7 @@ main = do
   putStrLn "# scope=loaded checked program; cold per-query compilation/cache construction+execution+projection+validation; no parsing or CLI startup"
   putStrLn "# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)"
   putStrLn "# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 measured_probe=5 normal_counters=false no_timing_threshold"
+  putStrLn "# compiled counters describe accepted activations; failed head instruction work is excluded"
   putStrLn "engine\tcase\tmedian_wall_seconds\tmedian_cpu_seconds\twall_samples\tcpu_samples"
   forM_ cases $ \testCase@(Case name text model) -> do
     query <- either fail pure (parseQuery text)
@@ -195,3 +206,10 @@ main = do
             cpus = map snd samples
         putStrLn (intercalate "\t"
           [engine, name, show (median walls), show (median cpus), show walls, show cpus])
+  let plans = [code | TLClause clause <- items, Just code <- [Compile.compileClause clause]]
+  putStrLn (intercalate " "
+    [ "# register_plan", "scope=all_supported_fixture_clauses",
+      "unshared_slots=" ++ show (sum (map Compile.codeUnsharedSlotCount plans)),
+      "pooled_slots=" ++ show (sum (map Compile.codeSlotCount plans)),
+      "timed=false"
+    ])

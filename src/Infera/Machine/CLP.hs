@@ -4,6 +4,7 @@
 -- the heap prefix; no reference goal evaluator participates in this layer.
 module Infera.Machine.CLP
   ( unify,
+    unifyUsing,
     apply,
     applyAccepted,
     bindInteger,
@@ -47,9 +48,26 @@ transaction heap action = do
 -- exact reference writes. This also maintains the substitution mirror when
 -- no constraints are active, so later posting needs no full heap export.
 unify :: Heap s -> Bridge.Bindings -> Store -> Address -> Address -> ST s (Either HeapError Result)
-unify heap bindings store left right = transaction heap $ do
-  (accepted, written) <- checked $
-    Heap.unifyWithChanges (Bridge.compareVariables bindings) heap left right
+unify heap bindings store left right = unifyUsing heap bindings store $
+  Heap.unifyWithChanges (Bridge.compareVariables bindings) heap left right
+
+-- | Internal whole-head matching boundary. The action must use this heap and
+-- these bindings' stable variable order, returning every actual reference
+-- write in the same depth-first order as one whole heap unification. It may
+-- inspect known constructor shapes instead of allocating a matching pattern.
+-- No propagation may run inside the action: a later structural mismatch must
+-- discard earlier bindings before a watched variable can raise an error.
+--
+-- Only after the entire match succeeds are its final raw writes exported and
+-- propagated once. Mismatch, heap failure or CLP failure restores the complete
+-- heap prefix preceding the action, including any pattern allocations. A
+-- caller allocating activation roots beforehand owns an outer transaction
+-- when those allocations must also be discarded on rejection.
+unifyUsing :: Heap s -> Bridge.Bindings -> Store
+  -> ST s (Either HeapError (Bool, [Address])) -> ST s (Either HeapError Result)
+{-# INLINE unifyUsing #-}
+unifyUsing heap bindings store action = transaction heap $ do
+  (accepted, written) <- checked action
   if not accepted
     then pure (Right Nothing)
     else do

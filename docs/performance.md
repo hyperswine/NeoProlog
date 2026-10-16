@@ -1,7 +1,24 @@
 # Performance measurements
 
+## Head matching and registers - 2026-10-16
+
+The opt-in compiler now matches known head structures without duplicating their
+graphs, pools repeated variable/scalar registers and delays body construction
+until head acceptance. A structured-head probe avoids 80,001 head constructors;
+the fixture's construction plan shrinks from 135 to 84 slots. Whole-head CLP
+propagation and complete rollback retain the existing semantics.
+
+Current paired measurements remain mixed: Bytecode is faster on the structured
+list case, but slower on helper dispatch and structured heads. No general
+throughput win is established. The interpreted native driver remains the public
+default. All 28 compiled residency samples pass, including million-iteration
+loops with live alternatives, opaque scopes and CLP state.
+The [head/register report](engine-step2-head-register-2026-10-16.md) records
+current source-matched samples, validation and remaining work.
+
 ## Native follow-up and first bytecode slice - 2026-10-16
 
+This section records the foundation snapshot before the head/register changes.
 The large-minefield regression is fixed. Constrained table calls now evaluate
 their plain fallback on the active driver. Monotone native-store synchronization
 avoids revalidating unchanged historical substitutions, and graph normalization

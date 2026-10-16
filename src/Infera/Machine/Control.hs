@@ -180,12 +180,17 @@ data Metrics = Metrics
     metricMaxFunctors :: !Int,
     metricCompiledActivations :: !Int,
     metricBytecodeInstructions :: !Int,
-    metricDirectCalls :: !Int
+    metricDirectCalls :: !Int,
+    -- Compiled instruction/allocation counts describe accepted activations;
+    -- failed heads can execute instructions without returning an activation.
+    metricHeadInstructions :: !Int,
+    metricHeadCellsAvoided :: !Int,
+    metricMaxActivationRegisters :: !Int
   }
   deriving (Eq, Show)
 
 emptyMetrics :: Metrics
-emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 data Checkpoint = Checkpoint !Env !Heap.FrozenHeap !Running
 
@@ -976,35 +981,49 @@ tryClauses environment heap running goal fuel scopes call ((ordinal, clause) : r
       located template task
         | not (runningTraced running) = task
         | otherwise = Located ((\site -> Trace.goalSourceSpan site template) <$> source) task
-  (bindings, headAddress, tasks, instructionCount) <-
+  (bindings, result, tasks, activation, acceptedFresh) <-
     case Map.lookup (callKey call, ordinal) (runningCode running) of
       Just code -> do
-        (allocated, headRoot, bodyRoots) <- checked
-          (BytecodeVM.instantiate heap (branchBindings branch) base code)
-        let task bodyCall bodyRoot = located (Compile.bodyTemplate bodyCall)
-              (compiledTask environment (Compile.bodyKey bodyCall) bodyRoot (fuel - 1) scopes)
-        pure (allocated, headRoot, zipWith task (Compile.codeBody code) bodyRoots,
-          Just (length (Compile.codeInstructions code)))
+        let activate = if runningMeasured running then BytecodeVM.activateMeasured else BytecodeVM.activate
+        matched <- checked (activate heap (branchBindings branch)
+          (ssStore (branchState branch)) goal base code)
+        case matched of
+          Left problem -> pure (branchBindings branch, Left problem, [], Nothing, base)
+          Right Nothing -> pure (branchBindings branch, Right Nothing, [], Nothing, base)
+          Right (Just accepted) -> do
+            let allocated = BytecodeVM.activationBindings accepted
+                task bodyCall bodyRoot = located (Compile.bodyTemplate bodyCall)
+                  (compiledTask environment (Compile.bodyKey bodyCall) bodyRoot (fuel - 1) scopes)
+            pure (allocated, Right (Just (allocated, BytecodeVM.activationStore accepted)),
+              zipWith task (Compile.codeBody code) (BytecodeVM.activationBodyRoots accepted),
+              Just accepted, fresh)
       Nothing -> do
         let headTerm = renameTerm base (clauseHead clause)
             body = map (renameBody base) (clauseBody clause)
         (allocated, addresses) <- checked (Bridge.importTerms heap (branchBindings branch)
           (map Var [base .. fresh - 1] ++ headTerm : body))
         case drop (fresh - base) addresses of
-          headRoot : bodyRoots -> pure (allocated, headRoot,
-            zipWith (\template bodyRoot -> located template (Run bodyRoot (fuel - 1) scopes))
-              (clauseBody clause) bodyRoots, Nothing)
+          headRoot : bodyRoots -> do
+            matched <- checked (NativeCLP.unify heap allocated (ssStore (branchState branch)) goal headRoot)
+            pure (allocated, matched,
+              zipWith (\template bodyRoot -> located template (Run bodyRoot (fuel - 1) scopes))
+                (clauseBody clause) bodyRoots, Nothing, fresh)
           _ -> throwError Heap.IncompatibleBindings
-  result <- checked (NativeCLP.unify heap bindings (ssStore (branchState branch)) goal headAddress)
   let previous = runningMetrics withRetry
-      metrics = case instructionCount of
-        Just count | runningMeasured withRetry -> previous
+      metrics = case activation of
+        Just accepted | runningMeasured withRetry -> previous
           {metricCompiledActivations = metricCompiledActivations previous + 1,
-           metricBytecodeInstructions = metricBytecodeInstructions previous + count}
+           metricBytecodeInstructions = metricBytecodeInstructions previous
+             + BytecodeVM.activationHeadInstructions accepted
+             + BytecodeVM.activationAllocationInstructions accepted,
+           metricHeadInstructions = metricHeadInstructions previous + BytecodeVM.activationHeadInstructions accepted,
+           metricHeadCellsAvoided = metricHeadCellsAvoided previous + BytecodeVM.activationHeadCellsAvoided accepted,
+           metricMaxActivationRegisters = max (metricMaxActivationRegisters previous)
+             (BytecodeVM.activationRegisterSlots accepted)}
         _ -> previous
       nextBranch = branch
         { branchBindings = bindings,
-          branchState = (branchState branch) {ssFresh = fresh},
+          branchState = (branchState branch) {ssFresh = acceptedFresh},
           branchTasks = tasks ++ Return selected : branchTasks branch }
       selectedRunning = withRetry {runningBranch = nextBranch, runningMetrics = metrics}
       locatedHead = case result of

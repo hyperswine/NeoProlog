@@ -2,7 +2,7 @@
 """Check bounded tail residency in fresh processes, including disabled tracing.
 
 Build with cabal build bench:machine-tail --enable-optimization=2, then run:
-python3 bench/check-tail-memory.py BINARY --output samples.jsonl [--quick]
+python3 bench/check-tail-memory.py BINARY --output samples.jsonl [--quick] [--backend bytecode]
 The quick CI gate checks mutual recursion and helpers; the full gate adds live checkpoints,
 structured arguments, helpers, CLP, tables and dynamic state. Timings are reports.
 """
@@ -29,6 +29,7 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--backend", choices=("interpreted", "bytecode"), default="interpreted")
     args = parser.parse_args()
     binary = str(args.binary.resolve())
     if sys.platform == "darwin":
@@ -48,13 +49,15 @@ def main():
     prefix_rss = prefix_live = 0
     with args.output.open("w") as destination:
         for case, count, measured, repeat in matrix:
-            command = timer + [binary, str(count), "--case", case]
+            command = timer + [binary, str(count), "--case", case, "--backend", args.backend]
             if not measured:
                 command.append("--unmeasured")
             command += ["+RTS", "-T", "-s", "-RTS"]
             result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
                                     timeout=180, check=True)
             row = json.loads(result.stdout)
+            if row["backend"] != args.backend:
+                raise RuntimeError("Tail runner used a different execution backend")
             peak = re.search(peak_pattern, result.stderr)
             if peak is None:
                 raise RuntimeError("Missing process peak RSS: " + result.stderr)

@@ -1,0 +1,20 @@
+# source-fingerprint=4b6282d23718d7e2ac8359ddaf092989
+# compiler=ghc-9.8 platform=aarch64-darwin
+# scope=loaded checked program; cold per-query compilation/cache construction+execution+projection+validation; no parsing or CLI startup
+# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)
+# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 measured_probe=5 normal_counters=false no_timing_threshold
+# compiled counters describe accepted activations; failed head instruction work is excluded
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples
+# compiled_probe case=helper-dispatch-10000 compiled_activations=20001 bytecode_instructions=270004 direct_calls=20000 head_instructions=90004 head_cells_avoided=20001 max_activation_registers=10 fully_drained=true timed=false
+reference	helper-dispatch-10000	7.0078e-2	6.9105e-2	[6.2515e-2,7.4642e-2,7.0078e-2]	[6.1934e-2,7.3296e-2,6.9105e-2]
+interpreted	helper-dispatch-10000	0.198521	0.194035	[0.193734,0.205117,0.198521]	[0.191064,0.200623,0.194035]
+bytecode	helper-dispatch-10000	0.237541	0.231128	[0.236323,0.239483,0.237541]	[0.230413,0.234149,0.231128]
+# compiled_probe case=structured-list-300 compiled_activations=601 bytecode_instructions=8704 direct_calls=600 head_instructions=2404 head_cells_avoided=601 max_activation_registers=13 fully_drained=true timed=false
+reference	structured-list-300	0.105633	0.104594	[0.120984,0.105633,0.100593]	[0.119882,0.104594,9.9878e-2]
+interpreted	structured-list-300	0.383948	0.379348	[0.387707,0.383244,0.383948]	[0.382364,0.379138,0.379348]
+bytecode	structured-list-300	0.36569	0.362964	[0.36569,0.364434,0.366507]	[0.362964,0.36149,0.363539]
+# compiled_probe case=structured-head-10000 compiled_activations=20001 bytecode_instructions=430004 direct_calls=20000 head_instructions=210004 head_cells_avoided=80001 max_activation_registers=23 fully_drained=true timed=false
+reference	structured-head-10000	9.2924e-2	9.198e-2	[9.3701e-2,8.3806e-2,9.2924e-2]	[9.2576e-2,8.3196e-2,9.198e-2]
+interpreted	structured-head-10000	0.287963	0.285686	[0.285792,0.287963,0.293503]	[0.283618,0.285686,0.290462]
+bytecode	structured-head-10000	0.301909	0.298902	[0.314554,0.301909,0.292179]	[0.310495,0.298902,0.289923]
+# register_plan scope=all_supported_fixture_clauses unshared_slots=135 pooled_slots=84 timed=false

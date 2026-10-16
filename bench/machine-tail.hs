@@ -23,7 +23,7 @@ data Case = Ground | Result | Structured | Mutual | Helper | Choice | Once
   | Call | Conditional | Collected | Constrained | Cached | Dynamic
   deriving (Eq)
 
-data Options = Options Int Bool Case
+data Options = Options Int Bool Case Machine.ExecutionBackend
 
 -- Keep the historical scalar fixture as the default. The additional cases
 -- distinguish a free result from a fixed structured input with a shared leaf.
@@ -99,18 +99,27 @@ helperSource = unlines
   ]
 
 usage :: String
-usage = "Usage: machine-tail [iterations] [--case ground|result|structured|mutual|helper|choice|once|call|if|findall|clp|cached|dynamic] [--unmeasured] +RTS -T -s"
+usage = "Usage: machine-tail [iterations] [--case ground|result|structured|mutual|helper|choice|once|call|if|findall|clp|cached|dynamic] [--backend interpreted|bytecode] [--unmeasured] +RTS -T -s"
 
 -- Flags and the single positional count can occur in any order. Rejecting
 -- duplicate or unknown inputs avoids silently measuring a different fixture.
 parseOptions :: [String] -> Either String Options
-parseOptions = parse Nothing Nothing Nothing
+parseOptions = parse Nothing Nothing Nothing Nothing
   where
-    parse count measured chosen [] = Right $ Options
+    parse count measured chosen backend [] = Right $ Options
       (maybe 1000000 id count) (maybe True id measured) (maybe Ground id chosen)
-    parse count Nothing chosen ("--unmeasured" : rest) = parse count (Just False) chosen rest
-    parse _ (Just _) _ ("--unmeasured" : _) = Left "Duplicate --unmeasured flag"
-    parse count measured Nothing ("--case" : name : rest) = do
+      (maybe Machine.Interpreted id backend)
+    parse count Nothing chosen backend ("--unmeasured" : rest) = parse count (Just False) chosen backend rest
+    parse _ (Just _) _ _ ("--unmeasured" : _) = Left "Duplicate --unmeasured flag"
+    parse count measured chosen Nothing ("--backend" : name : rest) = do
+      backend <- case name of
+        "interpreted" -> Right Machine.Interpreted
+        "bytecode" -> Right Machine.Bytecode
+        _ -> Left ("Unknown backend: " ++ name)
+      parse count measured chosen (Just backend) rest
+    parse _ _ _ (Just _) ("--backend" : _) = Left "Duplicate --backend flag"
+    parse _ _ _ _ ["--backend"] = Left "Missing value after --backend"
+    parse count measured Nothing backend ("--case" : name : rest) = do
       selected <- case name of
         "ground" -> Right Ground
         "result" -> Right Result
@@ -126,15 +135,15 @@ parseOptions = parse Nothing Nothing Nothing
         "cached" -> Right Cached
         "dynamic" -> Right Dynamic
         _ -> Left ("Unknown tail case: " ++ name)
-      parse count measured (Just selected) rest
-    parse _ _ (Just _) ("--case" : _) = Left "Duplicate --case flag"
-    parse _ _ _ ["--case"] = Left "Missing value after --case"
-    parse count measured chosen (text : rest)
+      parse count measured (Just selected) backend rest
+    parse _ _ (Just _) _ ("--case" : _) = Left "Duplicate --case flag"
+    parse _ _ _ _ ["--case"] = Left "Missing value after --case"
+    parse count measured chosen backend (text : rest)
       | "--" `isPrefixOf` text = Left ("Unknown option: " ++ text)
       | otherwise = case count of
           Just _ -> Left "Only one iteration count may be supplied"
           Nothing -> case readMaybe text of
-            Just value | value >= (0 :: Int) -> parse (Just value) measured chosen rest
+            Just value | value >= (0 :: Int) -> parse (Just value) measured chosen backend rest
             _ -> Left "Iteration count must be a nonnegative machine integer"
 
 -- Fully drain the continuation. Keep only projected observations rather than
@@ -169,20 +178,27 @@ metricFields metrics =
     ("max_bindings", show (Machine.metricMaxBindings metrics)),
     ("max_substitutions", show (Machine.metricMaxSubstitutions metrics)),
     ("max_constants", show (Machine.metricMaxConstants metrics)),
-    ("max_functors", show (Machine.metricMaxFunctors metrics))
+    ("max_functors", show (Machine.metricMaxFunctors metrics)),
+    ("compiled_activations", show (Machine.metricCompiledActivations metrics)),
+    ("bytecode_instructions", show (Machine.metricBytecodeInstructions metrics)),
+    ("direct_calls", show (Machine.metricDirectCalls metrics)),
+    ("head_instructions", show (Machine.metricHeadInstructions metrics)),
+    ("head_cells_avoided", show (Machine.metricHeadCellsAvoided metrics)),
+    ("max_activation_registers", show (Machine.metricMaxActivationRegisters metrics))
   ]
 
 main :: IO ()
 main = do
   arguments <- getArgs
-  Options count measured selected <- either (fail . (++ "\n" ++ usage)) pure (parseOptions arguments)
+  Options count measured selected backend <- either (fail . (++ "\n" ++ usage)) pure (parseOptions arguments)
   let (caseName, source, querySource, expected) = fixture selected count
   enabled <- getRTSStatsEnabled
   unless enabled (fail "Enable RTS statistics with +RTS -T -s")
   program <- either fail pure (Reference.loadProgramText source)
   query <- either fail pure (parseQuery querySource)
   _ <- evaluate (length (show program) + length (show query))
-  let paths = ["src/Infera/Machine/Control.hs", "src/Infera/Machine/Heap.hs",
+  let paths = ["src/Infera/Compile.hs", "src/Infera/Machine/Bytecode.hs",
+        "src/Infera/Machine/Control.hs", "src/Infera/Machine/Heap.hs",
         "src/Infera/Machine/Bridge.hs", "src/Infera/Machine/CLP.hs",
         "src/Infera/Machine/Builtins.hs", "src/Infera/Machine/Tail.hs",
         "src/Infera/Machine/Table.hs", "src/Infera/Engine/Reference.hs",
@@ -196,13 +212,17 @@ main = do
   performGC
   before <- getRTSStats
   started <- getMonotonicTimeNSec
-  let begin = if measured then Machine.startMeasured else Machine.start
+  let begin = if measured then Machine.startMeasuredWithBackend backend else Machine.startWithBackend backend
       result = begin program query >>= drain query
   (answers, metrics) <- either (fail . show) pure result
   _ <- evaluate (length (show answers) + length (show (metricFields metrics)))
   unless (answers == expected) (fail ("Tail loop did not produce its verified answer: " ++ show answers))
   unless (not measured || Machine.metricCalls metrics >= count + 1)
     (fail "Call counter missed a loop activation")
+  unless (not measured || backend /= Machine.Bytecode || Machine.metricCompiledActivations metrics > 0)
+    (fail "Bytecode tail loop did not exercise compiled activation")
+  unless (measured || all ((== "0") . snd) (metricFields metrics))
+    (fail "Unmeasured tail execution retained metric counters")
   if measured && count >= 10000
     then do
       unless (Machine.metricTailCalls metrics > count - 1000) (fail "Tail loop did not reuse its frame")
@@ -213,6 +233,7 @@ main = do
   after <- getRTSStats
   putStrLn $ json
     [ ("case", show caseName),
+      ("backend", show (if backend == Machine.Bytecode then "bytecode" else "interpreted" :: String)),
       ("iterations", show count),
       ("verified_answers", show (length expected)),
       ("fully_drained", "true"),

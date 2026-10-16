@@ -193,6 +193,30 @@ prop_compiled_path_and_direct_call_counters = unit $ do
   Machine.metricBytecodeInstructions disabled === 0
   Machine.metricDirectCalls disabled === 0
 
+prop_structured_head_tail_collection_and_register_counts :: Property
+prop_structured_head_tail_collection_and_register_counts = unit $ do
+  program <- load $ unlines
+    [ "<- notable.",
+      "shape (node (pair X X) [X, X, X] (tag X X X)) X.",
+      "down 0 Acc Acc.",
+      "down N Acc R <- N > 0, shape (node (pair N N) [N, N, N] (tag N N N)) Value, Next is Acc + Value, M is N - 1, down M Next R."
+    ]
+  query <- queryText "down 10000 0 Result?"
+  initial <- evalEither (Machine.startMeasuredWithBackend Machine.Bytecode program query)
+  (actual, metrics) <- evalEither (drain initial)
+  observe query actual === observe query (Reference.solveQuery program query)
+  observe query actual === observe query (Machine.solveQueryWithBackend Machine.Interpreted program query)
+  case [Reference.projectAnswer query state | Reference.Found state <- actual] of
+    [answer] -> Reference.answerBindings answer === [("Result", IntLit 50005000)]
+    other -> annotateShow other >> failure
+  assert (Machine.metricHeadInstructions metrics > 10000)
+  assert (Machine.metricHeadCellsAvoided metrics > 10000)
+  assert (Machine.metricMaxActivationRegisters metrics > 0)
+  assert (Machine.metricMaxHeapCells metrics <= 4096)
+  assert (Machine.metricMaxTasks metrics <= 8)
+  assert (Machine.metricCollections metrics > 0)
+  assert (Machine.metricTailCalls metrics >= 9000)
+
 prop_contracts_errors_and_small_fuel :: Property
 prop_contracts_errors_and_small_fuel = unit $ do
   program <- load $ unlines
@@ -365,6 +389,7 @@ machineBytecodeGroup = Group "opt-in bytecode driver"
   [ ("generated first-order ordered answers versus both engines", prop_generated_ordered_first_order_answers),
     ("generated structured heads and body variable sharing", prop_generated_head_sharing_and_body_variables),
     ("compiled and direct-call counters exclude total fallback", prop_compiled_path_and_direct_call_counters),
+    ("structured head tail collection and register counts", prop_structured_head_tail_collection_and_register_counts),
     ("contracts errors and explicit fuel match both engines", prop_contracts_errors_and_small_fuel),
     ("generic control and meta fallback preserve observations", prop_generic_control_and_meta_fallback),
     ("standard library executes through opt-in bytecode", prop_stdlib_first_order_execution),
