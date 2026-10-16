@@ -23,6 +23,7 @@ module Infera.Machine.Heap
     Environment,
     Checkpoint,
     HeapError (..),
+    CellView (..),
     newHeap,
     thawHeap,
     freezeHeap,
@@ -33,6 +34,9 @@ module Infera.Machine.Heap
     exportTerm,
     exportTerms,
     dereference,
+    view,
+    viewRaw,
+    referenceTarget,
     unify,
     checkpoint,
     rollback,
@@ -67,6 +71,19 @@ data HeapError
   = InvalidAddress !Address
   | InvalidCheckpoint
   | HeapCapacityExceeded
+  | IncompatibleBindings
+  deriving (Eq, Show)
+
+-- | A dereferenced cell without exposing mutable heap storage. Child handles
+-- retain the same branch ownership rules as any other 'Address'.
+data CellView
+  = VariableView !Address
+  | AtomView !String
+  | IntegerView !Integer
+  | FloatView !Double
+  | CharacterView !Char
+  | StringView !String
+  | CompoundView !String [Address]
   deriving (Eq, Show)
 
 newtype Environment = Environment (IntMap Address)
@@ -290,6 +307,46 @@ deref heap address = do
 
 dereference :: Heap s -> Address -> ST s (Either HeapError Address)
 dereference heap address = runExceptT (fst <$> deref heap address)
+
+view :: Heap s -> Address -> ST s (Either HeapError CellView)
+view heap address = runExceptT $ do
+  (target, cell) <- deref heap address
+  viewCell heap target cell
+
+-- | Inspect syntactic variable occurrences before dereferencing. A bound
+-- variable remains a 'VariableView' of its original root, allowing callers
+-- to preserve the reference interpreter's shallow control-pattern matches.
+viewRaw :: Heap s -> Address -> ST s (Either HeapError CellView)
+viewRaw heap address = runExceptT $ do
+  cell <- readCell heap address
+  viewCell heap address cell
+
+-- | The direct target of a raw reference, including a free variable's self
+-- reference. This retains binding syntax when exporting a substitution;
+-- following all references would erase nested variable occurrences that the
+-- reference evaluator deliberately inspects before deeper dereferencing.
+referenceTarget :: Heap s -> Address -> ST s (Either HeapError (Maybe Address))
+referenceTarget heap address = runExceptT $ do
+  cell <- readCell heap address
+  pure $ case cell of
+    Ref target -> Just target
+    _ -> Nothing
+
+viewCell :: Heap s -> Address -> Cell -> HeapM s CellView
+viewCell heap target cell =
+  case cell of
+    Ref _ -> pure (VariableView target)
+    Con ident -> do
+      value <- lift (getConstant heap ident)
+      pure $ case value of
+        AtomConstant scalar -> AtomView scalar
+        IntegerConstant scalar -> IntegerView scalar
+        FloatConstant scalar -> FloatView scalar
+        CharConstant scalar -> CharacterView scalar
+        StringConstant scalar -> StringView scalar
+    Structure ident children -> do
+      (name, _) <- lift (getFunctor heap ident)
+      pure (CompoundView name children)
 
 checkpoint :: Heap s -> ST s Checkpoint
 checkpoint heap = do

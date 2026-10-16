@@ -79,9 +79,37 @@ prop_store_reference = withTests 300 $ property $ do
   mapM_ (\values -> do
       let bindings = zip [0..2] values
           actual = foldl (\r (v,n) -> continue (\st -> storeBind st v n) r) current bindings
-          expected = foldl (\r (v,n) -> continue (\st -> Ref.storeBind st v n) r) reference bindings
+          referenceBound = foldl (\r (v,n) -> continue (\st -> Ref.storeBind st v n) r) reference bindings
+          -- The frozen store does not remap its watched-variable set when an
+          -- alias rewrites a nonlinear residual. Settle the complete assignment
+          -- explicitly so that a missed reference wake-up cannot accept an
+          -- invalid answer (for example abs X = X, X = Y, Y = -1).
+          expected = continue Ref.propagate referenceBound
       accepted actual === accepted expected
     ) (sequence (replicate 3 [-2..2]))
+
+prop_absolute_alias_fixed_point :: Property
+prop_absolute_alias_fixed_point = withTests 1 $ property $ do
+  mapM_ (\(reverseSides, aliasFirst, bindingOrder, n) -> do
+      let variable = Var 1
+          absolute = Compound "abs" [variable]
+          relation = if reverseSides then Relation RelEq variable absolute
+            else Relation RelEq absolute variable
+          alias = Alias 1 0
+          operations = if aliasFirst then [alias, relation] else [relation, alias]
+          current = foldl (\r op -> continue (post op) r) (Right (Just emptyStore)) operations
+          reference = foldl (\r op -> continue (postReference op) r) (Right (Just Ref.emptyStore)) operations
+          actual = foldl (\r v -> continue (\st -> storeBind st v n) r) current bindingOrder
+          expected = continue Ref.propagate $
+            foldl (\r v -> continue (\st -> Ref.storeBind st v n) r) reference bindingOrder
+      annotateShow (reverseSides, aliasFirst, bindingOrder, n)
+      -- This oracle is the integer equation itself, independent of either
+      -- store's scheduler, domain narrowing, or residual representation.
+      accepted actual === Right (abs n == n)
+      accepted expected === Right (abs n == n)
+    ) [(reverseSides, aliasFirst, bindingOrder, n)
+      | reverseSides <- [False, True], aliasFirst <- [False, True],
+        bindingOrder <- [[0,1], [1,0]], n <- [-3..3]]
 
 solve :: [String] -> String -> PropertyT IO [[Integer]]
 solve names query = do
@@ -202,6 +230,7 @@ prop_propagation_regressions = withTests 1 $ property $ do
 clpPerformanceGroup :: Group
 clpPerformanceGroup = Group "CLP performance correctness"
   [ ("store_reference", prop_store_reference),
+    ("absolute_alias_fixed_point", prop_absolute_alias_fixed_point),
     ("reification_model", prop_reification_model),
     ("absolute_model", prop_absolute_model),
     ("global_distinct_model", prop_global_distinct_model),

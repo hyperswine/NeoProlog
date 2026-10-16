@@ -48,6 +48,7 @@ import Data.Char (toLower, toUpper)
 import Infera.Arith
 import Infera.CLP
 import Infera.Error
+import qualified Infera.Engine.Contracts as Contracts
 import Infera.Infer (builtinDet, inferProgram)
 import Infera.Program
 import Infera.Purity (describeViolation, programViolations)
@@ -740,7 +741,7 @@ callPred env fuel st goal = case functorOf goal of
           goalN = normArithTerm s goal
           args = case goalN of Compound _ as -> as; _ -> []
           argsW = map (deepWalk s) args
-       in case selectSignature key p argsW of
+       in case Contracts.selectSignature key p argsW of
             Left err -> [BranchError err]
             Right msig ->
               let raw =
@@ -752,47 +753,6 @@ callPred env fuel st goal = case functorOf goal of
                     Nothing -> raw
                in applyDeterminism key p msig argsW withOut
 
--- | Pick the declared signature matching the call (first whose input args
--- are ground), checking sorts of bound arguments.  Nothing when undeclared.
-selectSignature :: PredKey -> Pred -> [Term] -> Either SolveError (Maybe Signature)
-selectSignature key p argsW = case predDecls p of
-  [] -> Right Nothing
-  sigs ->
-    case [sig | sig <- sigs, all inOk (zip (sigArgs sig) argsW)] of
-      (sig : _) -> do
-        mapM_ (checkSort key) (zip3 [1 ..] (sigArgs sig) argsW)
-        Right (Just sig)
-      [] ->
-        let bad = [(i, a) | sig <- take 1 sigs, (i, ArgSpec _ ModeIn, a) <- zip3 [1 ..] (sigArgs sig) argsW, not (isGroundTerm a)]
-         in case bad of
-              ((i, a) : _) -> Left (ModeError key i a)
-              [] -> Right Nothing
-  where
-    inOk (ArgSpec _ ModeIn, a) = isGroundTerm a
-    inOk _ = True
-
-checkSort :: PredKey -> (Int, ArgSpec, Term) -> Either SolveError ()
-checkSort key (i, ArgSpec sort _, a)
-  | sortMatches sort a = Right ()
-  | otherwise = Left (SortError key i sort a)
-
--- | Does a (dereferenced) term conform to a sort?  Unbound parts always do.
-sortMatches :: Sort -> Term -> Bool
-sortMatches sort t = case (sort, t) of
-  (_, Var _) -> True
-  (SAny, _) -> True
-  (SNone, _) -> True
-  (SInt, IntLit _) -> True
-  (SFloat, FloatLit _) -> True
-  (SNum, IntLit _) -> True
-  (SNum, FloatLit _) -> True
-  (SStr, StrLit _) -> True
-  (SChar, CharLit _) -> True
-  (SAtom, Atom _) -> True
-  (SList _, Atom "nil") -> True
-  (SList e, Compound "cons" [h, tl]) -> sortMatches e h && sortMatches (SList e) tl
-  _ -> False
-
 -- | After the call: output arguments must be ground and every argument must
 -- match its declared sort.
 checkOutputs :: PredKey -> Signature -> [Term] -> Search -> Search
@@ -801,19 +761,10 @@ checkOutputs key sig args = map check
     check (Found st) =
       let s = subst st
           argsW = map (deepWalk s) args
-          problems =
-            [ err
-            | (i, ArgSpec sort mode, a) <- zip3 [1 ..] (sigArgs sig) argsW,
-              err <- outErr i sort mode a
-            ]
-       in case problems of
-            (e : _) -> BranchError e
-            [] -> Found st
+       in case Contracts.checkOutputs key sig argsW of
+            Just e -> BranchError e
+            Nothing -> Found st
     check item = item
-    outErr i sort mode a
-      | mode == ModeOut && not (isGroundTerm a) = [OutputModeError key i a]
-      | not (sortMatches sort a) = [SortError key i sort a]
-      | otherwise = []
 
 -- | Enforce declared determinism, or commit on soundly inferred semidet.
 applyDeterminism :: PredKey -> Pred -> Maybe Signature -> [Term] -> Search -> Search
@@ -824,9 +775,7 @@ applyDeterminism key p msig argsW items = case msig of
     Multi -> requireOne Multi items
     Nondet -> items
   Nothing ->
-    let inf = predInferred p
-        switchGround = all (\i -> i < length argsW && isGroundTerm (argsW !! i)) (sigSwitch inf)
-     in if sigDet inf == Semidet && switchGround then commitFirst items else items
+    if Contracts.commitsAfterSuccess p Nothing argsW then commitFirst items else items
   where
     requireOne d xs =
       let hasFound = any isFound xs
@@ -893,9 +842,7 @@ evalTabled env fuel st0 p goal
       | not (safeContract p) || inferredCommit = Nothing
       | otherwise = fmap (map fst . filter snd) (mapM classifyClause candidates)
       where
-        inferredCommit = sigDet (predInferred p) == Semidet
-          && all (\i -> i < length argsW && isGroundTerm (argsW !! i))
-            (sigSwitch (predInferred p))
+        inferredCommit = Contracts.commitsAfterSuccess p Nothing argsW
         candidates = candidateClauses p
           (if predIsIndexed (envProg env) p then map indexKey argsW else [])
         classifyClause ci =

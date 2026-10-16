@@ -77,12 +77,37 @@ heap snapshots. Twelve heap properties include 1,500 generated comparisons
 with `Infera.Unify`, plus fixed failure, aliasing, scalar, rollback and
 page-boundary cases.
 
-This starts milestone 1. The production resolver still uses `Infera.Engine`;
-the search driver, compatible frozen `SolverState` exports, control stack,
-CLP/table adapters and collector remain to be implemented. Initial structures
-hold child-address lists rather than packed WAM cells, and every binding is
-trailed. The opaque layout can change after profiling. No query-speed or
-bounded-residency improvement is claimed by this isolated layer.
+The experimental [`Infera.Machine.Control`](../src/Infera/Machine/Control.hs)
+now adds explicit task and choice-point stacks. Indexed ordinary clauses,
+conjunction, disjunction, scoped cuts and constraint-free unification run on
+the heap. Predicate mode/sort checks and first-success commitments share their
+decisions with the reference engine through `Infera.Engine.Contracts`.
+Output validation precedes a commitment; declared failure guards survive
+clause retries. Foreign cuts stop at committing call boundaries, preserving
+the reference's marker handling rather than pruning caller alternatives.
+Their delivery remains deferred through reference iterators so a later local
+cut can suppress an earlier foreign marker.
+
+`start`/`resume` expose immutable suspended execution and compatible
+`SearchItem`/`SolverState` results through an opt-in Haskell API. The
+[`Bridge`](../src/Infera/Machine/Bridge.hs) preserves logical variable IDs,
+cross-root sharing and the complete persistent store, including propagation
+queues, output, tables and dynamic facts. It retains raw nested variable
+references in substitutions: deep expansion can change shallow matching of
+control expressions. Builtins, opaque sub-searches, tabled calls and calls
+with active constraints still use lazy reference iterators through this
+bridge. Adapter alternatives restore the heap and all branch metadata
+together; their tails are not forced before yielding the current answer.
+
+Fourteen control/bridge properties include 600 generated ordered-stream
+comparisons, failure and cut regressions, declaration checks, shallow control
+syntax, complete adapter state, and repeated/interleaved/prefix consumption.
+The production resolver still uses `Infera.Engine`. Native opaque sub-search,
+CLP/table execution, last-call reuse, collection and tracing remain later
+work; milestones 1 and 2 are not the step 1 exit gate. Initial structures hold
+child-address lists rather than packed WAM cells, and every binding is trailed.
+The opaque layout can change after profiling. No query-speed or
+bounded-residency improvement is claimed for this experimental path.
 
 Heap addresses, activation environments and rollback marks belong to one
 branch. They may accompany the matching frozen snapshot, but must not cross
@@ -308,6 +333,7 @@ must survive candidate rollback without leaking losing candidate state.
 
 ```
 src/Infera/Machine/Heap.hs      cells, trail, interning, Term <-> heap
+src/Infera/Machine/Bridge.hs    logical IDs and complete reference-state adapters
 src/Infera/Machine/Control.hs   frames, choice points, driver loop, cut, LCO
 src/Infera/Machine/Builtins.hs  the current builtin table, ported
 src/Infera/Machine/Table.hs     scoped tabling and immutable canonical answers
@@ -451,9 +477,9 @@ work through the instruction loop's event hook.
 
 ## Validation throughout
 
-* The established 109 Hedgehog properties (including correctness models and the
-  signature golden file), plus the 12 heap properties and subsequent
-  machine/compiler properties, must pass
+* The established engine properties (including correctness models and the
+  signature golden file), plus the 12 heap properties, 14 control/bridge
+  properties and subsequent machine/compiler properties, must pass
   against each engine. Keep generated comparisons with independent models as
   well as the reference; agreement between two engines is not a proof.
 * Compare ordered answers, duplicates, residual constraints, output, error
