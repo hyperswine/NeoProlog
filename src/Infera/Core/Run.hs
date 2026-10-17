@@ -18,6 +18,7 @@ where
 import Control.Monad (foldM, forM, forM_, when)
 import Data.Array ((!))
 import Data.Array.Base (getNumElements, unsafeRead, unsafeWrite)
+import Data.Bits ((.|.))
 import Data.Array.IO (IOArray, newArray_)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
@@ -284,7 +285,7 @@ step m goal goals base barrier depth next = case goal of
         | otherwise -> do
             compiled <- compileGoalTerm (mStore m) (mProgram m) (cpPreds (mCore m)) goalWith
             height <- readIORef (mChoiceTop m)
-            runGoals m [compiled] base height depth rest
+            runGoals m [compiled] base height depth (CGoals goals base barrier depth next)
   GUnify a b -> do
     wa <- buildArg m base False a
     wb <- buildArg m base False b
@@ -306,9 +307,10 @@ step m goal goals base barrier depth next = case goal of
         if same then backtrack m else continue
       else pure (Abandon "disequality constraint on non-ground operands")
   GIs target expr -> do
-    quick <- evalFast m base expr
-    if quick /= noFast
+    fast <- evalFast m base expr
+    if fast
       then do
+        quick <- readReg (mStore m) rVAL
         wt <- buildArg m base False target
         ok <- unify (mStore m) wt (intWord quick)
         if ok then continue else backtrack m
@@ -325,9 +327,11 @@ step m goal goals base barrier depth next = case goal of
             ok <- unify (mStore m) wt wv
             if ok then continue else backtrack m
   GCmp op a b -> do
-    qa <- evalFast m base a
-    qb <- if qa == noFast then pure noFast else evalFast m base b
-    if qb /= noFast
+    fa <- evalFast m base a
+    qa <- readReg (mStore m) rVAL
+    fb <- if fa then evalFast m base b else pure False
+    qb <- readReg (mStore m) rVAL
+    if fb
       then if cmpAccepts op (compare qa qb) then continue else backtrack m
       else do
         outcome <- compareGoal m base a b
@@ -335,10 +339,12 @@ step m goal goals base barrier depth next = case goal of
           Left err -> raiseError m err
           Right ordering -> if cmpAccepts op ordering then continue else backtrack m
   GOr left right -> do
+    let rest = CGoals goals base barrier depth next
     _ <- pushChoice m (AltGoals right base barrier depth rest)
     runGoals m left base barrier depth rest
   GIf condition thenGoals elseGoals -> do
     counter <- newIORef 0
+    let rest = CGoals goals base barrier depth next
     sentinel <- pushChoice m (AltIf counter (fmap (\gs -> (gs, base, barrier, depth)) elseGoals) rest)
     pushScope m (SCount counter)
     runGoals m condition base (sentinel + 1) depth (CExitIf sentinel thenGoals base barrier depth rest)
@@ -346,6 +352,7 @@ step m goal goals base barrier depth next = case goal of
   GNot inner -> do
     flag <- newIORef False
     buffer <- newIORef []
+    let rest = CGoals goals base barrier depth next
     sentinel <- pushChoice m (AltNot flag buffer rest)
     pushScope m (SBuffer buffer)
     runGoals m inner base (sentinel + 1) depth (CExitNot sentinel flag depth)
@@ -354,6 +361,7 @@ step m goal goals base barrier depth next = case goal of
     buffer <- newIORef []
     entryHeap <- heapTop (mStore m)
     entryOut <- outLen (mStore m)
+    let rest = CGoals goals base barrier depth next
     sentinel <- pushChoice m (AltFindAll results buffer target base depth rest)
     pushScope m (SBuffer buffer)
     runGoals m inner base (sentinel + 1) depth (CExitFindAll sentinel results template base entryHeap entryOut depth)
@@ -372,7 +380,6 @@ step m goal goals base barrier depth next = case goal of
   GUnsupported term -> pure (Abandon ("unsupported goal " ++ show term))
   where
     continue = runGoals m goals base barrier depth next
-    rest = CGoals goals base barrier depth next
 
 -- ─── calls ───────────────────────────────────────────────────────────────────
 
@@ -491,8 +498,12 @@ buildArg m base normalize pattern = case pattern of
   PSlot i -> pure (refWord (base + i))
   PWord w -> pure w
   PStruct functor children -> do
-    words' <- mapM (buildArg m base normalize) children
-    structure s functor words'
+    let n = funArity functor
+    addr <- reserveCells s (n + 1)
+    writeCell s addr functor
+    ground <- fill (addr + 1) children
+    when ground (writeCell s addr (functor .|. groundBit))
+    pure (strWord addr)
   PArith functor op children -> do
     words' <- mapM (buildArg m base normalize) children
     evaluated <-
@@ -510,6 +521,13 @@ buildArg m base normalize pattern = case pattern of
         structure s functor words'
   where
     s = mStore m
+    fill _ [] = pure True
+    fill !i (child : rest) = do
+      w <- buildArg m base normalize child
+      writeCell s i w
+      g <- groundNowWord s w
+      ok <- fill (i + 1) rest
+      pure (g && ok)
 
 structure :: Store -> Word' -> [Word'] -> IO Word'
 structure = structureWord
@@ -666,49 +684,55 @@ outputSince m entryOut = do
 
 -- ─── arithmetic ──────────────────────────────────────────────────────────────
 
--- | Sentinel for the immediate-integer fast path: no immediate value is
--- 'minBound', because immediates have 61 bits.
-noFast :: Int
-noFast = minBound
-
 -- | Evaluate an expression when every operand is an immediate integer and
--- every intermediate result fits; otherwise 'noFast', and the general
--- evaluator decides the outcome (including errors).
-evalFast :: Machine -> Int -> Expr -> IO Int
+-- every intermediate result fits, leaving the value in the scratch
+-- register and returning True; otherwise False, and the general evaluator
+-- decides the outcome (including errors). Results stay unboxed.
+evalFast :: Machine -> Int -> Expr -> IO Bool
 evalFast m base expr = case expr of
-  EImm i -> pure i
+  EImm i -> yield i
   EPat (PSlot i) -> immediate (refWord (base + i))
   EPat (PWord w) -> immediate w
   EOp op [a, b] -> do
-    x <- evalFast m base a
-    if x == noFast
-      then pure noFast
+    okA <- evalFast m base a
+    if not okA
+      then pure False
       else do
-        y <- evalFast m base b
-        if y == noFast then pure noFast else pure (binaryFast op x y)
+        x <- readReg s rVAL
+        okB <- evalFast m base b
+        if not okB
+          then pure False
+          else do
+            y <- readReg s rVAL
+            case op of
+              OpPlus -> fits (x + y)
+              OpMinus -> fits (x - y)
+              OpMul
+                | abs x < 2 ^ (30 :: Int) && abs y < 2 ^ (30 :: Int) -> yield (x * y)
+                | otherwise -> pure False
+              OpDiv -> if y == 0 then pure False else fits (x `div` y)
+              OpMod -> if y == 0 then pure False else yield (x `mod` y)
+              OpMin -> yield (min x y)
+              OpMax -> yield (max x y)
+              _ -> pure False
   EOp op [a] -> do
-    x <- evalFast m base a
-    pure $ if x == noFast then noFast else case op of
-      OpNeg -> fits (negate x)
-      OpAbs -> fits (abs x)
-      _ -> noFast
-  _ -> pure noFast
+    okA <- evalFast m base a
+    if not okA
+      then pure False
+      else do
+        x <- readReg s rVAL
+        case op of
+          OpNeg -> fits (negate x)
+          OpAbs -> fits (abs x)
+          _ -> pure False
+  _ -> pure False
   where
+    s = mStore m
+    yield v = writeReg s rVAL v >> pure True
     immediate w0 = do
-      w <- deref (mStore m) w0
-      pure (if tagOf w == tagInt then valOf w else noFast)
-    fits r = if r >= -(2 ^ (60 :: Int)) && r < 2 ^ (60 :: Int) then r else noFast
-    binaryFast op x y = case op of
-      OpPlus -> fits (x + y)
-      OpMinus -> fits (x - y)
-      OpMul
-        | abs x < 2 ^ (30 :: Int) && abs y < 2 ^ (30 :: Int) -> x * y
-        | otherwise -> noFast
-      OpDiv -> if y == 0 then noFast else fits (x `div` y)
-      OpMod -> if y == 0 then noFast else x `mod` y
-      OpMin -> min x y
-      OpMax -> max x y
-      _ -> noFast
+      w <- deref s w0
+      if tagOf w == tagInt then yield (valOf w) else pure False
+    fits r = if r >= -(2 ^ (60 :: Int)) && r < 2 ^ (60 :: Int) then yield r else pure False
 
 evalExpr :: Machine -> Int -> Expr -> IO (Either SolveError (Maybe NumericValue))
 evalExpr m base expr = case expr of

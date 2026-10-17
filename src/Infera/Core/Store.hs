@@ -33,7 +33,8 @@ module Infera.Core.Store
     heapTop, setHeapTop, trailTop, setTrailTop, hb, setHb,
     outLen, setOutLen, arithData, bumpArithData, freshId, setFreshId,
     readCell, writeCell, pushCell, allocCells, allocSlots, markerWord, logicalId,
-    readArg, writeArg, saveArgs, loadArgs,
+    readArg, writeArg, saveArgs, loadArgs, reserveCells, groundNowWord,
+    readReg, writeReg, rVAL,
     deref, bind, unwindTrail, trailIf, trailValueIf,
     structureWord,
     box, boxed,
@@ -163,7 +164,7 @@ functorName :: Symbols -> Int -> IO (String, Int)
 functorName symbols i = (IM.! i) <$> readIORef (functorNames symbols)
 
 -- Register slots of the unboxed register file.
-rH, rTR, rHB, rOUT, rBOX, rARITH, rFRESH, rCAP :: Int
+rH, rTR, rHB, rOUT, rBOX, rARITH, rFRESH, rCAP, rVAL :: Int
 rH = 0
 rTR = 1
 rHB = 2
@@ -172,6 +173,16 @@ rBOX = 4
 rARITH = 5
 rFRESH = 6
 rCAP = 7
+-- | scratch result register of the integer fast path
+rVAL = 8
+
+readReg :: Store -> Int -> IO Int
+readReg s = unsafeRead (regs s)
+{-# INLINE readReg #-}
+
+writeReg :: Store -> Int -> Int -> IO ()
+writeReg s = unsafeWrite (regs s)
+{-# INLINE writeReg #-}
 
 data Store = Store
   { cells :: !(IORef (IOUArray Int Int)),
@@ -183,12 +194,14 @@ data Store = Store
     symbols :: !Symbols
   }
 
+-- Cells are never read before they are written, so the array need not be
+-- initialised; untouched pages cost nothing.
 initialCells :: Int
-initialCells = 65536
+initialCells = 1048576
 
 newStore :: Symbols -> IO Store
 newStore syms = do
-  cs <- newArray (0, initialCells - 1) 0
+  cs <- newArray_ (0, initialCells - 1)
   tr <- newArray (0, 4095) 0
   bx <- newArray_ (0, 255)
   rs <- newArray (0, 15) 0
@@ -275,8 +288,8 @@ growCells :: Store -> Int -> IO ()
 growCells s needed = do
   arr <- readIORef (cells s)
   size <- getNumElements arr
-  let size' = max needed (size * 2)
-  arr' <- newArray (0, size' - 1) 0
+  let size' = max needed (size * 4)
+  arr' <- newArray_ (0, size' - 1)
   top <- heapTop s
   let copy !i
         | i >= top = pure ()
@@ -294,6 +307,26 @@ pushCell s w = do
   setHeapTop s (top + 1)
   pure top
 {-# INLINE pushCell #-}
+
+-- | Reserve @n@ cells without initialising them; the caller writes each one
+-- before anything reads it.
+reserveCells :: Store -> Int -> IO Int
+reserveCells s n = do
+  top <- heapTop s
+  ensureCells s (top + n)
+  setHeapTop s (top + n)
+  pure top
+{-# INLINE reserveCells #-}
+
+-- | Is this word ground right now (unbound cells are not; structures use
+-- their memo only)?
+groundNowWord :: Store -> Word' -> IO Bool
+groundNowWord s w = case tagOf w of
+  t | t == tagRef -> do
+        d <- deref s w
+        if tagOf d == tagRef then pure False else groundNowWord s d
+    | t == tagStr -> funGround <$> readCell s (valOf w)
+    | otherwise -> pure True
 
 -- | Reserve @n@ unbound variable cells and return the first address.
 allocCells :: Store -> Int -> IO Int
