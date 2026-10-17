@@ -1,4 +1,5 @@
--- | Public solver facade over the explicit abstract machine.
+-- | Public solver facade: queries run on the core resolution engine, goal-level
+-- entry points on the explicit abstract machine.
 -- The reference implementation remains available for parity tests.
 module Infera.Engine
   ( -- * State and results
@@ -30,6 +31,7 @@ module Infera.Engine
 where
 
 import Infera.Engine.Reference hiding (solveGoal, solveGoals, solveQuery, solveAll, runInfera)
+import qualified Infera.Core as Core
 import qualified Infera.Machine.Control as Machine
 import Infera.Program (Program)
 import Infera.Syntax (Query, Term, parseQuery)
@@ -41,8 +43,10 @@ solveGoal environment fuel state goal = Machine.solveGoals environment fuel stat
 solveGoals :: Env -> Int -> SolverState -> [Term] -> Search
 solveGoals = Machine.solveGoals
 
+-- | Queries run on the core; a construct the core cannot execute continues
+-- on the machine from the same point in the stream.
 solveQuery :: Program -> Query -> Search
-solveQuery = Machine.solveQuery
+solveQuery = Core.solveQueryOrFallback
 
 solveAll :: Program -> Query -> QuerySummary
 solveAll program query = summarizeSearch query (solveQuery program query)

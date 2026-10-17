@@ -305,6 +305,33 @@ collector's block retention the rest); loop 90000 0.013 s, fib 25 0.054 s,
 queens 0.014 s. Not yet on the core: interactive tracing (`--trace`), which
 still runs on the existing machine.
 
+### The core is the public engine (same day, evening)
+
+`Infera.Engine.solveQuery` now runs on the core with fallback to the
+machine, which switches the CLI, the REPL and every test that solves through
+the public API. The complete suite passes (including the generated
+correctness models, tabling, CLP, breadboard and minesweeper groups), the
+CLI acceptance passes, and the validated CLI harness
+(`python3 bench/run.py`, one warmup and three timed processes, medians,
+process time including startup and loading) records:
+
+| Workload | Infera (core) | SWI-Prolog 10.0.2 | Scryer 0.10.0 | Infera before (machine) |
+| --- | ---: | ---: | ---: | ---: |
+| reverse 30 x 3000 | 0.700 s | 0.052 s | 0.140 s | 20.155 s |
+| counting loop 90000 | 0.030 s | 0.017 s | 0.056 s | 0.446 s |
+| fib 25 | 0.068 s | 0.050 s | 0.076 s | 2.318 s |
+| 8 queens, first | 0.030 s | 0.018 s | 0.053 s | 0.572 s |
+
+The "before" column is the machine's loaded-program CPU time from the
+opaque-control report, so it excludes startup and flatters the old engine.
+Infera's process startup is about 20 ms of each figure. The core is now
+ahead of Scryer on three of the four workloads and within 2x of SWI there;
+naive reverse remains 5x behind Scryer and 13x behind SWI, with the
+remaining cost in the collector's work for the program's retained choice
+points and the boxed intermediate results on the hot path. The goal-level
+entry points (`solveGoal`, `solveGoals`) and `--trace` still use the
+machine.
+
 ### Next
 
 1. Hot-path allocation: argument registers instead of lists, immediate-int

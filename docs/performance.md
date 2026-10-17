@@ -7,10 +7,13 @@ machine (15-45 KB of allocation per inference, a flat profile, 50-200x the
 CPU of Scryer), attributes the cost to the representation, and records the
 first slice of the replacement core in `src/Infera/Core/`: unboxed tagged
 cells, a trail, choice points without snapshots, compiled heads and
-heap-native arithmetic. It is opt-in behind `Infera.Core.solveQuery`, with a
-checked-in parity test group, and runs naive reverse at about 2.1 million
-inferences per second (25-38x the current machine on the four core
-workloads). The sections below are the earlier history.
+heap-native arithmetic. By the end of the day the core covered tabling,
+dynamic facts, `minimize` and constraints, passed the whole suite, and became
+the public engine behind `Infera.Engine.solveQuery` (with fallback to the
+machine). The validated CLI harness then recorded reverse 0.700 s, loop
+0.030 s, fib 0.068 s and queens 0.030 s against the machine's 20.2 s,
+0.45 s, 2.3 s and 0.57 s; SWI and Scryer figures are in the report. The
+sections below are the earlier history.
 
 ## Head matching and registers - 2026-10-16
 
