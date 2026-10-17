@@ -332,6 +332,11 @@ points and the boxed intermediate results on the hot path. The goal-level
 entry points (`solveGoal`, `solveGoals`) and `--trace` still use the
 machine.
 
+Collecting at four times the live size (above the floor) instead of twice
+brought reverse to 0.47 s of process time for a few MB more residency.
+Building the library at `-O2` (as CI does) gains a further 5% on reverse and
+nothing on the other workloads, so the default profile is unchanged.
+
 ### Next
 
 1. Hot-path allocation: argument registers instead of lists, immediate-int

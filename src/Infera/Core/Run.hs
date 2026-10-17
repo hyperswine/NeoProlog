@@ -940,8 +940,10 @@ matchHead m base (pattern : patterns) !i = do
 buildArgs :: Machine -> Int -> [Pattern] -> Int -> IO ()
 buildArgs _ _ [] _ = pure ()
 buildArgs m base (pattern : patterns) !i = do
-  w <- buildArg m base True pattern
-  writeArg (mStore m) i w
+  case pattern of
+    PSlot k -> writeArg (mStore m) i (refWord (base + k))
+    PWord w -> writeArg (mStore m) i w
+    _ -> buildArg m base True pattern >>= writeArg (mStore m) i
   buildArgs m base patterns (i + 1)
 
 normalizeArgs :: Machine -> Int -> IO ()
@@ -1010,7 +1012,10 @@ buildArg m base normalize pattern = case pattern of
     s = mStore m
     fill _ [] = pure True
     fill !i (child : rest) = do
-      w <- buildArg m base normalize child
+      w <- case child of
+        PSlot k -> pure (refWord (base + k))
+        PWord cw -> pure cw
+        _ -> buildArg m base normalize child
       writeCell s i w
       g <- groundNowWord s w
       ok <- fill (i + 1) rest
@@ -1515,17 +1520,19 @@ checkOutputs m key signature args =
 commitsAfterSuccess :: Machine -> Pred -> Maybe P.Signature -> IO Bool
 commitsAfterSuccess m predicate signature = case signature of
   Just sig -> pure (P.sigDet sig == S.Det || P.sigDet sig == S.Semidet)
-  Nothing -> do
-    let inferred = pInferred predicate
-        n = pArity predicate
-    if P.sigDet inferred /= S.Semidet
-      then pure False
-      else allM (\i -> if i < n then readArg (mStore m) i >>= isGroundWord (mStore m) else pure False) (P.sigSwitch inferred)
-  where
-    allM _ [] = pure True
-    allM p (x : xs) = do
-      ok <- p x
-      if ok then allM p xs else pure False
+  Nothing -> case pSwitch predicate of
+    Nothing -> pure False
+    Just positions -> switchGround (mStore m) positions
+
+-- | Are the switch arguments ground? Immediate words answer at once.
+switchGround :: Store -> [Int] -> IO Bool
+switchGround _ [] = pure True
+switchGround s (i : rest) = do
+  w <- readArg s i
+  ok <- case tagOf w of
+    t | t == tagInt || t == tagAtm || t == tagChr || t == tagBox -> pure True
+      | otherwise -> isGroundWord s w
+  if ok then switchGround s rest else pure False
 
 -- ─── exchange with the public state ──────────────────────────────────────────
 

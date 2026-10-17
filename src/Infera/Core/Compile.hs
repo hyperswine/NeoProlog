@@ -148,7 +148,10 @@ data Pred = Pred
     pIndex :: [ArgIndex],
     pIndexed :: !Bool,
     pDecls :: [P.Signature],
-    pInferred :: !P.Signature
+    pInferred :: !P.Signature,
+    -- | inferred semidet: the argument positions that must be ground for
+    -- the call to commit after its first solution
+    pSwitch :: !(Maybe [Int])
   }
 
 data CoreProgram = CoreProgram
@@ -215,7 +218,11 @@ compilePred ctx p = do
         pIndex = index,
         pIndexed = P.predIsIndexed (ctxProgram ctx) p,
         pDecls = P.predDecls p,
-        pInferred = P.predInferred p
+        pInferred = P.predInferred p,
+        pSwitch =
+          if P.sigDet (P.predInferred p) == S.Semidet
+            then Just (filter (< arity) (P.sigSwitch (P.predInferred p)))
+            else Nothing
       }
 
 buildIndex :: Store -> Int -> [Clause] -> IO ArgIndex
