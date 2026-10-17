@@ -313,9 +313,7 @@ constantWord store term = case term of
 -- that the reference would evaluate before the call.
 compileArg :: Ctx -> Term -> IO Pattern
 compileArg ctx term = case term of
-  Var v
-    | v < 0 -> pure (PWord (refWord (negate v - 1)))
-    | otherwise -> pure (PSlot v)
+  Var v -> pure (PSlot v)
   Compound f as -> do
     fid <- internFunctor (symbols (ctxStore ctx)) f (length as)
     args <- mapM (compileArg ctx) as
@@ -352,9 +350,7 @@ compileBody ctx = mapM (compileGoal ctx) . concatMap flatten
 
 compileGoal :: Ctx -> Term -> IO Goal
 compileGoal ctx term = case term of
-  Var v
-    | v < 0 -> pure (GCallDyn True (PWord (refWord (negate v - 1))) [])
-    | otherwise -> pure (GCallDyn True (PSlot v) [])
+  Var v -> pure (GCallDyn True (PSlot v) [])
   Atom "true" -> pure GTrue
   Atom "fail" -> pure GFail
   Atom "false" -> pure GFail
@@ -424,8 +420,9 @@ referenceBuiltins =
   ]
 
 -- | Compile a goal that a running program handed to @call/N@. The caller
--- exports it to a term whose variables are the words of their cells, so
--- 'Var' leaves here are cell words, not slots.
+-- exports it with its distinct unbound cells numbered @0, 1, ...@ and runs
+-- the result in an activation block whose slots alias those cells, so no
+-- plan ever holds a raw address.
 compileGoalTerm :: Store -> P.Program -> Map.Map PredKey PredRef -> Term -> IO Goal
 compileGoalTerm store program preds term = do
   problems <- newIORef []

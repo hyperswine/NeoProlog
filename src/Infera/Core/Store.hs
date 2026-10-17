@@ -34,7 +34,7 @@ module Infera.Core.Store
     outLen, setOutLen, arithData, bumpArithData, freshId, setFreshId,
     readCell, writeCell, pushCell, allocCells, allocSlots, markerWord, logicalId,
     readArg, writeArg, saveArgs, loadArgs, reserveCells, groundNowWord,
-    readReg, writeReg, rVAL,
+    readReg, writeReg, rVAL, rGCLIM, initialCollectLimit, markerBase, markerVars,
     deref, bind, unwindTrail, trailIf, trailValueIf,
     structureWord,
     box, boxed,
@@ -176,6 +176,13 @@ rCAP = 7
 -- | scratch result register of the integer fast path
 rVAL = 8
 
+-- | heap size (cells) above which the next call collects
+rGCLIM :: Int
+rGCLIM = 9
+
+initialCollectLimit :: Int
+initialCollectLimit = 262144
+
 readReg :: Store -> Int -> IO Int
 readReg s = unsafeRead (regs s)
 {-# INLINE readReg #-}
@@ -206,6 +213,7 @@ newStore syms = do
   bx <- newArray_ (0, 255)
   rs <- newArray (0, 15) 0
   unsafeWrite rs rCAP initialCells
+  unsafeWrite rs rGCLIM initialCollectLimit
   ar <- newArray (0, 4095) 0
   Store <$> newIORef cs <*> newIORef tr <*> newIORef bx <*> pure rs <*> pure ar <*> pure syms
 
@@ -345,9 +353,17 @@ allocCells s n = do
 -- words never occur as values, so a marker is unambiguous when scanning
 -- down from a variable cell. Its value is the reference engine's id of the
 -- first variable of the block, which keeps exported variable names equal.
-markerWord :: Int -> Word'
-markerWord = mkWord tagFun
+-- The marker packs the block size above bit 40 so a collector can find the
+-- whole block from its base.
+markerWord :: Int -> Int -> Word'
+markerWord logicalBase n = mkWord tagFun (logicalBase .|. (n `shiftL` 40))
 {-# INLINE markerWord #-}
+
+markerBase :: Word' -> Int
+markerBase w = valOf w .&. (2 ^ (40 :: Int) - 1)
+
+markerVars :: Word' -> Int
+markerVars w = valOf w `shiftR` 40
 
 -- | Reserve @n@ variable cells preceded by a marker; returns the address of
 -- the first variable.
@@ -356,7 +372,7 @@ allocSlots s logicalBase n = do
   top <- heapTop s
   ensureCells s (top + n + 1)
   arr <- readIORef (cells s)
-  unsafeWrite arr top (markerWord logicalBase)
+  unsafeWrite arr top (markerWord logicalBase n)
   let go !i
         | i > top + n = pure ()
         | otherwise = unsafeWrite arr i (refWord i) >> go (i + 1)
@@ -372,7 +388,7 @@ logicalId s addr = do
         | i < 0 = pure Nothing
         | otherwise = do
             w <- unsafeRead arr i
-            if tagOf w == tagFun then pure (Just (valOf w + (addr - i - 1))) else go (i - 1)
+            if tagOf w == tagFun then pure (Just (markerBase w + (addr - i - 1))) else go (i - 1)
   go (addr - 1)
 
 -- | Build a structure from a functor word and argument words, setting the

@@ -8,12 +8,13 @@
 -- valid because it was exported when it was produced.
 module Infera.Core
   ( solveQuery,
+    solveQueryWith,
     solveQueryOrFallback,
     coreSupports,
   )
 where
 
-import Infera.Core.Run (Step (..), runCore)
+import Infera.Core.Run (Step (..), runCore, runCoreWith)
 import Infera.Engine.Reference (Search)
 import qualified Infera.Machine.Control as Machine
 import Infera.Program (Program)
@@ -39,6 +40,22 @@ solveQuery program query = unsafePerformIO $ do
         Yield item continue -> (item :) <$> stream (produced + 1) continue
         Abandon _ -> pure (drop produced (Machine.solveQuery program query))
 {-# NOINLINE solveQuery #-}
+
+-- | 'solveQuery' with an explicit initial collection threshold in cells.
+solveQueryWith :: Int -> Program -> Query -> Maybe Search
+solveQueryWith limit program query = unsafePerformIO $ do
+  started <- runCoreWith limit program query
+  case started of
+    Left _ -> pure Nothing
+    Right first -> Just <$> stream (0 :: Int) first
+  where
+    stream produced next = unsafeInterleaveIO $ do
+      step <- next
+      case step of
+        Stop -> pure []
+        Yield item continue -> (item :) <$> stream (produced + 1) continue
+        Abandon _ -> pure (drop produced (Machine.solveQuery program query))
+{-# NOINLINE solveQueryWith #-}
 
 -- | The core when it applies, otherwise the existing machine.
 solveQueryOrFallback :: Program -> Query -> Search

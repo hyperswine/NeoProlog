@@ -44,6 +44,10 @@ prop_parity file = withTests 1 . property $ do
           Just items -> do
             observe query items === observe query (Reference.solveQuery program query)
             observe query items === observe query (Machine.solveQuery program query)
+            -- Collect at nearly every call: relocation must be invisible.
+            case Core.solveQueryWith 1 program query of
+              Nothing -> failure
+              Just stressed -> observe query stressed === observe query items
 
 -- | A construct outside the subset makes the facade fall back rather than
 -- fail, and a runtime abandonment continues the same stream.

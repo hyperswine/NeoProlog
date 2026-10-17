@@ -12,6 +12,7 @@
 module Infera.Core.Run
   ( Step (..),
     runCore,
+    runCoreWith,
   )
 where
 
@@ -19,7 +20,7 @@ import Control.Monad (foldM, forM, forM_, when)
 import Data.Array ((!))
 import Data.Array.Base (getNumElements, unsafeRead, unsafeWrite)
 import Data.Bits ((.|.))
-import Data.Array.IO (IOArray, newArray_)
+import Data.Array.IO (IOArray, IOUArray, newArray, newArray_)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
 import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble, numericTerm)
@@ -93,9 +94,15 @@ data Machine = Machine
 -- | Compile and start a query. Left names the construct that puts the
 -- program outside the supported subset; Right produces the first step.
 runCore :: P.Program -> S.Query -> IO (Either String (IO Step))
-runCore program query = do
+runCore = runCoreWith initialCollectLimit
+
+-- | Start with an explicit initial collection threshold (cells); tests use
+-- a tiny one to collect at nearly every call.
+runCoreWith :: Int -> P.Program -> S.Query -> IO (Either String (IO Step))
+runCoreWith limit program query = do
   syms <- newSymbols
   store <- newStore syms
+  writeReg store rGCLIM limit
   compiled <- compileProgram store program query
   case compiled of
     Left (Unsupported reason) -> pure (Left reason)
@@ -270,8 +277,9 @@ step m goal goals base barrier depth next = case goal of
     callPredicate m predicate (if null goals then next else CGoals goals base barrier depth next)
   GCallDyn direct callable extra -> do
     word <- buildArg m base False callable
-    extraTerms <- mapM (\p -> buildArg m base False p >>= exportGoal m) extra
-    goalTerm <- exportGoal m word
+    aliases <- newIORef IM.empty
+    extraTerms <- mapM (\p -> buildArg m base False p >>= exportGoal m aliases) extra
+    goalTerm <- exportGoal m aliases word
     let goalWith = case goalTerm of
           Atom f | null extraTerms -> Atom f
           Atom f -> Compound f extraTerms
@@ -284,8 +292,13 @@ step m goal goals base barrier depth next = case goal of
             raiseError m (TypeError "callable" shown)
         | otherwise -> do
             compiled <- compileGoalTerm (mStore m) (mProgram m) (cpPreds (mCore m)) goalWith
+            cellsByVar <- readIORef aliases
+            let s = mStore m
+            fresh <- freshId s
+            block <- allocSlots s fresh (max 1 (IM.size cellsByVar))
+            forM_ (IM.toList cellsByVar) $ \(v, addr) -> writeCell s (block + v) (refWord addr)
             height <- readIORef (mChoiceTop m)
-            runGoals m [compiled] base height depth (CGoals goals base barrier depth next)
+            runGoals m [compiled] block height depth (CGoals goals base barrier depth next)
   GUnify a b -> do
     wa <- buildArg m base False a
     wb <- buildArg m base False b
@@ -385,10 +398,13 @@ step m goal goals base barrier depth next = case goal of
 
 -- | Call with the arguments in the registers.
 callPredicate :: Machine -> Pred -> Cont -> IO Step
-callPredicate m predicate cont = do
+callPredicate m predicate cont0 = do
   let s = mStore m
       key = pKey predicate
       n = pArity predicate
+  top <- heapTop s
+  limit <- readReg s rGCLIM
+  cont <- if top > limit then collect m cont0 n else pure cont0
   selected <- selectSignature m predicate
   case selected of
     Left err -> raiseError m err
@@ -1037,17 +1053,24 @@ exportState m = do
         ssOutLen = count
       }
 
--- | Export a goal for @call/N@: unbound cells become negative variable ids,
--- which the compiler turns back into cell words.
-exportGoal :: Machine -> Word' -> IO Term
-exportGoal m w0 = do
+-- | Export a goal for @call/N@: distinct unbound cells become variables
+-- @0, 1, ...@ recorded in the alias table.
+exportGoal :: Machine -> IORef (IM.IntMap Int) -> Word' -> IO Term
+exportGoal m aliases w0 = do
   w <- deref s w0
   case tagOf w of
-    t | t == tagRef -> pure (Var (negate (valOf w) - 1))
+    t | t == tagRef -> do
+          table <- readIORef aliases
+          case [v | (v, addr) <- IM.toList table, addr == valOf w] of
+            (v : _) -> pure (Var v)
+            [] -> do
+              let v = IM.size table
+              writeIORef aliases (IM.insert v (valOf w) table)
+              pure (Var v)
       | t == tagStr -> do
           f <- readCell s (valOf w)
           (name, arity) <- functorName (symbols s) (funId f)
-          children <- forM [1 .. arity] $ \i -> readCell s (valOf w + i) >>= exportGoal m
+          children <- forM [1 .. arity] $ \i -> readCell s (valOf w + i) >>= exportGoal m aliases
           pure (Compound name children)
       | otherwise -> exportTerm s w
   where
@@ -1056,3 +1079,218 @@ exportGoal m w0 = do
 showValue :: Term -> String
 showValue (StrLit str) = str
 showValue t = show t
+
+
+-- ─── collection ──────────────────────────────────────────────────────────────
+
+-- | Mark-compact collection of the cell store at a call boundary. Roots are
+-- the first @nargs@ argument registers, the current continuation, every
+-- choice point's alternatives and continuation, and findall results. Live
+-- cells slide down in address order, so every age relation survives; the
+-- control records are rebuilt with forwarded addresses and the trail keeps
+-- only entries for live cells.
+collect :: Machine -> Cont -> Int -> IO Cont
+collect m cont nargs = do
+  let s = mStore m
+      queryCells = max 1 (cpQueryVars (mCore m))
+  top <- heapTop s
+  arr <- readIORef (cells s)
+  marks <- newArray (0, top) False :: IO (IOUArray Int Bool)
+  stackRef <- newIORef =<< (newArray (0, 4095) 0 :: IO (IOUArray Int Int))
+  stackTop <- newIORef (0 :: Int)
+  let push a = do
+        st <- readIORef stackRef
+        i <- readIORef stackTop
+        size <- getNumElements st
+        st' <-
+          if i < size
+            then pure st
+            else do
+              grown <- newArray (0, size * 2 - 1) 0
+              forM_ [0 .. i - 1] $ \j -> unsafeRead st j >>= unsafeWrite grown j
+              writeIORef stackRef grown
+              pure grown
+        unsafeWrite st' i a
+        writeIORef stackTop (i + 1)
+      markCell a = do
+        seen <- unsafeRead marks a
+        if seen then pure () else unsafeWrite marks a True >> push a
+      markStructure a = do
+        seen <- unsafeRead marks a
+        if seen
+          then pure ()
+          else do
+            f <- unsafeRead arr a
+            unsafeWrite marks a True
+            forM_ [a + 1 .. a + funArity f] markCell
+      markWord w
+        | tagOf w == tagRef = markCell (valOf w)
+        | tagOf w == tagStr = markStructure (valOf w)
+        | otherwise = pure ()
+      drain = do
+        i <- readIORef stackTop
+        if i == 0
+          then pure ()
+          else do
+            st <- readIORef stackRef
+            a <- unsafeRead st (i - 1)
+            writeIORef stackTop (i - 1)
+            w <- unsafeRead arr a
+            if tagOf w == tagRef
+              then (if valOf w /= a then markCell (valOf w) else pure ())
+              else if tagOf w == tagStr then markStructure (valOf w) else pure ()
+            drain
+      markBlock base
+        | base == 0 = forM_ [0 .. queryCells - 1] markCell
+        | otherwise = do
+            marker <- unsafeRead arr (base - 1)
+            unsafeWrite marks (base - 1) True
+            forM_ [base .. base + markerVars marker - 1] markCell
+      markCont c = case c of
+        CDone -> pure ()
+        CGoals _ base _ _ next -> markBlock base >> markCont next
+        CReturn _ _ check next -> do
+          forM_ (maybe [] (\(_, _, ws) -> ws) check) markWord
+          markCont next
+        CExitIf _ _ base _ _ next -> markBlock base >> markCont next
+        CExitNot _ _ _ -> pure ()
+        CExitFindAll _ results _ base _ _ _ -> markBlock base >> markResults results
+      markResults ref = do
+        collected <- readIORef ref
+        forM_ collected (markCopy . fst)
+      markCopy copy = case copy of
+        CpRef a -> markCell a
+        CpStruct _ children -> mapM_ markCopy children
+        _ -> pure ()
+      markAlt alt = case alt of
+        AltClauses predicate _ saved _ c -> do
+          forM_ [saved .. saved + pArity predicate - 1] markCell
+          markCont c
+        AltGoals _ base _ _ c -> markBlock base >> markCont c
+        AltGuard _ _ _ -> pure ()
+        AltNot _ _ c -> markCont c
+        AltIf _ elseGoals c -> do
+          forM_ elseGoals (\(_, base, _, _) -> markBlock base)
+          markCont c
+        AltFindAll results _ _ base _ c -> markBlock base >> markResults results >> markCont c
+  -- The query block is a root even when no continuation names it any
+  -- more: the answer is exported from it.
+  forM_ [0 .. queryCells - 1] markCell
+  forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= markWord
+  markCont cont
+  choiceTop <- readIORef (mChoiceTop m)
+  forM_ [0 .. choiceTop - 1] $ \i -> readChoice m i >>= markAlt . chAlt
+  drain
+  -- Forwarding: fwd a = live cells below a.
+  fwd <- newArray (0, top) 0 :: IO (IOUArray Int Int)
+  let count !a !n
+        | a > top = pure ()
+        | otherwise = do
+            unsafeWrite fwd a n
+            live <- if a < top then unsafeRead marks a else pure False
+            count (a + 1) (if live then n + 1 else n)
+  count 0 0
+  newTop <- unsafeRead fwd top
+  let forward a = unsafeRead fwd a
+      reloc w
+        | tagOf w == tagRef = refWord <$> forward (valOf w)
+        | tagOf w == tagStr = strWord <$> forward (valOf w)
+        | otherwise = pure w
+      slide !a
+        | a >= top = pure ()
+        | otherwise = do
+            live <- unsafeRead marks a
+            when live $ do
+              w <- unsafeRead arr a
+              w' <- reloc w
+              a' <- forward a
+              unsafeWrite arr a' w'
+            slide (a + 1)
+  -- Relocate control records before sliding: they read markers via old
+  -- addresses only through 'forward', which does not touch cells.
+  let relocBlock base
+        | base == 0 = pure 0
+        | otherwise = (+ 1) <$> forward (base - 1)
+      relocCont c = case c of
+        CDone -> pure CDone
+        CGoals goals base barrier depth next ->
+          CGoals goals <$> relocBlock base <*> pure barrier <*> pure depth <*> relocCont next
+        CReturn commit guard check next -> do
+          check' <- case check of
+            Nothing -> pure Nothing
+            Just (key, sig, ws) -> Just . (,,) key sig <$> mapM reloc ws
+          CReturn commit guard check' <$> relocCont next
+        CExitIf sentinel thenGoals base barrier depth next ->
+          CExitIf sentinel thenGoals <$> relocBlock base <*> pure barrier <*> pure depth <*> relocCont next
+        CExitNot sentinel flag depth -> pure (CExitNot sentinel flag depth)
+        CExitFindAll sentinel results template base entryHeap entryOut depth -> do
+          relocResults results
+          CExitFindAll sentinel results template <$> relocBlock base <*> forward entryHeap <*> pure entryOut <*> pure depth
+      relocResults ref = do
+        collected <- readIORef ref
+        relocated <- forM collected $ \(copy, produced) -> (\c -> (c, produced)) <$> relocCopy copy
+        writeIORef ref relocated
+      relocCopy copy = case copy of
+        CpRef a -> CpRef <$> forward a
+        CpStruct f children -> CpStruct f <$> mapM relocCopy children
+        other -> pure other
+      relocAlt alt = case alt of
+        AltClauses predicate more saved depth c ->
+          AltClauses predicate more <$> forward saved <*> pure depth <*> relocCont c
+        AltGoals goals base barrier depth c ->
+          AltGoals goals <$> relocBlock base <*> pure barrier <*> pure depth <*> relocCont c
+        AltGuard key det flag -> pure (AltGuard key det flag)
+        AltNot flag buffer c -> AltNot flag buffer <$> relocCont c
+        AltIf counter elseGoals c -> do
+          elseGoals' <- case elseGoals of
+            Nothing -> pure Nothing
+            Just (goals, base, barrier, depth) -> do
+              base' <- relocBlock base
+              pure (Just (goals, base', barrier, depth))
+          AltIf counter elseGoals' <$> relocCont c
+        AltFindAll results buffer target base depth c -> do
+          relocResults results
+          AltFindAll results buffer target <$> relocBlock base <*> pure depth <*> relocCont c
+  cont' <- relocCont cont
+  forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
+  -- Trail: keep entries of live cells, remember how many survive below
+  -- each original index for the choice points' marks.
+  trailArr <- readIORef (trail s)
+  trailLen <- trailTop s
+  keptBelow <- newArray (0, trailLen) 0 :: IO (IOUArray Int Int)
+  kept <- newIORef (0 :: Int)
+  let classify i acc
+        | i < 0 = pure acc
+        | otherwise = do
+            entry <- unsafeRead trailArr i
+            if odd entry then classify (i - 2) ((i - 1, 2, entry) : acc) else classify (i - 1) ((i, 1, entry) : acc)
+  entries <- classify (trailLen - 1) []
+  forM_ entries $ \(start, len, entry) -> do
+    k <- readIORef kept
+    forM_ [start .. start + len - 1] $ \j -> unsafeWrite keptBelow j k
+    let addr = entry `div` 2
+    live <- unsafeRead marks addr
+    when live $ do
+      addr' <- forward addr
+      if len == 1
+        then unsafeWrite trailArr k (addr' * 2)
+        else do
+          old <- unsafeRead trailArr start
+          unsafeWrite trailArr k old
+          unsafeWrite trailArr (k + 1) (addr' * 2 + 1)
+      writeIORef kept (k + len)
+  keptTotal <- readIORef kept
+  unsafeWrite keptBelow trailLen keptTotal
+  setTrailTop s keptTotal
+  forM_ [0 .. choiceTop - 1] $ \i -> do
+    choice <- readChoice m i
+    h' <- forward (chH choice)
+    tr' <- unsafeRead keptBelow (chTR choice)
+    alt' <- relocAlt (chAlt choice)
+    writeChoice m i choice {chH = h', chTR = tr', chAlt = alt'}
+  slide 0
+  setHeapTop s newTop
+  refreshHb m
+  floor' <- readReg s rGCLIM
+  writeReg s rGCLIM (max (min floor' initialCollectLimit) (newTop * 2))
+  pure cont'
