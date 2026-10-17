@@ -81,6 +81,8 @@ data Goal
   | GAssert Pattern
   | GRetract Pattern
   | GRetractAll Pattern
+  | -- | @minimize Cost Goal@
+    GMinimize Pattern [Goal]
   | -- | a variable goal (True) or @call/N@ (False): a goal word plus extra arguments
     GCallDyn !Bool Pattern [Pattern]
   | GAnd [Goal]
@@ -400,6 +402,7 @@ compileGoal ctx term = case term of
   Compound "phrase" [nt, l] -> GPhrase <$> arg nt <*> arg l
   Compound "phrase_from_file" [nt, path] -> GPhraseFile <$> arg nt <*> arg path
   Compound "emit" [nt] -> GEmit <$> arg nt
+  Compound "minimize" [cost, g] -> GMinimize <$> arg cost <*> body g
   Compound "assert" [t] -> GAssert <$> arg t
   Compound "retract" [t] -> GRetract <$> arg t
   Compound "retractall" [t] -> GRetractAll <$> arg t
@@ -440,7 +443,7 @@ leafBuiltins =
 abandonedBuiltins :: [String]
 abandonedBuiltins =
   [ "int_eq", "fd_ne", "fd_le", "fd_lt", "fd_ge", "fd_gt", "reify", "in", "label", "labeling",
-    "all_different", "all_distinct", "minimize"
+    "all_different", "all_distinct"
   ]
 
 -- | Compile a goal that a running program handed to @call/N@. The caller

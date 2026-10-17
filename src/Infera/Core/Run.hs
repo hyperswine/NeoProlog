@@ -60,6 +60,8 @@ data Cont
     CExitFindAll !Int !(IORef [(Copy, [OutputEvent])]) Pattern !Int !Int !Int !Int
   | -- | a solution of a tabled fixpoint iteration
     CExitTable !(IORef Fix)
+  | -- | a candidate of a minimize scope: cost pattern, base, state ref
+    CExitMinimize Pattern !Int !(IORef Minimum)
 
 data Choice = Choice
   { chH :: !Int,
@@ -92,6 +94,17 @@ data Alt
   | -- | remaining facts a retract may remove: (index, fact, size), key,
     -- saved term cell, continuation
     AltRetract [(Int, Term, Int)] !PredKey !Int Cont
+  | -- | sentinel of a minimize scope
+    AltMinimize !(IORef Minimum) !(IORef [SearchItem]) Cont
+
+-- | The state of a minimize scope: entry marks and the best candidate so
+-- far as the bindings it made to older cells, its output, tables and facts.
+data Minimum = Minimum
+  { mnEntryHeap :: !Int,
+    mnEntryTrail :: !Int,
+    mnEntryOut :: !Int,
+    mnBest :: Maybe (Integer, [(Int, Copy)], [OutputEvent], Map.Map Term TableEntry, Map.Map PredKey [(Term, Int)])
+  }
 
 -- | The state of one tabled call's fixpoint, as in the reference engine.
 data Fix = Fix
@@ -297,6 +310,40 @@ run m cont = case cont of
     writeIORef flag True
     cutTo m (sentinel + 1)
     backtrack m
+  CExitMinimize cost base ref -> do
+    let s = mStore m
+    mn <- readIORef ref
+    costWord <- buildArg m base False cost
+    value <- evalWord m costWord
+    outcome <- case value of
+      Left err -> pure (Left err)
+      Right Nothing -> Left . InstantiationError <$> exportFor m costWord
+      Right (Just (NVInt n)) -> pure (Right n)
+      Right (Just bad) -> pure (Left (ExpectedInteger (numericTerm bad)))
+    case outcome of
+      Left err -> raiseItems m [BranchError err] (backtrack m)
+      Right n -> do
+        let better = case mnBest mn of
+              Nothing -> True
+              Just (current, _, _, _, _) -> n < current
+        when better $ do
+          trailArr <- readIORef (trail s)
+          top <- trailTop s
+          bound <- fmap concat . forM [mnEntryTrail mn .. top - 1] $ \i -> do
+            entry <- unsafeRead trailArr i
+            if odd entry
+              then pure []
+              else do
+                let addr = entry `div` 2
+                w <- readCell s addr
+                if tagOf w == tagRef && valOf w == addr then pure [] else do
+                  copy <- copyOut m (mnEntryHeap mn) w
+                  pure [(addr, copy)]
+          produced <- outputSince m (mnEntryOut mn)
+          tables <- readIORef (mTables m)
+          dynamic <- readIORef (mDynamic m)
+          writeIORef ref mn {mnBest = Just (n, bound, produced, tables, dynamic)}
+        backtrack m
   CExitTable fixRef -> do
     fx <- readIORef fixRef
     (answer, count) <- canonicalCall m (fst (pKey (fxPred fx))) (fxArgs fx) (pArity (fxPred fx))
@@ -323,6 +370,7 @@ contDepth cont = case cont of
   CExitNot _ _ depth -> depth
   CExitFindAll _ _ _ _ _ _ depth -> depth
   CExitTable _ -> 0
+  CExitMinimize _ _ _ -> 0
 
 -- Skip exhausted goal lists so that a tail call sees its caller's return.
 dropEmpty :: Cont -> Cont
@@ -362,6 +410,17 @@ step m goal goals base barrier depth next = case goal of
     saved <- saveArgs s arity
     facts <- Map.findWithDefault [] key <$> readIORef (mDynamic m)
     consumeAnswers m [(fact, n, []) | (fact, n) <- facts] saved arity (CGoals goals base barrier depth next)
+  GMinimize cost inner -> do
+    let s = mStore m
+    entryHeap <- heapTop s
+    entryTrail <- trailTop s
+    entryOut <- outLen s
+    ref <- newIORef (Minimum entryHeap entryTrail entryOut Nothing)
+    buffer <- newIORef []
+    let rest = CGoals goals base barrier depth next
+    sentinel <- pushChoice m (AltMinimize ref buffer rest)
+    pushScope m (SBuffer buffer)
+    runGoals m inner base (sentinel + 1) depth (CExitMinimize cost base ref)
   GAssert pattern -> do
     word <- buildArg m base False pattern
     fact <- exportFor m word
@@ -910,6 +969,23 @@ backtrack m = do
         AltRetract facts key saved cont -> do
           pop
           retractFacts m facts key saved cont
+        AltMinimize ref buffer cont -> do
+          pop
+          issues <- reverse <$> readIORef buffer
+          mn <- readIORef ref
+          if not (null issues)
+            then raiseItems m issues (backtrack m)
+            else case mnBest mn of
+              Nothing -> backtrack m
+              Just (_, bound, produced, tables, dynamic) -> do
+                fresh <- newIORef IM.empty
+                forM_ bound $ \(addr, copy) -> do
+                  w <- rebuildCopyWith m fresh copy
+                  bind s addr w
+                mapM_ (emitOutput m) produced
+                writeIORef (mTables m) tables
+                writeIORef (mDynamic m) dynamic
+                run m cont
   where
     pop = do
       top <- readIORef (mChoiceTop m)
@@ -947,25 +1023,29 @@ copyOut m entryHeap word = do
 
 rebuildList :: Machine -> [Copy] -> IO Word'
 rebuildList m copies = do
-  items <- mapM rebuildCopy copies
+  items <- forM copies $ \copy -> do
+    fresh <- newIORef IM.empty
+    rebuildCopyWith m fresh copy
   foldM (\tl hd -> structure s (cpCons (mCore m)) [hd, tl]) (cpNil (mCore m)) (reverse items)
   where
     s = mStore m
-    rebuildCopy copy = do
-      fresh <- newIORef IM.empty
-      let go c = case c of
-            CpRef addr -> pure (refWord addr)
-            CpWord w -> pure w
-            CpFresh k logical -> do
-              table <- readIORef fresh
-              case IM.lookup k table of
-                Just addr -> pure (refWord addr)
-                Nothing -> do
-                  addr <- allocSlots s logical 1
-                  writeIORef fresh (IM.insert k addr table)
-                  pure (refWord addr)
-            CpStruct f children -> mapM go children >>= structure s f
-      go copy
+
+-- | Rebuild a copy on the heap; fresh variables share the supplied table.
+rebuildCopyWith :: Machine -> IORef (IM.IntMap Int) -> Copy -> IO Word'
+rebuildCopyWith m fresh copy = case copy of
+  CpRef addr -> pure (refWord addr)
+  CpWord w -> pure w
+  CpFresh k logical -> do
+    table <- readIORef fresh
+    case IM.lookup k table of
+      Just addr -> pure (refWord addr)
+      Nothing -> do
+        addr <- allocSlots s logical 1
+        writeIORef fresh (IM.insert k addr table)
+        pure (refWord addr)
+  CpStruct f children -> mapM (rebuildCopyWith m fresh) children >>= structure s f
+  where
+    s = mStore m
 
 outputSince :: Machine -> Int -> IO [OutputEvent]
 outputSince m entryOut = do
@@ -1593,6 +1673,7 @@ collect m cont nargs = do
           fx <- readIORef fixRef
           forM_ [fxArgs fx .. fxArgs fx + pArity (fxPred fx) - 1] markCell
           markCont (fxCont fx)
+        CExitMinimize _ base _ -> markBlock base
       markResults ref = do
         collected <- readIORef ref
         forM_ collected (markCopy . fst)
@@ -1618,6 +1699,10 @@ collect m cont nargs = do
           markCont (fxCont fx)
         AltAnswers _ saved arity c -> forM_ [saved .. saved + arity - 1] markCell >> markCont c
         AltRetract _ _ saved c -> markCell saved >> markCont c
+        AltMinimize ref _ c -> do
+          mn <- readIORef ref
+          forM_ (mnBest mn) $ \(_, bound, _, _, _) -> forM_ bound $ \(addr, copy) -> markCell addr >> markCopy copy
+          markCont c
   -- The query block is a root even when no continuation names it any
   -- more: the answer is exported from it.
   forM_ [0 .. queryCells - 1] markCell
@@ -1651,6 +1736,35 @@ collect m cont nargs = do
               a' <- forward a
               unsafeWrite arr a' w'
             slide (a + 1)
+  -- Trail: keep entries of live cells, remember how many survive below
+  -- each original index for the choice points' marks.
+  trailArr <- readIORef (trail s)
+  trailLen <- trailTop s
+  keptBelow <- newArray (0, trailLen) 0 :: IO (IOUArray Int Int)
+  kept <- newIORef (0 :: Int)
+  let classify i acc
+        | i < 0 = pure acc
+        | otherwise = do
+            entry <- unsafeRead trailArr i
+            if odd entry then classify (i - 2) ((i - 1, 2, entry) : acc) else classify (i - 1) ((i, 1, entry) : acc)
+  entries <- classify (trailLen - 1) []
+  forM_ entries $ \(start, len, entry) -> do
+    k <- readIORef kept
+    forM_ [start .. start + len - 1] $ \j -> unsafeWrite keptBelow j k
+    let addr = entry `div` 2
+    live <- unsafeRead marks addr
+    when live $ do
+      addr' <- forward addr
+      if len == 1
+        then unsafeWrite trailArr k (addr' * 2)
+        else do
+          old <- unsafeRead trailArr start
+          unsafeWrite trailArr k old
+          unsafeWrite trailArr (k + 1) (addr' * 2 + 1)
+      writeIORef kept (k + len)
+  keptTotal <- readIORef kept
+  unsafeWrite keptBelow trailLen keptTotal
+  setTrailTop s keptTotal
   -- Relocate control records before sliding: they read markers via old
   -- addresses only through 'forward', which does not touch cells.
   let relocBlock base
@@ -1672,6 +1786,7 @@ collect m cont nargs = do
         CExitFindAll sentinel results template base entryHeap entryOut depth ->
           CExitFindAll sentinel results template <$> relocBlock base <*> forward entryHeap <*> pure entryOut <*> pure depth
         CExitTable fixRef -> pure (CExitTable fixRef)
+        CExitMinimize cost base ref -> CExitMinimize cost <$> relocBlock base <*> pure ref
       relocResults ref = do
         collected <- readIORef ref
         relocated <- forM collected $ \(copy, produced) -> (\c -> (c, produced)) <$> relocCopy copy
@@ -1710,37 +1825,19 @@ collect m cont nargs = do
           AltAnswers answers <$> forward saved <*> pure arity <*> relocCont c
         AltRetract facts key saved c ->
           AltRetract facts key <$> forward saved <*> relocCont c
+        AltMinimize ref buffer c -> do
+          mn <- readIORef ref
+          best' <- case mnBest mn of
+            Nothing -> pure Nothing
+            Just (n, bound, produced, tables, dynamic) -> do
+              bound' <- forM bound $ \(addr, copy) -> (,) <$> forward addr <*> relocCopy copy
+              pure (Just (n, bound', produced, tables, dynamic))
+          entryHeap' <- forward (mnEntryHeap mn)
+          entryTrail' <- unsafeRead keptBelow (mnEntryTrail mn)
+          writeIORef ref mn {mnEntryHeap = entryHeap', mnEntryTrail = entryTrail', mnBest = best'}
+          AltMinimize ref buffer <$> relocCont c
   cont' <- relocCont cont
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
-  -- Trail: keep entries of live cells, remember how many survive below
-  -- each original index for the choice points' marks.
-  trailArr <- readIORef (trail s)
-  trailLen <- trailTop s
-  keptBelow <- newArray (0, trailLen) 0 :: IO (IOUArray Int Int)
-  kept <- newIORef (0 :: Int)
-  let classify i acc
-        | i < 0 = pure acc
-        | otherwise = do
-            entry <- unsafeRead trailArr i
-            if odd entry then classify (i - 2) ((i - 1, 2, entry) : acc) else classify (i - 1) ((i, 1, entry) : acc)
-  entries <- classify (trailLen - 1) []
-  forM_ entries $ \(start, len, entry) -> do
-    k <- readIORef kept
-    forM_ [start .. start + len - 1] $ \j -> unsafeWrite keptBelow j k
-    let addr = entry `div` 2
-    live <- unsafeRead marks addr
-    when live $ do
-      addr' <- forward addr
-      if len == 1
-        then unsafeWrite trailArr k (addr' * 2)
-        else do
-          old <- unsafeRead trailArr start
-          unsafeWrite trailArr k old
-          unsafeWrite trailArr (k + 1) (addr' * 2 + 1)
-      writeIORef kept (k + len)
-  keptTotal <- readIORef kept
-  unsafeWrite keptBelow trailLen keptTotal
-  setTrailTop s keptTotal
   forM_ [0 .. choiceTop - 1] $ \i -> do
     choice <- readChoice m i
     h' <- forward (chH choice)
