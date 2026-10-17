@@ -191,9 +191,91 @@ prop_standard_acceptance = withTests 1 $ property $ do
     [answer] -> assert (not (null (answerOutput answer)))
     other -> annotateShow other >> failure
 
+data FlexPlaced = FlexPlaced Term Term Term Integer Integer Integer Integer Integer Integer Integer
+  deriving (Eq, Show)
+
+data Jumper = Jumper Term Integer Integer Integer Integer Integer Integer
+  deriving (Eq, Show)
+
+flexPlacement :: Term -> PropertyT IO [FlexPlaced]
+flexPlacement term = asList term >>= mapM part
+  where
+    part (Compound "pl" [_, kind, _, a, b, _, IntLit row, IntLit col, IntLit half,
+                         IntLit ha, IntLit hb, IntLit na, IntLit nb]) =
+      pure (FlexPlaced kind a b row col half ha hb na nb)
+    part other = annotateShow other >> failure
+
+flexJumpers :: Term -> PropertyT IO [Jumper]
+flexJumpers term = asList term >>= mapM item
+  where
+    item (Compound "jmp" [net, IntLit ra, IntLit rb, IntLit ha, IntLit hb, IntLit na, IntLit nb]) =
+      pure (Jumper net ra rb ha hb na nb)
+    item other = annotateShow other >> failure
+
+validFlexPlacement :: Integer -> Integer -> [FlexPlaced] -> [Jumper] -> Bool
+validFlexPlacement lo hi parts jumpers =
+  not (null parts) && firstOnTop &&
+  all validPart parts && all validJumper jumpers &&
+  length allHoles == length (nub allHoles) &&
+  and [na /= nb | (a, na) <- pins, (b, nb) <- pins, a /= b] &&
+  all netConnected netNames
+  where
+    polarizedKinds = [Atom "d", Atom "led", Atom "ecap"]
+    firstOnTop = case parts of FlexPlaced _ _ _ _ _ h _ _ _ _ : _ -> h == 0; [] -> False
+    validPart (FlexPlaced kind _ _ row col half ha hb na nb) =
+      let base = half * 100 + col
+          orientationOk
+            | kind `elem` polarizedKinds = na == base && nb == base + 1
+            | otherwise = (na == base && nb == base + 1) || (na == base + 1 && nb == base)
+       in row >= 1 && row <= 5 && col >= lo && col <= hi && half `elem` [0, 1] &&
+          orientationOk && ha == na * 10 + row && hb == nb * 10 + row
+    validJumper (Jumper net ra rb ha hb na nb) =
+      ra >= 1 && ra <= 5 && rb >= 1 && rb <= 5 &&
+      na /= nb && ha == na * 10 + ra && hb == nb * 10 + rb &&
+      (net, na) `elem` pins && (net, nb) `elem` pins
+    compHoles = concat [[ha, hb] | FlexPlaced _ _ _ _ _ _ ha hb _ _ <- parts]
+    jmpHoles = concat [[ha, hb] | Jumper _ _ _ ha hb _ _ <- jumpers]
+    allHoles = compHoles ++ jmpHoles
+    pins = concat [[(a, na), (b, nb)] | FlexPlaced _ a b _ _ _ _ _ na nb <- parts]
+    netNames = nub (map fst pins)
+    netConnected net =
+      let nodes = nub [n | (m, n) <- pins, m == net]
+          edges = [(na, nb) | Jumper m _ _ _ _ na nb <- jumpers, m == net]
+       in length nodes == 1 + length edges
+
+prop_flexible_placement :: Property
+prop_flexible_placement = withTests 1 $ property $ do
+  prog <- loadExample
+  -- Reversed parallel resistors need 1 jumper without flipping, 0 with flipping.
+  unflippedPar <- solve prog "comps par_flip Cs, nets Cs Ns, best Cs Ns Wired P Cost?"
+  case summaryAnswers unflippedPar of
+    [ans] -> (binding "Wired" ans >>= asList >>= \w -> length w === 1)
+    other -> annotateShow other >> failure
+  mapM_ (\(circuit, expectedJumpers) -> do
+      result <- solve prog ("comps " ++ circuit ++ " Cs, nets Cs Ns, best_flex Cs Ns JumpNets P Jumpers Cost?")
+      case summaryAnswers result of
+        [ans] -> do
+          jumpNets <- binding "JumpNets" ans >>= asList
+          fps <- binding "P" ans >>= flexPlacement
+          ps <- binding "P" ans >>= placement
+          js <- binding "Jumpers" ans >>= flexJumpers
+          cost <- binding "Cost" ans >>= integer
+          length jumpNets === expectedJumpers
+          length js === expectedJumpers
+          cost === referenceScore ps
+          assert (validFlexPlacement 7 11 fps js)
+        other -> annotateShow other >> failure
+    ) [("par_flip" :: String, 0 :: Int), ("par_diode", 0), ("anti_diode", 1), ("ladder6", 0), ("tri", 1)]
+  rendered <- solve prog "emit (report_flex anti_diode), emit (report_flex ladder6)?"
+  case summaryAnswers rendered of
+    [ans] -> assert (not (null (answerOutput ans)))
+    other -> annotateShow other >> failure
+
 breadboardGroup :: Group
 breadboardGroup = Group "Breadboard branch-and-bound"
   [("constrained score vs independent arithmetic", prop_score_model),
    ("bounded optima vs exhaustive placements", prop_bounded_optimum),
    ("score auxiliaries ground after placement-only labeling", prop_score_auxiliary_groundness),
-   ("standard circuits and report acceptance", prop_standard_acceptance)]
+   ("standard circuits and report acceptance", prop_standard_acceptance),
+   ("flexible placement with flipping, CLP rows and jumper holes", prop_flexible_placement)]
+
