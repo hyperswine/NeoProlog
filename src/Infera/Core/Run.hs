@@ -2142,5 +2142,5 @@ collect m cont nargs = do
   refreshHb m
   when traceOn (checkInvariants m cont')
   floor' <- readReg s rGCLIM
-  writeReg s rGCLIM (max (min floor' initialCollectLimit) (newTop * 2))
+  writeReg s rGCLIM (max (min floor' initialCollectLimit) (newTop * 4))
   pure cont'
