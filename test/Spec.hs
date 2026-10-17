@@ -38,6 +38,9 @@ import MachineLifetimeTest (machineLifetimeGroup)
 import MachineCompiledControlTest (machineCompiledControlGroup)
 import MachineCacheTest (machineCacheGroup)
 import MachineOperandTest (machineOperandGroup)
+import CoreTest (coreGroup)
+import MachineTypedBuiltinTest (machineTypedBuiltinGroup)
+import MachineOpaqueScopeTest (machineOpaqueScopeGroup)
 import System.Environment (getArgs)
 import Data.List (isPrefixOf)
 import System.Exit (exitFailure)
@@ -65,7 +68,10 @@ groups =
     ("machine-lifetime", machineLifetimeGroup),
     ("machine-compiled-control", machineCompiledControlGroup),
     ("machine-cache", machineCacheGroup),
-    ("machine-operands", machineOperandGroup)
+    ("machine-operands", machineOperandGroup),
+    ("core-engine", coreGroup),
+    ("machine-typed-builtin", machineTypedBuiltinGroup),
+    ("machine-opaque-scope", machineOpaqueScopeGroup)
   ]
 
 main :: IO ()

@@ -195,7 +195,9 @@ metricFields metrics =
     ("compiled_cuts", show (Machine.metricCompiledCuts metrics)),
     ("code_cache_hits", show (Machine.metricCodeCacheHits metrics)),
     ("predicate_cache_hits", show (Machine.metricPredicateCacheHits metrics)),
-    ("predicate_cache_misses", show (Machine.metricPredicateCacheMisses metrics))
+    ("predicate_cache_misses", show (Machine.metricPredicateCacheMisses metrics)),
+    ("typed_builtin_calls", show (Machine.metricTypedBuiltinCalls metrics)),
+    ("builtin_wrappers_avoided", show (Machine.metricBuiltinWrappersAvoided metrics))
   ]
 
 main :: IO ()

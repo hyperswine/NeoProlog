@@ -260,6 +260,8 @@ compiledProbe program query testCase@(Case name _ _ model) expected = do
         "code_cache_hits=" ++ show (Machine.metricCodeCacheHits metrics),
         "predicate_cache_hits=" ++ show (Machine.metricPredicateCacheHits metrics),
         "predicate_cache_misses=" ++ show (Machine.metricPredicateCacheMisses metrics),
+        "typed_builtin_calls=" ++ show (Machine.metricTypedBuiltinCalls metrics),
+        "builtin_wrappers_avoided=" ++ show (Machine.metricBuiltinWrappersAvoided metrics),
         "max_heap_cells=" ++ show (Machine.metricMaxHeapCells metrics),
         "max_tasks=" ++ show (Machine.metricMaxTasks metrics),
         "fully_drained=true", "timed=false"
@@ -274,6 +276,7 @@ median values = sort values !! div (length values) 2
 controlRegisterPeak :: Compile.ControlCode -> Int
 controlRegisterPeak code = case Compile.controlView code of
   Compile.Invoke plan _ -> Compile.dataRegisterCount plan
+  Compile.BuiltinCall _ plan _ -> Compile.operandRegisterCount plan
   Compile.Sequence children -> maximum (0 : map controlRegisterPeak children)
   Compile.Alternative left right -> max (controlRegisterPeak left) (controlRegisterPeak right)
   Compile.Cut _ -> 0

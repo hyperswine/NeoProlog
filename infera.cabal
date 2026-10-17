@@ -17,6 +17,20 @@ copyright:          2025 Jasen Qin
 category:           Language
 build-type:         Simple
 extra-doc-files:    README.md docs/engine-roadmap.md
+                    docs/engine-step2-opaque-controls-2026-10-17.md
+                    docs/engine-step2-opaque-controls-cache-2026-10-17.jsonl
+                    docs/engine-step2-opaque-controls-breadboard-2026-10-17.jsonl
+                    docs/engine-step2-opaque-controls-external-2026-10-17.jsonl
+                    docs/engine-step2-opaque-controls-external-initial-2026-10-17.jsonl
+                    docs/engine-step2-opaque-controls-bytecode-2026-10-17.tsv
+                    docs/engine-step2-opaque-controls-tail-2026-10-17.jsonl
+                    docs/engine-step2-opaque-controls-native-tail-2026-10-17.jsonl
+                    docs/engine-step2-builtin-operands-2026-10-17.md
+                    docs/engine-step2-builtin-operands-cache-2026-10-17.jsonl
+                    docs/engine-step2-builtin-operands-breadboard-2026-10-17.jsonl
+                    docs/engine-step2-builtin-operands-bytecode-2026-10-17.tsv
+                    docs/engine-step2-builtin-operands-tail-2026-10-17.jsonl
+                    docs/engine-step2-builtin-operands-native-tail-2026-10-17.jsonl
                     docs/engine-step2-operands-2026-10-16.jsonl
                     docs/engine-step2-operands-2026-10-16.md
                     docs/engine-step2-operands-before-root-sets-2026-10-16.jsonl
@@ -90,7 +104,8 @@ extra-doc-files:    README.md docs/engine-roadmap.md
                     docs/engine-step2-control-tail-2026-10-16.jsonl
                     docs/engine-step2-control-native-tail-2026-10-16.jsonl
 extra-source-files: infera.conf examples/*.nprolog test/cli.py test/bench.py
-                    test/bench_harness_test.py bench/run.sh bench/run.py
+                    test/bench_harness_test.py test/runtime_bench_harness_test.py
+                    bench/run.sh bench/run.py bench/runtime-compare.py bench/runtime-compare.pl
                     bench/bench.nprolog bench/bench.pl bench/check-tail-memory.py
 tested-with:        GHC == 9.8.2
 
@@ -138,6 +153,10 @@ library
         Infera.Purity
         Infera.Engine
         Infera.Engine.Reference
+        Infera.Core
+        Infera.Core.Store
+        Infera.Core.Compile
+        Infera.Core.Run
         Infera.Module
         Infera.Repl
     other-modules:    Infera.Engine.Contracts
@@ -173,7 +192,7 @@ test-suite infera-test
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     main-is:          Spec.hs
-    other-modules:    InferaTest CorrectnessTest MinesweeperTest InferenceTest
+    other-modules:    InferaTest CorrectnessTest MinesweeperTest InferenceTest CoreTest
                       CLPPerformanceTest ReferenceCLP BreadboardTest TablingTest
                       MachineHeapTest MachineControlTest MachineSubsearchTest
                       MachineCLPTest MachineBreadboardTest
@@ -190,7 +209,9 @@ test-suite infera-test
                       MachineLifetimeTest
                       MachineCompiledControlTest
                       MachineCacheTest
-                      MachineOperandTest
+                      MachineOpaqueScopeTest
+        MachineTypedBuiltinTest
+        MachineOperandTest
     default-language: Haskell2010
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1"
     build-depends:
@@ -245,3 +266,14 @@ benchmark machine-cache
     default-language: Haskell2010
     ghc-options:      -O2 -rtsopts
     build-depends:    base, directory, filepath, infera
+
+benchmark core-engine
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   bench
+    main-is:          core-engine.hs
+    default-language: Haskell2010
+    ghc-options:      -O2 -rtsopts
+    build-depends:
+        base,
+        infera

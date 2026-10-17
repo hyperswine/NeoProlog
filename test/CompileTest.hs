@@ -243,7 +243,11 @@ prop_control_and_recursive_cut_lowering = unit $ do
       (Compound "once" [Atom "true"], "once"),
       (Compound "not" [Atom "true"], "not"),
       (Compound "findall" [Var 0, Atom "true", Var 1], "findall"),
-      (Compound "call" [Var 0, Atom "a"], "call")
+      (Compound "call" [Var 0, Atom "a"], "call"),
+      (Compound "unify" [Var 0, Var 1], "builtin"),
+      (Compound "all_different" [Var 0], "builtin"),
+      (Compound "unify" [Var 0], "invoke"),
+      (Atom "unify", "invoke")
     ] $ \(template, expected) -> do
       code <- evalMaybe (compileClause (Clause (Atom "p") [template] 2))
       control <- evalMaybe (listToMaybe (codeControls code))
@@ -251,6 +255,7 @@ prop_control_and_recursive_cut_lowering = unit $ do
   where
     controlKind code = case controlView code of
       Invoke _ _ -> "invoke" :: String
+      BuiltinCall _ _ _ -> "builtin"
       Sequence _ -> "sequence"
       Alternative _ _ -> "alternative"
       Cut LocalBase -> "cut-local"

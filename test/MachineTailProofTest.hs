@@ -38,11 +38,18 @@ eligible program key = case lookupPred key program of
   Nothing -> annotateShow key >> failure
   Just definition -> pure (Tail.eligiblePredicate program definition)
 
+fuelReusable :: Program -> (String, Int) -> PropertyT IO Bool
+fuelReusable program key = case lookupPred key program of
+  Nothing -> annotateShow key >> failure
+  Just definition -> pure (Tail.eligibleFuelReuse program definition)
+
 prop_generated_pure_mutual_cycles :: Property
 prop_generated_pure_mutual_cycles = withTests 200 . property $ do
   count <- forAll (Gen.int (Range.linear 1 8))
   let program = buildProgram (cycleItems count)
-  forM_ [0 .. count - 1] $ \index -> eligible program (name index, 1) >>= (=== True)
+  forM_ [0 .. count - 1] $ \index -> do
+    eligible program (name index, 1) >>= (=== True)
+    fuelReusable program (name index, 1) >>= (=== True)
 
 prop_generated_recursive_edge_does_not_hide_effect :: Property
 prop_generated_recursive_edge_does_not_hide_effect = withTests 300 . property $ do
@@ -52,8 +59,8 @@ prop_generated_recursive_edge_does_not_hide_effect = withTests 300 . property $ 
     [ Var 0,
       Atom "!",
       Compound "call" [Atom "true"],
-      Compound "once" [Atom "true"],
-      Compound "not" [Atom "false"],
+      Compound "once" [Compound "call" [Atom "true"]],
+      Compound "not" [Compound "write" [Atom "value"]],
       Compound "in" [Var 0, Compound "range" [IntLit 0, IntLit 1]],
       Compound "neq" [Var 0, IntLit 2],
       Compound "write" [Atom "value"],
@@ -67,6 +74,69 @@ prop_generated_recursive_edge_does_not_hide_effect = withTests 300 . property $ 
         [Compound (name ((poisoned + 1) `mod` count)) [Var 0], bad] 1)
       program = buildProgram (cycleItems count ++ [extra])
   forM_ [0 .. count - 1] $ \index -> eligible program (name index, 1) >>= (=== False)
+
+-- Control arguments are source goal trees only at the exact native arities.
+-- Recursively wrapping a shared recursive edge must preserve the closed graph
+-- proof without turning arbitrary data or meta-call arguments into source.
+prop_generated_closed_control_trees :: Property
+prop_generated_closed_control_trees = withTests 200 . property $ do
+  count <- forAll (Gen.int (Range.linear 1 8))
+  wrappers <- forAll (Gen.list (Range.linear 1 10) (Gen.int (Range.linear 0 5)))
+  let wrap index goal = case index of
+        0 -> Compound "once" [goal]
+        1 -> Compound "not" [Compound "not" [goal]]
+        2 -> Compound "," [Atom "true", goal]
+        3 -> Compound ";" [Atom "fail", goal]
+        4 -> Compound "->" [Atom "true", goal]
+        _ -> Compound ";" [Compound "->" [Atom "false", Atom "fail"], goal]
+      child = foldr wrap (Compound (name 0) [Var 0]) wrappers
+      extra = TLClause (Clause (Compound (name (count - 1)) [Var 0]) [child] 1)
+      program = buildProgram (cycleItems count ++ [extra])
+  forM_ [0 .. count - 1] $ \index -> do
+    eligible program (name index, 1) >>= (=== True)
+    fuelReusable program (name index, 1) >>= (=== False)
+
+prop_every_control_arm_rejects_forbidden_descendants :: Property
+prop_every_control_arm_rejects_forbidden_descendants = unit $ do
+  let wrappers child =
+        [ Compound "once" [child],
+          Compound "not" [child],
+          Compound "," [child, Atom "true"],
+          Compound "," [Atom "true", child],
+          Compound ";" [child, Atom "true"],
+          Compound ";" [Atom "true", child],
+          Compound "->" [child, Atom "true"],
+          Compound "->" [Atom "false", child],
+          Compound ";" [Compound "->" [Atom "false", child], Atom "true"],
+          Compound ";" [Compound "->" [Atom "true", Atom "true"], child]
+        ]
+      forbidden =
+        [ Var 0,
+          Atom "!",
+          Compound "call" [Atom "true"],
+          Compound "findall" [Var 0, Atom "true", Var 1],
+          Compound "write" [Atom "value"],
+          Compound "in" [Var 0, Compound "range" [IntLit 0, IntLit 1]],
+          Compound "unify" [Var 0, Compound "box" [Compound "$cut" [IntLit 1]]],
+          Atom "unknown"
+        ]
+  forM_ forbidden $ \bad -> forM_ (wrappers bad) $ \body -> do
+    let extra = TLClause (Clause (Compound (name 1) [Var 0])
+          [Compound (name 0) [Var 0], body] 2)
+        program = buildProgram (cycleItems 2 ++ [extra])
+    annotateShow body
+    eligible program (name 0, 1) >>= (=== False)
+    eligible program (name 1, 1) >>= (=== False)
+    fuelReusable program (name 0, 1) >>= (=== False)
+  forM_ [FlagUnsafe, FlagDynamic, FlagTable] $ \flag -> do
+    let extra =
+          [ TLClause (Clause (Atom "scoped")
+              [Compound "once" [Compound (name 0) [IntLit 0]]] 0),
+            TLDecl (Decl (name 1) Nothing [flag] [])
+          ]
+        program = buildProgram (cycleItems 2 ++ extra)
+    annotateShow flag
+    eligible program ("scoped", 0) >>= (=== False)
 
 prop_generated_reachable_flags_reject :: Property
 prop_generated_reachable_flags_reject = withTests 200 . property $ do
@@ -184,6 +254,8 @@ machineTailProofGroup :: Group
 machineTailProofGroup = Group "machine tail call proof"
   [ ("generated_pure_mutual_cycles", prop_generated_pure_mutual_cycles),
     ("generated_recursive_edge_does_not_hide_effect", prop_generated_recursive_edge_does_not_hide_effect),
+    ("generated_closed_control_trees", prop_generated_closed_control_trees),
+    ("every_control_arm_rejects_forbidden_descendants", prop_every_control_arm_rejects_forbidden_descendants),
     ("generated_reachable_flags_reject", prop_generated_reachable_flags_reject),
     ("unreachable_bad_definitions_are_independent", prop_unreachable_bad_definitions_are_independent),
     ("completed_helpers_and_mutual_runtime_parity", prop_completed_helpers_and_mutual_runtime_parity),

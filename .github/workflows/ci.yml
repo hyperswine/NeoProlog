@@ -107,7 +107,7 @@ jobs:
         working-directory: lsp
       - run: INFERA_BIN="$(cabal list-bin exe:infera --enable-optimization=2)" npm test --prefix lsp
       - run: python3 test/cli.py "$(cabal list-bin exe:infera --enable-optimization=2)"
-      - run: python3 -m unittest discover -s test -p bench_harness_test.py
+      - run: python3 -m unittest discover -s test -p '*bench_harness_test.py'
       - run: python3 bench/check-tail-memory.py "$(cabal list-bin bench:machine-tail --enable-optimization=2)" --quick --output /tmp/infera-tail-memory.jsonl
       - run: python3 bench/check-tail-memory.py "$(cabal list-bin bench:machine-tail --enable-optimization=2)" --backend bytecode --quick --output /tmp/infera-bytecode-tail-memory.jsonl
       - run: '"$(cabal list-bin bench:machine-minefield --enable-optimization=2)" --engine native --phase ordinary --size 16 --bombs 50 --timeout 120'

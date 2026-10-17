@@ -1,0 +1,50 @@
+<- notable.
+app [] L L.
+app [H | T] L [H | R] <- app T L R.
+nrev [] [].
+nrev [H | T] R <- nrev T RT, app RT [H] R.
+mem X [X | _].
+mem X [_ | T] <- mem X T.
+fact 0 1.
+fact N F <- N > 0, N1 is N - 1, fact N1 F1, F is N * F1.
+color red. color green. color blue.
+pick X <- color X, X != red.
+first : unsafe.
+first X <- color X, !.
+cond X Y <- (X > 5 -> Y = big ; Y = small).
+neg X <- not (color X).
+collect L <- findall (X - Y) (color X, color Y, X != Y) L.
+len [] 0.
+len [_ | T] N <- len T M, N is M + 1.
+sq X Y <- Y is X * X.
+> app X Y [1, 2, 3]?
+> nrev [1, 2, 3, 4] R?
+> mem X [a, b, c]?
+> fact 10 F?
+> fact 25 F?
+> pick X?
+> first X?
+> cond 7 Y, cond 2 Z?
+> neg red?
+> neg purple?
+> collect L?
+> len [a, b, c] N?
+> X = 1 + 2, Y is X * 2?
+> sq (1 + 2) Y?
+> fact (2 + 3) F?
+> X is foo + 1?
+> X is 1 / 0?
+> (X = 1 ; X = 2), X > 1?
+> once (mem X [a, b]), Y = X?
+> call mem X [p, q]?
+> G = (mem Z [u, v]), call G?
+> X = f(Y), Y = 1, X == f(1)?
+> app [1] X X?
+> 3.5 > 2, 1.0 = 1.0, a < b?
+> fact Z 1?
+> findall X (mem X [1, 2, 3], X > 1) L, len L N?
+> writeln hello, X = done?
+> not (X = 1), X = 2?
+> forall (mem X [1, 2]) (X > 0)?
+> fact a 1?
+> unknown_pred 1?

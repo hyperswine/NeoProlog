@@ -5,6 +5,7 @@
 -- Frozen branches own their rollback state independently of the active heap.
 module Infera.Machine.Tail
   ( eligiblePredicate,
+    eligibleFuelReuse,
     eligibleArguments,
   )
 where
@@ -26,16 +27,31 @@ eligibleArguments signature arguments = all withoutCut arguments
   && (signature == Nothing || all isGroundTerm arguments)
 
 -- | Prove that every reachable definition stays within native first-order
--- arithmetic, equality, guards and direct user calls. A revisit closes a pure
--- strongly connected component: its first visit still checks all clauses, so
--- an effect in any other branch cannot hide behind a recursive edge.
+-- arithmetic, equality, guards, closed control trees and direct user calls.
+-- A revisit closes a pure strongly connected component: its first visit still
+-- checks all clauses, so an effect in any other branch cannot hide behind a
+-- recursive edge.
 --
--- Helpers may finish before the tail call, and mutual recursion may transfer
--- between different predicates. The runtime task stack, rather than clause
--- syntax, establishes which completed activation can actually be retired.
+-- Helpers and opaque pure controls may finish before the tail call, and mutual
+-- recursion may transfer between different predicates. Each control child is
+-- proved as source, including both alternatives and every conditional arm.
+-- Meta-call arguments are never treated as trusted source. The runtime task
+-- stack, rather than clause syntax, establishes which completed activation can
+-- actually be retired.
 -- Internal cut markers are forbidden even in nested data.
 eligiblePredicate :: Program -> Pred -> Bool
-eligiblePredicate program definition = case prove Set.empty definition of
+eligiblePredicate = provePredicate True
+
+-- | Preserve the historical default-query depth budget policy separately
+-- from physical frame retirement. Closed controls can retire completed
+-- activations without refunding their logical resolution fuel. In particular,
+-- widening the purity proof must not turn a previously exhausted scoped loop
+-- into a successful query merely by discarding its completed return frames.
+eligibleFuelReuse :: Program -> Pred -> Bool
+eligibleFuelReuse = provePredicate False
+
+provePredicate :: Bool -> Program -> Pred -> Bool
+provePredicate controls program definition = case prove Set.empty definition of
   Just _ -> True
   Nothing -> False
   where
@@ -53,6 +69,10 @@ eligiblePredicate program definition = case prove Set.empty definition of
       | functorOf (clauseHead clause) /= Just (predKey target)
           || not (all withoutCut (clauseHead clause : clauseBody clause)) = Nothing
       | otherwise = foldM eligibleGoal visited (clauseBody clause)
+    eligibleGoal visited (Compound name children)
+      | controls && ((name `elem` [",", ";", "->"] && length children == 2)
+          || (name `elem` ["once", "not"] && length children == 1)) =
+          foldM eligibleGoal visited children
     eligibleGoal visited goal
       | nativeGoal goal = Just visited
       | otherwise = case functorOf goal of

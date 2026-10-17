@@ -10,6 +10,7 @@ module Infera.Machine.Bytecode
     BodyFrame,
     BodyStep (..),
     DataStep (..),
+    OperandStep (..),
     activate,
     activateMeasured,
     activateHead,
@@ -20,6 +21,10 @@ module Infera.Machine.Bytecode
     nextControl,
     materializeData,
     materializeDataMeasured,
+    materializeOperands,
+    materializeOperandsMeasured,
+    materializeOperandsInTransaction,
+    materializeOperandsInTransactionMeasured,
     instantiate,
   )
 where
@@ -92,6 +97,15 @@ data DataStep = DataStep
   { dataStepRoot :: !Address,
     dataStepAllocationInstructions :: !Int,
     dataStepRegisterSlots :: !Int
+  }
+
+-- | All arguments of one typed builtin, constructed together without its
+-- callable wrapper. The roots retain source order and may alias. Mutable
+-- construction registers never escape this materialization.
+data OperandStep = OperandStep
+  { operandStepRoots :: [Address],
+    operandStepAllocationInstructions :: !Int,
+    operandStepRegisterSlots :: !Int
   }
 
 -- | All source-local occurrences in the remaining body are live, including
@@ -334,6 +348,105 @@ materializeDataWithMetrics measured heap bindings base plan = do
       pure $ case restored of
         Left rollbackError -> Left rollbackError
         Right () -> Left problem
+
+-- | Materialize all operands using one environment lookup, temporary array
+-- and outer heap transaction. A failure restores allocation and intern-table
+-- additions. Even a ground plan strictly validates its binding environment.
+materializeOperands :: Heap s -> Bridge.Bindings -> VarId -> OperandPlan
+  -> ST s (Either HeapError OperandStep)
+materializeOperands = materializeOperandsWithMetrics False
+
+materializeOperandsMeasured :: Heap s -> Bridge.Bindings -> VarId -> OperandPlan
+  -> ST s (Either HeapError OperandStep)
+materializeOperandsMeasured = materializeOperandsWithMetrics True
+
+materializeOperandsWithMetrics :: Bool -> Heap s -> Bridge.Bindings -> VarId -> OperandPlan
+  -> ST s (Either HeapError OperandStep)
+materializeOperandsWithMetrics measured heap bindings base plan = do
+  mark <- Heap.checkpoint heap
+  result <- materializeOperandsWithMetricsInTransaction measured heap bindings base plan
+  case result of
+    Right built -> pure (Right built)
+    Left problem -> do
+      restored <- Heap.rollback heap mark
+      pure $ case restored of
+        Left rollbackError -> Left rollbackError
+        Right () -> Left problem
+
+-- | Trusted variants for a driver-owned transaction spanning operand
+-- allocation and builtin execution. The caller must roll back its checkpoint
+-- on every failure before exposing that failure or continuing another branch.
+materializeOperandsInTransaction :: Heap s -> Bridge.Bindings -> VarId -> OperandPlan
+  -> ST s (Either HeapError OperandStep)
+materializeOperandsInTransaction = materializeOperandsWithMetricsInTransaction False
+
+materializeOperandsInTransactionMeasured :: Heap s -> Bridge.Bindings -> VarId -> OperandPlan
+  -> ST s (Either HeapError OperandStep)
+materializeOperandsInTransactionMeasured = materializeOperandsWithMetricsInTransaction True
+
+materializeOperandsWithMetricsInTransaction :: Bool -> Heap s -> Bridge.Bindings -> VarId -> OperandPlan
+  -> ST s (Either HeapError OperandStep)
+materializeOperandsWithMetricsInTransaction measured heap bindings base plan = runExceptT $ do
+  addresses <- checked (Bridge.lookupVariables heap bindings (map (+ base) (operandLocalIds plan)))
+  let localCount = operandLocalCount plan
+      locals = listArray (0, localCount - 1) addresses
+      count = operandRegisterCount plan
+      instructions = operandRuntimeInstructions plan
+      rootOperands = operandRuntimeRoots plan
+      localAddress local
+        | localCount <= 4 = readSmallLocal addresses localCount local
+        | otherwise = readLocal locals localCount local
+      resultStep roots allocations registers = OperandStep roots
+        (if measured then allocations else 0) (if measured then registers else 0)
+      scalarAddress scalar = checked (Heap.importScalarInTransaction heap scalar)
+      -- One-instruction plans need no temporary array. Earlier arguments
+      -- that are locals remain directly addressable alongside the final
+      -- temporary, including duplicate aliases of either kind.
+      oneResult destination address = do
+        validateRegister count destination
+        let root (DataLocal local) = localAddress local
+            root (DataTemporary register)
+              | register == destination = pure address
+              | otherwise = throwError IncompatibleBindings
+        roots <- mapM root rootOperands
+        pure (resultStep roots 1 0)
+  when (count < 0 || localCount < 0) (throwError IncompatibleBindings)
+  case instructions of
+    [] -> do
+      let root (DataLocal local) = localAddress local
+          root (DataTemporary _) = throwError IncompatibleBindings
+      roots <- mapM root rootOperands
+      pure (resultStep roots 0 0)
+    [DataConstant destination scalar] -> scalarAddress scalar >>= oneResult destination
+    [DataOwner destination] ->
+      scalarAddress (IntLit (toInteger base)) >>= oneResult destination
+    [DataCompound destination name children] -> do
+      let child (DataLocal local) = localAddress local
+          child (DataTemporary _) = throwError IncompatibleBindings
+      childrenAddresses <- mapM child children
+      address <- checked (Heap.newCompoundInTransaction heap name childrenAddresses)
+      oneResult destination address
+    _ -> do
+      slots <- lift (newSlots count)
+      let operand (DataLocal local) = localAddress local
+          operand (DataTemporary register) = readSlot slots count register
+          executeData instruction = case instruction of
+            DataConstant destination scalar -> do
+              address <- scalarAddress scalar
+              overwriteSlot slots count destination address
+            DataOwner destination -> do
+              address <- scalarAddress (IntLit (toInteger base))
+              overwriteSlot slots count destination address
+            DataCompound destination name children -> do
+              -- Capture children before a last-use slot is recycled. Final
+              -- argument roots were counted as uses during compilation and
+              -- therefore remain live until all returned roots are read.
+              childrenAddresses <- mapM operand children
+              address <- checked (Heap.newCompoundInTransaction heap name childrenAddresses)
+              overwriteSlot slots count destination address
+      mapM_ executeData instructions
+      roots <- mapM operand rootOperands
+      pure (resultStep roots (length instructions) count)
 
 -- Legacy source-oriented construction remains an independent oracle for the
 -- normal dense plan. It is used by materializeNext and eager activation only.

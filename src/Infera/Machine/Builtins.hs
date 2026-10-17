@@ -4,6 +4,8 @@
 module Infera.Machine.Builtins
   ( Builtin (..),
     builtin,
+    builtinOperands,
+    evalIsOperand,
     ordinaryBuiltin,
     dynamicCall,
     readFileContents,
@@ -14,6 +16,7 @@ import Data.Char (toLower, toUpper)
 import qualified Data.Map.Strict as Map
 import Infera.Arith (compareNumeric, deepEval, evalArithSafe, evalNumeric)
 import Infera.CLP
+import Infera.Compile (BuiltinTag (..))
 import Infera.Engine.Reference (Env (..), OutputEvent (..), Search, SearchItem (..), SolverState (..))
 import Infera.Error (PredKey, SolveError (..), showPredKey)
 import Infera.Program (nameHasFlag)
@@ -36,10 +39,7 @@ builtin store goal = case walk substitution goal of
   Compound "unify" [left, right] -> Unify left right
   Compound "equiv" [left, right] -> accept (deepWalk substitution left == deepWalk substitution right)
   Compound "neq" [left, right] -> Post (addDiseq left right)
-  Compound "is" [left, right] -> case evalArithSafe substitution right of
-    Left err -> Raise err
-    Right Nothing -> Raise (InstantiationError (deepWalk substitution right))
-    Right (Just value) -> Unify left value
+  Compound "is" [left, right] -> either Raise (Unify left) (evalIsOperand store right)
   Compound "gt" [left, right] -> comparison (== GT) substitution left right
   Compound "lt" [left, right] -> comparison (== LT) substitution left right
   Compound "gte" [left, right] -> comparison (/= LT) substitution left right
@@ -55,6 +55,42 @@ builtin store goal = case walk substitution goal of
   Compound "all_distinct" [terms] -> allDifferent substitution terms
   Compound "reify" [relation, truth] -> reifyRelation substitution relation truth
   _ -> NotBuiltin
+  where
+    substitution = stSubst store
+
+-- | Dispatch already selected, raw argument syntax without reconstructing a
+-- callable wrapper. Semantic helpers are shared with the native dispatcher;
+-- malformed source arities never lower to a typed instruction.
+builtinOperands :: BuiltinTag -> Store -> [Term] -> Builtin
+builtinOperands tag store arguments = case (tag, arguments) of
+  (BuiltinUnify, [left, right]) -> Unify left right
+  (BuiltinEquiv, [left, right]) -> accept (deepWalk substitution left == deepWalk substitution right)
+  (BuiltinNeq, [left, right]) -> Post (addDiseq left right)
+  (BuiltinIs, [left, right]) -> either Raise (Unify left) (evalIsOperand store right)
+  (BuiltinGt, [left, right]) -> comparison (== GT) substitution left right
+  (BuiltinLt, [left, right]) -> comparison (== LT) substitution left right
+  (BuiltinGte, [left, right]) -> comparison (/= LT) substitution left right
+  (BuiltinLte, [left, right]) -> comparison (/= GT) substitution left right
+  (BuiltinIntEq, [left, right]) -> Post (addRelation RelEq left right)
+  (BuiltinFdNe, [left, right]) -> Post (addRelation RelNe left right)
+  (BuiltinFdLe, [left, right]) -> Post (addRelation RelLe left right)
+  (BuiltinFdLt, [left, right]) -> Post (addRelation RelLe (plusOne left) right)
+  (BuiltinFdGe, [left, right]) -> Post (addRelation RelLe right left)
+  (BuiltinFdGt, [left, right]) -> Post (addRelation RelLe (plusOne right) left)
+  (BuiltinIn, [target, range]) -> inDomain substitution target range
+  (BuiltinAllDifferent, [terms]) -> allDifferent substitution terms
+  (BuiltinAllDistinct, [terms]) -> allDifferent substitution terms
+  (BuiltinReify, [relation, truth]) -> reifyRelation substitution relation truth
+  _ -> NotBuiltin
+  where
+    substitution = stSubst store
+
+-- Keep the RHS error/instantiation policy identical for both dispatch paths.
+evalIsOperand :: Store -> Term -> Either SolveError Term
+evalIsOperand store right = case evalArithSafe substitution right of
+  Left err -> Left err
+  Right Nothing -> Left (InstantiationError (deepWalk substitution right))
+  Right (Just value) -> Right value
   where
     substitution = stSubst store
 

@@ -23,12 +23,15 @@ import Text.Read (readMaybe)
 
 data Engine = Reference | Interpreted | Bytecode deriving (Eq)
 data Phase = Cold | Warm deriving (Eq)
-data Workload = Helper Int | StructuredHeads | Controls | Minefield deriving (Eq)
+data Workload
+  = Helper Int | StructuredHeads | Controls | ControlsArithmetic | ControlsOnce
+  | ControlsNot | ControlsIf | Minefield | CoreNrev | CoreLoop | CoreFib | CoreQueens
+  deriving (Eq)
 data Options = Options Engine Phase Workload Double Int
-data Model = ExactInteger Integer | BinaryGrid Int Integer
+data Model = ExactInteger Integer | BinaryGrid Int Integer | ReverseThirty | QueensEight
 
 usage :: String
-usage = "Usage: machine-cache --engine reference|interpreted|bytecode --phase cold|warm --case helper-0|helper-100|helper-1000|structured-head|controls|minefield-16 [--timeout seconds] [--batch 1..1000000; warm only when greater than 1]"
+usage = "Usage: machine-cache --engine reference|interpreted|bytecode --phase cold|warm --case helper-0|helper-100|helper-1000|structured-head|controls|controls-arithmetic|controls-once|controls-not|controls-if|minefield-16|core-nrev|core-loop|core-fib|core-queens [--timeout seconds] [--batch 1..1000000; warm only when greater than 1]"
 
 parseOptions :: [String] -> Either String Options
 parseOptions = parse Nothing Nothing Nothing Nothing Nothing
@@ -60,7 +63,15 @@ parseOptions = parse Nothing Nothing Nothing Nothing Nothing
         "helper-1000" -> Right (Helper 1000)
         "structured-head" -> Right StructuredHeads
         "controls" -> Right Controls
+        "controls-arithmetic" -> Right ControlsArithmetic
+        "controls-once" -> Right ControlsOnce
+        "controls-not" -> Right ControlsNot
+        "controls-if" -> Right ControlsIf
         "minefield-16" -> Right Minefield
+        "core-nrev" -> Right CoreNrev
+        "core-loop" -> Right CoreLoop
+        "core-fib" -> Right CoreFib
+        "core-queens" -> Right CoreQueens
         _ -> Left ("Unknown case: " ++ value)
       parse engine phase (Just chosen) budget batch rest
     parse engine phase workload Nothing batch ("--timeout" : value : rest) = case readMaybe value of
@@ -80,7 +91,15 @@ workloadName workload = case workload of
   Helper padding -> "helper-" ++ show padding
   StructuredHeads -> "structured-head"
   Controls -> "controls"
+  ControlsArithmetic -> "controls-arithmetic"
+  ControlsOnce -> "controls-once"
+  ControlsNot -> "controls-not"
+  ControlsIf -> "controls-if"
   Minefield -> "minefield-16"
+  CoreNrev -> "core-nrev"
+  CoreLoop -> "core-loop"
+  CoreFib -> "core-fib"
+  CoreQueens -> "core-queens"
 
 fixture :: Workload -> IO (String, String, Model)
 fixture workload = case workload of
@@ -102,9 +121,30 @@ fixture workload = case workload of
       "loop 0 Acc Acc.",
       "loop N Acc Result <- N > 0, once ((Picked = N ; Picked = 0)), not (Picked < 0), (Picked > 0 -> Next is Acc + Picked ; Next = Acc), M is N - 1, loop M Next Result."
     ], "loop 300 0 Result?", ExactInteger 45150)
+  ControlsArithmetic -> controlFixture "Next is Acc + N"
+  ControlsOnce -> controlFixture "once ((Picked = N ; Picked = 0)), Next is Acc + Picked"
+  ControlsNot -> controlFixture "not (N < 0), Next is Acc + N"
+  ControlsIf -> controlFixture "(N > 150 -> Next is Acc + N ; Next is Acc + N)"
   Minefield -> do
     source <- readFile "examples/minesweeper.nprolog"
     pure (source, "once (minefield 16 16 50 [window 2 2 2] Result)?", BinaryGrid 16 50)
+  CoreNrev -> coreFixture "once (bench_nrev 3000, range 1 30 L, nrev L Result)?" ReverseThirty
+  CoreLoop -> coreFixture "once (loop 90000, Result = 90000)?" (ExactInteger 90000)
+  CoreFib -> coreFixture "once (fib 25 Result)?" (ExactInteger 75025)
+  CoreQueens -> coreFixture "once (queens 8 Result)?" QueensEight
+  where
+    controlFixture body = pure (unlines
+      [ "<- notable.",
+        "loop 0 Acc Acc.",
+        "loop N Acc Result <- N > 0, " ++ body ++ ", M is N - 1, loop M Next Result."
+      ], "loop 300 0 Result?", ExactInteger 45150)
+    coreFixture query model = do
+      source <- readFile "bench/bench.nprolog"
+      pure (source, query, model)
+
+hasOpaqueControl :: Workload -> Bool
+hasOpaqueControl workload = workload `elem`
+  [Controls, ControlsOnce, ControlsNot, ControlsIf]
 
 data Observation
   = AnswerObservation [(String, Term)] [String] [OutputEvent]
@@ -168,6 +208,28 @@ independent (BinaryGrid size bombs) actual = do
       _ -> Left "Grid contains an improper list"
     binary (IntLit value) | value == 0 || value == 1 = Right value
     binary _ = Left "Grid contains a nonbinary or nonground cell"
+independent ReverseThirty actual = do
+  value <- singleResult actual
+  unless (unfoldCons value == (map IntLit [30, 29 .. 1], Nothing))
+    (Left "Independent reverse model failed")
+independent QueensEight actual = do
+  value <- singleResult actual
+  columns <- case unfoldCons value of
+    (values, Nothing) -> mapM integer values
+    _ -> Left "Queen vector is an improper list"
+  unless (sort columns == [1 .. 8] && and
+    [abs (a - b) /= toInteger (j - i)
+      | (i, a) <- zip [0 :: Int ..] columns, (j, b) <- zip [0 :: Int ..] columns, i < j])
+    (Left "Independent queens model failed")
+  where
+    integer (IntLit value) = Right value
+    integer _ = Left "Queen vector contains a noninteger or nonground cell"
+
+singleResult :: [Observation] -> Either String Term
+singleResult [AnswerObservation bindings [] []] = case lookup "Result" bindings of
+  Just value -> Right value
+  Nothing -> Left "Result binding is missing"
+singleResult _ = Left "Expected exactly one answer without residuals/output/errors"
 
 validate :: Model -> [Observation] -> [Observation] -> IO ()
 validate model expected actual = do
@@ -222,7 +284,7 @@ probe budget workload program query model expected = Just <$> within budget "Pos
     && Machine.metricPredicateCacheHits metrics > 0
     && Machine.metricPredicateCacheMisses metrics == 0)
     (fail "Post-timing probe did not exercise compiled/cache paths")
-  when (workload == Controls) $ unless (Machine.metricCompiledControlInstructions metrics > 0)
+  when (hasOpaqueControl workload) $ unless (Machine.metricCompiledControlInstructions metrics > 0)
     (fail "Post-timing probe did not exercise compiled controls")
   pure metrics)
 
@@ -306,4 +368,7 @@ main = do
      ("per_query_wall_seconds", show (fromIntegral (ended - started) / 1.0e9 / fromIntegral batch :: Double)),
      ("per_query_cpu_seconds", show (fromIntegral (cpuEnded - cpuStarted) / 1.0e12 / fromIntegral batch :: Double)),
      ("timed_instruction_counters", "false"), ("probe_timed", "false"),
-     ("post_timing_probe", maybe "null" (json . metricFields) metrics)])
+     ("post_timing_probe", maybe "null" (json . metricFields) metrics),
+     -- Keep the runner source compatible with older runtimes while exposing
+     -- new measured fields to a matched-stage orchestration after timing.
+     ("post_timing_metrics_show", maybe "null" (show . show) metrics)])

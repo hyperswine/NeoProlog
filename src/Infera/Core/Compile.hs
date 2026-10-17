@@ -1,0 +1,396 @@
+{-# LANGUAGE BangPatterns #-}
+
+-- | Compile an inferred 'P.Program' and a query into the core's plans.
+--
+-- Clause heads become argument patterns matched against call words without
+-- building a head term. Bodies become goal plans over activation slots. The
+-- compiler also decides, once per program, whether every reachable construct
+-- is inside the core's supported subset; otherwise the caller keeps using the
+-- existing machine.
+module Infera.Core.Compile
+  ( Pattern (..),
+    Expr (..),
+    ArithOp (..),
+    CmpOp (..),
+    Check (..),
+    Goal (..),
+    Pred (..),
+    PredRef,
+    Clause (..),
+    ArgIndex (..),
+    Key (..),
+    CoreProgram (..),
+    Unsupported (..),
+    compileProgram,
+    compileGoalTerm,
+    candidateClauses,
+    keyOfWord,
+  )
+where
+
+import Control.Monad (forM, forM_)
+import Data.Array (Array, listArray)
+import Data.IORef
+import qualified Data.IntMap.Strict as IM
+import Data.IntSet (IntSet)
+import qualified Data.IntSet as IS
+import Data.List (foldl')
+import qualified Data.Map.Strict as Map
+import Infera.Core.Store
+import Infera.Error (PredKey, SolveError (..))
+import qualified Infera.Program as P
+import qualified Infera.Syntax as S
+import Infera.Syntax (Term (..))
+
+-- | How a goal argument or head argument is obtained or matched.
+data Pattern
+  = -- | activation variable, offset from the activation base
+    PSlot !Int
+  | -- | a ready word: a constant, or a runtime cell handed to a dynamic goal
+    PWord !Word'
+  | -- | functor word and argument patterns
+    PStruct !Word' [Pattern]
+  | -- | arithmetic structure in a call argument: evaluated when ground,
+    -- otherwise built as data (the reference normalises call arguments)
+    PArith !Word' !ArithOp [Pattern]
+
+data ArithOp = OpPlus | OpMinus | OpMul | OpDiv | OpMod | OpPow | OpNeg | OpAbs | OpMin | OpMax
+  deriving (Eq, Show)
+
+data Expr
+  = EImm !Int
+  | EBig !Integer
+  | EFlt !Double
+  | -- | evaluate a word at runtime: a number, or arithmetic data
+    EPat Pattern
+  | EOp !ArithOp [Expr]
+
+data CmpOp = CmpGt | CmpLt | CmpGte | CmpLte deriving (Eq, Show)
+
+data Check = CkVar | CkNonvar | CkGround | CkInt | CkFloat | CkNum | CkStr | CkAtom | CkChar | CkList
+  deriving (Eq, Show)
+
+-- | Predicates are resolved through a reference so that bodies can name
+-- predicates compiled later (or recursively) without a runtime map lookup.
+type PredRef = IORef Pred
+
+data Goal
+  = GCall !PredRef [Pattern]
+  | -- | a variable goal (True) or @call/N@ (False): a goal word plus extra arguments
+    GCallDyn !Bool Pattern [Pattern]
+  | GAnd [Goal]
+  | GUnify Pattern Pattern
+  | GEquiv Pattern Pattern
+  | -- | disequality; a constraint when non-ground, which the core abandons
+    GNeq Pattern Pattern
+  | GIs Pattern Expr
+  | GCmp !CmpOp Expr Expr
+  | GTrue
+  | GFail
+  | GCut
+  | GOr [Goal] [Goal]
+  | GIf [Goal] [Goal] (Maybe [Goal])
+  | GNot [Goal]
+  | GOnce [Goal]
+  | GFindAll Pattern [Goal] Pattern
+  | GCheck !Check Pattern
+  | -- | write (False) or writeln (True)
+    GWrite !Bool Pattern
+  | GNl
+  | GError SolveError
+  | -- | reached only through a dynamic goal: abandon the core run
+    GUnsupported Term
+
+data Clause = Clause
+  { clVars :: !Int,
+    clHead :: [Pattern],
+    clBody :: [Goal]
+  }
+
+data Key = KAtm !Int | KInt !Int | KChr !Int | KFun !Word' | KBig !Integer | KFlt !Double | KStr !String
+  deriving (Eq, Ord, Show)
+
+data ArgIndex = ArgIndex !(Map.Map Key IntSet) !IntSet
+
+data Pred = Pred
+  { pKey :: !PredKey,
+    pArity :: !Int,
+    pClauses :: !(Array Int Clause),
+    pClauseCount :: !Int,
+    pIndex :: [ArgIndex],
+    pIndexed :: !Bool,
+    pDecls :: [P.Signature],
+    pInferred :: !P.Signature
+  }
+
+data CoreProgram = CoreProgram
+  { cpPreds :: Map.Map PredKey PredRef,
+    cpQuery :: [Goal],
+    cpQueryVars :: !Int,
+    cpNil :: !Word',
+    cpCons :: !Word',
+    -- | arithmetic functor words and their operators
+    cpArith :: IM.IntMap ArithOp
+  }
+
+newtype Unsupported = Unsupported String deriving (Show)
+
+data Ctx = Ctx
+  { ctxStore :: Store,
+    ctxProgram :: P.Program,
+    ctxPreds :: Map.Map PredKey PredRef,
+    -- | compiling a goal handed to call/N at runtime: unsupported goals
+    -- become runtime abandonment instead of a compile-time rejection
+    ctxDynamic :: Bool,
+    ctxProblems :: IORef [String]
+  }
+
+-- | Compile the whole program for one store. Right only when the program and
+-- query are inside the supported subset.
+compileProgram :: Store -> P.Program -> S.Query -> IO (Either Unsupported CoreProgram)
+compileProgram store program query = do
+  let preds = P.programPreds program
+      unsupportedPred p
+        | P.predIsTabled program p = Just ("tabled predicate " ++ showKey (P.predKey p))
+        | P.predIsDynamic program p = Just ("dynamic predicate " ++ showKey (P.predKey p))
+        | otherwise = Nothing
+      dynamicNames = any (elem S.FlagDynamic) (Map.elems (P.progNameFlags program))
+  case [problem | p <- preds, Just problem <- [unsupportedPred p]] of
+    (problem : _) -> pure (Left (Unsupported problem))
+    []
+      | dynamicNames -> pure (Left (Unsupported "dynamic declarations"))
+      | otherwise -> do
+          problems <- newIORef []
+          nilW <- atmWord <$> internAtom (symbols store) "nil"
+          consW <- (\f -> funWord f 2) <$> internFunctor (symbols store) "cons" 2
+          refs <- forM preds $ \p -> do
+            ref <- newIORef (error "predicate compiled later")
+            pure (P.predKey p, ref)
+          let table = Map.fromList refs
+              ctx = Ctx store program table False problems
+          forM_ preds $ \p -> do
+            compiled <- compilePred ctx p
+            writeIORef (table Map.! P.predKey p) compiled
+          goals <- compileBody ctx (S.queryGoals query)
+          arith <- forM arithFunctors $ \(name, arity, op) -> do
+            fid <- internFunctor (symbols store) name arity
+            pure (funWord fid arity, op)
+          found <- readIORef problems
+          case found of
+            (problem : _) -> pure (Left (Unsupported problem))
+            [] -> pure (Right (CoreProgram table goals (S.queryNVars query) nilW consW (IM.fromList arith)))
+  where
+    showKey (name, arity) = name ++ "/" ++ show arity
+
+compilePred :: Ctx -> P.Pred -> IO Pred
+compilePred ctx p = do
+  let clauses = IM.elems (P.predClauses p)
+      arity = snd (P.predKey p)
+  compiledClauses <- mapM (compileClause ctx) clauses
+  let count = length compiledClauses
+  index <- mapM (\i -> buildIndex (ctxStore ctx) i compiledClauses) [0 .. arity - 1]
+  pure
+    Pred
+      { pKey = P.predKey p,
+        pArity = arity,
+        pClauses = listArray (0, max 0 (count - 1)) compiledClauses,
+        pClauseCount = count,
+        pIndex = index,
+        pIndexed = P.predIsIndexed (ctxProgram ctx) p,
+        pDecls = P.predDecls p,
+        pInferred = P.predInferred p
+      }
+
+buildIndex :: Store -> Int -> [Clause] -> IO ArgIndex
+buildIndex store position clauses = do
+  keyed <- forM (zip [0 ..] clauses) $ \(ordinal, clause) -> do
+    key <- case drop position (clHead clause) of
+      (pattern : _) -> patternKey store pattern
+      [] -> pure Nothing
+    pure (ordinal :: Int, key)
+  pure (foldl' add (ArgIndex Map.empty IS.empty) keyed)
+  where
+    add (ArgIndex m open) (ordinal, Nothing) = ArgIndex m (IS.insert ordinal open)
+    add (ArgIndex m open) (ordinal, Just key) = ArgIndex (Map.insertWith IS.union key (IS.singleton ordinal) m) open
+
+patternKey :: Store -> Pattern -> IO (Maybe Key)
+patternKey store pattern = case pattern of
+  PSlot _ -> pure Nothing
+  PWord w -> keyOfWord store w
+  PStruct f _ -> pure (Just (KFun f))
+  PArith f _ _ -> pure (Just (KFun f))
+
+-- | The index key of a dereferenced word; Nothing for an unbound variable.
+keyOfWord :: Store -> Word' -> IO (Maybe Key)
+keyOfWord store w = case tagOf w of
+  t | t == tagRef -> pure Nothing
+    | t == tagAtm -> pure (Just (KAtm (valOf w)))
+    | t == tagInt -> pure (Just (KInt (valOf w)))
+    | t == tagChr -> pure (Just (KChr (valOf w)))
+    | t == tagStr -> Just . KFun <$> readCell store (valOf w)
+    | t == tagBox -> do
+        value <- boxed store w
+        pure . Just $ case value of
+          BInt n -> KBig n
+          BFlt d -> KFlt d
+          BStr s -> KStr s
+    | otherwise -> pure Nothing
+
+-- | Candidate clause ordinals for dereferenced argument keys (Nothing for an
+-- unbound argument). Any bound argument prunes, as in the reference.
+candidateClauses :: Pred -> [Maybe Key] -> [Int]
+candidateClauses p keys =
+  case [restrict ai k | (ai, Just k) <- zip (pIndex p) keys] of
+    [] -> [0 .. pClauseCount p - 1]
+    (s : ss) -> IS.toAscList (foldl' IS.intersection s ss)
+  where
+    restrict (ArgIndex keyed open) k = IS.union open (Map.findWithDefault IS.empty k keyed)
+
+compileClause :: Ctx -> S.Clause -> IO Clause
+compileClause ctx clause = do
+  headPatterns <- case S.clauseHead clause of
+    Compound _ as -> mapM (compileHeadArg ctx) as
+    _ -> pure []
+  body <- compileBody ctx (S.clauseBody clause)
+  pure (Clause (max 1 (S.clauseNVars clause)) headPatterns body)
+
+compileHeadArg :: Ctx -> Term -> IO Pattern
+compileHeadArg ctx term = case term of
+  Var v -> pure (PSlot v)
+  Compound f as -> do
+    fid <- internFunctor (symbols (ctxStore ctx)) f (length as)
+    PStruct (funWord fid (length as)) <$> mapM (compileHeadArg ctx) as
+  _ -> PWord <$> constantWord (ctxStore ctx) term
+
+constantWord :: Store -> Term -> IO Word'
+constantWord store term = case term of
+  Atom a -> atmWord <$> internAtom (symbols store) a
+  IntLit n
+    | fitsImmediate n -> pure (intWord (fromInteger n))
+    | otherwise -> box store (BInt n)
+  FloatLit d -> box store (BFlt d)
+  CharLit c -> pure (chrWord (fromEnum c))
+  StrLit s -> box store (BStr s)
+  _ -> fail "constantWord: not a constant"
+
+-- | Goal arguments: slots, constants, structures, and arithmetic structures
+-- that the reference would evaluate before the call.
+compileArg :: Ctx -> Term -> IO Pattern
+compileArg ctx term = case term of
+  Var v
+    | v < 0 -> pure (PWord (refWord (negate v - 1)))
+    | otherwise -> pure (PSlot v)
+  Compound f as -> do
+    fid <- internFunctor (symbols (ctxStore ctx)) f (length as)
+    args <- mapM (compileArg ctx) as
+    pure $ case arithOp f (length as) of
+      Just op -> PArith (funWord fid (length as)) op args
+      Nothing -> PStruct (funWord fid (length as)) args
+  _ -> PWord <$> constantWord (ctxStore ctx) term
+
+arithFunctors :: [(String, Int, ArithOp)]
+arithFunctors =
+  [ ("plus", 2, OpPlus), ("minus", 2, OpMinus), ("mul", 2, OpMul), ("div", 2, OpDiv),
+    ("mod", 2, OpMod), ("^", 2, OpPow), ("neg", 1, OpNeg), ("abs", 1, OpAbs),
+    ("min", 2, OpMin), ("max", 2, OpMax)
+  ]
+
+arithOp :: String -> Int -> Maybe ArithOp
+arithOp f n = case [op | (name, arity, op) <- arithFunctors, name == f, arity == n] of
+  (op : _) -> Just op
+  [] -> Nothing
+
+compileExpr :: Ctx -> Term -> IO Expr
+compileExpr ctx term = case term of
+  IntLit n | fitsImmediate n -> pure (EImm (fromInteger n))
+  IntLit n -> pure (EBig n)
+  FloatLit d -> pure (EFlt d)
+  Compound f as | Just op <- arithOp f (length as) -> EOp op <$> mapM (compileExpr ctx) as
+  _ -> EPat <$> compileArg ctx term
+
+compileBody :: Ctx -> [Term] -> IO [Goal]
+compileBody ctx = mapM (compileGoal ctx) . concatMap flatten
+  where
+    flatten (Compound "," [a, b]) = flatten a ++ flatten b
+    flatten t = [t]
+
+compileGoal :: Ctx -> Term -> IO Goal
+compileGoal ctx term = case term of
+  Var v
+    | v < 0 -> pure (GCallDyn True (PWord (refWord (negate v - 1))) [])
+    | otherwise -> pure (GCallDyn True (PSlot v) [])
+  Atom "true" -> pure GTrue
+  Atom "fail" -> pure GFail
+  Atom "false" -> pure GFail
+  Atom "!" -> pure GCut
+  Atom "nl" -> pure GNl
+  Compound "$cut" [IntLit _] -> pure GCut
+  Compound "," [_, _] -> GAnd <$> body term
+  Compound ";" [Compound "->" [c, t], e] -> GIf <$> body c <*> body t <*> (Just <$> body e)
+  Compound ";" [a, b] -> GOr <$> body a <*> body b
+  Compound "->" [c, t] -> GIf <$> body c <*> body t <*> pure Nothing
+  Compound "not" [g] -> GNot <$> body g
+  Compound "once" [g] -> GOnce <$> body g
+  Compound "forall" [c, a] -> do
+    cg <- body c
+    ag <- body a
+    pure (GNot (cg ++ [GNot ag]))
+  Compound "findall" [tmpl, g, l] -> GFindAll <$> arg tmpl <*> body g <*> arg l
+  Compound "call" (p : args) -> GCallDyn False <$> arg p <*> mapM arg args
+  Compound "unify" [a, b] -> GUnify <$> arg a <*> arg b
+  Compound "equiv" [a, b] -> GEquiv <$> arg a <*> arg b
+  Compound "neq" [a, b] -> GNeq <$> arg a <*> arg b
+  Compound "is" [a, b] -> GIs <$> arg a <*> compileExpr ctx b
+  Compound "gt" [a, b] -> GCmp CmpGt <$> compileExpr ctx a <*> compileExpr ctx b
+  Compound "lt" [a, b] -> GCmp CmpLt <$> compileExpr ctx a <*> compileExpr ctx b
+  Compound "gte" [a, b] -> GCmp CmpGte <$> compileExpr ctx a <*> compileExpr ctx b
+  Compound "lte" [a, b] -> GCmp CmpLte <$> compileExpr ctx a <*> compileExpr ctx b
+  Compound "var" [x] -> GCheck CkVar <$> arg x
+  Compound "nonvar" [x] -> GCheck CkNonvar <$> arg x
+  Compound "ground" [x] -> GCheck CkGround <$> arg x
+  Compound "is_int" [x] -> GCheck CkInt <$> arg x
+  Compound "is_float" [x] -> GCheck CkFloat <$> arg x
+  Compound "is_num" [x] -> GCheck CkNum <$> arg x
+  Compound "is_str" [x] -> GCheck CkStr <$> arg x
+  Compound "is_atom" [x] -> GCheck CkAtom <$> arg x
+  Compound "is_char" [x] -> GCheck CkChar <$> arg x
+  Compound "is_list" [x] -> GCheck CkList <$> arg x
+  Compound "write" [x] -> GWrite False <$> arg x
+  Compound "print" [x] -> GWrite False <$> arg x
+  Compound "writeln" [x] -> GWrite True <$> arg x
+  Compound f as
+    | f `elem` referenceBuiltins -> unsupported ("builtin " ++ f ++ "/" ++ show (length as))
+    | otherwise -> userCall f as
+  Atom f
+    | f `elem` referenceBuiltins -> unsupported ("builtin " ++ f ++ "/0")
+    | otherwise -> userCall f []
+  _ -> pure (GError (TypeError "callable goal" term))
+  where
+    body t = compileBody ctx [t]
+    arg = compileArg ctx
+    unsupported what = do
+      if ctxDynamic ctx then pure () else modifyIORef' (ctxProblems ctx) (what :)
+      pure (GUnsupported term)
+    userCall f as = case Map.lookup (f, length as) (ctxPreds ctx) of
+      Just ref -> GCall ref <$> mapM arg as
+      Nothing
+        | P.nameHasFlag (ctxProgram ctx) f S.FlagDynamic -> unsupported ("dynamic " ++ f)
+        | otherwise -> pure (GError (UnknownPredicate (f, length as)))
+
+-- Goals handled by the reference engine that this slice does not compile.
+referenceBuiltins :: [String]
+referenceBuiltins =
+  [ "int_eq", "fd_ne", "fd_le", "fd_lt", "fd_ge", "fd_gt", "reify", "in", "label", "labeling",
+    "all_different", "all_distinct", "minimize", "phrase", "phrase_from_file", "emit",
+    "read_file", "assert", "retract", "retractall", "str_concat", "str_length", "str_chars",
+    "str_atom", "str_num", "str_upper", "str_lower", "str_lines", "term_str", "char_code",
+    "fmt", "wr", "sp", "seq", "padl", "padr"
+  ]
+
+-- | Compile a goal that a running program handed to @call/N@. The caller
+-- exports it to a term whose variables are the words of their cells, so
+-- 'Var' leaves here are cell words, not slots.
+compileGoalTerm :: Store -> P.Program -> Map.Map PredKey PredRef -> Term -> IO Goal
+compileGoalTerm store program preds term = do
+  problems <- newIORef []
+  compileGoal (Ctx store program preds True problems) term

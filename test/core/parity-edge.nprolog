@@ -1,0 +1,87 @@
+<- notable.
+len : det (list any: <=) (int: =>).
+len [] 0.
+len [_ | T] N <- len T M, N is M + 1.
+sum : semidet (list int: <=) (int: =>).
+sum [] 0.
+sum [X | Xs] S <- sum Xs S1, S is S1 + X.
+choose : multi (list any: <=) (any: =>).
+choose [X | _] X.
+choose [_ | T] X <- choose T X.
+broken : det (int: <=) (int: =>).
+broken 1 one.
+broken 2 Y <- Y = 2.
+twice : det (int: <=) (int: =>).
+twice X Y <- (Y is X * 2 ; Y is X * 3).
+pal : unsafe.
+pal L <- rev L L, !.
+rev [] [].
+rev [H | T] R <- rev T RT, app RT [H] R.
+app [] L L.
+app [H | T] L [H | R] <- app T L R.
+classify X K <- (X < 0 -> K = negative ; X == 0 -> K = zero ; K = positive).
+oops X <- (X is foo -> true ; true).
+notoops X <- not (X is foo).
+loud : unsafe.
+items : unsafe.
+loud X <- writeln X, X > 1.
+items L <- findall X (loud X, X = 2 ; X = 3) L.
+big N <- N is 2 ^ 70.
+chars C <- C = 'x', C < 'y'.
+strs S <- S = "abc", S < "abd".
+flt F <- F is 7 / 2, F > 3.
+mixed M <- M is 1 + 2.5.
+deep 0.
+deep N <- N > 0, N1 is N - 1, deep N1, true.
+cutcall : unsafe.
+cutcall X <- call ((X = 1, ! ; X = 2)).
+nested X <- findall (A - B) (choose [1, 2] A, findall C (choose [a, b] C) B), X = yes.
+> len [a, b] N?
+> len X 2?
+> sum [1, 2, 3] S?
+> sum [1, a] S?
+> choose [p, q] X?
+> choose [] X?
+> broken 1 Y?
+> broken 2 Y?
+> twice 3 Y?
+> pal [1, 2, 1]?
+> pal [1, 2]?
+> classify -3 K, classify 0 L, classify 9 M?
+> oops 1?
+> notoops 1?
+> items L?
+> big N?
+> chars C?
+> strs S?
+> flt F?
+> mixed M?
+> deep 50?
+> cutcall X?
+> nested X?
+> X = "str", Y = 'c', Z = 1.5, W = 123456789012345678901234567890, V is W + 1?
+> X = f(A, B, A), Y = f(1, 2, 1), X = Y?
+> X = f(A), X = A?
+> ground f(1), not (ground f(_)), var V, nonvar 1, is_list [1], not (is_list [1 | _])?
+> is_int 1, is_float 1.5, is_num 1, is_str "s", is_atom a, is_char 'c'?
+> X is max 2 3.0, Y is min 2 1, Z is abs (-4), W is neg 5, U is 7 % 3?
+> X is 5 % 0?
+> X is 2 ^ -1?
+> X is 2.0 ^ 3?
+> X is foo?
+> 1 < a?
+> a < 1?
+> X < 1?
+> (X = 1 ; X = 2), (Y = a ; Y = b)?
+> once ((X = 1 ; X = 2)), (Y = a ; Y = b)?
+> not ((X = 1, X = 2))?
+> findall X (X = 1 ; X is bar ; X = 2) L?
+> findall X (X = 1 ; X = 2) [1, 2]?
+> forall (choose [1, 2] X) (X > 0)?
+> forall (choose [1, 2] X) (X > 1)?
+> writeln "hi", write 1, nl, write (1 + 2)?
+> (writeln a, fail ; writeln b)?
+> call (X = 1)?
+> G = foo, call G?
+> call 1?
+> call X?

@@ -774,6 +774,10 @@ Before switching, require the complete generated/API/stdlib suite and exact
 source traces under both backends, cross-platform CI, real breadboard/minefield
 acceptance, retained-checkpoint and million-iteration residency gates, and
 checked serial cold/warm timings without material representative regressions.
+The user-selected external target is roughly **2× or better than either SWI
+or Scryer across representative, answer-checked workloads**. Compare explicit
+bytecode loaded execution separately from CLI startup; require a valid result
+and usable timing in each comparison, and retain workload gaps explicitly.
 Then route public `Infera.Engine` entry points to bytecode, retain explicit
 `Interpreted` selection for differential checks and troubleshooting, and run
 the full default-facing CLI/editor suite again. The reference remains an
@@ -790,9 +794,11 @@ selector closure over the entire parent driver. The operand report separates
 matched cold queries and fresh-state warm batches, including intermediate
 refinements and sample variation. Profile remaining regressions before
 builtin/argument-register specialisation; a default switch remains a separate
-validated migration. Warm controls and the RC/wide breadboard cases still
-trail interpreted execution in the operand recheck; those representative
-regressions keep the performance gate open despite passing local correctness.
+validated migration. The operand recheck recorded warm-control and RC/wide
+breadboard regressions. The subsequent typed builtin report records the new
+paired comparison: control and wide improve locally, but the minefield sanity
+case regresses against baseline. The representative performance gate remains
+open despite passing local correctness.
 
 ### Next performance work
 
@@ -801,25 +807,42 @@ work: the latest probes report zero predicate-cache misses. These are
 source-grounded candidates, not established causes of the measured regressions.
 Profile normal execution on a controlled runner before claiming a speedup.
 
-1. **Typed builtin arguments.** Compiled arithmetic and CLP leaves still build
-   a callable graph, export it to `Term`, and sometimes import its operands
-   again. Start with `=`, `is` and arithmetic comparisons, then domain and CLP
-   relations. Use a fixed builtin tag and one multi-root operand plan with one
-   checked local layout and transaction. Reuse existing arithmetic/CLP helpers;
-   retain generic dispatch for dynamic goals, malformed shapes and unsupported
-   cases. Preserve builtin precedence, shallow walks, exact error order, fuel,
-   rollback and source traces. Count avoided wrapper nodes explicitly rather
-   than presenting measured queued dispatch as the normal fused path.
-2. **Opaque controls and tail transfer.** Split the combined control benchmark
-   into arithmetic-only, `once`, negation and conditional cases. Profile heap
-   snapshots, accepted-state restoration and binding replay. The current
-   300-iteration combined fixture retains up to 302 tasks because conservative
-   tail analysis excludes these controls. A successful `once`/conditional may
-   permit a checked child-state handoff when no relocation occurred; pure
-   completed control may also admit tail transfer. Prove parent-handle,
-   rollback, contract, cut and fuel compatibility before either change; retain
-   the existing path after collection or suspension.
-3. **CLP change tracking.** Separate posting, fixed labeling and full optimum
+1. **Typed builtin arguments implemented for 18 fixed arithmetic/CLP calls.**
+   [The typed builtin report](engine-step2-builtin-operands-2026-10-17.md) records
+   shared multi-root argument plans, direct heap unification and scalar-result
+   `is`, with the source invocation retained for tracing and malformed calls.
+   Each operation owns argument allocations and the CLP/heap result together.
+   Other typed builtins still export raw argument terms for the existing
+   arithmetic/CLP helpers. Expression opcodes and additional builtin coverage
+   remain later profiling candidates. Dynamic goals, malformed shapes and
+   unsupported cases retain generic dispatch. Builtin precedence, shallow walks,
+   exact error order, fuel, rollback and source traces remain invariants.
+   New counters identify typed calls and omitted wrappers separately from the
+   generic invocation and traced fallback paths.
+2. **Opaque controls and tail transfer implemented.**
+   [The opaque control report](engine-step2-opaque-controls-2026-10-17.md) records
+   split arithmetic/once/negation/conditional benchmarks and matched measurements.
+   Successful once/conditional/emit scopes keep the current child's heap and
+   bindings when a monotone heap epoch proves the parent's prefix addresses
+   survived. Restores, relocating collections and traces retain state replay;
+   earlier minimum-search results always use the existing restore/replay path.
+   A closed proof admits only pure, fully checked control trees for frame
+   retirement, including every alternative and reachable definition. Historical
+   fuel-refund eligibility remains a separate, unchanged proof, so newly retired
+   frames still consume the existing logical resolution budget. Generated tests
+   retain complete stores, rollback, contracts, cuts, checkpoints and traces.
+3. **Compiled arithmetic expression plans.** The checked external arithmetic
+   loop is substantially slower than Scryer even without opaque controls.
+   Typed builtins still construct an expression on the heap, export it to
+   syntax and evaluate through the persistent substitution. Compile supported
+   ground-integer expressions for `is` and ordinary comparisons to numeric
+   plans, retaining generic fallback for blocked variables, malformed inputs,
+   unsupported operations and traces. Preserve exact arithmetic/error order,
+   transactional rollback and native unification/CLP synchronization. Profile
+   callable export, fresh activation variables and substitution mirroring too;
+   this is a bounded next candidate, not evidence that one change closes the
+   external gap.
+4. **CLP change tracking.** Separate posting, fixed labeling and full optimum
    search on all four breadboard cases. If profiles justify it, return actual
    newly bound IDs from trusted internal CLP operations instead of deriving
    differences from whole substitutions, and avoid replacing dependency

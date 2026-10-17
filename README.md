@@ -407,10 +407,17 @@ branches, opaque searches and cut barriers. The
 code reuse, edit correctness and cold/warm scaling. The
 [operand report](docs/engine-step2-operands-2026-10-16.md) covers dense local
 dispatch, simple operand fast paths, deferred protected-root sets and matched
-batch measurements. Bytecode is the intended eventual
+batch measurements. The [typed builtin report](docs/engine-step2-builtin-operands-2026-10-17.md)
+covers multi-root arithmetic/CLP operands, operation-owned rollback and measured
+wrapper avoidance. The [opaque control report](docs/engine-step2-opaque-controls-2026-10-17.md)
+covers successful child-heap handoff, completed pure-control frame retirement
+and checked comparisons with installed SWI and Scryer. Bytecode is the intended eventual
 default; the roadmap records its correctness and performance migration gates.
-Proved tail transfers
-reuse their depth budget; other nested calls
+The checked external control/core comparison still misses the roughly 2×
+SWI-or-Scryer target, so public entry points continue to use Interpreted.
+Historically eligible first-order tail transfers
+reuse their depth budget; newly proved pure control transfers retire frames
+while retaining the logical budget. Other nested calls
 retain the 100 000 activation limit and explicit exhaustion reporting.
 `bench/run.sh` runs checked engine benchmarks. Earlier relative-speed numbers
 from the unchecked harness are historical observations, not validated baselines.
@@ -464,6 +471,7 @@ test/MachineGraphReuseTest.hs shared argument graphs and normalization compatibi
 test/MachineNormalizeTest.hs generated raw graph normalization, alias and scalar-bit parity
 test/CompileTest.hs     generated compiler register contracts and fallback boundaries
 test/MachineBytecodeTest.hs interpreted/bytecode/reference parity and immutable resumes
+test/MachineTypedBuiltinTest.hs generated arithmetic/CLP operand and transaction parity
 test/MachineHeadTest.hs whole-head CLP transactions, raw IDs, register sharing and snapshots
 test/MachineLifetimeTest.hs pending body roots, register reuse and incremental allocation parity
 test/MachineCompiledControlTest.hs generated control trees, cut barriers, scopes and trace parity
@@ -629,7 +637,11 @@ four locals and arrays for larger layouts. Source-facing instruction views and
 fresh IDs remain unchanged. Simple locals, scalars and all-local constructors
 avoid temporary arrays. The materializer owns one rollback transaction for its
 whole plan; checked scalar/constructor helpers avoid redundant nested marks.
-Public heap builders retain their atomic behavior. Local variables retain
+Public heap builders retain their atomic behavior. Eighteen fixed arithmetic
+and CLP builtins now share one multi-root argument plan and dispatch without
+a callable wrapper; `unify` consumes raw handles and `is` imports only its
+evaluated result. Tracing and malformed arities retain their source invocation
+path. Local variables retain
 their logical identities;
 temporary constructor/scalar registers are reused after their last read.
 Scalar sharing preserves exact bits. Pending code keeps suffix-live logical
@@ -666,7 +678,7 @@ recorded separately in the
 [control report](docs/engine-step2-control-2026-10-16.md) and
 [cache/dispatch report](docs/engine-step2-cache-2026-10-16.md) and
 [operand report](docs/engine-step2-operands-2026-10-16.md).
-The current gate passed 361 Haskell properties (25,018 cases), 47 LSP tests,
+The current gate passed 370 Haskell properties (25,723 cases), 47 LSP tests,
 20 harness tests and CLI acceptance. Ordinary compiled execution skips
 instruction statistics; measured variants distinguish accepted-head work from
 reached body construction. The allocation changes establish smaller temporary
@@ -764,7 +776,8 @@ cabal bench machine-cache --offline --enable-optimization=2 --benchmark-options=
 ```
 
 Cases cover helper dispatch with 0/100/1,000 unused predicates, structured heads,
-compiled opaque control and the 16x16 minefield acceptance grid. Reference and
+compiled opaque control (combined and arithmetic/once/negation/conditional splits),
+core reverse/loop/Fibonacci/queens workloads and the 16x16 minefield acceptance grid. Reference and
 explicit Interpreted selection remain available for comparisons.
 
 Warm control and breadboard comparisons can batch fresh validated queries to
@@ -777,6 +790,16 @@ behind distinct opaque nonces to avoid reusing evaluated searches:
 cabal bench machine-cache --offline --enable-optimization=2 --benchmark-options='--engine bytecode --phase warm --case controls --batch 100'
 cabal bench machine-breadboard --offline --enable-optimization=2 --benchmark-options='--batch 100'
 ```
+
+`bench/runtime-compare.py` compares the explicit bytecode backend with installed
+SWI and Scryer on equivalent, independently checked control and core workloads.
+Pass the built `machine-cache` pathname with `--infera-runner`, and optional
+`--swipl`/`--scryer` paths. Loading, startup and one checked warmup are outside
+timing; every timed query drains and validates its result. Increase `--batch`
+when millisecond clock resolution is too coarse. Scryer reports loaded CPU
+only; the runner leaves loaded wall time unavailable. The bytecode default
+requires roughly 2× or better than at least one engine across representative
+workloads, alongside the roadmap's correctness and residency gates.
 
 The separate tail runner verifies and fully drains one query per fresh process:
 

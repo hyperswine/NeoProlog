@@ -1,0 +1,62 @@
+# source-fingerprint=14e6921762eae70ffb2a232877db5b5e
+# compiler=ghc-9.8 platform=aarch64-darwin
+# scope=loaded case-specific checked program; reached immutable predicate plans warmed by untimed compiled probe; per-query dispatch/tail setup+execution+projection+validation; no parsing or CLI startup
+# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)
+# warmups=1 runs=3 timeout_seconds=30 fresh_unused_variables=1..4 measured_probe=5 normal_counters=false no_timing_threshold
+# head counters describe accepted heads; failed head work is excluded; body counters count reached materializations
+# predicate_code_cache=warm reached plans; each timed query has fresh heap/Store/tables/dynamic state; cold samples use machine-cache
+engine	case	median_wall_seconds	median_cpu_seconds	wall_samples	cpu_samples
+# workload_fingerprint case=helper-dispatch-10000 value=9e801455f778ebadc46cb06c32c893cb
+# compiled_probe case=helper-dispatch-10000 compiled_activations=20001 bytecode_instructions=180004 direct_calls=20000 head_instructions=90004 head_cells_avoided=20001 max_activation_registers=1 body_goals_materialized=50000 body_allocation_instructions=60000 compiled_control_instructions=0 compiled_cuts=0 code_cache_hits=19998 predicate_cache_hits=3 predicate_cache_misses=0 typed_builtin_calls=30000 builtin_wrappers_avoided=30000 max_heap_cells=1027 max_tasks=4 fully_drained=true timed=false
+reference	helper-dispatch-10000	6.3398e-2	6.2608e-2	[6.8935e-2,6.3398e-2,6.0247e-2]	[6.8182e-2,6.2608e-2,5.987e-2]
+interpreted	helper-dispatch-10000	0.173419	0.17153	[0.167068,0.173419,0.174571]	[0.165874,0.17153,0.173063]
+bytecode	helper-dispatch-10000	0.163888	0.162338	[0.161627,0.163888,0.164515]	[0.16012,0.162338,0.162971]
+# register_plan case=helper-dispatch-10000 scope=all_supported_case_clauses unshared_slots=135 pooled_slots=84 max_body_temporary_registers=3 legacy_max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=structured-list-300 value=1fb6142a448e9821a63828e2497c1678
+# compiled_probe case=structured-list-300 compiled_activations=601 bytecode_instructions=7204 direct_calls=600 head_instructions=2404 head_cells_avoided=601 max_activation_registers=10 body_goals_materialized=1200 body_allocation_instructions=1500 compiled_control_instructions=0 compiled_cuts=0 code_cache_hits=598 predicate_cache_hits=3 predicate_cache_misses=0 typed_builtin_calls=600 builtin_wrappers_avoided=600 max_heap_cells=3442 max_tasks=3 fully_drained=true timed=false
+reference	structured-list-300	9.9994e-2	9.9105e-2	[0.103763,9.83e-2,9.9994e-2]	[0.102861,9.7398e-2,9.9105e-2]
+interpreted	structured-list-300	0.329356	0.327206	[0.331808,0.329356,0.323334]	[0.329365,0.327206,0.321366]
+bytecode	structured-list-300	0.328032	0.325384	[0.326051,0.328032,0.342012]	[0.323296,0.325384,0.338517]
+# register_plan case=structured-list-300 scope=all_supported_case_clauses unshared_slots=135 pooled_slots=84 max_body_temporary_registers=3 legacy_max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=structured-head-10000 value=feb3dd40986114f7bc9ebb73f88b4d37
+# compiled_probe case=structured-head-10000 compiled_activations=20001 bytecode_instructions=370004 direct_calls=20000 head_instructions=210004 head_cells_avoided=80001 max_activation_registers=3 body_goals_materialized=50000 body_allocation_instructions=130000 compiled_control_instructions=0 compiled_cuts=0 code_cache_hits=19998 predicate_cache_hits=3 predicate_cache_misses=0 typed_builtin_calls=30000 builtin_wrappers_avoided=30000 max_heap_cells=1028 max_tasks=3 fully_drained=true timed=false
+reference	structured-head-10000	0.105435	9.9511e-2	[0.128951,0.105435,8.434e-2]	[0.113646,9.9511e-2,8.3702e-2]
+interpreted	structured-head-10000	0.255693	0.253839	[0.255693,0.249445,0.261443]	[0.253839,0.247978,0.259024]
+bytecode	structured-head-10000	0.210866	0.209094	[0.210866,0.212467,0.210453]	[0.209094,0.210831,0.208785]
+# register_plan case=structured-head-10000 scope=all_supported_case_clauses unshared_slots=135 pooled_slots=84 max_body_temporary_registers=3 legacy_max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=early-fail-body-2000 value=835cfe0ab5d1658e123e2e8271275837
+# compiled_probe case=early-fail-body-2000 compiled_activations=1 bytecode_instructions=3 direct_calls=0 head_instructions=2 head_cells_avoided=1 max_activation_registers=0 body_goals_materialized=1 body_allocation_instructions=1 compiled_control_instructions=0 compiled_cuts=0 code_cache_hits=0 predicate_cache_hits=1 predicate_cache_misses=0 typed_builtin_calls=0 builtin_wrappers_avoided=0 max_heap_cells=16 max_tasks=3 fully_drained=true timed=false
+reference	early-fail-body-2000	3.0e-6	2.0e-6	[4.0e-6,3.0e-6,3.0e-6]	[5.0e-6,2.0e-6,2.0e-6]
+interpreted	early-fail-body-2000	3.1446e-2	3.1213e-2	[3.6787e-2,3.0056e-2,3.1446e-2]	[3.6455e-2,2.9772e-2,3.1213e-2]
+bytecode	early-fail-body-2000	2.0e-3	2.0e-3	[1.941e-3,2.42e-3,2.0e-3]	[1.94e-3,2.36e-3,2.0e-3]
+# register_plan case=early-fail-body-2000 scope=all_supported_case_clauses unshared_slots=28006 pooled_slots=14007 max_body_temporary_registers=3 legacy_max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=control-ordered-disjunction value=67adf62e8031597b6c57c704aa7febf6
+# compiled_probe case=control-ordered-disjunction compiled_activations=1 bytecode_instructions=10 direct_calls=0 head_instructions=2 head_cells_avoided=1 max_activation_registers=0 body_goals_materialized=3 body_allocation_instructions=3 compiled_control_instructions=2 compiled_cuts=0 code_cache_hits=0 predicate_cache_hits=1 predicate_cache_misses=0 typed_builtin_calls=3 builtin_wrappers_avoided=3 max_heap_cells=12 max_tasks=2 fully_drained=true timed=false
+reference	control-ordered-disjunction	1.1e-5	6.0e-6	[1.5e-5,1.1e-5,5.0e-6]	[1.4e-5,6.0e-6,5.0e-6]
+interpreted	control-ordered-disjunction	2.7e-5	2.7e-5	[3.0e-5,2.7e-5,2.5e-5]	[3.0e-5,2.7e-5,2.4e-5]
+bytecode	control-ordered-disjunction	2.2e-5	2.3e-5	[2.5e-5,2.2e-5,2.2e-5]	[2.4e-5,2.3e-5,2.1e-5]
+# register_plan case=control-ordered-disjunction scope=all_supported_case_clauses unshared_slots=13 pooled_slots=10 max_body_temporary_registers=1 legacy_max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=control-once-not-if-300 value=6b8cbfac9bbcdea94a8458dc755fe945
+# compiled_probe case=control-once-not-if-300 compiled_activations=301 bytecode_instructions=6304 direct_calls=300 head_instructions=1204 head_cells_avoided=301 max_activation_registers=1 body_goals_materialized=2100 body_allocation_instructions=2100 compiled_control_instructions=1200 compiled_cuts=0 code_cache_hits=299 predicate_cache_hits=2 predicate_cache_misses=0 typed_builtin_calls=1800 builtin_wrappers_avoided=1800 max_heap_cells=1026 max_tasks=3 fully_drained=true timed=false
+reference	control-once-not-if-300	1.125e-3	1.121e-3	[1.123e-3,1.125e-3,1.194e-3]	[1.12e-3,1.121e-3,1.195e-3]
+interpreted	control-once-not-if-300	6.459e-3	6.422e-3	[6.459e-3,6.382e-3,7.192e-3]	[6.422e-3,6.327e-3,7.014e-3]
+bytecode	control-once-not-if-300	5.822e-3	5.76e-3	[5.822e-3,6.371e-3,5.684e-3]	[5.76e-3,6.287e-3,5.635e-3]
+# register_plan case=control-once-not-if-300 scope=all_supported_case_clauses unshared_slots=45 pooled_slots=28 max_body_temporary_registers=1 legacy_max_body_temporary_registers=2 timed=false
+# workload_fingerprint case=control-findall-100 value=38cc8ef8d32201348aa952ce30a8389c
+# compiled_probe case=control-findall-100 compiled_activations=101 bytecode_instructions=2204 direct_calls=100 head_instructions=303 head_cells_avoided=101 max_activation_registers=5 body_goals_materialized=600 body_allocation_instructions=800 compiled_control_instructions=300 compiled_cuts=0 code_cache_hits=99 predicate_cache_hits=2 predicate_cache_misses=0 typed_builtin_calls=500 builtin_wrappers_avoided=500 max_heap_cells=1303 max_tasks=102 fully_drained=true timed=false
+reference	control-findall-100	4.27e-4	4.24e-4	[4.27e-4,4.58e-4,4.18e-4]	[4.24e-4,4.55e-4,4.17e-4]
+interpreted	control-findall-100	4.067e-3	4.005e-3	[3.96e-3,4.946e-3,4.067e-3]	[3.959e-3,4.879e-3,4.005e-3]
+bytecode	control-findall-100	3.016e-3	2.986e-3	[3.962e-3,2.761e-3,3.016e-3]	[3.941e-3,2.761e-3,2.986e-3]
+# register_plan case=control-findall-100 scope=all_supported_case_clauses unshared_slots=37 pooled_slots=25 max_body_temporary_registers=1 legacy_max_body_temporary_registers=3 timed=false
+# workload_fingerprint case=control-cut-1000 value=deeff78a6ff621a71985478da02cf8ae
+# compiled_probe case=control-cut-1000 compiled_activations=2001 bytecode_instructions=19004 direct_calls=2000 head_instructions=7004 head_cells_avoided=2001 max_activation_registers=1 body_goals_materialized=6000 body_allocation_instructions=6000 compiled_control_instructions=2000 compiled_cuts=1000 code_cache_hits=1998 predicate_cache_hits=3 predicate_cache_misses=0 typed_builtin_calls=4000 builtin_wrappers_avoided=4000 max_heap_cells=1026 max_tasks=1004 fully_drained=true timed=false
+reference	control-cut-1000	4.669e-3	4.604e-3	[4.669e-3,4.478e-3,5.105e-3]	[4.604e-3,4.478e-3,5.072e-3]
+interpreted	control-cut-1000	4.3546e-2	4.3189e-2	[4.8658e-2,4.0452e-2,4.3546e-2]	[4.8165e-2,4.0173e-2,4.3189e-2]
+bytecode	control-cut-1000	3.7978e-2	3.7615e-2	[3.8346e-2,3.7659e-2,3.7978e-2]	[3.7997e-2,3.731e-2,3.7615e-2]
+# register_plan case=control-cut-1000 scope=all_supported_case_clauses unshared_slots=40 pooled_slots=28 max_body_temporary_registers=1 legacy_max_body_temporary_registers=2 timed=false
+# workload_fingerprint case=control-untaken-else-2000 value=1b58e64a2fa4b29099596ced2117a392
+# compiled_probe case=control-untaken-else-2000 compiled_activations=1 bytecode_instructions=6 direct_calls=0 head_instructions=2 head_cells_avoided=1 max_activation_registers=0 body_goals_materialized=2 body_allocation_instructions=2 compiled_control_instructions=1 compiled_cuts=0 code_cache_hits=0 predicate_cache_hits=1 predicate_cache_misses=0 typed_builtin_calls=1 builtin_wrappers_avoided=1 max_heap_cells=13 max_tasks=2 fully_drained=true timed=false
+reference	control-untaken-else-2000	4.0e-6	4.0e-6	[4.0e-6,4.0e-6,3.0e-6]	[4.0e-6,4.0e-6,2.0e-6]
+interpreted	control-untaken-else-2000	6.7485e-2	6.7005e-2	[6.8409e-2,6.1969e-2,6.7485e-2]	[6.7777e-2,6.1344e-2,6.7005e-2]
+bytecode	control-untaken-else-2000	1.73e-3	1.727e-3	[1.73e-3,1.839e-3,1.574e-3]	[1.727e-3,1.766e-3,1.514e-3]
+# register_plan case=control-untaken-else-2000 scope=all_supported_case_clauses unshared_slots=30010 pooled_slots=16010 max_body_temporary_registers=3 legacy_max_body_temporary_registers=2003 timed=false

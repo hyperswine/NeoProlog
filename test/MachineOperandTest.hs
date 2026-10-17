@@ -121,7 +121,10 @@ planFor :: Term -> Int -> Maybe DataPlan
 planFor term count = do
   code <- compileClause (Clause (Atom "root") [term] count)
   case codeControls code of
-    [control] -> case controlView control of Invoke plan _ -> Just plan; _ -> Nothing
+    [control] -> case controlView control of
+      Invoke plan _ -> Just plan
+      BuiltinCall _ _ fallback -> Just fallback
+      _ -> Nothing
     _ -> Nothing
 
 -- Both decoders capture every child value before overwriting a physical

@@ -32,6 +32,17 @@ module Infera.Compile
     dataInstructions,
     dataRoot,
     dataRegisterCount,
+    BuiltinTag (..),
+    builtinKey,
+    builtinTagFor,
+    OperandPlan,
+    operandTemplates,
+    operandVariables,
+    operandLocalIds,
+    operandLocalCount,
+    operandRuntimeInstructions,
+    operandRuntimeRoots,
+    operandRegisterCount,
     ControlCode,
     ControlInstruction (..),
     CutOwner (..),
@@ -188,11 +199,94 @@ dataRegisterCount (DataPlan _ _ _ registers _ _ _ _) = registers
 dataVariables :: DataPlan -> IS.IntSet
 dataVariables (DataPlan _ _ _ _ variables _ _ _) = variables
 
+-- | Fixed first-order native builtin dispatch. Only these exact arities are
+-- lowered; malformed calls retain ordinary invocation and its diagnostics.
+data BuiltinTag
+  = BuiltinUnify | BuiltinEquiv | BuiltinNeq | BuiltinIs
+  | BuiltinGt | BuiltinLt | BuiltinGte | BuiltinLte
+  | BuiltinIntEq | BuiltinFdNe | BuiltinFdLe | BuiltinFdLt
+  | BuiltinFdGe | BuiltinFdGt | BuiltinIn
+  | BuiltinAllDifferent | BuiltinAllDistinct | BuiltinReify
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+builtinKey :: BuiltinTag -> (String, Int)
+builtinKey tag = case tag of
+  BuiltinUnify -> ("unify", 2)
+  BuiltinEquiv -> ("equiv", 2)
+  BuiltinNeq -> ("neq", 2)
+  BuiltinIs -> ("is", 2)
+  BuiltinGt -> ("gt", 2)
+  BuiltinLt -> ("lt", 2)
+  BuiltinGte -> ("gte", 2)
+  BuiltinLte -> ("lte", 2)
+  BuiltinIntEq -> ("int_eq", 2)
+  BuiltinFdNe -> ("fd_ne", 2)
+  BuiltinFdLe -> ("fd_le", 2)
+  BuiltinFdLt -> ("fd_lt", 2)
+  BuiltinFdGe -> ("fd_ge", 2)
+  BuiltinFdGt -> ("fd_gt", 2)
+  BuiltinIn -> ("in", 2)
+  BuiltinAllDifferent -> ("all_different", 1)
+  BuiltinAllDistinct -> ("all_distinct", 1)
+  BuiltinReify -> ("reify", 2)
+
+builtinTagFor :: (String, Int) -> Maybe BuiltinTag
+builtinTagFor key = case key of
+  ("unify", 2) -> Just BuiltinUnify
+  ("equiv", 2) -> Just BuiltinEquiv
+  ("neq", 2) -> Just BuiltinNeq
+  ("is", 2) -> Just BuiltinIs
+  ("gt", 2) -> Just BuiltinGt
+  ("lt", 2) -> Just BuiltinLt
+  ("gte", 2) -> Just BuiltinGte
+  ("lte", 2) -> Just BuiltinLte
+  ("int_eq", 2) -> Just BuiltinIntEq
+  ("fd_ne", 2) -> Just BuiltinFdNe
+  ("fd_le", 2) -> Just BuiltinFdLe
+  ("fd_lt", 2) -> Just BuiltinFdLt
+  ("fd_ge", 2) -> Just BuiltinFdGe
+  ("fd_gt", 2) -> Just BuiltinFdGt
+  ("in", 2) -> Just BuiltinIn
+  ("all_different", 1) -> Just BuiltinAllDifferent
+  ("all_distinct", 1) -> Just BuiltinAllDistinct
+  ("reify", 2) -> Just BuiltinReify
+  _ -> Nothing
+
+-- | A builtin's operands share one dense local layout and construction
+-- schedule. Every returned root contributes a final read to register
+-- allocation, so later arguments cannot overwrite an earlier argument root.
+-- This plan has no callable wrapper constructor or runtime heap handles.
+data OperandPlan = OperandPlan [Term] [DataInstruction] [DataOperand] !Int
+  !IS.IntSet [Int] !Int
+  deriving (Eq, Show)
+
+operandTemplates :: OperandPlan -> [Term]
+operandTemplates (OperandPlan templates _ _ _ _ _ _) = templates
+
+operandRuntimeInstructions :: OperandPlan -> [DataInstruction]
+operandRuntimeInstructions (OperandPlan _ instructions _ _ _ _ _) = instructions
+
+operandRuntimeRoots :: OperandPlan -> [DataOperand]
+operandRuntimeRoots (OperandPlan _ _ roots _ _ _ _) = roots
+
+operandRegisterCount :: OperandPlan -> Int
+operandRegisterCount (OperandPlan _ _ _ count _ _ _) = count
+
+operandVariables :: OperandPlan -> IS.IntSet
+operandVariables (OperandPlan _ _ _ _ variables _ _) = variables
+
+operandLocalIds :: OperandPlan -> [Int]
+operandLocalIds (OperandPlan _ _ _ _ _ locals _) = locals
+
+operandLocalCount :: OperandPlan -> Int
+operandLocalCount (OperandPlan _ _ _ _ _ _ count) = count
+
 data CutOwner = LocalBase | LiteralInteger !Integer
   deriving (Eq, Show)
 
 data ControlInstruction
   = Invoke !DataPlan !(Maybe (String, Int))
+  | BuiltinCall !BuiltinTag !OperandPlan DataPlan
   | Sequence [ControlCode]
   | Alternative !ControlCode !ControlCode
   | Cut !CutOwner
@@ -415,17 +509,30 @@ goalFromPlan plan =
 compatibilityGoal :: ControlCode -> GoalCode
 compatibilityGoal control = case controlView control of
   Invoke plan _ -> goalFromPlan plan
+  BuiltinCall _ _ fallback -> goalFromPlan fallback
   _ -> case compileDataPlan (controlTemplate control) of
     Just plan -> goalFromPlan plan
     Nothing -> error "Infera.Compile: validated compatibility plan failed"
 
 compileDataPlan :: Term -> Maybe DataPlan
 compileDataPlan template = do
-  (rootSlot, Builder _ _ reversed _) <- compileBodyTerm (Builder 0 0 [] Map.empty) template
+  plan <- compileOperandPlan [template]
+  root <- case operandRuntimeRoots plan of
+    [single] -> Just single
+    _ -> Nothing
+  let localIds = operandLocalIds plan
+      localCount = operandLocalCount plan
+  pure (DataPlan template (operandRuntimeInstructions plan) root
+    (operandRegisterCount plan) (operandVariables plan) localIds localCount
+    (listArray (0, localCount - 1) localIds))
+
+compileOperandPlan :: [Term] -> Maybe OperandPlan
+compileOperandPlan templates = do
+  (rootSlots, Builder _ _ reversed _) <- compileOperands (Builder 0 0 [] Map.empty) templates
   (virtual, roots) <- virtualGoal (reverse reversed)
-  root <- IM.lookup rootSlot roots
-  (instructions, physicalRoot, registers) <- allocateGoal virtual root
-  let variables = IS.fromList (termVarIds template)
+  virtualRoots <- mapM (`IM.lookup` roots) rootSlots
+  (instructions, physicalRoots, registers) <- allocateOperands virtual virtualRoots
+  let variables = IS.fromList (concatMap termVarIds templates)
       localIds = IS.toAscList variables
       localCount = IS.size variables
       localIndices = IM.fromDistinctAscList (zip localIds [0 ..])
@@ -436,9 +543,14 @@ compileDataPlan template = do
       instruction (GoalCompound register name children) =
         DataCompound register name <$> mapM operand children
   denseInstructions <- mapM instruction instructions
-  denseRoot <- operand physicalRoot
-  pure (DataPlan template denseInstructions denseRoot registers variables
-    localIds localCount (listArray (0, localCount - 1) localIds))
+  denseRoots <- mapM operand physicalRoots
+  pure (OperandPlan templates denseInstructions denseRoots registers variables localIds localCount)
+  where
+    compileOperands builder [] = Just ([], builder)
+    compileOperands builder (template : remaining) = do
+      (root, next) <- compileBodyTerm builder template
+      (roots, final) <- compileOperands next remaining
+      pure (root : roots, final)
 
 -- Erase variable move instructions before physical allocation. Source locals
 -- are resolved through their stable IDs only when this goal materializes.
@@ -460,15 +572,15 @@ virtualGoal = go [] IM.empty
 -- Read every child using the old assignment, retire its final uses, then
 -- assign the destination from the free pool. The runtime must likewise read
 -- every child address before overwriting a recycled destination register.
-allocateGoal :: [GoalInstruction] -> GoalOperand
-  -> Maybe ([GoalInstruction], GoalOperand, Int)
-allocateGoal instructions root = do
+allocateOperands :: [GoalInstruction] -> [GoalOperand]
+  -> Maybe ([GoalInstruction], [GoalOperand], Int)
+allocateOperands instructions roots = do
   let countOperand counts (Local _) = counts
       countOperand counts (Temporary temporary) = IM.insertWith (+) temporary (1 :: Int) counts
       operands (GoalConstant _ _) = []
       operands (GoalOwner _) = []
       operands (GoalCompound _ _ children) = children
-      uses = foldl' countOperand IM.empty (root : concatMap operands instructions)
+      uses = foldl' countOperand IM.empty (roots ++ concatMap operands instructions)
       resolve _ local@(Local _) = Just local
       resolve assignments (Temporary temporary) = Temporary <$> IM.lookup temporary assignments
       release (assignments, remaining, free) operand = case operand of
@@ -494,8 +606,8 @@ allocateGoal instructions root = do
               GoalCompound temporary name _ -> (temporary, GoalCompound destination name physicalChildren)
         pure (physical : built, IM.insert virtualDestination destination retained, usesLeft, pool, following)
   (reversed, assignments, _, _, registers) <- foldMaybe step ([], IM.empty, uses, IS.empty, 0) instructions
-  physicalRoot <- resolve assignments root
-  pure (reverse reversed, physicalRoot, registers)
+  physicalRoots <- mapM (resolve assignments) roots
+  pure (reverse reversed, physicalRoots, registers)
 
 foldMaybe :: (state -> value -> Maybe state) -> state -> [value] -> Maybe state
 foldMaybe _ state [] = Just state
@@ -547,6 +659,12 @@ compileControl template = do
       argumentPlans <- mapM compileDataPlan arguments
       pure (Call callablePlan argumentPlans,
         IS.unions (map dataVariables (callablePlan : argumentPlans)))
+    Compound name arguments | Just tag <- builtinTagFor (name, length arguments) -> do
+      plan <- compileOperandPlan arguments
+      let fallback = case compileDataPlan template of
+            Just fullPlan -> fullPlan
+            Nothing -> error "Infera.Compile: validated builtin fallback plan failed"
+      pure (BuiltinCall tag plan fallback, operandVariables plan)
     _ -> do
       plan <- compileDataPlan template
       pure (Invoke plan (functorOf template), dataVariables plan)

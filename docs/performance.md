@@ -1,5 +1,17 @@
 # Performance measurements
 
+## Diagnosis and the new core - 2026-10-17
+
+The [engine diagnosis](engine-diagnosis-2026-10-17.md) profiles the current
+machine (15-45 KB of allocation per inference, a flat profile, 50-200x the
+CPU of Scryer), attributes the cost to the representation, and records the
+first slice of the replacement core in `src/Infera/Core/`: unboxed tagged
+cells, a trail, choice points without snapshots, compiled heads and
+heap-native arithmetic. It is opt-in behind `Infera.Core.solveQuery`, with a
+checked-in parity test group, and runs naive reverse at about 2.1 million
+inferences per second (25-38x the current machine on the four core
+workloads). The sections below are the earlier history.
+
 ## Head matching and registers - 2026-10-16
 
 The opt-in compiler now matches known head structures without duplicating their

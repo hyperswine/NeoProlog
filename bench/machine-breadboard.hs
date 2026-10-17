@@ -18,12 +18,27 @@ import System.Info (arch, compilerName, compilerVersion, os)
 import System.Timeout (timeout)
 import Text.Read (readMaybe)
 
-parseBatch :: [String] -> Either String Int
-parseBatch [] = Right 1
-parseBatch ["--batch", value] = case readMaybe value of
-  Just count | count > 0 && count <= 1000000 -> Right count
-  _ -> Left "Batch size must be an integer between 1 and 1000000"
-parseBatch _ = Left "Usage: machine-breadboard [--batch 1..1000000]"
+data Options = Options Int (Maybe String) (Maybe String)
+
+usage :: String
+usage = "Usage: machine-breadboard [--batch 1..1000000] [--engine reference|machine|bytecode] [--case rc|div|tri|wide-disconnected]"
+
+parseOptions :: [String] -> Either String Options
+parseOptions = parse Nothing Nothing Nothing
+  where
+    parse batch engine testCase [] = Right (Options (maybe 1 id batch) engine testCase)
+    parse Nothing engine testCase ("--batch" : value : rest) = case readMaybe value of
+      Just count | count > 0 && count <= 1000000 -> parse (Just count) engine testCase rest
+      _ -> Left "Batch size must be an integer between 1 and 1000000"
+    parse batch Nothing testCase ("--engine" : value : rest)
+      | value `elem` ["reference", "machine", "bytecode"] = parse batch (Just value) testCase rest
+      | otherwise = Left ("Unknown engine: " ++ value)
+    parse batch engine Nothing ("--case" : value : rest)
+      | value `elem` ["rc", "div", "tri", "wide-disconnected"] = parse batch engine (Just value) rest
+      | otherwise = Left ("Unknown case: " ++ value)
+    parse _ _ _ [flag] | flag `elem` ["--batch", "--engine", "--case"] =
+      Left ("Missing value after " ++ flag)
+    parse _ _ _ (flag : _) = Left ("Duplicate or unknown option: " ++ flag)
 
 data Case = Case String String Integer Integer Int
 
@@ -176,7 +191,10 @@ compiledProbe program query testCase@(Case name _ _ _ _) optimum expected = do
        "code_cache_hits=" ++ show (Machine.metricCodeCacheHits metrics),
        "predicate_cache_hits=" ++ show (Machine.metricPredicateCacheHits metrics),
        "predicate_cache_misses=" ++ show (Machine.metricPredicateCacheMisses metrics),
-       "fully_drained=true", "timed=false"])
+       "fully_drained=true", "timed=false"]) >>
+      -- Show includes new runtime fields without requiring their accessors in
+      -- an older baseline. Matched-stage orchestration checks new path counters.
+      putStrLn ("# compiled_metrics case=" ++ name ++ " value=" ++ show metrics)
   where
     drain checkpoint = case Machine.resume checkpoint of
       Left problem -> Left (show problem)
@@ -188,7 +206,7 @@ compiledProbe program query testCase@(Case name _ _ _ _) optimum expected = do
 main :: IO ()
 main = do
   arguments <- getArgs
-  batch <- either fail pure (parseBatch arguments)
+  Options batch selectedEngine selectedCase <- either (fail . (++ "\n" ++ usage)) pure (parseOptions arguments)
   source <- readFile "examples/breadboard.nprolog"
   items <- either fail pure (parseFile source)
   program <- either fail pure (buildChecked [item | item <- items, case item of TLQuery _ -> False; _ -> True])
@@ -205,23 +223,30 @@ main = do
   sources <- mapM (\path -> readFile path >>= \contents -> pure (path, contents)) sourcePaths
   putStrLn ("# source-fingerprint=" ++ show (fingerprintString (concatMap (\(path, contents) -> path ++ "\n" ++ contents) sources)))
   putStrLn ("# compiler=" ++ compilerName ++ "-" ++ showVersion compilerVersion ++ " platform=" ++ arch ++ "-" ++ os)
-  putStrLn "# scope=loaded checked program; reached immutable predicate plans warmed by untimed compiled probe; per-query dispatch/tail setup+execution+projection+validation; no parsing or CLI startup"
+  putStrLn "# scope=loaded checked program; each selected engine warmed by one checked query; execution+projection+validation; compiled probe after all timed batches per case; no parsing or CLI startup"
   putStrLn "# build=runner target -O2; library optimization follows Cabal configuration (run with -O2)"
   putStrLn "# warmups=1 checked query before timing; runs=3 timeout_seconds=30 per timed batch; no_timing_threshold"
   putStrLn ("# phase=warm batch_queries=" ++ show batch ++ " timed_instruction_counters=false query_base_policy=" ++
     (if batch == 1 then "historical fresh_unused_variables=1..4" else "unique NOINLINE nonce; unused roots cycle 2..5"))
+  putStrLn ("# selected_engine=" ++ maybe "all" id selectedEngine ++ " selected_case=" ++ maybe "all" id selectedCase)
   putStrLn "# existing wall/cpu columns are per-query averages; appended batch columns are total batch durations"
   putStrLn "engine\tcase\tmedian_wall_seconds\tmedian_cpu_seconds\twall_samples\tcpu_samples\tmedian_batch_wall_seconds\tmedian_batch_cpu_seconds\tbatch_wall_samples\tbatch_cpu_samples"
-  forM_ cases $ \testCase@(Case name text _ _ _) -> do
+  forM_ [testCase | testCase@(Case name _ _ _ _) <- cases,
+    maybe True (== name) selectedCase] $ \testCase@(Case name text _ _ _) -> do
     query <- either fail pure (parseQuery text)
     let expected = execute 0 Reference.solveQuery program query
     initial <- timeout 30000000 (evaluate (length (show expected)))
     case initial of Nothing -> fail (name ++ ": reference validation timed out"); Just _ -> pure ()
     optimum <- either fail pure (expectedCost testCase expected)
     either fail pure (validate testCase optimum expected)
-    compiledProbe program query testCase optimum expected
-    forM_ [("reference", Reference.solveQuery), ("machine", Machine.solveQuery),
-      ("bytecode", Machine.solveQueryWithBackend Machine.Bytecode)] $ \(engine, resolver) -> do
+    putStrLn ("# workload_fingerprint case=" ++ name ++ " value=" ++
+      show (fingerprintString (source ++ text)))
+    putStrLn ("# answer_fingerprint case=" ++ name ++ " value=" ++
+      show (fingerprintString (show (observe expected))))
+    forM_ [(engine, resolver) |
+      (engine, resolver) <- [("reference", Reference.solveQuery), ("machine", Machine.solveQuery),
+        ("bytecode", Machine.solveQueryWithBackend Machine.Bytecode)],
+      maybe True (== engine) selectedEngine] $ \(engine, resolver) -> do
       _ <- checkedRun 1 1 resolver program query testCase optimum expected
       samples <- forM [2 .. 4] $ \serial -> checkedRun serial batch resolver program query testCase optimum expected
       let batchWalls = map fst samples
@@ -230,3 +255,4 @@ main = do
           cpus = map (/ fromIntegral batch) batchCpus
       putStrLn (intercalate "\t" [engine, name, show (median walls), show (median cpus), show walls, show cpus,
         show (median batchWalls), show (median batchCpus), show batchWalls, show batchCpus])
+    compiledProbe program query testCase optimum expected

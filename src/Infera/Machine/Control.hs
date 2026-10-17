@@ -86,7 +86,8 @@ data PredicateRoute = PredicateRoute
     routeDirect :: Bool,
     routeTabled :: Bool,
     routeIndexed :: Bool,
-    routeTail :: Bool
+    routeTail :: Bool,
+    routeFuelReuse :: Bool
   }
 
 data Call = Call
@@ -99,6 +100,7 @@ data Call = Call
     callArguments :: ![Heap.Address],
     callCommits :: !Bool,
     callTailEligible :: !Bool,
+    callFuelReusable :: !Bool,
     callGoalTerm :: !Term,
     callSite :: !(Maybe SourceSpan),
     callClause :: !(Maybe Int),
@@ -154,7 +156,8 @@ data Scope = Scope
   { scopeParent :: !Running,
     scopeEntry :: !Heap.FrozenHeap,
     scopeKind :: !ScopeKind,
-    scopeIssues :: [SearchItem]
+    scopeIssues :: [SearchItem],
+    scopeEntryEpoch :: !Integer
   }
 
 data Phase = Seeking | Backtracking | Complete
@@ -185,7 +188,10 @@ data Running = Running
     runningBackend :: !ExecutionBackend,
     -- Force the map spine when crossing an opaque boundary, so a lazy field
     -- selector cannot retain the completed child Running. Values stay lazy.
-    runningCode :: !(Map.Map (PredKey, Int) (Maybe Compile.ClauseCode))
+    runningCode :: !(Map.Map (PredKey, Int) (Maybe Compile.ClauseCode)),
+    -- Monotone within a driver lineage. A full restore or relocating
+    -- collection invalidates direct reuse of a scope parent's physical roots.
+    runningHeapEpoch :: !Integer
   }
 
 -- | Opt-in execution high-water counts, independent of process RTS memory.
@@ -221,12 +227,18 @@ data Metrics = Metrics
     -- A predicate hit means its witness matched, not that its lazy plan was
     -- already evaluated by an earlier query.
     metricPredicateCacheHits :: !Int,
-    metricPredicateCacheMisses :: !Int
+    metricPredicateCacheMisses :: !Int,
+    -- Reached normal/measured typed builtin instructions (tracing uses the
+    -- full source invocation path). One callable wrapper is avoided per call.
+    metricTypedBuiltinCalls :: !Int,
+    metricBuiltinWrappersAvoided :: !Int,
+    metricScopeHandoffs :: !Int,
+    metricScopeReplays :: !Int
   }
   deriving (Eq, Show)
 
 emptyMetrics :: Metrics
-emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+emptyMetrics = Metrics 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 data Checkpoint = Checkpoint !Env !Heap.FrozenHeap !Running
 
@@ -302,8 +314,8 @@ startWithRoots backend dense tailReuse measured scopes environment fuel state go
       routes = Map.mapWithKey (\(name, arity) definition ->
         PredicateRoute definition (builtinDet name arity == Nothing && Set.notMember name dynamic)
           (predIsTabled program definition) (predIsIndexed program definition)
-          (Tail.eligiblePredicate program definition)) (progPreds program)
-      running = Running branch [] 0 0 Seeking Nothing tailReuse routes dynamic protected measured emptyMetrics 1024 False [] Nothing Nothing [] backend Map.empty
+          (Tail.eligiblePredicate program definition) (Tail.eligibleFuelReuse program definition)) (progPreds program)
+      running = Running branch [] 0 0 Seeking Nothing tailReuse routes dynamic protected measured emptyMetrics 1024 False [] Nothing Nothing [] backend Map.empty 0
   sampled <- sample heap running
   pure (Checkpoint environment frozen sampled)
 
@@ -420,12 +432,11 @@ runCompiledControl :: Env -> Heap.Heap s -> Running -> VarId -> Compile.ControlC
   -> Int -> Scopes -> MachineM s DriverStep
 runCompiledControl environment heap original base code fuel scopes =
   case Compile.controlView code of
+    Compile.BuiltinCall tag operands fallback
+      | not (runningTraced original) -> runTypedBuiltin environment heap original base tag operands
+      | otherwise -> invocation fallback (Just (Compile.builtinKey tag))
     Compile.Invoke plan key -> do
-      (root, allocated) <- materializeData heap original base plan
-      let previous = runningMetrics allocated
-          counted = if runningMeasured allocated then allocated {runningMetrics = previous
-            {metricBodyGoalsMaterialized = metricBodyGoalsMaterialized previous + 1}} else allocated
-      dispatchInvocation environment heap counted key root fuel scopes
+      invocation plan key
     instruction -> do
       traced <- beginCodeTrace original base code
       let previous = runningMetrics traced
@@ -472,12 +483,74 @@ runCompiledControl environment heap original base code fuel scopes =
           (callableRoot, prepared) <- materializeData heap counted base callable
           (roots, ready) <- materializeArguments prepared arguments
           callGoal environment heap ready fuel callableRoot roots
+        Compile.BuiltinCall {} -> throwError Heap.IncompatibleBindings
+        Compile.Invoke {} -> throwError Heap.IncompatibleBindings
   where
+    invocation plan key = do
+      (root, allocated) <- materializeData heap original base plan
+      let previous = runningMetrics allocated
+          counted = if runningMeasured allocated then allocated {runningMetrics = previous
+            {metricBodyGoalsMaterialized = metricBodyGoalsMaterialized previous + 1}} else allocated
+      dispatchInvocation environment heap counted key root fuel scopes
     materializeArguments running [] = pure ([], running)
     materializeArguments running (plan : plans) = do
       (root, prepared) <- materializeData heap running base plan
       (remaining, ready) <- materializeArguments prepared plans
       pure (root : remaining, ready)
+
+-- Operand roots live only inside this operation. No driver/collection boundary
+-- occurs between construction and consumption; pending code retains logical
+-- IDs, never these handles. One outer mark owns construction, scalar results,
+-- heap writes and CLP reconciliation, including every rejected/error path.
+runTypedBuiltin :: Env -> Heap.Heap s -> Running -> VarId -> Compile.BuiltinTag
+  -> Compile.OperandPlan -> MachineM s DriverStep
+runTypedBuiltin environment heap running base tag plan = do
+  mark <- lift (Heap.checkpoint heap)
+  attempted <- lift $ runExceptT $ do
+    let build = if runningMeasured running
+          then BytecodeVM.materializeOperandsInTransactionMeasured
+          else BytecodeVM.materializeOperandsInTransaction
+    step <- checked (build heap bindings base plan)
+    result <- case (tag, BytecodeVM.operandStepRoots step) of
+      (Compile.BuiltinUnify, [left, right]) ->
+        checked (NativeCLP.unify heap bindings store left right)
+      (Compile.BuiltinIs, [left, right]) -> do
+        term <- checked (Bridge.exportRawTerms heap bindings [right]) >>= single
+        case Builtins.evalIsOperand store term of
+          Left err -> pure (Left err)
+          Right value -> do
+            scalar <- checked (Heap.importScalarInTransaction heap value)
+            checked (NativeCLP.unify heap bindings store left scalar)
+      _ -> do
+        terms <- checked (Bridge.exportRawTerms heap bindings (BytecodeVM.operandStepRoots step))
+        case Builtins.builtinOperands tag store terms of
+          Builtins.Accept -> pure (Right (Just (bindings, store)))
+          Builtins.Reject -> pure (Right Nothing)
+          Builtins.Raise err -> pure (Left err)
+          Builtins.Post operation -> checked (NativeCLP.applyAccepted heap bindings store operation)
+          _ -> throwError Heap.IncompatibleBindings
+    pure (result, step)
+  case attempted of
+    Left problem -> checked (Heap.rollback heap mark) >> throwError problem
+    Right (result, step) -> do
+      case result of
+        Right (Just _) -> pure ()
+        _ -> checked (Heap.rollback heap mark)
+      let previous = runningMetrics running
+          allocations = BytecodeVM.operandStepAllocationInstructions step
+          counted = if runningMeasured running then running {runningMetrics = previous
+            {metricBodyGoalsMaterialized = metricBodyGoalsMaterialized previous + 1,
+             metricBodyAllocationInstructions = metricBodyAllocationInstructions previous + allocations,
+             metricBytecodeInstructions = metricBytecodeInstructions previous + allocations + 1,
+             metricMaxActivationRegisters = max (metricMaxActivationRegisters previous)
+               (BytecodeVM.operandStepRegisterSlots step),
+             metricTypedBuiltinCalls = metricTypedBuiltinCalls previous + 1,
+             metricBuiltinWrappersAvoided = metricBuiltinWrappersAvoided previous + 1}} else running
+      acceptGoalStore environment heap counted result
+  where
+    branch = runningBranch running
+    bindings = branchBindings branch
+    store = ssStore (branchState branch)
 
 materializeData :: Heap.Heap s -> Running -> VarId -> Compile.DataPlan
   -> MachineM s (Heap.Address, Running)
@@ -935,6 +1008,7 @@ callPredicate environment heap running address fuel scopes route = do
           eligible = routeTail route
             && Tail.eligibleArguments signature argsW
             && Contracts.requiredSuccess signature == Nothing
+          fuelEligible = eligible && routeFuelReuse route
           reusable = runningTailReuse running && eligible && quiet running
             && case branchTasks branch of
               Return parent : _ -> callTailEligible parent
@@ -951,12 +1025,15 @@ callPredicate environment heap running address fuel scopes route = do
           prepared = if reusable then running
             {runningBranch = branch {branchTasks = retiredTasks}} else running
           liveScopes = if reusable then drop 1 scopes else scopes
-          nextFuel = if reusable then fuel + 1 else fuel
+          refundable = reusable && fuelEligible && case branchTasks branch of
+            Return parent : _ -> callFuelReusable parent
+            _ -> False
+          nextFuel = if refundable then fuel + 1 else fuel
           previous = runningMetrics prepared
           counted = if runningMeasured prepared then prepared {runningMetrics = previous
             {metricCalls = metricCalls previous + 1,
              metricTailCalls = metricTailCalls previous + if reusable then 1 else 0}} else prepared
-      when (reusable && fuel == maxBound) (throwError Heap.HeapCapacityExceeded)
+      when (refundable && fuel == maxBound) (throwError Heap.HeapCapacityExceeded)
       -- Force both retired tails even in unmeasured execution. Otherwise a
       -- chain of lazy drop/filter thunks retains the supposedly dead frames.
       when reusable (retiredTasks `seq` liveScopes `seq` pure ())
@@ -986,7 +1063,7 @@ callPredicate environment heap running address fuel scopes route = do
           checkedArguments = case signature of
             Nothing -> []
             Just _ -> arguments
-          call = Call ident (ssFresh activeState) (runningDepth active) key definition signature checkedArguments commits eligible
+          call = Call ident (ssFresh activeState) (runningDepth active) key definition signature checkedArguments commits eligible fuelEligible
             (if runningTraced active then normalized else Atom "") (runningSite active) Nothing Nothing inherited
           entryBranch = activeBranch {branchBindings = bindings}
           entry = active {runningBranch = entryBranch, runningNextId = ident + 1}
@@ -1088,7 +1165,8 @@ collectLive heap running = do
         limit = if liveSize > maxBound `div` 2 then maxBound else max 1024 (liveSize * 2)
     pure (rebuiltHeap, running {runningBranch = branch
       {branchBindings = bindings, branchState = state, branchTasks = relocated},
-      runningMetrics = metrics, runningCollectionLimit = limit})
+      runningMetrics = metrics, runningCollectionLimit = limit,
+      runningHeapEpoch = runningHeapEpoch running + 1})
   where
     relocate :: [Task] -> [Heap.Address] -> MachineM s [Task]
     relocate [] [] = pure []
@@ -1307,6 +1385,7 @@ backtrack environment heap running = case runningChoices running of
             runningChoices = rest,
             runningDepth = runningDepth running - 1,
             runningPhase = Seeking,
+            runningHeapEpoch = runningHeapEpoch running + 1,
             runningCurrent = fst <$> branchTraceContext branch,
             runningSite = branchTraceContext branch >>= snd
           }
@@ -1326,6 +1405,7 @@ backtrack environment heap running = case runningChoices running of
                 runningMetrics = runningMetrics restored,
                 runningEvents = runningEvents restored,
                 runningCode = Map.union (runningCode restored) (runningCode saved),
+                runningHeapEpoch = runningHeapEpoch restored + 1,
                 runningScope = fmap (\scope -> scope {scopeParent = restored}) (runningScope saved)
               }
         drive environment heap rebased
@@ -1376,7 +1456,7 @@ launchTasks environment heap parent mark bindings state tasks kind =
           branchTasks = tasks,
           branchMarker = Nothing
         }
-      scope = Scope parent mark kind []
+      scope = Scope parent mark kind [] (runningHeapEpoch parent)
       child = parent {runningBranch = branch, runningChoices = [], runningDepth = 0,
         runningPhase = Seeking, runningScope = Just scope,
         runningProtected = scopeProtectedRoots parent}
@@ -1480,12 +1560,30 @@ advanced scope child = (scopeParent scope)
    runningEvents = runningEvents child,
    runningCode = runningCode child}
 
+-- The selected store must belong to the current child heap. Only once,
+-- successful conditions and emit call here; minimizers replay their earlier
+-- best result separately. An unchanged epoch proves the parked parent roots
+-- still address the same prefix; a restore/collection uses the replay path.
 restoreSelected :: Heap.Heap s -> Scope -> Running -> SolverState -> MachineM s Running
-restoreSelected heap scope child state = do
-  parent <- restoreScope heap scope child
-  let branch = runningBranch parent
-  bindings <- checked (Bridge.syncAcceptedState heap (branchBindings branch) (branchState branch) state)
-  pure parent {runningBranch = branch {branchBindings = bindings, branchState = state}}
+restoreSelected heap scope child state
+  | not (runningTraced child) && runningHeapEpoch child == scopeEntryEpoch scope =
+      let parent = advanced scope child
+          branch = runningBranch parent
+          previous = runningMetrics parent
+          metrics = if runningMeasured parent then previous
+            {metricScopeHandoffs = metricScopeHandoffs previous + 1} else previous
+       in pure parent {runningBranch = branch
+            {branchBindings = branchBindings (runningBranch child), branchState = state},
+            runningMetrics = metrics, runningHeapEpoch = runningHeapEpoch child}
+  | otherwise = do
+      parent <- restoreScope heap scope child
+      let branch = runningBranch parent
+          previous = runningMetrics parent
+          metrics = if runningMeasured parent then previous
+            {metricScopeReplays = metricScopeReplays previous + 1} else previous
+      bindings <- checked (Bridge.syncAcceptedState heap (branchBindings branch) (branchState branch) state)
+      pure parent {runningBranch = branch {branchBindings = bindings, branchState = state},
+        runningMetrics = metrics}
 
 resumeRetained :: Env -> Heap.Heap s -> Scope -> Running -> SolverState -> [Task] -> MachineM s DriverStep
 resumeRetained environment heap scope child state tasks = do
@@ -1495,7 +1593,8 @@ resumeRetained environment heap scope child state tasks = do
 restoreScope :: Heap.Heap s -> Scope -> Running -> MachineM s Running
 restoreScope heap scope child = do
   lift (Heap.restoreHeap heap (scopeEntry scope))
-  pure (advanced scope child) {runningPhase = Seeking}
+  pure (advanced scope child) {runningPhase = Seeking,
+    runningHeapEpoch = runningHeapEpoch child + 1}
 
 withTasks :: [Task] -> Running -> Running
 withTasks tasks running = running
