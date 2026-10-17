@@ -1,0 +1,42 @@
+<- notable.
+puzzle X Y <- [X, Y] in 0 .. 20, X + Y #= 10, X #> Y, X - Y #= 4.
+pick X <- X in 1 .. 3, label [X].
+pair X Y <- X in 1 .. 3, Y in 1 .. 3, X #< Y, label [X, Y].
+diff L <- L = [A, B, C], L in 1 .. 3, all_different L, A #< B, label L.
+cheapest X Y C <- [X, Y] in 1 .. 5, X + Y #>= 6, C #= X * 2 + Y, labeling [min C] [X, Y].
+flag B <- X in 0 .. 5, reify (X #> 2) B, X = 4.
+flag2 B <- X in 0 .. 5, reify (X #> 2) B, label [X].
+later X <- X in 1 .. 2, Y = X, Y = 3.
+chain X Y <- X in 1 .. 4, Y #= X + 1, Y #< 3.
+app [] L L.
+app [H | T] L [H | R] <- app T L R.
+> puzzle X Y?
+> pick X?
+> pair X Y?
+> diff L?
+> cheapest X Y C?
+> flag B?
+> flag2 B?
+> later X?
+> X in 1 .. 3?
+> X in 1 .. 3, X = 5?
+> X in 1 .. 3, X = a?
+> X #= 3 + 4?
+> 3 #= X + 1?
+> X #> 3, X #< 6?
+> X #> 3, X #< 6, label [X]?
+> X in 0 .. 5, Y in 0 .. 5, X + Y #= 10?
+> X in 1 .. 3, findall X (label [X]) L?
+> X in 1 .. 3, not (X = 7)?
+> X in 1 .. 3, (X = 2 -> Y = yes ; Y = no)?
+> X != Y, X = 1, Y = 2?
+> X != Y, X = 1, Y = 1?
+> X != 3, X in 1 .. 4, label [X]?
+> X in 1 .. 2, app [X] [Y] L, Y in 5 .. 6, label L?
+> chain X Y?
+> X in 1 .. 3, Y in 1 .. 3, label [X, Y], X #= Y?
+> label [X]?
+> X in 1 .. 3, labeling [min X] [X]?
+> X in 1 .. 3, labeling [max X] [X]?
+> X in 1 .. 1000000, Y #= X * X, Y #< 10, label [X]?
+> X in 1 .. 3, X #= Y, Y = 2?

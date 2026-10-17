@@ -23,6 +23,12 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
+    ("parity" : "--gc-limit" : limit : files) -> do
+      results <- mapM (parityFileWith (Just (read limit))) files
+      let failures = sum results
+      if failures == 0 then putStrLn "parity: all queries agree" else do
+        hPutStrLn stderr ("parity: " ++ show failures ++ " disagreement(s)")
+        exitFailure
     ("parity" : files) -> do
       results <- mapM parityFile files
       let failures = sum results
@@ -33,6 +39,7 @@ main = do
     ["time", file, query, runs] -> timeFile False file query (read runs)
     ["time", "--core", file, query] -> timeFile True file query 3
     ["time", "--core", file, query, runs] -> timeFile True file query (read runs)
+    ["time", "--core-no-gc", file, query, runs] -> timeFileWith (Just 2000000000) file query (read runs)
     _ -> hPutStrLn stderr "usage: core-engine parity FILE... | core-engine time [--core] FILE \"query?\" [RUNS]" >> exitFailure
 
 -- | The observable result of a query: rendered answers with their output,
@@ -52,7 +59,10 @@ observe query items =
       events -> " | output: " ++ show (concatMap renderOutputEvent (reverse events))
 
 parityFile :: FilePath -> IO Int
-parityFile file = do
+parityFile = parityFileWith Nothing
+
+parityFileWith :: Maybe Int -> FilePath -> IO Int
+parityFileWith limit file = do
   loaded <- loadFile file
   case loaded of
     Left err -> hPutStrLn stderr (file ++ ": " ++ err) >> pure 1
@@ -60,7 +70,7 @@ parityFile file = do
       counts <- forM queries $ \query -> do
         let reference = observe query (Reference.solveQuery program query)
             machine = observe query (Machine.solveQuery program query)
-            core = fmap (observe query) (Core.solveQuery program query)
+            core = fmap (observe query) (maybe Core.solveQuery Core.solveQueryWith limit program query)
             shown = intercalate ", " (map show (queryGoals query))
         outcome <- Core.coreOutcome program query
         case core of
@@ -82,6 +92,22 @@ parityFile file = do
                 pure 1
       putStrLn (file ++ ": " ++ show (length queries) ++ " queries")
       pure (sum counts)
+
+timeFileWith :: Maybe Int -> FilePath -> String -> Int -> IO ()
+timeFileWith limit file queryText runs = do
+  loaded <- loadFile file
+  case loaded of
+    Left err -> hPutStrLn stderr err >> exitFailure
+    Right (program, _) -> forM_ [1 .. runs] $ \i -> do
+      fresh <- either (\e -> hPutStrLn stderr e >> exitFailure) pure (parseQuery queryText)
+      cpu0 <- getCPUTime
+      wall0 <- getMonotonicTimeNSec
+      let observed = observe fresh (maybe (error "no") id (maybe Core.solveQuery Core.solveQueryWith limit program fresh))
+      _ <- evaluate (length (show observed))
+      wall1 <- getMonotonicTimeNSec
+      cpu1 <- getCPUTime
+      printf "core(nogc) run %d: %.3f s wall, %.3f s cpu\n" (i :: Int)
+        (fromIntegral (wall1 - wall0) / 1e9 :: Double) (fromIntegral (cpu1 - cpu0) / 1e12 :: Double)
 
 timeFile :: Bool -> FilePath -> String -> Int -> IO ()
 timeFile coreOnly file queryText runs = do

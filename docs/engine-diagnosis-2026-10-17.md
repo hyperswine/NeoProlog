@@ -266,6 +266,45 @@ no collector yet, as expected for this step.
   Across `examples/`, 47 of 85 inline queries complete on the core and
   every query agrees with the reference after fallback.
 
+### Language coverage (same day, later)
+
+The core now runs the whole language that the examples and parity programs
+exercise; every inline query in `examples/` and `test/core/` completes on
+the core with no fallback and agrees with the reference, also when the
+collector runs at every call (`core-engine parity --gc-limit 1`).
+
+* **Tabling** is native: the reference's branch-local variant table and
+  linear fixpoint, with dependency, error and exhaustion items in the
+  reference's order, answers replayed with their output, and tables saved
+  in choice points. Calls and answers that touch constrained variables use
+  plain evaluation, as the reference does.
+* **Dynamic facts**: `assert`, `retract`, `retractall` and calls to
+  flag-declared names use a branch-local fact map.
+* **`minimize`** is a sentinel scope that records the cheapest solution's
+  trailed bindings to older cells, output, tables, facts and store, and
+  reinstates them when the search is exhausted.
+* **Constraints** keep the persistent `Infera.CLP` store, branch-local in
+  choice points. Store goals, labeling and branch-and-bound are delegated
+  to the reference's own goal functions on exported terms with the store
+  passed in and out, so propagation is the same code. The core owns
+  bindings: once a store exists, `bind` records bound cells, and at the
+  next goal boundary the watched ones are fed to `applyBindings`; bindings
+  the propagator made are installed back on the heap. Variables are
+  exported with their marker-based logical ids, so a variable keeps one
+  identity across goals; the collector retains the activation block of
+  every live slot that is unbound or still undoable, so those ids survive
+  compaction. Programs without constraints pay one register test per
+  binding and per goal boundary.
+* **Leaf builtins** (strings, characters, formatting, DCG text helpers,
+  file reads) are delegated the same way; `phrase`, `phrase_from_file`,
+  `emit` and `call/N` run natively in alias activation blocks.
+
+Costs after this: naive reverse 3000 is 0.54 s with collection and
+0.38 s without (the hooks above cost about 15% on the hot path, the
+collector's block retention the rest); loop 90000 0.013 s, fib 25 0.054 s,
+queens 0.014 s. Not yet on the core: interactive tracing (`--trace`), which
+still runs on the existing machine.
+
 ### Next
 
 1. Hot-path allocation: argument registers instead of lists, immediate-int

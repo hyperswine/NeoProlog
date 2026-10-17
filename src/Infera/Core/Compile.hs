@@ -408,11 +408,9 @@ compileGoal ctx term = case term of
   Compound "retractall" [t] -> GRetractAll <$> arg t
   Compound f as
     | (f, length as) `elem` leafBuiltins -> GLeaf f <$> mapM arg as
-    | f `elem` abandonedBuiltins -> unsupported ("builtin " ++ f ++ "/" ++ show (length as))
+    | f `elem` constraintBuiltins -> GLeaf f <$> mapM arg as
     | otherwise -> userCall f as
-  Atom f
-    | f `elem` abandonedBuiltins -> unsupported ("builtin " ++ f ++ "/0")
-    | otherwise -> userCall f []
+  Atom f -> userCall f []
   _ -> pure (GError (TypeError "callable goal" term))
   where
     body t = compileBody ctx [t]
@@ -438,10 +436,10 @@ leafBuiltins =
     ("read_file", 2), ("fmt", 4), ("wr", 3), ("sp", 2), ("nl", 2), ("seq", 3), ("padl", 4), ("padr", 4)
   ]
 
--- | Goals that need the constraint store, tables, dynamic facts or
--- optimisation: the run falls back to the existing machine.
-abandonedBuiltins :: [String]
-abandonedBuiltins =
+-- | Goals that post to or search the constraint store: also delegated to
+-- the reference implementation, with the store passed in and out.
+constraintBuiltins :: [String]
+constraintBuiltins =
   [ "int_eq", "fd_ne", "fd_le", "fd_lt", "fd_ge", "fd_gt", "reify", "in", "label", "labeling",
     "all_different", "all_distinct"
   ]

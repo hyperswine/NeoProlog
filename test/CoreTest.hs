@@ -13,7 +13,7 @@ import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Machine.Control as Machine
 
 parityFiles :: [FilePath]
-parityFiles = ["test/core/parity-basic.nprolog", "test/core/parity-edge.nprolog", "test/core/parity-tabling.nprolog", "test/core/parity-dynamic.nprolog", "test/core/parity-minimize.nprolog"]
+parityFiles = ["test/core/parity-basic.nprolog", "test/core/parity-edge.nprolog", "test/core/parity-tabling.nprolog", "test/core/parity-dynamic.nprolog", "test/core/parity-minimize.nprolog", "test/core/parity-clp.nprolog"]
 
 data Observed = Observed [String] [String] Bool deriving (Eq, Show)
 
@@ -56,13 +56,15 @@ prop_fallback = withTests 1 . property $ do
   let source = unlines ["<- notable.", "p : dynamic.", "q X <- X = 1."]
   program <- either (\e -> annotate e >> failure) pure (loadProgramText source)
   query <- either (\e -> annotate e >> failure) pure (parseQuery "q Y, Z in 1 .. 3, p X?")
-  Core.coreSupports program query === Just "builtin in/2"
+  Core.coreSupports program query === Nothing
   observe query (Core.solveQueryOrFallback program query) === observe query (Reference.solveQuery program query)
   let constrained = unlines ["<- notable.", "r X Y <- X != Y, X = 1, Y = 2."]
   program' <- either (\e -> annotate e >> failure) pure (loadProgramText constrained)
   query' <- either (\e -> annotate e >> failure) pure (parseQuery "r A B?")
   Core.coreSupports program' query' === Nothing
   observe query' (Core.solveQueryOrFallback program' query') === observe query' (Reference.solveQuery program' query')
+  outcome <- evalIO (Core.coreOutcome program' query')
+  outcome === Right 1
 
 coreGroup :: Group
 coreGroup = Group "core engine"

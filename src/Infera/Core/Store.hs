@@ -34,7 +34,8 @@ module Infera.Core.Store
     outLen, setOutLen, arithData, bumpArithData, freshId, setFreshId,
     readCell, writeCell, pushCell, allocCells, allocSlots, markerWord, logicalId,
     readArg, writeArg, saveArgs, loadArgs, reserveCells, groundNowWord,
-    readReg, writeReg, rVAL, rGCLIM, initialCollectLimit, markerBase, markerVars,
+    readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, initialCollectLimit, markerBase, markerVars,
+    drainBound, recordBoundCell,
     deref, bind, unwindTrail, trailIf, trailValueIf,
     structureWord,
     box, boxed,
@@ -180,6 +181,14 @@ rVAL = 8
 rGCLIM :: Int
 rGCLIM = 9
 
+-- | non-zero once constraints exist: bindings are recorded for the store
+rCLP :: Int
+rCLP = 10
+
+-- | number of recorded bindings awaiting reconciliation
+rBOUND :: Int
+rBOUND = 11
+
 initialCollectLimit :: Int
 initialCollectLimit = 262144
 
@@ -198,6 +207,8 @@ data Store = Store
     regs :: !(IOUArray Int Int),
     -- | argument registers of the call being made
     argRegs :: !(IOUArray Int Int),
+    -- | cells bound since the last reconciliation with the constraint store
+    bound :: !(IORef (IOUArray Int Int)),
     symbols :: !Symbols
   }
 
@@ -215,7 +226,8 @@ newStore syms = do
   unsafeWrite rs rCAP initialCells
   unsafeWrite rs rGCLIM initialCollectLimit
   ar <- newArray (0, 4095) 0
-  Store <$> newIORef cs <*> newIORef tr <*> newIORef bx <*> pure rs <*> pure ar <*> pure syms
+  bd <- newArray (0, 255) 0
+  Store <$> newIORef cs <*> newIORef tr <*> newIORef bx <*> pure rs <*> pure ar <*> newIORef bd <*> pure syms
 
 readArg :: Store -> Int -> IO Word'
 readArg s = unsafeRead (argRegs s)
@@ -459,12 +471,47 @@ trailValueIf s addr old = do
   when (addr < boundary) (pushTrail s old >> pushTrail s (addr * 2 + 1))
 {-# INLINE trailValueIf #-}
 
--- | Bind the unbound cell at @addr@ to @w@.
+-- | Bind the unbound cell at @addr@ to @w@. With constraints active the
+-- address is recorded for the next reconciliation.
 bind :: Store -> Int -> Word' -> IO ()
 bind s addr w = do
   writeCell s addr w
   trailIf s addr
+  flag <- unsafeRead (regs s) rCLP
+  when (flag /= 0) (recordBound s addr)
 {-# INLINE bind #-}
+
+-- | Record a cell for reconciliation (used when relocating pending ones).
+recordBoundCell :: Store -> Int -> IO ()
+recordBoundCell = recordBound
+
+recordBound :: Store -> Int -> IO ()
+recordBound s addr = do
+  arr <- readIORef (bound s)
+  top <- unsafeRead (regs s) rBOUND
+  size <- getNumElements arr
+  arr' <-
+    if top < size
+      then pure arr
+      else do
+        grown <- newArray (0, size * 2 - 1) 0
+        let copy !i
+              | i >= top = pure ()
+              | otherwise = unsafeRead arr i >>= unsafeWrite grown i >> copy (i + 1)
+        copy 0
+        writeIORef (bound s) grown
+        pure grown
+  unsafeWrite arr' top addr
+  unsafeWrite (regs s) rBOUND (top + 1)
+
+-- | Take the recorded bindings, oldest first, and clear the record.
+drainBound :: Store -> IO [Int]
+drainBound s = do
+  top <- unsafeRead (regs s) rBOUND
+  arr <- readIORef (bound s)
+  addrs <- mapM (unsafeRead arr) [0 .. top - 1]
+  unsafeWrite (regs s) rBOUND 0
+  pure addrs
 
 -- | Reset every trailed cell above @mark@ to unbound and restore the mark.
 unwindTrail :: Store -> Int -> IO ()

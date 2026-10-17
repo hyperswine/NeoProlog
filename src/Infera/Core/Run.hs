@@ -23,6 +23,7 @@ import Data.Bits ((.|.))
 import Data.Array.IO (IOArray, IOUArray, newArray, newArray_)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
+import qualified Data.IntSet as IS
 import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble, numericTerm)
 import qualified Infera.CLP as CLP
 import Infera.Core.Compile
@@ -36,7 +37,18 @@ import qualified Infera.Program as P
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
 import Infera.Unify (canonicalize, deepWalk, emptySubst, instantiate, unifyPlain)
+import System.IO (hPutStrLn, stderr)
+import System.IO.Unsafe (unsafePerformIO)
+import System.Environment (lookupEnv)
+
 import Infera.Error (showPredKey)
+
+traceOn :: Bool
+traceOn = unsafePerformIO (maybe False (const True) <$> lookupEnv "INFERA_CORE_TRACE")
+{-# NOINLINE traceOn #-}
+
+traceMsg :: String -> IO ()
+traceMsg msg = when traceOn (hPutStrLn stderr msg)
 
 data Step
   = Stop
@@ -73,6 +85,9 @@ data Choice = Choice
     chTables :: Map.Map Term TableEntry,
     -- | branch-local dynamic facts
     chDynamic :: Map.Map PredKey [(Term, Int)],
+    -- | branch-local constraint store and watched cells
+    chStore :: CLP.Store,
+    chWatched :: IS.IntSet,
     chAlt :: !Alt
   }
 
@@ -84,8 +99,9 @@ data Alt
   | AltNot !(IORef Bool) !(IORef [SearchItem]) Cont
   | AltIf !(IORef Int) (Maybe ([Goal], Int, Int, Int)) Cont
   | AltFindAll !(IORef [(Copy, [OutputEvent])]) !(IORef [SearchItem]) Pattern !Int !Int Cont
-  | -- | remaining reference items of a leaf builtin and its variable table
-    AltLeaf [SearchItem] !(IM.IntMap Word') Cont
+  | -- | remaining reference items of a delegated goal and the substitution
+    -- the goal started from
+    AltLeaf [SearchItem] !(IM.IntMap Term) Cont
   | -- | sentinel of a tabled fixpoint iteration
     AltTable !(IORef Fix)
   | -- | remaining table answers to consume: answers, saved call address,
@@ -103,7 +119,7 @@ data Minimum = Minimum
   { mnEntryHeap :: !Int,
     mnEntryTrail :: !Int,
     mnEntryOut :: !Int,
-    mnBest :: Maybe (Integer, [(Int, Copy)], [OutputEvent], Map.Map Term TableEntry, Map.Map PredKey [(Term, Int)])
+    mnBest :: Maybe (Integer, [(Int, Copy)], [OutputEvent], Map.Map Term TableEntry, Map.Map PredKey [(Term, Int)], CLP.Store, IS.IntSet)
   }
 
 -- | The state of one tabled call's fixpoint, as in the reference engine.
@@ -124,7 +140,9 @@ data Fix = Fix
     -- | completed entries seen in this iteration's solutions
     fxCompleted :: Map.Map Term TableEntry,
     fxIssues :: !(IORef [SearchItem]),
-    fxCont :: Cont
+    fxCont :: Cont,
+    -- | a solution bound a constrained variable: evaluate plainly instead
+    fxUnsafe :: !Bool
   }
 
 -- Issue scopes: a negation or findall buffers issues until its outcome is
@@ -145,7 +163,13 @@ data Machine = Machine
     mScopes :: !(IORef [Scope]),
     mOutput :: !(IORef [OutputEvent]),
     mTables :: !(IORef (Map.Map Term TableEntry)),
-    mDynamic :: !(IORef (Map.Map PredKey [(Term, Int)]))
+    mDynamic :: !(IORef (Map.Map PredKey [(Term, Int)])),
+    -- | the persistent constraint store (branch-local)
+    mCLP :: !(IORef CLP.Store),
+    -- | cells of variables the store may mention, by logical id
+    mVarCells :: !(IORef (IM.IntMap Int)),
+    -- | addresses of watched variables (branch-local)
+    mWatched :: !(IORef IS.IntSet)
   }
 
 -- | Compile and start a query. Left names the construct that puts the
@@ -167,8 +191,10 @@ runCoreWith limit program query = do
     Right core -> do
       choices <- newArray_ (0, 1023)
       m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef [] <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
+        <*> newIORef CLP.emptyStore <*> newIORef IM.empty <*> newIORef IS.empty
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
+      writeIORef (mVarCells m) (IM.fromList [(i, i) | i <- [0 .. cpQueryVars core - 1]])
       pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone))
 
 -- ─── choice stack ────────────────────────────────────────────────────────────
@@ -182,6 +208,8 @@ pushChoice m alt = do
   fresh <- freshId s
   tables <- readIORef (mTables m)
   dynamic <- readIORef (mDynamic m)
+  store <- readIORef (mCLP m)
+  watched <- readIORef (mWatched m)
   scopes <- length <$> readIORef (mScopes m)
   top <- readIORef (mChoiceTop m)
   arr <- readIORef (mChoices m)
@@ -194,7 +222,7 @@ pushChoice m alt = do
         forM_ [0 .. top - 1] $ \i -> unsafeRead arr i >>= unsafeWrite grown i
         writeIORef (mChoices m) grown
         pure grown
-  unsafeWrite arr' top (Choice h tr out scopes fresh tables dynamic alt)
+  unsafeWrite arr' top (Choice h tr out scopes fresh tables dynamic store watched alt)
   writeIORef (mChoiceTop m) (top + 1)
   setHb s h
   pure top
@@ -289,6 +317,13 @@ truncateOutput m saved = do
 
 run :: Machine -> Cont -> IO Step
 run m cont = case cont of
+  CGoals goals base barrier depth next -> runGoals m goals base barrier depth next
+  _ -> do
+    pending <- readReg (mStore m) rBOUND
+    if pending > 0 then reconciled m (run' m cont) else run' m cont
+
+run' :: Machine -> Cont -> IO Step
+run' m cont = case cont of
   CDone -> do
     state <- exportState m
     pure (Yield (Found state) (backtrack m))
@@ -325,33 +360,45 @@ run m cont = case cont of
       Right n -> do
         let better = case mnBest mn of
               Nothing -> True
-              Just (current, _, _, _, _) -> n < current
+              Just (current, _, _, _, _, _, _) -> n < current
         when better $ do
           trailArr <- readIORef (trail s)
           top <- trailTop s
-          bound <- fmap concat . forM [mnEntryTrail mn .. top - 1] $ \i -> do
-            entry <- unsafeRead trailArr i
-            if odd entry
-              then pure []
-              else do
-                let addr = entry `div` 2
-                w <- readCell s addr
-                if tagOf w == tagRef && valOf w == addr then pure [] else do
-                  copy <- copyOut m (mnEntryHeap mn) w
-                  pure [(addr, copy)]
+          -- Walk the trail downward: an odd entry restores the word below it.
+          let scan !i acc
+                | i < mnEntryTrail mn = pure acc
+                | otherwise = do
+                    entry <- unsafeRead trailArr i
+                    if odd entry
+                      then scan (i - 2) acc
+                      else do
+                        -- Only cells older than the scope survive it.
+                        let addr = entry `div` 2
+                        w <- readCell s addr
+                        if addr >= mnEntryHeap mn || (tagOf w == tagRef && valOf w == addr)
+                          then scan (i - 1) acc
+                          else do
+                            copy <- copyOut m (mnEntryHeap mn) w
+                            scan (i - 1) ((addr, copy) : acc)
+          bound <- scan (top - 1) []
           produced <- outputSince m (mnEntryOut mn)
           tables <- readIORef (mTables m)
           dynamic <- readIORef (mDynamic m)
-          writeIORef ref mn {mnBest = Just (n, bound, produced, tables, dynamic)}
+          store <- readIORef (mCLP m)
+          watched <- readIORef (mWatched m)
+          writeIORef ref mn {mnBest = Just (n, bound, produced, tables, dynamic, store, watched)}
         backtrack m
   CExitTable fixRef -> do
     fx <- readIORef fixRef
     (answer, count) <- canonicalCall m (fst (pKey (fxPred fx))) (fxArgs fx) (pArity (fxPred fx))
     produced <- outputSince m (fxEntryOut fx)
     tables <- readIORef (mTables m)
+    store <- readIORef (mCLP m)
+    bad <- callConstrained m store (fxArgs fx) (pArity (fxPred fx))
     writeIORef fixRef fx
       { fxFound = (answer, count, produced) : fxFound fx,
-        fxCompleted = Map.union (fxCompleted fx) (Map.filter teComplete tables)
+        fxCompleted = Map.union (fxCompleted fx) (Map.filter teComplete tables),
+        fxUnsafe = fxUnsafe fx || bad
       }
     backtrack m
   CExitFindAll _ results template base entryHeap entryOut _ -> do
@@ -381,10 +428,109 @@ dropEmpty cont = cont
 -- a choice point or a scope needs a value.
 runGoals :: Machine -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
 runGoals m [] _ _ _ next = run m next
-runGoals m (goal : goals) base barrier depth next = step m goal goals base barrier depth next
+runGoals m (goal : goals) base barrier depth next = do
+  pending <- readReg (mStore m) rBOUND
+  if pending > 0
+    then reconciled m (step m goal goals base barrier depth next)
+    else step m goal goals base barrier depth next
+
+-- | Feed the bindings recorded since the last goal boundary to the
+-- constraint store, install what propagation bound, then continue; a
+-- contradiction fails and a type error is raised here.
+reconciled :: Machine -> IO Step -> IO Step
+reconciled m continue = do
+  let s = mStore m
+  addrs <- drainBound s
+  watched <- readIORef (mWatched m)
+  let hits = filter (`IS.member` watched) addrs
+  if null hits
+    then continue
+    else do
+      changes <- forM hits $ \addr -> do
+        ident <- cellId m addr
+        value <- readCell s addr >>= exportFor m
+        pure (ident, value)
+      store <- readIORef (mCLP m)
+      case CLP.applyBindings changes store of
+        Left err -> raiseError m err
+        Right Nothing -> backtrack m
+        Right (Just store') -> do
+          ok <- installStore m (CLP.stSubst store) store'
+          if ok then continue else backtrack m
+
+-- | The logical id of a variable cell: query cells by position, others
+-- through their block marker.
+cellId :: Machine -> Int -> IO Int
+cellId m addr
+  | addr < cpQueryVars (mCore m) = pure addr
+  | otherwise = maybe addr id <$> logicalId (mStore m) addr
+
+-- | Adopt a store returned by the reference: bind every variable it newly
+-- bound (without recording those writes again) and refresh the watched
+-- set. False when a propagated binding contradicts the heap.
+installStore :: Machine -> IM.IntMap Term -> CLP.Store -> IO Bool
+installStore m previous store = do
+  let s = mStore m
+      added = IM.toList (IM.difference (CLP.stSubst store) previous)
+  writeIORef (mCLP m) store
+  writeReg s rCLP 1
+  flag <- readReg s rBOUND
+  ok <- installBindings added
+  writeReg s rBOUND flag
+  cells' <- readIORef (mVarCells m)
+  writeIORef (mWatched m) (IS.fromList [addr | v <- IS.toList (CLP.stWatched store), Just addr <- [IM.lookup v cells']])
+  pure ok
+  where
+    s = mStore m
+    installBindings [] = pure True
+    installBindings ((v, term) : rest) = do
+      cells' <- readIORef (mVarCells m)
+      case IM.lookup v cells' of
+        Nothing -> installBindings rest
+        Just addr -> do
+          table <- newIORef (IM.map refWord cells')
+          w <- importKnown table term
+          cell <- readCell s addr
+          ok <- unify s cell w
+          when traceOn $ do
+            shown <- exportFor m cell
+            traceMsg ("  install " ++ show v ++ "@" ++ show addr ++ " := " ++ show term ++ " (cell held " ++ show shown ++ ") -> " ++ show ok)
+          -- Fresh variables the reference introduced keep their ids.
+          final <- readIORef table
+          forM_ (IM.toList final) $ \(ident, word) ->
+            when (tagOf word == tagRef && not (IM.member ident cells')) $
+              modifyIORef' (mVarCells m) (IM.insert ident (valOf word))
+          if ok then installBindings rest else pure False
+    importKnown table term = case term of
+      Var v -> do
+        known <- readIORef table
+        case IM.lookup v known of
+          Just w -> pure w
+          Nothing -> do
+            addr <- allocSlots s v 1
+            modifyIORef' table (IM.insert v (refWord addr))
+            pure (refWord addr)
+      Compound f as -> do
+        fid <- internFunctor (symbols s) f (length as)
+        words' <- mapM (importKnown table) as
+        structureWord s (funWord fid (length as)) words'
+      _ -> importTermWords s table term
 
 step :: Machine -> Goal -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
-step m goal goals base barrier depth next = case goal of
+step = step'
+
+goalName :: Goal -> String
+goalName g = case g of
+  GCall _ _ -> "call"; GTabled _ _ -> "tabled"; GCallFacts k _ -> "facts " ++ show k; GAssert _ -> "assert"
+  GRetract _ -> "retract"; GRetractAll _ -> "retractall"; GMinimize _ _ -> "minimize"; GCallDyn _ _ _ -> "calldyn"
+  GAnd _ -> "and"; GUnify _ _ -> "unify"; GEquiv _ _ -> "equiv"; GNeq _ _ -> "neq"; GIs _ _ -> "is"; GCmp _ _ _ -> "cmp"
+  GTrue -> "true"; GFail -> "fail"; GCut -> "cut"; GOr _ _ -> "or"; GIf _ _ _ -> "if"; GNot _ -> "not"; GOnce _ -> "once"
+  GFindAll _ _ _ -> "findall"; GCheck _ _ -> "check"; GWrite _ _ -> "write"; GNl -> "nl"; GError _ -> "error"
+  GLeaf n _ -> "leaf " ++ n; GPhrase _ _ -> "phrase"; GPhraseFile _ _ -> "phrasefile"; GEmit _ -> "emit"; GEmitText _ -> "emittext"
+  GUnsupported _ -> "unsupported"
+
+step' :: Machine -> Goal -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
+step' m goal goals base barrier depth next = case goal of
   GTrue -> continue
   GFail -> backtrack m
   GCut -> cutTo m barrier >> continue
@@ -517,12 +663,8 @@ step m goal goals base barrier depth next = case goal of
         shown <- exportFor m word
         raiseError m (TypeError "character list from the DCG" shown)
   GLeaf name patterns -> do
-    aliases <- newIORef IM.empty
-    args <- mapM (\p -> buildArg m base False p >>= exportGoal m aliases) patterns
-    table <- readIORef aliases
-    let goal = Compound name args
-        items = Reference.solveGoal (mEnv m) maxResolutionDepth (initialState (IM.size table)) goal
-    leafItems m items table (CGoals goals base barrier depth next)
+    args <- mapM (\p -> buildArg m base False p >>= exportFor m) patterns
+    delegate m (Compound name args) (CGoals goals base barrier depth next)
   GUnify a b -> do
     wa <- buildArg m base False a
     wb <- buildArg m base False b
@@ -542,7 +684,10 @@ step m goal goals base barrier depth next = case goal of
       then do
         same <- equiv (mStore m) wa wb
         if same then backtrack m else continue
-      else pure (Abandon "disequality constraint on non-ground operands")
+      else do
+        ta <- exportFor m wa
+        tb <- exportFor m wb
+        delegate m (Compound "neq" [ta, tb]) (CGoals goals base barrier depth next)
   GIs target expr -> do
     fast <- evalFast m base expr
     if fast
@@ -683,35 +828,37 @@ fileContents m pathWord
         _ -> Left . TypeError "file path string" <$> exportFor m pathWord
   | otherwise = Left . TypeError "file path string" <$> exportFor m pathWord
 
--- | Consume the reference items of a leaf builtin: each solution imports the
--- bindings of the exported variables; later items wait in a choice point.
-leafItems :: Machine -> [SearchItem] -> IM.IntMap Word' -> Cont -> IO Step
-leafItems m items table cont = case items of
+-- | Run a goal on the reference engine with the current store and adopt
+-- each solution's store and bindings; later solutions wait in a choice
+-- point. Variables are exported with their logical ids, so store state
+-- stays consistent across goals.
+delegate :: Machine -> Term -> Cont -> IO Step
+delegate m goal cont = do
+  let s = mStore m
+  store <- readIORef (mCLP m)
+  fresh <- freshId s
+  let state = (initialState fresh) {ssStore = store}
+      items = Reference.solveGoal (mEnv m) maxResolutionDepth state goal
+  when traceOn $ do
+    cells' <- readIORef (mVarCells m)
+    traceMsg ("delegate " ++ show goal ++ " fresh=" ++ show fresh ++ " cells=" ++ show [(v, a) | v <- S.termVarIds goal, Just a <- [IM.lookup v cells']])
+  leafItems m items (CLP.stSubst store) cont
+
+leafItems :: Machine -> [SearchItem] -> IM.IntMap Term -> Cont -> IO Step
+leafItems m items previous cont = case items of
   [] -> backtrack m
   (item : rest) -> do
-    unless (null rest) $ () <$ pushChoice m (AltLeaf rest table cont)
+    unless (null rest) $ () <$ pushChoice m (AltLeaf rest previous cont)
     case item of
       Found state -> do
-        ok <- importBindings m table (CLP.stSubst (ssStore state))
+        let s = mStore m
+        current <- freshId s
+        setFreshId s (max current (ssFresh state))
+        ok <- installStore m previous (ssStore state)
         if ok then run m cont else backtrack m
       BranchError err -> raiseItems m [BranchError err] (backtrack m)
       BranchExhausted -> raiseItems m [BranchExhausted] (backtrack m)
       _ -> backtrack m
-
-importBindings :: Machine -> IM.IntMap Word' -> IM.IntMap Term -> IO Bool
-importBindings m table subst = go (IM.toList table)
-  where
-    s = mStore m
-    go [] = pure True
-    go ((v, w) : rest) = case deepWalk subst (Var v) of
-      Var same | same == v -> go rest
-      term -> do
-        cells' <- newIORef table
-        -- Variables of the imported term that alias exported ones map back
-        -- to their words; new ones get fresh cells.
-        imported <- importTermWords s cells' term
-        ok <- unify s w imported
-        if ok then go rest else pure False
 
 -- ─── calls ───────────────────────────────────────────────────────────────────
 
@@ -901,6 +1048,7 @@ normalizeWord m w0 = do
 backtrack :: Machine -> IO Step
 backtrack m = do
   top <- readIORef (mChoiceTop m)
+  traceMsg ("backtrack B=" ++ show top)
   if top == 0
     then pure Stop
     else do
@@ -914,6 +1062,9 @@ backtrack m = do
       setFreshId s (chFresh choice)
       writeIORef (mTables m) (chTables choice)
       writeIORef (mDynamic m) (chDynamic choice)
+      writeIORef (mCLP m) (chStore choice)
+      writeIORef (mWatched m) (chWatched choice)
+      writeReg s rBOUND 0
       case chAlt choice of
         AltClauses predicate (ordinal : more) saved depth cont -> do
           loadArgs s saved (pArity predicate)
@@ -945,9 +1096,9 @@ backtrack m = do
           case elseGoals of
             Just (goals, base, barrier, depth) | issues == 0 -> run m (CGoals goals base barrier depth cont)
             _ -> backtrack m
-        AltLeaf items table cont -> do
+        AltLeaf items previous cont -> do
           pop
-          leafItems m items table cont
+          leafItems m items previous cont
         AltFindAll results buffer target base _ cont -> do
           pop
           issues <- reverse <$> readIORef buffer
@@ -977,7 +1128,7 @@ backtrack m = do
             then raiseItems m issues (backtrack m)
             else case mnBest mn of
               Nothing -> backtrack m
-              Just (_, bound, produced, tables, dynamic) -> do
+              Just (_, bound, produced, tables, dynamic, store, watched) -> do
                 fresh <- newIORef IM.empty
                 forM_ bound $ \(addr, copy) -> do
                   w <- rebuildCopyWith m fresh copy
@@ -985,6 +1136,10 @@ backtrack m = do
                 mapM_ (emitOutput m) produced
                 writeIORef (mTables m) tables
                 writeIORef (mDynamic m) dynamic
+                writeIORef (mCLP m) store
+                writeIORef (mWatched m) watched
+                -- The winner's store already holds these bindings.
+                writeReg s rBOUND 0
                 run m cont
   where
     pop = do
@@ -1383,7 +1538,12 @@ exportFor m word = do
       s = mStore m
   names <- newIORef (IM.fromList [(i, i) | i <- [0 .. n - 1]])
   next <- newIORef =<< freshId s
-  exportTermWith s names next word
+  term <- exportTermWith s names next word
+  -- Remember where each exported variable lives for the constraint store.
+  seen <- readIORef names
+  when (IM.size seen > n) $
+    modifyIORef' (mVarCells m) (\cells' -> IM.foldlWithKey' (\acc addr ident -> if ident < n then acc else IM.insert ident addr acc) cells' seen)
+  pure term
 
 -- | The immutable solver state of the current answer: query variables bound
 -- to fully dereferenced terms, internal variables numbered after them.
@@ -1399,13 +1559,18 @@ exportState m = do
   fresh <- freshId s
   events <- readIORef (mOutput m)
   count <- outLen s
+  store <- readIORef (mCLP m)
+  tables <- readIORef (mTables m)
+  dynamic <- readIORef (mDynamic m)
   let subst = IM.fromList [(i, term) | (i, term) <- bindings, term /= Var i]
       base = initialState fresh
   pure
     base
-      { ssStore = (ssStore base) {CLP.stSubst = subst},
+      { ssStore = store {CLP.stSubst = IM.union subst (CLP.stSubst store)},
         ssOutput = events,
-        ssOutLen = count
+        ssOutLen = count,
+        ssTables = tables,
+        ssDynamic = dynamic
       }
 
 -- | Export a goal for @call/N@ and the leaf builtins: distinct unbound
@@ -1483,21 +1648,33 @@ callTabled m predicate cont0 = do
             _ -> CReturn (if commits then entry else -1) guard checked cont
       saved <- saveArgs s n
       (callKey, _) <- canonicalCall m (fst key) saved n
+      store <- readIORef (mCLP m)
+      constrained <- callConstrained m store saved n
       tables <- readIORef (mTables m)
-      case Map.lookup callKey tables of
-        Just te
-          | teComplete te ->
-              raiseItems m [BranchExhausted | teTruncated te] (consumeAnswers m (teAnswers te) saved n returnCont)
-          | otherwise ->
-              raiseItems m [ConsumedIncomplete callKey] (consumeAnswers m (teAnswers te) saved n returnCont)
-        Nothing -> do
-          entryOut <- outLen s
-          issues <- newIORef []
-          fixRef <- newIORef Fix
-            { fxKey = callKey, fxPred = predicate, fxArgs = saved, fxEntryOut = entryOut, fxDepth = depth,
-              fxTables = tables, fxAnswers = [], fxSet = Set.empty, fxIteration = 0, fxFound = [],
-              fxCompleted = Map.empty, fxIssues = issues, fxCont = returnCont }
-          startIteration m fixRef
+      if constrained
+        then do
+          loadArgs s saved n
+          callClauses m predicate entry depth returnCont
+        else case Map.lookup callKey tables of
+          Just te
+            | teComplete te ->
+                raiseItems m [BranchExhausted | teTruncated te] (consumeAnswers m (teAnswers te) saved n returnCont)
+            | otherwise ->
+                raiseItems m [ConsumedIncomplete callKey] (consumeAnswers m (teAnswers te) saved n returnCont)
+          Nothing -> do
+            entryOut <- outLen s
+            issues <- newIORef []
+            fixRef <- newIORef Fix
+              { fxKey = callKey, fxPred = predicate, fxArgs = saved, fxEntryOut = entryOut, fxDepth = depth,
+                fxTables = tables, fxAnswers = [], fxSet = Set.empty, fxIteration = 0, fxFound = [],
+                fxCompleted = Map.empty, fxIssues = issues, fxCont = returnCont, fxUnsafe = False }
+            startIteration m fixRef
+
+-- | Does the saved call mention a constrained variable?
+callConstrained :: Machine -> CLP.Store -> Int -> Int -> IO Bool
+callConstrained m store saved arity = do
+  args <- forM [0 .. arity - 1] $ \i -> readCell (mStore m) (saved + i) >>= exportFor m
+  pure (any (CLP.isConstrained store) (concatMap S.termVarIds args))
 
 -- | One fixpoint iteration: all clauses run against the partial table.
 startIteration :: Machine -> IORef Fix -> IO Step
@@ -1531,7 +1708,13 @@ finishIteration m fixRef = do
       tables' = Map.union completed (Map.delete (fxKey fx) (fxTables fx))
       converged = null fresh
       gaveUp = fxIteration fx >= maxTableIterations
-  if converged || gaveUp
+  if fxUnsafe fx
+    then do
+      writeIORef (mTables m) (fxTables fx)
+      loadArgs (mStore m) (fxArgs fx) (pArity (fxPred fx))
+      entry <- readIORef (mChoiceTop m)
+      callClauses m (fxPred fx) entry (fxDepth fx) (fxCont fx)
+    else if converged || gaveUp
     then do
       let tables'' =
             if null deps
@@ -1595,6 +1778,59 @@ retractFacts m facts key saved cont = case facts of
         run m cont
       else backtrack m
 
+-- | Trace-mode self check after a collection.
+checkInvariants :: Machine -> Cont -> IO ()
+checkInvariants m cont = do
+  let s = mStore m
+  top <- heapTop s
+  arr <- readIORef (cells s)
+  forM_ [0 .. top - 1] $ \a -> do
+    w <- unsafeRead arr a
+    when ((tagOf w == tagRef || tagOf w == tagStr) && (valOf w < 0 || valOf w >= top)) $
+      traceMsg ("INVARIANT: cell " ++ show a ++ " points outside the heap: " ++ show w)
+  tr <- readIORef (trail s)
+  trTop <- trailTop s
+  let walk i
+        | i < 0 = pure ()
+        | otherwise = do
+            e <- unsafeRead tr i
+            let addr = e `div` 2
+            when (addr >= top) (traceMsg ("INVARIANT: trail entry " ++ show i ++ " -> dead cell " ++ show addr))
+            w <- if addr < top then unsafeRead arr addr else pure 0
+            when (addr < top && even e && w == refWord addr) (traceMsg ("INVARIANT: trail entry " ++ show i ++ " for unbound cell " ++ show addr))
+            walk (if odd e then i - 2 else i - 1)
+  walk (trTop - 1)
+  choiceTop <- readIORef (mChoiceTop m)
+  choices <- forM [0 .. choiceTop - 1] (readChoice m)
+  let hs = map chH choices
+      trs = map chTR choices
+  when (hs /= IM.elems (IM.fromList (zip [0 :: Int ..] hs)) || or (zipWith (>) hs (drop 1 hs))) (traceMsg ("INVARIANT: choice H marks not ascending " ++ show hs))
+  when (or (zipWith (>) trs (drop 1 trs)) || any (> trTop) trs) (traceMsg ("INVARIANT: choice trail marks wrong " ++ show trs ++ " top " ++ show trTop))
+  let checkCont c = case c of
+        CGoals _ base _ _ next -> checkBase base >> checkCont next
+        CReturn _ _ _ next -> checkCont next
+        CExitIf _ _ base _ _ next -> checkBase base >> checkCont next
+        CExitFindAll _ _ _ base _ _ _ -> checkBase base
+        CExitMinimize _ base _ -> checkBase base
+        _ -> pure ()
+      checkBase base = when (base > 0) $ do
+        marker <- unsafeRead arr (base - 1)
+        unless (tagOf marker == tagFun) (traceMsg ("INVARIANT: block base " ++ show base ++ " has no marker: " ++ show marker))
+      checkAlt alt = case alt of
+        AltClauses _ _ _ _ c -> checkCont c
+        AltGoals _ base _ _ c -> checkBase base >> checkCont c
+        AltNot _ _ c -> checkCont c
+        AltIf _ e c -> forM_ e (\(_, base, _, _) -> checkBase base) >> checkCont c
+        AltFindAll _ _ _ base _ c -> checkBase base >> checkCont c
+        AltLeaf _ _ c -> checkCont c
+        AltAnswers _ _ _ c -> checkCont c
+        AltRetract _ _ _ c -> checkCont c
+        AltMinimize _ _ c -> checkCont c
+        _ -> pure ()
+  checkCont cont
+  forM_ choices (checkAlt . chAlt)
+  traceMsg "GC checked"
+
 -- ─── collection ──────────────────────────────────────────────────────────────
 
 -- | Mark-compact collection of the cell store at a call boundary. Roots are
@@ -1608,8 +1844,22 @@ collect m cont nargs = do
   let s = mStore m
       queryCells = max 1 (cpQueryVars (mCore m))
   top <- heapTop s
+  traceMsg ("GC at H=" ++ show top)
   arr <- readIORef (cells s)
   marks <- newArray (0, top) False :: IO (IOUArray Int Bool)
+  -- Cells with a trail entry can become unbound again; their ids matter.
+  trailed <- newArray (0, top) False :: IO (IOUArray Int Bool)
+  do
+    trailArr0 <- readIORef (trail s)
+    trailLen0 <- trailTop s
+    let noteTrail i
+          | i < 0 = pure ()
+          | otherwise = do
+              entry <- unsafeRead trailArr0 i
+              let addr = entry `div` 2
+              when (addr < top) (unsafeWrite trailed addr True)
+              noteTrail (if odd entry then i - 2 else i - 1)
+    noteTrail (trailLen0 - 1)
   stackRef <- newIORef =<< (newArray (0, 4095) 0 :: IO (IOUArray Int Int))
   stackTop <- newIORef (0 :: Int)
   let push a = do
@@ -1628,7 +1878,28 @@ collect m cont nargs = do
         writeIORef stackTop (i + 1)
       markCell a = do
         seen <- unsafeRead marks a
-        if seen then pure () else unsafeWrite marks a True >> push a
+        if seen then pure () else unsafeWrite marks a True >> push a >> markBlockOf a
+      -- A live slot that is unbound, or bound but undoable, keeps its whole
+      -- activation block, marker included, so its logical id survives
+      -- compaction. Functor words below a cell are either its structure's
+      -- functor (block size 0) or a block marker.
+      markBlockOf a = do
+        w0 <- unsafeRead arr a
+        undoable <- unsafeRead trailed a
+        when ((tagOf w0 == tagRef && valOf w0 == a) || undoable) $ scanBlock a
+      scanBlock a = do
+        let scan i
+              | i < 0 = pure ()
+              | otherwise = do
+                  w <- unsafeRead arr i
+                  if tagOf w == tagFun
+                    then do
+                      let n = markerVars w
+                      when (n > 0 && a <= i + n) $ do
+                        unsafeWrite marks i True
+                        forM_ [i + 1 .. i + n] markCell
+                    else scan (i - 1)
+        scan (a - 1)
       markStructure a = do
         seen <- unsafeRead marks a
         if seen
@@ -1692,7 +1963,7 @@ collect m cont nargs = do
           forM_ elseGoals (\(_, base, _, _) -> markBlock base)
           markCont c
         AltFindAll results _ _ base _ c -> markBlock base >> markResults results >> markCont c
-        AltLeaf _ table c -> mapM_ markWord (IM.elems table) >> markCont c
+        AltLeaf _ _ c -> markCont c
         AltTable fixRef -> do
           fx <- readIORef fixRef
           forM_ [fxArgs fx .. fxArgs fx + pArity (fxPred fx) - 1] markCell
@@ -1701,7 +1972,7 @@ collect m cont nargs = do
         AltRetract _ _ saved c -> markCell saved >> markCont c
         AltMinimize ref _ c -> do
           mn <- readIORef ref
-          forM_ (mnBest mn) $ \(_, bound, _, _, _) -> forM_ bound $ \(addr, copy) -> markCell addr >> markCopy copy
+          forM_ (mnBest mn) $ \(_, bound, _, _, _, _, _) -> forM_ bound $ \(addr, copy) -> markCell addr >> markCopy copy
           markCont c
   -- The query block is a root even when no continuation names it any
   -- more: the answer is exported from it.
@@ -1721,7 +1992,9 @@ collect m cont nargs = do
             count (a + 1) (if live then n + 1 else n)
   count 0 0
   newTop <- unsafeRead fwd top
-  let forward a = unsafeRead fwd a
+  -- Entries from abandoned branches may point above the heap top.
+  let liveCell addr = if addr < top then unsafeRead marks addr else pure False
+      forward a = unsafeRead fwd a
       reloc w
         | tagOf w == tagRef = refWord <$> forward (valOf w)
         | tagOf w == tagStr = strWord <$> forward (valOf w)
@@ -1812,9 +2085,7 @@ collect m cont nargs = do
         AltFindAll results buffer target base depth c -> do
           relocResults results
           AltFindAll results buffer target <$> relocBlock base <*> pure depth <*> relocCont c
-        AltLeaf items table c -> do
-          table' <- traverse reloc table
-          AltLeaf items table' <$> relocCont c
+        AltLeaf items previous c -> AltLeaf items previous <$> relocCont c
         AltTable fixRef -> do
           fx <- readIORef fixRef
           saved' <- forward (fxArgs fx)
@@ -1829,24 +2100,47 @@ collect m cont nargs = do
           mn <- readIORef ref
           best' <- case mnBest mn of
             Nothing -> pure Nothing
-            Just (n, bound, produced, tables, dynamic) -> do
+            Just (n, bound, produced, tables, dynamic, store, watched) -> do
               bound' <- forM bound $ \(addr, copy) -> (,) <$> forward addr <*> relocCopy copy
-              pure (Just (n, bound', produced, tables, dynamic))
+              watchedList <- forM (IS.toList watched) $ \addr -> do
+                keep <- liveCell addr
+                if keep then (: []) <$> forward addr else pure []
+              pure (Just (n, bound', produced, tables, dynamic, store, IS.fromList (concat watchedList)))
           entryHeap' <- forward (mnEntryHeap mn)
           entryTrail' <- unsafeRead keptBelow (mnEntryTrail mn)
           writeIORef ref mn {mnEntryHeap = entryHeap', mnEntryTrail = entryTrail', mnBest = best'}
           AltMinimize ref buffer <$> relocCont c
   cont' <- relocCont cont
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
+  varCells <- readIORef (mVarCells m)
+  live <- forM (IM.toList varCells) $ \(ident, addr) -> do
+    keep <- liveCell addr
+    if keep then (\a -> [(ident, a)]) <$> forward addr else pure []
+  writeIORef (mVarCells m) (IM.fromList (concat live))
+  watched <- readIORef (mWatched m)
+  watched' <- forM (IS.toList watched) $ \addr -> do
+    keep <- liveCell addr
+    if keep then (: []) <$> forward addr else pure []
+  writeIORef (mWatched m) (IS.fromList (concat watched'))
+  pendingCount <- readReg s rBOUND
+  when (pendingCount > 0) $ do
+    pendingAddrs <- drainBound s
+    forM_ pendingAddrs $ \addr -> do
+      keep <- liveCell addr
+      when keep (forward addr >>= recordBoundCell s)
   forM_ [0 .. choiceTop - 1] $ \i -> do
     choice <- readChoice m i
     h' <- forward (chH choice)
     tr' <- unsafeRead keptBelow (chTR choice)
     alt' <- relocAlt (chAlt choice)
-    writeChoice m i choice {chH = h', chTR = tr', chAlt = alt'}
+    watchedList <- forM (IS.toList (chWatched choice)) $ \addr -> do
+      keep <- liveCell addr
+      if keep then (: []) <$> forward addr else pure []
+    writeChoice m i choice {chH = h', chTR = tr', chAlt = alt', chWatched = IS.fromList (concat watchedList)}
   slide 0
   setHeapTop s newTop
   refreshHb m
+  when traceOn (checkInvariants m cont')
   floor' <- readReg s rGCLIM
   writeReg s rGCLIM (max (min floor' initialCollectLimit) (newTop * 2))
   pure cont'
