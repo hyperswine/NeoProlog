@@ -76,6 +76,11 @@ data Goal
   = GCall !PredRef [Pattern]
   | -- | a call to a tabled predicate
     GTabled !PredRef [Pattern]
+  | -- | a call to a dynamic name without clauses: its asserted facts
+    GCallFacts !PredKey [Pattern]
+  | GAssert Pattern
+  | GRetract Pattern
+  | GRetractAll Pattern
   | -- | a variable goal (True) or @call/N@ (False): a goal word plus extra arguments
     GCallDyn !Bool Pattern [Pattern]
   | GAnd [Goal]
@@ -395,6 +400,9 @@ compileGoal ctx term = case term of
   Compound "phrase" [nt, l] -> GPhrase <$> arg nt <*> arg l
   Compound "phrase_from_file" [nt, path] -> GPhraseFile <$> arg nt <*> arg path
   Compound "emit" [nt] -> GEmit <$> arg nt
+  Compound "assert" [t] -> GAssert <$> arg t
+  Compound "retract" [t] -> GRetract <$> arg t
+  Compound "retractall" [t] -> GRetractAll <$> arg t
   Compound f as
     | (f, length as) `elem` leafBuiltins -> GLeaf f <$> mapM arg as
     | f `elem` abandonedBuiltins -> unsupported ("builtin " ++ f ++ "/" ++ show (length as))
@@ -413,11 +421,9 @@ compileGoal ctx term = case term of
       Just ref
         | Just p <- P.lookupPred (f, length as) (ctxProgram ctx), P.predIsTabled (ctxProgram ctx) p ->
             GTabled ref <$> mapM arg as
-        | Just p <- P.lookupPred (f, length as) (ctxProgram ctx), P.predIsDynamic (ctxProgram ctx) p ->
-            unsupported ("dynamic predicate " ++ f ++ "/" ++ show (length as))
         | otherwise -> GCall ref <$> mapM arg as
       Nothing
-        | P.nameHasFlag (ctxProgram ctx) f S.FlagDynamic -> unsupported ("dynamic " ++ f)
+        | P.nameHasFlag (ctxProgram ctx) f S.FlagDynamic -> GCallFacts (f, length as) <$> mapM arg as
         | otherwise -> pure (GError (UnknownPredicate (f, length as)))
 
 -- | Builtins whose reference implementation is a pure function of their
@@ -434,7 +440,7 @@ leafBuiltins =
 abandonedBuiltins :: [String]
 abandonedBuiltins =
   [ "int_eq", "fd_ne", "fd_le", "fd_lt", "fd_ge", "fd_gt", "reify", "in", "label", "labeling",
-    "all_different", "all_distinct", "minimize", "assert", "retract", "retractall"
+    "all_different", "all_distinct", "minimize"
   ]
 
 -- | Compile a goal that a running program handed to @call/N@. The caller

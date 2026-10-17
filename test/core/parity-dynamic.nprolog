@@ -1,0 +1,28 @@
+<- notable.
+counter : dynamic.
+seen : dynamic.
+pair : dynamic.
+add : unsafe.
+add X <- assert (counter X).
+remove : unsafe.
+remove X <- retract (counter X).
+clear : unsafe.
+clear <- retractall (counter _).
+all L <- findall X (counter X) L.
+> add 1, add 2, add 3, all L?
+> add 1, add 2, remove 2, all L?
+> add 1, add 2, remove X, all L?
+> add 1, add 2, clear, all L?
+> add 1, (add 2, fail ; true), all L?
+> counter X?
+> assert (seen a), assert (seen b), seen X?
+> assert (seen a), retract (seen z)?
+> assert (pair 1 Y), pair A B?
+> assert (pair X X), pair 1 Z?
+> assert (undeclared 1)?
+> assert X?
+> retract (nothing 1)?
+> retractall (nothing 1)?
+> assert (seen a), not (seen b), seen X?
+> assert (seen a), (retract (seen a) -> R = gone ; R = kept), findall X (seen X) L?
+> assert (counter 1), assert (counter 2), retract (counter N), N > 1, all L?

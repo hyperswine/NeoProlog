@@ -35,7 +35,8 @@ import Infera.Error (PredKey, SolveError (..))
 import qualified Infera.Program as P
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
-import Infera.Unify (canonicalize, deepWalk, emptySubst)
+import Infera.Unify (canonicalize, deepWalk, emptySubst, instantiate, unifyPlain)
+import Infera.Error (showPredKey)
 
 data Step
   = Stop
@@ -68,6 +69,8 @@ data Choice = Choice
     chFresh :: !Int,
     -- | branch-local tables
     chTables :: Map.Map Term TableEntry,
+    -- | branch-local dynamic facts
+    chDynamic :: Map.Map PredKey [(Term, Int)],
     chAlt :: !Alt
   }
 
@@ -86,6 +89,9 @@ data Alt
   | -- | remaining table answers to consume: answers, saved call address,
     -- arity, continuation
     AltAnswers [(Term, Int, [OutputEvent])] !Int !Int Cont
+  | -- | remaining facts a retract may remove: (index, fact, size), key,
+    -- saved term cell, continuation
+    AltRetract [(Int, Term, Int)] !PredKey !Int Cont
 
 -- | The state of one tabled call's fixpoint, as in the reference engine.
 data Fix = Fix
@@ -125,7 +131,8 @@ data Machine = Machine
     mChoiceTop :: !(IORef Int),
     mScopes :: !(IORef [Scope]),
     mOutput :: !(IORef [OutputEvent]),
-    mTables :: !(IORef (Map.Map Term TableEntry))
+    mTables :: !(IORef (Map.Map Term TableEntry)),
+    mDynamic :: !(IORef (Map.Map PredKey [(Term, Int)]))
   }
 
 -- | Compile and start a query. Left names the construct that puts the
@@ -146,7 +153,7 @@ runCoreWith limit program query = do
     Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason))
     Right core -> do
       choices <- newArray_ (0, 1023)
-      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef [] <*> newIORef [] <*> newIORef Map.empty
+      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef [] <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
       pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone))
@@ -161,6 +168,7 @@ pushChoice m alt = do
   out <- outLen s
   fresh <- freshId s
   tables <- readIORef (mTables m)
+  dynamic <- readIORef (mDynamic m)
   scopes <- length <$> readIORef (mScopes m)
   top <- readIORef (mChoiceTop m)
   arr <- readIORef (mChoices m)
@@ -173,7 +181,7 @@ pushChoice m alt = do
         forM_ [0 .. top - 1] $ \i -> unsafeRead arr i >>= unsafeWrite grown i
         writeIORef (mChoices m) grown
         pure grown
-  unsafeWrite arr' top (Choice h tr out scopes fresh tables alt)
+  unsafeWrite arr' top (Choice h tr out scopes fresh tables dynamic alt)
   writeIORef (mChoiceTop m) (top + 1)
   setHb s h
   pure top
@@ -345,6 +353,49 @@ step m goal goals base barrier depth next = case goal of
     pending <- arithData (mStore m)
     when (pending > 0) (normalizeArgs m (pArity predicate))
     callTabled m predicate (if null goals then next else CGoals goals base barrier depth next)
+  GCallFacts key patterns -> do
+    let s = mStore m
+        arity = length patterns
+    buildArgs m base patterns 0
+    pending <- arithData s
+    when (pending > 0) (normalizeArgs m arity)
+    saved <- saveArgs s arity
+    facts <- Map.findWithDefault [] key <$> readIORef (mDynamic m)
+    consumeAnswers m [(fact, n, []) | (fact, n) <- facts] saved arity (CGoals goals base barrier depth next)
+  GAssert pattern -> do
+    word <- buildArg m base False pattern
+    fact <- exportFor m word
+    case S.functorOf fact of
+      Nothing -> raiseError m (TypeError "callable fact" fact)
+      Just key@(name, _)
+        | not (P.nameHasFlag (mProgram m) name S.FlagDynamic) ->
+            raiseError m (UserError (showPredKey key ++ " is not declared dynamic (add `" ++ name ++ " : dynamic.`)"))
+        | otherwise -> do
+            let (canon, vs) = canonicalize emptySubst fact
+            modifyIORef' (mDynamic m) (Map.insertWith (flip (++)) key [(canon, length vs)])
+            continue
+  GRetract pattern -> do
+    let s = mStore m
+    word <- buildArg m base False pattern
+    shown <- exportFor m word
+    case S.functorOf shown of
+      Nothing -> raiseError m (TypeError "callable fact" shown)
+      Just key -> do
+        facts <- Map.findWithDefault [] key <$> readIORef (mDynamic m)
+        saved <- reserveCells s 1
+        writeCell s saved word
+        retractFacts m [(i, fact, n) | (i, (fact, n)) <- zip [0 ..] facts] key saved (CGoals goals base barrier depth next)
+  GRetractAll pattern -> do
+    word <- buildArg m base False pattern
+    shown <- exportFor m word
+    case S.functorOf shown of
+      Nothing -> raiseError m (TypeError "callable fact" shown)
+      Just key -> do
+        fresh <- freshId (mStore m)
+        facts <- Map.findWithDefault [] key <$> readIORef (mDynamic m)
+        let keep = [(canon, n) | (canon, n) <- facts, Nothing <- [unifyPlain emptySubst shown (instantiate fresh canon)]]
+        modifyIORef' (mDynamic m) (Map.insert key keep)
+        continue
   GCallDyn direct callable extra -> do
     word <- buildArg m base False callable
     aliases <- newIORef IM.empty
@@ -803,6 +854,7 @@ backtrack m = do
       truncateScopes m (chScopes choice)
       setFreshId s (chFresh choice)
       writeIORef (mTables m) (chTables choice)
+      writeIORef (mDynamic m) (chDynamic choice)
       case chAlt choice of
         AltClauses predicate (ordinal : more) saved depth cont -> do
           loadArgs s saved (pArity predicate)
@@ -855,6 +907,9 @@ backtrack m = do
         AltAnswers answers saved arity cont -> do
           pop
           consumeAnswers m answers saved arity cont
+        AltRetract facts key saved cont -> do
+          pop
+          retractFacts m facts key saved cont
   where
     pop = do
       top <- readIORef (mChoiceTop m)
@@ -1439,6 +1494,27 @@ consumeAnswers m answers saved arity cont = case answers of
       ok <- unify s cell w
       if ok then unifyArgs s table (i + 1) rest else pure False
 
+-- | Retract alternatives: each fact that unifies with the saved term is
+-- removed from the facts as they were when the retract began.
+retractFacts :: Machine -> [(Int, Term, Int)] -> PredKey -> Int -> Cont -> IO Step
+retractFacts m facts key saved cont = case facts of
+  [] -> backtrack m
+  ((index, fact, count) : rest) -> do
+    unless (null rest) $ () <$ pushChoice m (AltRetract rest key saved cont)
+    let s = mStore m
+    fresh <- freshId s
+    block <- allocSlots s fresh (max 1 count)
+    setFreshId s (fresh + count)
+    table <- newIORef (IM.fromList [(v, refWord (block + v)) | v <- [0 .. count - 1]])
+    imported <- importTermWords s table fact
+    target <- readCell s saved
+    ok <- unify s target imported
+    if ok
+      then do
+        modifyIORef' (mDynamic m) (Map.adjust (\fs -> [f | (j, f) <- zip [0 :: Int ..] fs, j /= index]) key)
+        run m cont
+      else backtrack m
+
 -- ─── collection ──────────────────────────────────────────────────────────────
 
 -- | Mark-compact collection of the cell store at a call boundary. Roots are
@@ -1541,6 +1617,7 @@ collect m cont nargs = do
           forM_ [fxArgs fx .. fxArgs fx + pArity (fxPred fx) - 1] markCell
           markCont (fxCont fx)
         AltAnswers _ saved arity c -> forM_ [saved .. saved + arity - 1] markCell >> markCont c
+        AltRetract _ _ saved c -> markCell saved >> markCont c
   -- The query block is a root even when no continuation names it any
   -- more: the answer is exported from it.
   forM_ [0 .. queryCells - 1] markCell
@@ -1631,6 +1708,8 @@ collect m cont nargs = do
           pure (AltTable fixRef)
         AltAnswers answers saved arity c ->
           AltAnswers answers <$> forward saved <*> pure arity <*> relocCont c
+        AltRetract facts key saved c ->
+          AltRetract facts key <$> forward saved <*> relocCont c
   cont' <- relocCont cont
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
   -- Trail: keep entries of live cells, remember how many survive below
