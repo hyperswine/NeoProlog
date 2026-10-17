@@ -32,9 +32,7 @@ import Control.Monad (forM, forM_)
 import Data.Array (Array, listArray)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
-import Data.IntSet (IntSet)
 import qualified Data.IntSet as IS
-import Data.List (foldl')
 import qualified Data.Map.Strict as Map
 import Infera.Core.Store
 import Infera.Error (PredKey, SolveError (..))
@@ -110,7 +108,17 @@ data Clause = Clause
 data Key = KAtm !Int | KInt !Int | KChr !Int | KFun !Word' | KBig !Integer | KFlt !Double | KStr !String
   deriving (Eq, Ord, Show)
 
-data ArgIndex = ArgIndex !(Map.Map Key IntSet) !IntSet
+-- | Per-position clause selection: immediate keys (atom, integer, character
+-- and functor words) map to the ascending candidates sharing that key or
+-- open at the position; boxed keys go through a value map; an unbound or
+-- unknown key yields the open clauses.
+data ArgIndex = ArgIndex
+  { aiFast :: !(IM.IntMap [Int]),
+    aiBoxed :: !(Map.Map Key [Int]),
+    aiOpen :: [Int],
+    -- | some clause has a key at this position
+    aiSelective :: !Bool
+  }
 
 data Pred = Pred
   { pKey :: !PredKey,
@@ -208,10 +216,20 @@ buildIndex store position clauses = do
       (pattern : _) -> patternKey store pattern
       [] -> pure Nothing
     pure (ordinal :: Int, key)
-  pure (foldl' add (ArgIndex Map.empty IS.empty) keyed)
-  where
-    add (ArgIndex m open) (ordinal, Nothing) = ArgIndex m (IS.insert ordinal open)
-    add (ArgIndex m open) (ordinal, Just key) = ArgIndex (Map.insertWith IS.union key (IS.singleton ordinal) m) open
+  let open = IS.fromList [ordinal | (ordinal, Nothing) <- keyed]
+      grouped = Map.fromListWith IS.union [(key, IS.singleton ordinal) | (ordinal, Just key) <- keyed]
+      withOpen members = IS.toAscList (IS.union members open)
+      fast = IM.fromList [(w, withOpen members) | (key, members) <- Map.toList grouped, Just w <- [immediateKey key]]
+      boxedKeys = Map.fromList [(key, withOpen members) | (key, members) <- Map.toList grouped, immediateKey key == Nothing]
+  pure (ArgIndex fast boxedKeys (IS.toAscList open) (not (Map.null grouped)))
+
+immediateKey :: Key -> Maybe Int
+immediateKey key = case key of
+  KAtm i -> Just (atmWord i)
+  KInt i -> Just (intWord i)
+  KChr i -> Just (chrWord i)
+  KFun w -> Just w
+  _ -> Nothing
 
 patternKey :: Store -> Pattern -> IO (Maybe Key)
 patternKey store pattern = case pattern of
@@ -227,7 +245,7 @@ keyOfWord store w = case tagOf w of
     | t == tagAtm -> pure (Just (KAtm (valOf w)))
     | t == tagInt -> pure (Just (KInt (valOf w)))
     | t == tagChr -> pure (Just (KChr (valOf w)))
-    | t == tagStr -> Just . KFun <$> readCell store (valOf w)
+    | t == tagStr -> Just . KFun . funKey <$> readCell store (valOf w)
     | t == tagBox -> do
         value <- boxed store w
         pure . Just $ case value of
@@ -236,15 +254,33 @@ keyOfWord store w = case tagOf w of
           BStr s -> KStr s
     | otherwise -> pure Nothing
 
--- | Candidate clause ordinals for dereferenced argument keys (Nothing for an
--- unbound argument). Any bound argument prunes, as in the reference.
-candidateClauses :: Pred -> [Maybe Key] -> [Int]
-candidateClauses p keys =
-  case [restrict ai k | (ai, Just k) <- zip (pIndex p) keys] of
-    [] -> [0 .. pClauseCount p - 1]
-    (s : ss) -> IS.toAscList (foldl' IS.intersection s ss)
+-- | Candidate clause ordinals for dereferenced argument words: the first
+-- bound argument at a selective position decides. Selection only skips
+-- clauses whose heads cannot match, so any sound choice preserves answers.
+candidateClauses :: Store -> Pred -> IO [Int]
+candidateClauses store p
+  | not (pIndexed p) = pure (all' p)
+  | otherwise = go (pIndex p) 0
   where
-    restrict (ArgIndex keyed open) k = IS.union open (Map.findWithDefault IS.empty k keyed)
+    all' predicate = [0 .. pClauseCount predicate - 1]
+    go (index : rest) !i
+      | not (aiSelective index) = go rest (i + 1)
+      | otherwise = do
+          w <- readArg store i >>= deref store
+          if tagOf w == tagRef
+            then go rest (i + 1)
+            else
+              if tagOf w == tagStr
+                then do
+                  f <- readCell store (valOf w)
+                  pure (IM.findWithDefault (aiOpen index) (funKey f) (aiFast index))
+                else
+                  if tagOf w == tagBox
+                    then do
+                      key <- keyOfWord store w
+                      pure (maybe (aiOpen index) (\k -> Map.findWithDefault (aiOpen index) k (aiBoxed index)) key)
+                    else pure (IM.findWithDefault (aiOpen index) w (aiFast index))
+    go [] _ = pure (all' p)
 
 compileClause :: Ctx -> S.Clause -> IO Clause
 compileClause ctx clause = do

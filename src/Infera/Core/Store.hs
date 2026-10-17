@@ -21,7 +21,7 @@ module Infera.Core.Store
   ( -- * Words
     Word',
     tagRef, tagStr, tagFun, tagInt, tagAtm, tagBox, tagChr,
-    tagOf, valOf, mkWord, refWord, strWord, funWord, funId, funArity,
+    tagOf, valOf, mkWord, refWord, strWord, funWord, funId, funArity, funKey, funGround, groundBit,
     intWord, atmWord, boxWord, chrWord, fitsImmediate,
     -- * Boxed constants and symbols
     Boxed (..),
@@ -33,7 +33,9 @@ module Infera.Core.Store
     heapTop, setHeapTop, trailTop, setTrailTop, hb, setHb,
     outLen, setOutLen, arithData, bumpArithData, freshId, setFreshId,
     readCell, writeCell, pushCell, allocCells, allocSlots, markerWord, logicalId,
-    deref, bind, unwindTrail, trailIf,
+    readArg, writeArg, saveArgs, loadArgs,
+    deref, bind, unwindTrail, trailIf, trailValueIf,
+    structureWord,
     box, boxed,
     -- * Unification and equality
     unify, equiv, isGroundWord, occursIn,
@@ -45,7 +47,7 @@ where
 import Control.Monad (when)
 import Data.Array.Base (getNumElements, unsafeRead, unsafeWrite)
 import Data.Array.IO (IOArray, IOUArray, newArray, newArray_)
-import Data.Bits (shiftL, shiftR, (.&.), (.|.))
+import Data.Bits (complement, shiftL, shiftR, (.&.), (.|.))
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
@@ -87,7 +89,8 @@ intWord :: Int -> Word'
 intWord = mkWord tagInt
 {-# INLINE intWord #-}
 
--- | Functor words pack the arity in the low 20 bits of the value.
+-- | Functor words pack the arity in the low 19 bits of the value; the next
+-- bit is the ground memo: set once the structure has been found ground.
 funWord :: Int -> Int -> Word'
 funWord fid arity = mkWord tagFun ((fid `shiftL` 20) .|. arity)
 {-# INLINE funWord #-}
@@ -97,8 +100,20 @@ funId w = valOf w `shiftR` 20
 {-# INLINE funId #-}
 
 funArity :: Word' -> Int
-funArity w = valOf w .&. 0xFFFFF
+funArity w = valOf w .&. 0x7FFFF
 {-# INLINE funArity #-}
+
+groundBit :: Int
+groundBit = 1 `shiftL` 22
+
+-- | The functor word without its ground memo, for comparisons and keys.
+funKey :: Word' -> Word'
+funKey w = w .&. complement groundBit
+{-# INLINE funKey #-}
+
+funGround :: Word' -> Bool
+funGround w = w .&. groundBit /= 0
+{-# INLINE funGround #-}
 
 fitsImmediate :: Integer -> Bool
 fitsImmediate n = n >= -(2 ^ (60 :: Int)) && n < 2 ^ (60 :: Int)
@@ -148,7 +163,7 @@ functorName :: Symbols -> Int -> IO (String, Int)
 functorName symbols i = (IM.! i) <$> readIORef (functorNames symbols)
 
 -- Register slots of the unboxed register file.
-rH, rTR, rHB, rOUT, rBOX, rARITH, rFRESH :: Int
+rH, rTR, rHB, rOUT, rBOX, rARITH, rFRESH, rCAP :: Int
 rH = 0
 rTR = 1
 rHB = 2
@@ -156,22 +171,60 @@ rOUT = 3
 rBOX = 4
 rARITH = 5
 rFRESH = 6
+rCAP = 7
 
 data Store = Store
   { cells :: !(IORef (IOUArray Int Int)),
     trail :: !(IORef (IOUArray Int Int)),
     boxes :: !(IORef (IOArray Int Boxed)),
     regs :: !(IOUArray Int Int),
+    -- | argument registers of the call being made
+    argRegs :: !(IOUArray Int Int),
     symbols :: !Symbols
   }
 
+initialCells :: Int
+initialCells = 65536
+
 newStore :: Symbols -> IO Store
 newStore syms = do
-  cs <- newArray (0, 65535) 0
+  cs <- newArray (0, initialCells - 1) 0
   tr <- newArray (0, 4095) 0
   bx <- newArray_ (0, 255)
   rs <- newArray (0, 15) 0
-  Store <$> newIORef cs <*> newIORef tr <*> newIORef bx <*> pure rs <*> pure syms
+  unsafeWrite rs rCAP initialCells
+  ar <- newArray (0, 4095) 0
+  Store <$> newIORef cs <*> newIORef tr <*> newIORef bx <*> pure rs <*> pure ar <*> pure syms
+
+readArg :: Store -> Int -> IO Word'
+readArg s = unsafeRead (argRegs s)
+{-# INLINE readArg #-}
+
+writeArg :: Store -> Int -> Word' -> IO ()
+writeArg s = unsafeWrite (argRegs s)
+{-# INLINE writeArg #-}
+
+-- | Copy the first @n@ argument registers to the heap for a choice point;
+-- returns the address of the copy.
+saveArgs :: Store -> Int -> IO Int
+saveArgs s n = do
+  top <- heapTop s
+  ensureCells s (top + n)
+  arr <- readIORef (cells s)
+  let go !i
+        | i >= n = pure ()
+        | otherwise = unsafeRead (argRegs s) i >>= unsafeWrite arr (top + i) >> go (i + 1)
+  go 0
+  setHeapTop s (top + n)
+  pure top
+
+loadArgs :: Store -> Int -> Int -> IO ()
+loadArgs s addr n = do
+  arr <- readIORef (cells s)
+  let go !i
+        | i >= n = pure ()
+        | otherwise = unsafeRead arr (addr + i) >>= unsafeWrite (argRegs s) i >> go (i + 1)
+  go 0
 
 heapTop, trailTop, hb, outLen, arithData, freshId :: Store -> IO Int
 heapTop s = unsafeRead (regs s) rH
@@ -214,17 +267,23 @@ writeCell s i w = do
 
 ensureCells :: Store -> Int -> IO ()
 ensureCells s needed = do
+  capacity <- unsafeRead (regs s) rCAP
+  when (needed > capacity) (growCells s needed)
+{-# INLINE ensureCells #-}
+
+growCells :: Store -> Int -> IO ()
+growCells s needed = do
   arr <- readIORef (cells s)
   size <- getNumElements arr
-  when (needed > size) $ do
-    let size' = max needed (size * 2)
-    arr' <- newArray (0, size' - 1) 0
-    top <- heapTop s
-    let copy !i
-          | i >= top = pure ()
-          | otherwise = unsafeRead arr i >>= unsafeWrite arr' i >> copy (i + 1)
-    copy 0
-    writeIORef (cells s) arr'
+  let size' = max needed (size * 2)
+  arr' <- newArray (0, size' - 1) 0
+  top <- heapTop s
+  let copy !i
+        | i >= top = pure ()
+        | otherwise = unsafeRead arr i >>= unsafeWrite arr' i >> copy (i + 1)
+  copy 0
+  writeIORef (cells s) arr'
+  unsafeWrite (regs s) rCAP size'
 
 -- | Append one word and return its address.
 pushCell :: Store -> Word' -> IO Int
@@ -283,37 +342,73 @@ logicalId s addr = do
             if tagOf w == tagFun then pure (Just (valOf w + (addr - i - 1))) else go (i - 1)
   go (addr - 1)
 
+-- | Build a structure from a functor word and argument words, setting the
+-- ground memo when every argument is ground now.
+structureWord :: Store -> Word' -> [Word'] -> IO Word'
+structureWord s functor args = do
+  ground <- allGround args
+  addr <- pushCell s (if ground then functor .|. groundBit else functor)
+  mapM_ (pushCell s) args
+  pure (strWord addr)
+  where
+    allGround [] = pure True
+    allGround (w : ws) = do
+      g <- groundNow w
+      if g then allGround ws else pure False
+    groundNow w = case tagOf w of
+      t | t == tagRef -> do
+            d <- deref s w
+            if tagOf d == tagRef then pure False else groundNow d
+        | t == tagStr -> funGround <$> readCell s (valOf w)
+        | otherwise -> pure True
+
 -- | Follow reference chains. The result is either a non-REF word or the
 -- REF of an unbound cell.
 deref :: Store -> Word' -> IO Word'
 deref s !w
   | tagOf w == tagRef = do
-      w' <- readCell s (valOf w)
-      if w' == w then pure w else deref s w'
+      arr <- readIORef (cells s)
+      let go !v = do
+            v' <- unsafeRead arr (valOf v)
+            if v' == v || tagOf v' /= tagRef then pure v' else go v'
+      go w
   | otherwise = pure w
 {-# INLINE deref #-}
+
+-- Trail entries: an even entry @2*addr@ resets the cell to unbound; an odd
+-- entry @2*addr+1@ restores the word pushed just below it.
+pushTrail :: Store -> Int -> IO ()
+pushTrail s entry = do
+  tr <- readIORef (trail s)
+  top <- trailTop s
+  size <- getNumElements tr
+  tr' <-
+    if top < size
+      then pure tr
+      else do
+        grown <- newArray (0, size * 2 - 1) 0
+        let copy !i
+              | i >= top = pure ()
+              | otherwise = unsafeRead tr i >>= unsafeWrite grown i >> copy (i + 1)
+        copy 0
+        writeIORef (trail s) grown
+        pure grown
+  unsafeWrite tr' top entry
+  setTrailTop s (top + 1)
 
 trailIf :: Store -> Int -> IO ()
 trailIf s addr = do
   boundary <- hb s
-  when (addr < boundary) $ do
-    tr <- readIORef (trail s)
-    top <- trailTop s
-    size <- getNumElements tr
-    tr' <-
-      if top < size
-        then pure tr
-        else do
-          grown <- newArray (0, size * 2 - 1) 0
-          let copy !i
-                | i >= top = pure ()
-                | otherwise = unsafeRead tr i >>= unsafeWrite grown i >> copy (i + 1)
-          copy 0
-          writeIORef (trail s) grown
-          pure grown
-    unsafeWrite tr' top addr
-    setTrailTop s (top + 1)
+  when (addr < boundary) (pushTrail s (addr * 2))
 {-# INLINE trailIf #-}
+
+-- | Record the previous word of a cell whose value changes in place (the
+-- ground memo), so backtracking restores it.
+trailValueIf :: Store -> Int -> Word' -> IO ()
+trailValueIf s addr old = do
+  boundary <- hb s
+  when (addr < boundary) (pushTrail s old >> pushTrail s (addr * 2 + 1))
+{-# INLINE trailValueIf #-}
 
 -- | Bind the unbound cell at @addr@ to @w@.
 bind :: Store -> Int -> Word' -> IO ()
@@ -331,9 +426,16 @@ unwindTrail s mark = do
   let go !i
         | i < mark = pure ()
         | otherwise = do
-            addr <- unsafeRead tr i
-            unsafeWrite arr addr (refWord addr)
-            go (i - 1)
+            entry <- unsafeRead tr i
+            if even entry
+              then do
+                let addr = entry `shiftR` 1
+                unsafeWrite arr addr (refWord addr)
+                go (i - 1)
+              else do
+                old <- unsafeRead tr (i - 1)
+                unsafeWrite arr (entry `shiftR` 1) old
+                go (i - 2)
   go (top - 1)
   setTrailTop s mark
 
@@ -381,7 +483,7 @@ unify s a0 b0 = do
         | ta == tagStr && tb == tagStr -> do
             fa <- readCell s (valOf a)
             fb <- readCell s (valOf b)
-            if fa /= fb
+            if funKey fa /= funKey fb
               then pure False
               else args (valOf a + 1) (valOf b + 1) (funArity fa)
         | ta == tagBox && tb == tagBox -> do
@@ -424,7 +526,7 @@ equiv s a0 b0 = do
         | ta == tagStr && tb == tagStr -> do
             fa <- readCell s (valOf a)
             fb <- readCell s (valOf b)
-            if fa /= fb then pure False else args (valOf a + 1) (valOf b + 1) (funArity fa)
+            if funKey fa /= funKey fb then pure False else args (valOf a + 1) (valOf b + 1) (funArity fa)
         | ta == tagBox && tb == tagBox -> sameBoxed <$> boxed s a <*> boxed s b
         | otherwise -> pure False
   where
@@ -436,6 +538,9 @@ equiv s a0 b0 = do
           ok <- equiv s x y
           if ok then args (i + 1) (j + 1) (n - 1) else pure False
 
+-- | Groundness, memoised in the functor cell: a structure found ground is
+-- marked, and the mark is trailed when a choice point could undo a binding
+-- inside it.
 isGroundWord :: Store -> Word' -> IO Bool
 isGroundWord s w0 = do
   w <- deref s w0
@@ -443,7 +548,14 @@ isGroundWord s w0 = do
     t | t == tagRef -> pure False
       | t == tagStr -> do
           f <- readCell s (valOf w)
-          args (valOf w + 1) (funArity f)
+          if funGround f
+            then pure True
+            else do
+              ok <- args (valOf w + 1) (funArity f)
+              when ok $ do
+                writeCell s (valOf w) (f .|. groundBit)
+                trailValueIf s (valOf w) f
+              pure ok
       | otherwise -> pure True
   where
     args !i !n
@@ -460,7 +572,7 @@ occursIn s addr w0 = do
     t | t == tagRef -> pure (valOf w == addr)
       | t == tagStr -> do
           f <- readCell s (valOf w)
-          args (valOf w + 1) (funArity f)
+          if funGround f then pure False else args (valOf w + 1) (funArity f)
       | otherwise -> pure False
   where
     args !i !n
@@ -491,9 +603,7 @@ importTerm s table term = case term of
   Compound f as -> do
     fid <- internFunctor (symbols s) f (length as)
     words' <- mapM (importTerm s table) as
-    base <- pushCell s (funWord fid (length as))
-    mapM_ (pushCell s) words'
-    pure (strWord base)
+    structureWord s (funWord fid (length as)) words'
 
 -- | Read a term back. Unbound cells take the id their activation marker
 -- gives them; cells without a marker are named by first occurrence from

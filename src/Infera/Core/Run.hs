@@ -63,7 +63,8 @@ data Choice = Choice
   }
 
 data Alt
-  = AltClauses !Pred [Int] [Word'] !Int Cont
+  = -- | remaining candidates, saved argument address, depth, continuation
+    AltClauses !Pred [Int] !Int !Int Cont
   | AltGoals [Goal] !Int !Int !Int Cont
   | AltGuard !PredKey !S.Det !(IORef Bool)
   | AltNot !(IORef Bool) !(IORef [SearchItem]) Cont
@@ -209,9 +210,7 @@ run m cont = case cont of
   CDone -> do
     state <- exportState m
     pure (Yield (Found state) (backtrack m))
-  CGoals [] _ _ _ next -> run m next
-  CGoals (goal : goals) base barrier depth next ->
-    step m goal base barrier depth (CGoals goals base barrier depth next)
+  CGoals goals base barrier depth next -> runGoals m goals base barrier depth next
   CReturn commitHeight guard check next -> do
     problem <- case check of
       Nothing -> pure Nothing
@@ -250,18 +249,24 @@ dropEmpty :: Cont -> Cont
 dropEmpty (CGoals [] _ _ _ next) = dropEmpty next
 dropEmpty cont = cont
 
-step :: Machine -> Goal -> Int -> Int -> Int -> Cont -> IO Step
-step m goal base barrier depth rest = case goal of
-  GTrue -> run m rest
+-- | Run a goal list. The continuation is materialised only where a call,
+-- a choice point or a scope needs a value.
+runGoals :: Machine -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
+runGoals m [] _ _ _ next = run m next
+runGoals m (goal : goals) base barrier depth next = step m goal goals base barrier depth next
+
+step :: Machine -> Goal -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
+step m goal goals base barrier depth next = case goal of
+  GTrue -> continue
   GFail -> backtrack m
-  GCut -> cutTo m barrier >> run m rest
-  GAnd goals -> run m (CGoals goals base barrier depth rest)
+  GCut -> cutTo m barrier >> continue
+  GAnd inner -> runGoals m (inner ++ goals) base barrier depth next
   GCall ref patterns -> do
     predicate <- readIORef ref
-    args <- mapM (buildArg m base True) patterns
+    buildArgs m base patterns 0
     pending <- arithData (mStore m)
-    normalized <- if pending > 0 then mapM (normalizeWord m) args else pure args
-    callPredicate m predicate normalized (dropEmpty rest)
+    when (pending > 0) (normalizeArgs m (pArity predicate))
+    callPredicate m predicate (if null goals then next else CGoals goals base barrier depth next)
   GCallDyn direct callable extra -> do
     word <- buildArg m base False callable
     extraTerms <- mapM (\p -> buildArg m base False p >>= exportGoal m) extra
@@ -279,17 +284,17 @@ step m goal base barrier depth rest = case goal of
         | otherwise -> do
             compiled <- compileGoalTerm (mStore m) (mProgram m) (cpPreds (mCore m)) goalWith
             height <- readIORef (mChoiceTop m)
-            run m (CGoals [compiled] base height depth rest)
+            runGoals m [compiled] base height depth rest
   GUnify a b -> do
     wa <- buildArg m base False a
     wb <- buildArg m base False b
     ok <- unify (mStore m) wa wb
-    if ok then run m rest else backtrack m
+    if ok then continue else backtrack m
   GEquiv a b -> do
     wa <- buildArg m base False a
     wb <- buildArg m base False b
     ok <- equiv (mStore m) wa wb
-    if ok then run m rest else backtrack m
+    if ok then continue else backtrack m
   GNeq a b -> do
     wa <- buildArg m base False a
     wb <- buildArg m base False b
@@ -298,82 +303,100 @@ step m goal base barrier depth rest = case goal of
     if ga && gb
       then do
         same <- equiv (mStore m) wa wb
-        if same then backtrack m else run m rest
+        if same then backtrack m else continue
       else pure (Abandon "disequality constraint on non-ground operands")
   GIs target expr -> do
-    value <- evalExpr m base expr
-    case value of
-      Left err -> raiseError m err
-      Right Nothing -> do
-        shown <- exprTerm m base expr
-        raiseError m (InstantiationError shown)
-      Right (Just number) -> do
+    quick <- evalFast m base expr
+    if quick /= noFast
+      then do
         wt <- buildArg m base False target
-        wv <- numberWord (mStore m) number
-        ok <- unify (mStore m) wt wv
-        if ok then run m rest else backtrack m
+        ok <- unify (mStore m) wt (intWord quick)
+        if ok then continue else backtrack m
+      else do
+        value <- evalExpr m base expr
+        case value of
+          Left err -> raiseError m err
+          Right Nothing -> do
+            shown <- exprTerm m base expr
+            raiseError m (InstantiationError shown)
+          Right (Just number) -> do
+            wt <- buildArg m base False target
+            wv <- numberWord (mStore m) number
+            ok <- unify (mStore m) wt wv
+            if ok then continue else backtrack m
   GCmp op a b -> do
-    outcome <- compareGoal m base a b
-    case outcome of
-      Left err -> raiseError m err
-      Right ordering -> if cmpAccepts op ordering then run m rest else backtrack m
+    qa <- evalFast m base a
+    qb <- if qa == noFast then pure noFast else evalFast m base b
+    if qb /= noFast
+      then if cmpAccepts op (compare qa qb) then continue else backtrack m
+      else do
+        outcome <- compareGoal m base a b
+        case outcome of
+          Left err -> raiseError m err
+          Right ordering -> if cmpAccepts op ordering then continue else backtrack m
   GOr left right -> do
     _ <- pushChoice m (AltGoals right base barrier depth rest)
-    run m (CGoals left base barrier depth rest)
+    runGoals m left base barrier depth rest
   GIf condition thenGoals elseGoals -> do
     counter <- newIORef 0
     sentinel <- pushChoice m (AltIf counter (fmap (\gs -> (gs, base, barrier, depth)) elseGoals) rest)
     pushScope m (SCount counter)
-    run m (CGoals condition base (sentinel + 1) depth (CExitIf sentinel thenGoals base barrier depth rest))
-  GOnce goals -> step m (GIf goals [] Nothing) base barrier depth rest
-  GNot goals -> do
+    runGoals m condition base (sentinel + 1) depth (CExitIf sentinel thenGoals base barrier depth rest)
+  GOnce inner -> step m (GIf inner [] Nothing) goals base barrier depth next
+  GNot inner -> do
     flag <- newIORef False
     buffer <- newIORef []
     sentinel <- pushChoice m (AltNot flag buffer rest)
     pushScope m (SBuffer buffer)
-    run m (CGoals goals base (sentinel + 1) depth (CExitNot sentinel flag depth))
-  GFindAll template goals target -> do
+    runGoals m inner base (sentinel + 1) depth (CExitNot sentinel flag depth)
+  GFindAll template inner target -> do
     results <- newIORef []
     buffer <- newIORef []
     entryHeap <- heapTop (mStore m)
     entryOut <- outLen (mStore m)
     sentinel <- pushChoice m (AltFindAll results buffer target base depth rest)
     pushScope m (SBuffer buffer)
-    run m (CGoals goals base (sentinel + 1) depth (CExitFindAll sentinel results template base entryHeap entryOut depth))
+    runGoals m inner base (sentinel + 1) depth (CExitFindAll sentinel results template base entryHeap entryOut depth)
   GCheck check pattern -> do
     word <- buildArg m base False pattern
     ok <- typeCheck m check word
-    if ok then run m rest else backtrack m
+    if ok then continue else backtrack m
   GWrite newline pattern -> do
     word <- buildArg m base False pattern
     term <- exportFor m word
     emitOutput m (WriteEvent (showValue (deepEval emptySubst term)))
     when newline (emitOutput m NewlineEvent)
-    run m rest
-  GNl -> emitOutput m NewlineEvent >> run m rest
+    continue
+  GNl -> emitOutput m NewlineEvent >> continue
   GError err -> raiseError m err
   GUnsupported term -> pure (Abandon ("unsupported goal " ++ show term))
+  where
+    continue = runGoals m goals base barrier depth next
+    rest = CGoals goals base barrier depth next
 
 -- ─── calls ───────────────────────────────────────────────────────────────────
 
-callPredicate :: Machine -> Pred -> [Word'] -> Cont -> IO Step
-callPredicate m predicate args cont = do
+-- | Call with the arguments in the registers.
+callPredicate :: Machine -> Pred -> Cont -> IO Step
+callPredicate m predicate cont = do
   let s = mStore m
       key = pKey predicate
-  derefs <- mapM (deref s) args
-  selected <- selectSignature m predicate derefs
+      n = pArity predicate
+  selected <- selectSignature m predicate
   case selected of
     Left err -> raiseError m err
     Right signature -> do
-      commits <- commitsAfterSuccess m predicate signature derefs
+      commits <- commitsAfterSuccess m predicate signature
       let required = case signature of
             Just sig | P.sigDet sig == S.Det -> Just S.Det
             Just sig | P.sigDet sig == S.Multi -> Just S.Multi
             _ -> Nothing
-          checked = case signature of
-            Just sig -> Just (key, sig, args)
-            Nothing -> Nothing
-          depth = contDepth cont + 1
+      checked <- case signature of
+        Just sig -> do
+          args <- mapM (readArg s) [0 .. n - 1]
+          pure (Just (key, sig, args))
+        Nothing -> pure Nothing
+      let depth = contDepth cont + 1
       if depth > maxResolutionDepth
         then raiseItems m [BranchExhausted] (backtrack m)
         else do
@@ -388,34 +411,49 @@ callPredicate m predicate args cont = do
                 (False, Nothing, Nothing, _) -> cont
                 (True, Nothing, Nothing, CReturn _ Nothing Nothing _) -> cont
                 _ -> CReturn (if commits then entry else -1) guard checked cont
-          keys <- if pIndexed predicate then mapM (keyOfWord s) derefs else pure []
-          case candidateClauses predicate keys of
+          candidates <- candidateClauses s predicate
+          case candidates of
             [] -> backtrack m
             [ordinal] -> do
               barrier <- readIORef (mChoiceTop m)
-              tryClause m predicate ordinal args barrier depth returnCont
+              tryClause m predicate ordinal barrier depth returnCont
             (ordinal : more) -> do
-              barrier <- pushChoice m (AltClauses predicate more args depth returnCont)
-              tryClause m predicate ordinal args barrier depth returnCont
+              saved <- saveArgs s n
+              barrier <- pushChoice m (AltClauses predicate more saved depth returnCont)
+              tryClause m predicate ordinal barrier depth returnCont
 
-tryClause :: Machine -> Pred -> Int -> [Word'] -> Int -> Int -> Cont -> IO Step
-tryClause m predicate ordinal args barrier depth cont = do
+-- | Try one clause against the argument registers.
+tryClause :: Machine -> Pred -> Int -> Int -> Int -> Cont -> IO Step
+tryClause m predicate ordinal barrier depth cont = do
   let clause = pClauses predicate ! ordinal
       s = mStore m
   fresh <- freshId s
   setFreshId s (fresh + clVars clause)
   base <- allocSlots s fresh (clVars clause)
-  ok <- matchHead m base (clHead clause) args
+  ok <- matchHead m base (clHead clause) 0
   if ok
-    then run m (CGoals (clBody clause) base barrier depth cont)
+    then runGoals m (clBody clause) base barrier depth cont
     else backtrack m
 
-matchHead :: Machine -> Int -> [Pattern] -> [Word'] -> IO Bool
+matchHead :: Machine -> Int -> [Pattern] -> Int -> IO Bool
 matchHead _ _ [] _ = pure True
-matchHead m base (pattern : patterns) (arg : args) = do
+matchHead m base (pattern : patterns) !i = do
+  arg <- readArg (mStore m) i
   ok <- unifyPattern m base pattern arg
-  if ok then matchHead m base patterns args else pure False
-matchHead _ _ _ [] = pure True
+  if ok then matchHead m base patterns (i + 1) else pure False
+
+-- | Build call arguments into the registers.
+buildArgs :: Machine -> Int -> [Pattern] -> Int -> IO ()
+buildArgs _ _ [] _ = pure ()
+buildArgs m base (pattern : patterns) !i = do
+  w <- buildArg m base True pattern
+  writeArg (mStore m) i w
+  buildArgs m base patterns (i + 1)
+
+normalizeArgs :: Machine -> Int -> IO ()
+normalizeArgs m n = forM_ [0 .. n - 1] $ \i -> do
+  w <- readArg (mStore m) i
+  normalizeWord m w >>= writeArg (mStore m) i
 
 -- | Match a head pattern against a word, building only where the word is
 -- an unbound variable.
@@ -432,7 +470,7 @@ unifyPattern m base pattern word = case pattern of
             if cyclic then pure False else bind s (valOf d) built >> pure True
         | t == tagStr -> do
             f <- readCell s (valOf d)
-            if f /= functor then pure False else matchChildren (valOf d + 1) children
+            if funKey f /= functor then pure False else matchChildren (valOf d + 1) children
         | otherwise -> pure False
   PArith {} -> do
     built <- buildArg m base False pattern
@@ -474,10 +512,7 @@ buildArg m base normalize pattern = case pattern of
     s = mStore m
 
 structure :: Store -> Word' -> [Word'] -> IO Word'
-structure s functor words' = do
-  addr <- pushCell s functor
-  mapM_ (pushCell s) words'
-  pure (strWord addr)
+structure = structureWord
 
 -- | Evaluate arithmetic data inside call arguments once such data exists.
 normalizeWord :: Machine -> Word' -> IO Word'
@@ -490,7 +525,7 @@ normalizeWord m w0 = do
       let n = funArity f
       children <- forM [1 .. n] $ \i -> readCell s (valOf w + i) >>= deref s
       normalized <- mapM (normalizeWord m) children
-      case IM.lookup f (cpArith (mCore m)) of
+      case IM.lookup (funKey f) (cpArith (mCore m)) of
         Just op -> do
           operands <- mapM (evalWord m) normalized
           case applyOp op operands of
@@ -501,7 +536,7 @@ normalizeWord m w0 = do
     s = mStore m
     rebuild f children normalized w
       | and (zipWith (==) children normalized) = pure w
-      | otherwise = structure s f normalized
+      | otherwise = structure s (funKey f) normalized
 
 -- ─── backtracking ────────────────────────────────────────────────────────────
 
@@ -520,11 +555,12 @@ backtrack m = do
       truncateScopes m (chScopes choice)
       setFreshId s (chFresh choice)
       case chAlt choice of
-        AltClauses predicate (ordinal : more) args depth cont -> do
+        AltClauses predicate (ordinal : more) saved depth cont -> do
+          loadArgs s saved (pArity predicate)
           if null more
             then writeIORef (mChoiceTop m) index >> refreshHb m
-            else writeChoice m index choice {chAlt = AltClauses predicate more args depth cont}
-          tryClause m predicate ordinal args index depth cont
+            else writeChoice m index choice {chAlt = AltClauses predicate more saved depth cont}
+          tryClause m predicate ordinal index depth cont
         AltClauses _ [] _ _ _ -> pop >> backtrack m
         AltGoals goals base barrier depth cont -> do
           pop
@@ -594,7 +630,7 @@ copyOut m entryHeap word = do
             | t == tagStr -> do
                 f <- readCell s (valOf w)
                 children <- forM [1 .. funArity f] $ \i -> readCell s (valOf w + i) >>= go
-                pure (CpStruct f children)
+                pure (CpStruct (funKey f) children)
             | otherwise -> pure (CpWord w)
   go word
   where
@@ -630,6 +666,50 @@ outputSince m entryOut = do
 
 -- ─── arithmetic ──────────────────────────────────────────────────────────────
 
+-- | Sentinel for the immediate-integer fast path: no immediate value is
+-- 'minBound', because immediates have 61 bits.
+noFast :: Int
+noFast = minBound
+
+-- | Evaluate an expression when every operand is an immediate integer and
+-- every intermediate result fits; otherwise 'noFast', and the general
+-- evaluator decides the outcome (including errors).
+evalFast :: Machine -> Int -> Expr -> IO Int
+evalFast m base expr = case expr of
+  EImm i -> pure i
+  EPat (PSlot i) -> immediate (refWord (base + i))
+  EPat (PWord w) -> immediate w
+  EOp op [a, b] -> do
+    x <- evalFast m base a
+    if x == noFast
+      then pure noFast
+      else do
+        y <- evalFast m base b
+        if y == noFast then pure noFast else pure (binaryFast op x y)
+  EOp op [a] -> do
+    x <- evalFast m base a
+    pure $ if x == noFast then noFast else case op of
+      OpNeg -> fits (negate x)
+      OpAbs -> fits (abs x)
+      _ -> noFast
+  _ -> pure noFast
+  where
+    immediate w0 = do
+      w <- deref (mStore m) w0
+      pure (if tagOf w == tagInt then valOf w else noFast)
+    fits r = if r >= -(2 ^ (60 :: Int)) && r < 2 ^ (60 :: Int) then r else noFast
+    binaryFast op x y = case op of
+      OpPlus -> fits (x + y)
+      OpMinus -> fits (x - y)
+      OpMul
+        | abs x < 2 ^ (30 :: Int) && abs y < 2 ^ (30 :: Int) -> x * y
+        | otherwise -> noFast
+      OpDiv -> if y == 0 then noFast else fits (x `div` y)
+      OpMod -> if y == 0 then noFast else x `mod` y
+      OpMin -> min x y
+      OpMax -> max x y
+      _ -> noFast
+
 evalExpr :: Machine -> Int -> Expr -> IO (Either SolveError (Maybe NumericValue))
 evalExpr m base expr = case expr of
   EImm i -> pure (Right (Just (NVInt (toInteger i))))
@@ -653,7 +733,7 @@ evalWord m w0 = do
             BStr _ -> Left . ExpectedNumber <$> exportFor m w
       | t == tagStr -> do
           f <- readCell s (valOf w)
-          case IM.lookup f (cpArith (mCore m)) of
+          case IM.lookup (funKey f) (cpArith (mCore m)) of
             Just op -> do
               children <- forM [1 .. funArity f] $ \i -> readCell s (valOf w + i)
               applyOp op <$> mapM (evalWord m) children
@@ -800,17 +880,18 @@ typeCheck m check w0 = do
       | w == cpNil (mCore m) = pure True
       | tagOf w == tagStr = do
           f <- readCell s (valOf w)
-          if f /= cpCons (mCore m)
+          if funKey f /= cpCons (mCore m)
             then pure False
             else readCell s (valOf w + 2) >>= deref s >>= properList
       | otherwise = pure False
 
 -- ─── contracts ───────────────────────────────────────────────────────────────
 
-selectSignature :: Machine -> Pred -> [Word'] -> IO (Either SolveError (Maybe P.Signature))
-selectSignature m predicate args = case pDecls predicate of
+selectSignature :: Machine -> Pred -> IO (Either SolveError (Maybe P.Signature))
+selectSignature m predicate = case pDecls predicate of
   [] -> pure (Right Nothing)
   sigs -> do
+    args <- mapM (readArg s) [0 .. pArity predicate - 1]
     grounds <- mapM (isGroundWord s) args
     let inOk sig = and [g | (S.ArgSpec _ mode, g) <- zip (P.sigArgs sig) grounds, mode == S.ModeIn]
     case filter inOk sigs of
@@ -854,7 +935,7 @@ sortMatches m sort w0 = do
         | w == cpNil (mCore m) -> pure True
         | tag == tagStr -> do
             f <- readCell s (valOf w)
-            if f /= cpCons (mCore m)
+            if funKey f /= cpCons (mCore m)
               then pure False
               else do
                 hd <- readCell s (valOf w + 1)
@@ -881,14 +962,15 @@ checkOutputs m key signature args =
           ok <- sortMatches m sort w
           if ok then pure Nothing else Just . SortError key i sort <$> exportFor m w
 
-commitsAfterSuccess :: Machine -> Pred -> Maybe P.Signature -> [Word'] -> IO Bool
-commitsAfterSuccess m predicate signature args = case signature of
+commitsAfterSuccess :: Machine -> Pred -> Maybe P.Signature -> IO Bool
+commitsAfterSuccess m predicate signature = case signature of
   Just sig -> pure (P.sigDet sig == S.Det || P.sigDet sig == S.Semidet)
   Nothing -> do
     let inferred = pInferred predicate
+        n = pArity predicate
     if P.sigDet inferred /= S.Semidet
       then pure False
-      else allM (\i -> if i < length args then isGroundWord (mStore m) (args !! i) else pure False) (P.sigSwitch inferred)
+      else allM (\i -> if i < n then readArg (mStore m) i >>= isGroundWord (mStore m) else pure False) (P.sigSwitch inferred)
   where
     allM _ [] = pure True
     allM p (x : xs) = do
