@@ -127,7 +127,11 @@ reference's limit.
 What remains: `det` still costs one guard record per call (24 bytes) for
 the failure obligation, since a call that could fail must be able to report
 it; `semidet` carries no such obligation and is the declaration to use for
-deterministic loops. Steps 2-4 below are not started.
+deterministic loops. Undeclared code is unaffected: the CLI harness after
+this step records reverse 0.42 s, loop 0.031 s, fib 0.068 s and queens
+0.031 s, the same as before it. Steps 2-4 below are not started; of them,
+only the guard commit (3) is expected to be measurable, and only on
+predicates whose clauses are selected by guards rather than by indexing.
 
 ## Order of work
 
