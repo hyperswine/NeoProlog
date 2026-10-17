@@ -74,6 +74,8 @@ type PredRef = IORef Pred
 
 data Goal
   = GCall !PredRef [Pattern]
+  | -- | a call to a tabled predicate
+    GTabled !PredRef [Pattern]
   | -- | a variable goal (True) or @call/N@ (False): a goal word plus extra arguments
     GCallDyn !Bool Pattern [Pattern]
   | GAnd [Goal]
@@ -410,7 +412,7 @@ compileGoal ctx term = case term of
     userCall f as = case Map.lookup (f, length as) (ctxPreds ctx) of
       Just ref
         | Just p <- P.lookupPred (f, length as) (ctxProgram ctx), P.predIsTabled (ctxProgram ctx) p ->
-            unsupported ("tabled predicate " ++ f ++ "/" ++ show (length as))
+            GTabled ref <$> mapM arg as
         | Just p <- P.lookupPred (f, length as) (ctxProgram ctx), P.predIsDynamic (ctxProgram ctx) p ->
             unsupported ("dynamic predicate " ++ f ++ "/" ++ show (length as))
         | otherwise -> GCall ref <$> mapM arg as

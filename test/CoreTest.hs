@@ -13,7 +13,7 @@ import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Machine.Control as Machine
 
 parityFiles :: [FilePath]
-parityFiles = ["test/core/parity-basic.nprolog", "test/core/parity-edge.nprolog"]
+parityFiles = ["test/core/parity-basic.nprolog", "test/core/parity-edge.nprolog", "test/core/parity-tabling.nprolog"]
 
 data Observed = Observed [String] [String] Bool deriving (Eq, Show)
 

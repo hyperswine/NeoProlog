@@ -1,0 +1,41 @@
+edge a b. edge b c. edge c a. edge c d.
+path X Y <- edge X Y.
+path X Y <- path X Z, edge Z Y.
+fib 0 0.
+fib 1 1.
+fib N F <- N > 1, N1 is N - 1, N2 is N - 2, fib N1 F1, fib N2 F2, F is F1 + F2.
+even 0.
+even N <- N > 0, M is N - 1, odd M.
+odd N <- N > 0, M is N - 1, even M.
+same X X.
+count_to : table.
+count_to 0 [].
+count_to N [N | T] <- N > 0, M is N - 1, count_to M T.
+loud : unsafe.
+loud : table.
+loud 0.
+loud N <- N > 0, writeln N, M is N - 1, loud M.
+bad : table.
+bad 0.
+bad N <- N > 0, M is N - foo, bad M.
+reach_count N <- findall Y (path a Y) L, len L N.
+len [] 0.
+len [_ | T] N <- len T M, N is M + 1.
+nat 0.
+nat N <- nat M, M < 3, N is M + 1.
+> path a X?
+> path X d?
+> path d X?
+> fib 20 F?
+> even 10, not (odd 10)?
+> odd 7?
+> count_to 3 L?
+> loud 2?
+> bad 2?
+> reach_count N?
+> not (path d a)?
+> findall X (path b X) L?
+> (path a X -> Y = yes ; Y = no)?
+> once (path c X)?
+> nat X?
+> fib X 5?

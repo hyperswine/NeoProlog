@@ -28,13 +28,14 @@ import qualified Infera.CLP as CLP
 import Infera.Core.Compile
 import Infera.Core.Store
 import qualified Data.Map.Strict as Map
-import Infera.Engine.Reference (Env (..), OutputEvent (..), SearchItem (..), SolverState (..), initialState, maxResolutionDepth, mkEnv)
+import qualified Data.Set as Set
+import Infera.Engine.Reference (Env (..), OutputEvent (..), SearchItem (..), SolverState (..), TableEntry (..), initialState, maxResolutionDepth, maxTableIterations, mkEnv)
 import qualified Infera.Engine.Reference as Reference
 import Infera.Error (PredKey, SolveError (..))
 import qualified Infera.Program as P
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
-import Infera.Unify (deepWalk, emptySubst)
+import Infera.Unify (canonicalize, deepWalk, emptySubst)
 
 data Step
   = Stop
@@ -56,6 +57,8 @@ data Cont
   | -- | a findall solution: copy the template and look for more
     -- (sentinel, results, template, base, entry heap, entry output, depth)
     CExitFindAll !Int !(IORef [(Copy, [OutputEvent])]) Pattern !Int !Int !Int !Int
+  | -- | a solution of a tabled fixpoint iteration
+    CExitTable !(IORef Fix)
 
 data Choice = Choice
   { chH :: !Int,
@@ -63,6 +66,8 @@ data Choice = Choice
     chOut :: !Int,
     chScopes :: !Int,
     chFresh :: !Int,
+    -- | branch-local tables
+    chTables :: Map.Map Term TableEntry,
     chAlt :: !Alt
   }
 
@@ -76,6 +81,32 @@ data Alt
   | AltFindAll !(IORef [(Copy, [OutputEvent])]) !(IORef [SearchItem]) Pattern !Int !Int Cont
   | -- | remaining reference items of a leaf builtin and its variable table
     AltLeaf [SearchItem] !(IM.IntMap Word') Cont
+  | -- | sentinel of a tabled fixpoint iteration
+    AltTable !(IORef Fix)
+  | -- | remaining table answers to consume: answers, saved call address,
+    -- arity, continuation
+    AltAnswers [(Term, Int, [OutputEvent])] !Int !Int Cont
+
+-- | The state of one tabled call's fixpoint, as in the reference engine.
+data Fix = Fix
+  { fxKey :: Term,
+    fxPred :: !Pred,
+    -- | saved call arguments (arity cells)
+    fxArgs :: !Int,
+    fxEntryOut :: !Int,
+    fxDepth :: !Int,
+    -- | the running table map of the fixpoint (the reference's @tables'@)
+    fxTables :: Map.Map Term TableEntry,
+    fxAnswers :: [(Term, Int, [OutputEvent])],
+    fxSet :: Set.Set Term,
+    fxIteration :: !Int,
+    -- | this iteration's extracted answers, newest first
+    fxFound :: [(Term, Int, [OutputEvent])],
+    -- | completed entries seen in this iteration's solutions
+    fxCompleted :: Map.Map Term TableEntry,
+    fxIssues :: !(IORef [SearchItem]),
+    fxCont :: Cont
+  }
 
 -- Issue scopes: a negation or findall buffers issues until its outcome is
 -- known; a condition only counts them.
@@ -93,7 +124,8 @@ data Machine = Machine
     mChoices :: !(IORef (IOArray Int Choice)),
     mChoiceTop :: !(IORef Int),
     mScopes :: !(IORef [Scope]),
-    mOutput :: !(IORef [OutputEvent])
+    mOutput :: !(IORef [OutputEvent]),
+    mTables :: !(IORef (Map.Map Term TableEntry))
   }
 
 -- | Compile and start a query. Left names the construct that puts the
@@ -114,7 +146,7 @@ runCoreWith limit program query = do
     Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason))
     Right core -> do
       choices <- newArray_ (0, 1023)
-      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef [] <*> newIORef []
+      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef [] <*> newIORef [] <*> newIORef Map.empty
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
       pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone))
@@ -128,6 +160,7 @@ pushChoice m alt = do
   tr <- trailTop s
   out <- outLen s
   fresh <- freshId s
+  tables <- readIORef (mTables m)
   scopes <- length <$> readIORef (mScopes m)
   top <- readIORef (mChoiceTop m)
   arr <- readIORef (mChoices m)
@@ -140,7 +173,7 @@ pushChoice m alt = do
         forM_ [0 .. top - 1] $ \i -> unsafeRead arr i >>= unsafeWrite grown i
         writeIORef (mChoices m) grown
         pure grown
-  unsafeWrite arr' top (Choice h tr out scopes fresh alt)
+  unsafeWrite arr' top (Choice h tr out scopes fresh tables alt)
   writeIORef (mChoiceTop m) (top + 1)
   setHb s h
   pure top
@@ -196,8 +229,22 @@ raiseItems m (item : rest) k = do
   if absorbed then raiseItems m rest k else pure (Yield item (raiseItems m rest k))
   where
     deliver [] = pure False
-    deliver (SCount counter : outer) = modifyIORef' counter (+ 1) >> deliver outer
+    deliver (SCount counter : outer) = do
+      when (isError item || isExhausted item) (modifyIORef' counter (+ 1))
+      deliver outer
     deliver (SBuffer buffer : _) = modifyIORef' buffer (item :) >> pure True
+
+isError :: SearchItem -> Bool
+isError (BranchError _) = True
+isError _ = False
+
+isExhausted :: SearchItem -> Bool
+isExhausted BranchExhausted = True
+isExhausted _ = False
+
+isDependency :: SearchItem -> Bool
+isDependency (ConsumedIncomplete _) = True
+isDependency _ = False
 
 raiseError :: Machine -> SolveError -> IO Step
 raiseError m err = raiseItems m [BranchError err] (backtrack m)
@@ -242,6 +289,16 @@ run m cont = case cont of
     writeIORef flag True
     cutTo m (sentinel + 1)
     backtrack m
+  CExitTable fixRef -> do
+    fx <- readIORef fixRef
+    (answer, count) <- canonicalCall m (fst (pKey (fxPred fx))) (fxArgs fx) (pArity (fxPred fx))
+    produced <- outputSince m (fxEntryOut fx)
+    tables <- readIORef (mTables m)
+    writeIORef fixRef fx
+      { fxFound = (answer, count, produced) : fxFound fx,
+        fxCompleted = Map.union (fxCompleted fx) (Map.filter teComplete tables)
+      }
+    backtrack m
   CExitFindAll _ results template base entryHeap entryOut _ -> do
     word <- buildArg m base False template
     copy <- copyOut m entryHeap word
@@ -257,6 +314,7 @@ contDepth cont = case cont of
   CExitIf _ _ _ _ depth _ -> depth
   CExitNot _ _ depth -> depth
   CExitFindAll _ _ _ _ _ _ depth -> depth
+  CExitTable _ -> 0
 
 -- Skip exhausted goal lists so that a tail call sees its caller's return.
 dropEmpty :: Cont -> Cont
@@ -281,6 +339,12 @@ step m goal goals base barrier depth next = case goal of
     pending <- arithData (mStore m)
     when (pending > 0) (normalizeArgs m (pArity predicate))
     callPredicate m predicate (if null goals then next else CGoals goals base barrier depth next)
+  GTabled ref patterns -> do
+    predicate <- readIORef ref
+    buildArgs m base patterns 0
+    pending <- arithData (mStore m)
+    when (pending > 0) (normalizeArgs m (pArity predicate))
+    callTabled m predicate (if null goals then next else CGoals goals base barrier depth next)
   GCallDyn direct callable extra -> do
     word <- buildArg m base False callable
     aliases <- newIORef IM.empty
@@ -579,16 +643,21 @@ callPredicate m predicate cont0 = do
                 (False, Nothing, Nothing, _) -> cont
                 (True, Nothing, Nothing, CReturn _ Nothing Nothing _) -> cont
                 _ -> CReturn (if commits then entry else -1) guard checked cont
-          candidates <- candidateClauses s predicate
-          case candidates of
-            [] -> backtrack m
-            [ordinal] -> do
-              barrier <- readIORef (mChoiceTop m)
-              tryClause m predicate ordinal barrier depth returnCont
-            (ordinal : more) -> do
-              saved <- saveArgs s n
-              barrier <- pushChoice m (AltClauses predicate more saved depth returnCont)
-              tryClause m predicate ordinal barrier depth returnCont
+          barrier <- readIORef (mChoiceTop m)
+          callClauses m predicate barrier depth returnCont
+
+-- | Select and try the clauses of a predicate against the registers.
+callClauses :: Machine -> Pred -> Int -> Int -> Cont -> IO Step
+callClauses m predicate barrier depth returnCont = do
+  let s = mStore m
+  candidates <- candidateClauses s predicate
+  case candidates of
+    [] -> backtrack m
+    [ordinal] -> tryClause m predicate ordinal barrier depth returnCont
+    (ordinal : more) -> do
+      saved <- saveArgs s (pArity predicate)
+      choice <- pushChoice m (AltClauses predicate more saved depth returnCont)
+      tryClause m predicate ordinal (min barrier choice) depth returnCont
 
 -- | Try one clause against the argument registers.
 tryClause :: Machine -> Pred -> Int -> Int -> Int -> Cont -> IO Step
@@ -733,6 +802,7 @@ backtrack m = do
       truncateOutput m (chOut choice)
       truncateScopes m (chScopes choice)
       setFreshId s (chFresh choice)
+      writeIORef (mTables m) (chTables choice)
       case chAlt choice of
         AltClauses predicate (ordinal : more) saved depth cont -> do
           loadArgs s saved (pArity predicate)
@@ -753,7 +823,7 @@ backtrack m = do
           succeeded <- readIORef flag
           issues <- reverse <$> readIORef buffer
           if succeeded
-            then backtrack m
+            then raiseItems m (filter isDependency issues) (backtrack m)
             else
               if any isError issues || any isExhausted issues
                 then raiseItems m issues (backtrack m)
@@ -772,22 +842,24 @@ backtrack m = do
           issues <- reverse <$> readIORef buffer
           collected <- reverse <$> readIORef results
           case [e | e@(BranchError _) <- issues] of
-            (e : _) -> raiseItems m [e] (backtrack m)
+            (e : _) -> raiseItems m (filter isDependency issues ++ [e]) (backtrack m)
             [] -> raiseItems m issues $ do
               forM_ collected $ \(_, produced) -> mapM_ (emitOutput m) produced
               list <- rebuildList m (map fst collected)
               wt <- buildArg m base False target
               ok <- unify s wt list
               if ok then run m cont else backtrack m
+        AltTable fixRef -> do
+          pop
+          finishIteration m fixRef
+        AltAnswers answers saved arity cont -> do
+          pop
+          consumeAnswers m answers saved arity cont
   where
     pop = do
       top <- readIORef (mChoiceTop m)
       writeIORef (mChoiceTop m) (top - 1)
       refreshHb m
-    isError (BranchError _) = True
-    isError _ = False
-    isExhausted BranchExhausted = True
-    isExhausted _ = False
 
 -- ─── findall copies ──────────────────────────────────────────────────────────
 
@@ -1229,6 +1301,144 @@ showValue (StrLit str) = str
 showValue t = show t
 
 
+-- ─── tabling ─────────────────────────────────────────────────────────────────
+
+-- | The canonical form of the saved call with current bindings, and the
+-- number of its free variables.
+canonicalCall :: Machine -> String -> Int -> Int -> IO (Term, Int)
+canonicalCall m name saved arity = do
+  args <- forM [0 .. arity - 1] $ \i -> readCell (mStore m) (saved + i) >>= exportFor m
+  let (answer, vars) = canonicalize emptySubst (if null args then Atom name else Compound name args)
+  pure (answer, length vars)
+
+-- | A call to a tabled predicate: contracts as for an ordinary call, then
+-- the reference's variant table and linear fixpoint.
+callTabled :: Machine -> Pred -> Cont -> IO Step
+callTabled m predicate cont0 = do
+  let s = mStore m
+      key = pKey predicate
+      n = pArity predicate
+  top <- heapTop s
+  limit <- readReg s rGCLIM
+  cont <- if top > limit then collect m cont0 n else pure cont0
+  selected <- selectSignature m predicate
+  case selected of
+    Left err -> raiseError m err
+    Right signature -> do
+      commits <- commitsAfterSuccess m predicate signature
+      let required = case signature of
+            Just sig | P.sigDet sig == S.Det -> Just S.Det
+            Just sig | P.sigDet sig == S.Multi -> Just S.Multi
+            _ -> Nothing
+      checked <- case signature of
+        Just sig -> do
+          args <- mapM (readArg s) [0 .. n - 1]
+          pure (Just (key, sig, args))
+        Nothing -> pure Nothing
+      let depth = contDepth cont + 1
+      entry <- readIORef (mChoiceTop m)
+      guard <- case required of
+        Nothing -> pure Nothing
+        Just det -> do
+          flag <- newIORef False
+          _ <- pushChoice m (AltGuard key det flag)
+          pure (Just flag)
+      let returnCont = case (commits, guard, checked) of
+            (False, Nothing, Nothing) -> cont
+            _ -> CReturn (if commits then entry else -1) guard checked cont
+      saved <- saveArgs s n
+      (callKey, _) <- canonicalCall m (fst key) saved n
+      tables <- readIORef (mTables m)
+      case Map.lookup callKey tables of
+        Just te
+          | teComplete te ->
+              raiseItems m [BranchExhausted | teTruncated te] (consumeAnswers m (teAnswers te) saved n returnCont)
+          | otherwise ->
+              raiseItems m [ConsumedIncomplete callKey] (consumeAnswers m (teAnswers te) saved n returnCont)
+        Nothing -> do
+          entryOut <- outLen s
+          issues <- newIORef []
+          fixRef <- newIORef Fix
+            { fxKey = callKey, fxPred = predicate, fxArgs = saved, fxEntryOut = entryOut, fxDepth = depth,
+              fxTables = tables, fxAnswers = [], fxSet = Set.empty, fxIteration = 0, fxFound = [],
+              fxCompleted = Map.empty, fxIssues = issues, fxCont = returnCont }
+          startIteration m fixRef
+
+-- | One fixpoint iteration: all clauses run against the partial table.
+startIteration :: Machine -> IORef Fix -> IO Step
+startIteration m fixRef = do
+  fx <- readIORef fixRef
+  let s = mStore m
+      partial = TableEntry False False (fxAnswers fx) (fxSet fx)
+  writeIORef (mTables m) (Map.insert (fxKey fx) partial (fxTables fx))
+  issues <- newIORef []
+  writeIORef fixRef fx {fxFound = [], fxCompleted = Map.empty, fxIssues = issues}
+  sentinel <- pushChoice m (AltTable fixRef)
+  pushScope m (SBuffer issues)
+  loadArgs s (fxArgs fx) (pArity (fxPred fx))
+  if fxDepth fx > maxResolutionDepth
+    then raiseItems m [BranchExhausted] (backtrack m)
+    else callClauses m (fxPred fx) (sentinel + 1) (fxDepth fx) (CExitTable fixRef)
+
+-- | The inner search of an iteration is exhausted; the state is back at the
+-- call entry.
+finishIteration :: Machine -> IORef Fix -> IO Step
+finishIteration m fixRef = do
+  fx <- readIORef fixRef
+  issues <- reverse <$> readIORef (fxIssues fx)
+  let extracted = reverse (fxFound fx)
+      fresh = dedup (fxSet fx) extracted
+      answers' = fxAnswers fx ++ fresh
+      set' = foldr (\(a, _, _) -> Set.insert a) (fxSet fx) fresh
+      deps = nubTerms [k | ConsumedIncomplete k <- issues, k /= fxKey fx]
+      others = [i | i@(BranchError _) <- issues] ++ [BranchExhausted | any isExhausted issues]
+      completed = Map.union (Map.filter teComplete (fxTables fx)) (fxCompleted fx)
+      tables' = Map.union completed (Map.delete (fxKey fx) (fxTables fx))
+      converged = null fresh
+      gaveUp = fxIteration fx >= maxTableIterations
+  if converged || gaveUp
+    then do
+      let tables'' =
+            if null deps
+              then Map.insert (fxKey fx) (TableEntry True (not converged) answers' set') tables'
+              else tables'
+      writeIORef (mTables m) tables''
+      raiseItems m (map ConsumedIncomplete deps ++ others ++ [BranchExhausted | gaveUp])
+        (consumeAnswers m answers' (fxArgs fx) (pArity (fxPred fx)) (fxCont fx))
+    else do
+      writeIORef fixRef fx {fxTables = tables', fxAnswers = answers', fxSet = set', fxIteration = fxIteration fx + 1}
+      startIteration m fixRef
+  where
+    dedup _ [] = []
+    dedup seen ((a, n, o) : rest)
+      | Set.member a seen = dedup seen rest
+      | otherwise = (a, n, o) : dedup (Set.insert a seen) rest
+    nubTerms = foldr (\k acc -> if k `elem` acc then acc else k : acc) [] . reverse
+
+-- | Consume table answers in order: each instantiates fresh variables,
+-- replays its output and unifies with the saved call.
+consumeAnswers :: Machine -> [(Term, Int, [OutputEvent])] -> Int -> Int -> Cont -> IO Step
+consumeAnswers m answers saved arity cont = case answers of
+  [] -> backtrack m
+  ((answer, count, produced) : rest) -> do
+    unless (null rest) $ () <$ pushChoice m (AltAnswers rest saved arity cont)
+    let s = mStore m
+    fresh <- freshId s
+    block <- allocSlots s fresh (max 1 count)
+    setFreshId s (fresh + count)
+    table <- newIORef (IM.fromList [(v, refWord (block + v)) | v <- [0 .. count - 1]])
+    mapM_ (emitOutput m) produced
+    let args = case answer of Compound _ as -> as; _ -> []
+    ok <- unifyArgs s table 0 args
+    if ok then run m cont else backtrack m
+  where
+    unifyArgs _ _ _ [] = pure True
+    unifyArgs s table i (term : rest) = do
+      w <- importTermWords s table term
+      cell <- readCell s (saved + i)
+      ok <- unify s cell w
+      if ok then unifyArgs s table (i + 1) rest else pure False
+
 -- ─── collection ──────────────────────────────────────────────────────────────
 
 -- | Mark-compact collection of the cell store at a call boundary. Roots are
@@ -1303,6 +1513,10 @@ collect m cont nargs = do
         CExitIf _ _ base _ _ next -> markBlock base >> markCont next
         CExitNot _ _ _ -> pure ()
         CExitFindAll _ results _ base _ _ _ -> markBlock base >> markResults results
+        CExitTable fixRef -> do
+          fx <- readIORef fixRef
+          forM_ [fxArgs fx .. fxArgs fx + pArity (fxPred fx) - 1] markCell
+          markCont (fxCont fx)
       markResults ref = do
         collected <- readIORef ref
         forM_ collected (markCopy . fst)
@@ -1322,6 +1536,11 @@ collect m cont nargs = do
           markCont c
         AltFindAll results _ _ base _ c -> markBlock base >> markResults results >> markCont c
         AltLeaf _ table c -> mapM_ markWord (IM.elems table) >> markCont c
+        AltTable fixRef -> do
+          fx <- readIORef fixRef
+          forM_ [fxArgs fx .. fxArgs fx + pArity (fxPred fx) - 1] markCell
+          markCont (fxCont fx)
+        AltAnswers _ saved arity c -> forM_ [saved .. saved + arity - 1] markCell >> markCont c
   -- The query block is a root even when no continuation names it any
   -- more: the answer is exported from it.
   forM_ [0 .. queryCells - 1] markCell
@@ -1372,9 +1591,10 @@ collect m cont nargs = do
         CExitIf sentinel thenGoals base barrier depth next ->
           CExitIf sentinel thenGoals <$> relocBlock base <*> pure barrier <*> pure depth <*> relocCont next
         CExitNot sentinel flag depth -> pure (CExitNot sentinel flag depth)
-        CExitFindAll sentinel results template base entryHeap entryOut depth -> do
-          relocResults results
+        -- Shared buffers are relocated once, through the sentinel's alternative.
+        CExitFindAll sentinel results template base entryHeap entryOut depth ->
           CExitFindAll sentinel results template <$> relocBlock base <*> forward entryHeap <*> pure entryOut <*> pure depth
+        CExitTable fixRef -> pure (CExitTable fixRef)
       relocResults ref = do
         collected <- readIORef ref
         relocated <- forM collected $ \(copy, produced) -> (\c -> (c, produced)) <$> relocCopy copy
@@ -1403,6 +1623,14 @@ collect m cont nargs = do
         AltLeaf items table c -> do
           table' <- traverse reloc table
           AltLeaf items table' <$> relocCont c
+        AltTable fixRef -> do
+          fx <- readIORef fixRef
+          saved' <- forward (fxArgs fx)
+          c' <- relocCont (fxCont fx)
+          writeIORef fixRef fx {fxArgs = saved', fxCont = c'}
+          pure (AltTable fixRef)
+        AltAnswers answers saved arity c ->
+          AltAnswers answers <$> forward saved <*> pure arity <*> relocCont c
   cont' <- relocCont cont
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
   -- Trail: keep entries of live cells, remember how many survive below
