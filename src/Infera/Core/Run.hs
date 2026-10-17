@@ -956,6 +956,11 @@ normalizeArgs m n = forM_ [0 .. n - 1] $ \i -> do
 unifyPattern :: Machine -> Int -> Pattern -> Word' -> IO Bool
 unifyPattern m base pattern word = case pattern of
   PSlot i -> unify s (refWord (base + i)) word
+  -- An unreferenced fresh cell: no dereference, trail, occurs check or
+  -- store record is needed. A self-reference stays a variable.
+  PFirst i -> do
+    d <- deref s word
+    if tagOf d == tagRef && valOf d == base + i then pure True else writeCell s (base + i) d >> pure True
   PWord w -> unify s w word
   PStruct functor children -> do
     d <- deref s word
@@ -985,6 +990,7 @@ unifyPattern m base pattern word = case pattern of
 buildArg :: Machine -> Int -> Bool -> Pattern -> IO Word'
 buildArg m base normalize pattern = case pattern of
   PSlot i -> pure (refWord (base + i))
+  PFirst i -> pure (refWord (base + i))
   PWord w -> pure w
   PStruct functor children -> do
     let n = funArity functor
@@ -1014,6 +1020,7 @@ buildArg m base normalize pattern = case pattern of
     fill !i (child : rest) = do
       w <- case child of
         PSlot k -> pure (refWord (base + k))
+        PFirst k -> pure (refWord (base + k))
         PWord cw -> pure cw
         _ -> buildArg m base normalize child
       writeCell s i w
@@ -1223,6 +1230,7 @@ evalFast :: Machine -> Int -> Expr -> IO Bool
 evalFast m base expr = case expr of
   EImm i -> yield i
   EPat (PSlot i) -> immediate (refWord (base + i))
+  EPat (PFirst i) -> immediate (refWord (base + i))
   EPat (PWord w) -> immediate w
   EOp op [a, b] -> do
     okA <- evalFast m base a

@@ -44,6 +44,9 @@ import Infera.Syntax (Term (..))
 data Pattern
   = -- | activation variable, offset from the activation base
     PSlot !Int
+  | -- | first occurrence of an activation variable in a clause head: the
+    -- cell is still unbound and unreferenced, so matching is a plain write
+    PFirst !Int
   | -- | a ready word: a constant, or a runtime cell handed to a dynamic goal
     PWord !Word'
   | -- | functor word and argument patterns
@@ -250,6 +253,7 @@ immediateKey key = case key of
 patternKey :: Store -> Pattern -> IO (Maybe Key)
 patternKey store pattern = case pattern of
   PSlot _ -> pure Nothing
+  PFirst _ -> pure Nothing
   PWord w -> keyOfWord store w
   PStruct f _ -> pure (Just (KFun f))
   PArith f _ _ -> pure (Just (KFun f))
@@ -300,18 +304,23 @@ candidateClauses store p
 
 compileClause :: Ctx -> S.Clause -> IO Clause
 compileClause ctx clause = do
+  seen <- newIORef IS.empty
   headPatterns <- case S.clauseHead clause of
-    Compound _ as -> mapM (compileHeadArg ctx) as
+    Compound _ as -> mapM (compileHeadArg ctx seen) as
     _ -> pure []
   body <- compileBody ctx (S.clauseBody clause)
   pure (Clause (max 1 (S.clauseNVars clause)) headPatterns body)
 
-compileHeadArg :: Ctx -> Term -> IO Pattern
-compileHeadArg ctx term = case term of
-  Var v -> pure (PSlot v)
+compileHeadArg :: Ctx -> IORef IS.IntSet -> Term -> IO Pattern
+compileHeadArg ctx seen term = case term of
+  Var v -> do
+    known <- readIORef seen
+    if IS.member v known
+      then pure (PSlot v)
+      else modifyIORef' seen (IS.insert v) >> pure (PFirst v)
   Compound f as -> do
     fid <- internFunctor (symbols (ctxStore ctx)) f (length as)
-    PStruct (funWord fid (length as)) <$> mapM (compileHeadArg ctx) as
+    PStruct (funWord fid (length as)) <$> mapM (compileHeadArg ctx seen) as
   _ -> PWord <$> constantWord (ctxStore ctx) term
 
 constantWord :: Store -> Term -> IO Word'
