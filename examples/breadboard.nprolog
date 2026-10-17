@@ -41,6 +41,26 @@ comp tri r1 r "1k" a b.
 comp tri r2 r "1k" b c.
 comp tri r3 r "1k" c a.
 
+# Two resistors in parallel with reversed net order: 0 jumpers when flipped.
+comp par_flip r1 r "1k" vin gnd.
+comp par_flip r2 r "1k" gnd vin.
+
+# Resistor and polarized diode in reverse parallel: resistor flips, diode stays fixed (0 jumpers).
+comp par_diode r1 r "1k" vin gnd.
+comp par_diode d1 d "1n4148" gnd vin.
+
+# Two antiparallel polarized diodes: neither may flip, so 1 jumper is required.
+comp anti_diode d1 d "1n4148" vin gnd.
+comp anti_diode d2 d "1n4148" gnd vin.
+
+# Six resistors where parts 1 and 6 share n1..n2: flexible CLP rows avoid row-1 collision (0 jumpers).
+comp ladder6 r1 r "1k" n1 n2.
+comp ladder6 r2 r "1k" n2 n3.
+comp ladder6 r3 r "1k" n3 n4.
+comp ladder6 r4 r "1k" n4 n5.
+comp ladder6 r5 r "1k" n5 n6.
+comp ladder6 r6 r "1k" n1 n2.
+
 # ─── List helpers ────────────────────────────────────────────────────────────
 
 member X [X | _].
@@ -144,6 +164,144 @@ solve_min Cs Wired Lo Hi P Cost <-
   score_constraints P Cost,
   labeling [min Cost] Vs.
 
+# ─── Enhanced placement: pin flipping, CLP rows and physical jumper holes ────
+#
+# Non-polarized 2-pin parts (r, c, l) may flip 180 degrees (`Flip in 0..1`);
+# polarized kinds (`d`, `led`, `ecap`) keep `Flip = 0` (`pin_a` at Col, `pin_b`
+# at Col + 1). Component rows (`1..5`) are CLP decision variables with row
+# symmetry breaking (`Row in 1..min(5, Idx)`), and each jumper wire is a
+# concrete `jmp Net RowA RowB HoleA HoleB NodeA NodeB` whose two endpoints
+# reserve physical holes in `all_different` and partition the net into K + 1
+# connected strips.
+
+polarized d.
+polarized led.
+polarized ecap.
+
+vars_flex [] _ _ [] [] [].
+vars_flex [c N K V A B I _ | T] Lo Hi
+          [pl N K V A B I Row Col Half HA HB NA NB | Ps]
+          [Flip | Flips] [Row | Rows] <-
+  Col in Lo..Hi,
+  Half in 0..1,
+  (polarized K -> Flip = 0 ; Flip in 0..1),
+  MaxRow is min 5 I,
+  Row in 1..MaxRow,
+  NA #= Half * 100 + Col + Flip,
+  NB #= Half * 100 + Col + 1 - Flip,
+  HA #= NA * 10 + Row,
+  HB #= NB * 10 + Row,
+  vars_flex T Lo Hi Ps Flips Rows.
+
+net_nodes _ [] [].
+net_nodes N [pin M Node | T] Nodes <-
+  (M == N -> Nodes = [Node | Rest] ; Nodes = Rest),
+  net_nodes N T Rest.
+
+disjoint_nets [].
+disjoint_nets [P | T] <- disjoint_net_with P T, disjoint_nets T.
+
+disjoint_net_with _ [].
+disjoint_net_with (pin N1 X) [pin N2 Y | T] <-
+  (N1 == N2 -> true ; X #!= Y),
+  disjoint_net_with (pin N1 X) T.
+
+distinct_nodes _ [].
+distinct_nodes X [Y | T] <- X #!= Y, distinct_nodes X T.
+
+# Partition a net's pin nodes across K + 1 connected strips with K jumper wires.
+net_jumpers _ [] 0 [].
+net_jumpers N [Node | Nodes] K Jumpers <-
+  net_jumpers_rest N Nodes [Node] K Jumpers.
+
+net_jumpers_rest _ [] _ 0 [].
+net_jumpers_rest N [Node | Nodes] Reps K Jumpers <-
+  length Nodes Rem,
+  Rem >= K,
+  member Rep Reps,
+  Node #= Rep,
+  net_jumpers_rest N Nodes Reps K Jumpers.
+net_jumpers_rest N [Node | Nodes] Reps K [jmp N JRA JRB JHA JHB JNA Node | Jumpers] <-
+  K > 0,
+  K1 is K - 1,
+  distinct_nodes Node Reps,
+  member JNA Reps,
+  JRA in 1..5,
+  JRB in 1..5,
+  JHA #= JNA * 10 + JRA,
+  JHB #= Node * 10 + JRB,
+  net_jumpers_rest N Nodes [Node | Reps] K1 Jumpers.
+
+count_net _ [] Acc Acc.
+count_net N [M | T] Acc K <-
+  (N == M -> Acc1 is Acc + 1 ; Acc1 = Acc),
+  count_net N T Acc1 K.
+
+connect_nets_jumpers [] _ _ [].
+connect_nets_jumpers [N | Ns] Pins JumpNets Jumpers <-
+  net_nodes N Pins Nodes,
+  count_net N JumpNets 0 K,
+  net_jumpers N Nodes K J1,
+  append J1 J2 Jumpers,
+  connect_nets_jumpers Ns Pins JumpNets J2.
+
+jumper_holes [] [].
+jumper_holes [jmp _ _ _ JHA JHB _ _ | T] [JHA, JHB | Hs] <- jumper_holes T Hs.
+
+net_capacities _ [] [].
+net_capacities Cs [N | Ns] [cap N Cap | Caps] <-
+  net_pins Cs N P,
+  Cap is P - 1,
+  net_capacities Cs Ns Caps.
+
+sum_caps [] Acc Acc.
+sum_caps [cap _ C | T] Acc Sum <-
+  Acc1 is Acc + C,
+  sum_caps T Acc1 Sum.
+
+choose_with_caps 0 _ [].
+choose_with_caps K [cap N Cap | Caps] [N | S] <-
+  K > 0,
+  Cap > 0,
+  K1 is K - 1,
+  Cap1 is Cap - 1,
+  choose_with_caps K1 [cap N Cap1 | Caps] S.
+choose_with_caps K [_ | Caps] S <-
+  K > 0,
+  choose_with_caps K Caps S.
+
+choose_jumpers K Cs MNs JumpNets <-
+  net_capacities Cs MNs Caps,
+  choose_with_caps K Caps JumpNets.
+
+placement_flex_constraints Cs JumpNets Lo Hi P Jumpers NodeVars HoleVars <-
+  vars_flex Cs Lo Hi P Flips Rows,
+  P = [pl _ _ _ _ _ _ _ _ 0 _ _ _ _ | _],      # symmetry: first part on top
+  pins P Pins,
+  disjoint_nets Pins,
+  nets Cs Ns,
+  connect_nets_jumpers Ns Pins JumpNets Jumpers,
+  holes P CompHoles,
+  jumper_holes Jumpers JHoles,
+  append CompHoles JHoles AllHoles,
+  all_different AllHoles,
+  cols P Cols,
+  halves P Halves,
+  append Halves Flips HF,
+  append HF Cols NodeVars,
+  append Rows JHoles HoleVars.
+
+solve_flex Cs JumpNets Lo Hi P Jumpers <-
+  placement_flex_constraints Cs JumpNets Lo Hi P Jumpers NodeVars HoleVars,
+  label NodeVars,
+  once (label HoleVars).
+
+solve_flex_min Cs JumpNets Lo Hi P Jumpers Cost <-
+  placement_flex_constraints Cs JumpNets Lo Hi P Jumpers NodeVars HoleVars,
+  score_constraints P Cost,
+  labeling [min Cost] NodeVars,
+  once (label HoleVars).
+
 # ─── Scoring (secondary preferences, evaluated on labelled placements) ───────
 #   4 per cramped pair (unconnected parts crowded in the same half)
 #   2 per pair in different halves
@@ -217,12 +375,31 @@ feasible Cs Ns Wired Placement Cost <-
   windows Ws, member (win Lo Hi) Ws,
   solve_min Cs Wired Lo Hi Placement Cost.
 
+best_flex Cs Ns JumpNets Placement Jumpers Cost <-
+  once (feasible_flex Cs Ns JumpNets Placement Jumpers Cost).
+
+feasible_flex Cs Ns JumpNets Placement Jumpers Cost <-
+  multi_nets Cs Ns MNs,
+  net_capacities Cs MNs Caps,
+  sum_caps Caps 0 MaxJ,
+  between 0 MaxJ K,
+  choose_with_caps K Caps JumpNets,
+  windows Ws, member (win Lo Hi) Ws,
+  solve_flex_min Cs JumpNets Lo Hi Placement Jumpers Cost.
+
 # ─── Reporting ───────────────────────────────────────────────────────────────
 
 row_letter 0 1 "a". row_letter 0 2 "b". row_letter 0 3 "c". row_letter 0 4 "d". row_letter 0 5 "e".
 row_letter 1 1 "f". row_letter 1 2 "g". row_letter 1 3 "h". row_letter 1 4 "i". row_letter 1 5 "j".
 
 hole_name Col Half Row S <- row_letter Half Row L, str_num CS Col, str_concat L CS S.
+
+hole_coord_name Hole S <-
+  Row is Hole % 10,
+  Node is Hole / 10,
+  Col is Node % 100,
+  Half is Node / 100,
+  hole_name Col Half Row S.
 
 pin_label N Pin S <- atom_upper N NS, str_concat NS Pin S.
 
@@ -235,6 +412,12 @@ net_holes N P Hs <-
   findall H (member (pl _ _ _ A B _ R Col Half _ _ _ _) P,
              ((A == N, hole_name Col Half R H) ; (B == N, Col2 is Col + 1, hole_name Col2 Half R H))) Hs.
 
+net_holes_flex N P Jumpers Hs <-
+  findall H ((member (pl _ _ _ A B _ _ _ _ HA HB _ _) P,
+              ((A == N, hole_coord_name HA H) ; (B == N, hole_coord_name HB H)))
+             ; (member (jmp JN _ _ JHA JHB _ _) Jumpers, JN == N,
+                (hole_coord_name JHA H ; hole_coord_name JHB H))) Hs.
+
 # The report is a DCG: a description of the text, printed by `emit` at the
 # top level.  No predicate below performs an effect, so none needs `unsafe`.
 
@@ -245,6 +428,13 @@ placement_lines [pl N K V _ _ _ R Col Half _ _ _ _ | T] ->
   "  ", padr NS 6, "  (", wr KS, ", ", padl V 6, ")   pin_a -> ", padr Ha 5, "  pin_b -> ", wr Hb, nl,
   placement_lines T.
 
+placement_lines_flex [] -> [].
+placement_lines_flex [pl N K V _ _ _ _ _ _ HA HB _ _ | T] ->
+  { atom_upper N NS, atom_upper K KS,
+    hole_coord_name HA Ha, hole_coord_name HB Hb },
+  "  ", padr NS 6, "  (", wr KS, ", ", padl V 6, ")   pin_a -> ", padr Ha 5, "  pin_b -> ", wr Hb, nl,
+  placement_lines_flex T.
+
 net_lines [] _ -> [].
 net_lines [N | T] P ->
   { atom_upper N NS, net_holes N P Hs, join Hs ", " HS, nodes_of N P Nodes, length Nodes K },
@@ -252,12 +442,30 @@ net_lines [N | T] P ->
   ( { K > 1 } -> { J is K - 1 }, "   <- WIRE NEEDED (", wr J, " jumper)" ; [] ), nl,
   net_lines T P.
 
+net_lines_flex [] _ _ -> [].
+net_lines_flex [N | T] P Jumpers ->
+  { atom_upper N NS, net_holes_flex N P Jumpers Hs, join Hs ", " HS,
+    nodes_of N P Nodes, length Nodes K },
+  "  ", padr NS 8, wr HS,
+  ( { K > 1 } -> { J is K - 1 }, "   <- WIRE NEEDED (", wr J, " jumper)" ; [] ), nl,
+  net_lines_flex T P Jumpers.
+
 wire_lines Ns P ->
   { findall N (member N Ns, nodes_of N P Nodes, length Nodes K, K > 1) Ws },
   ( { Ws == [] } -> "  none", nl ; wire_list Ws ).
 
 wire_list [] -> [].
 wire_list [N | T] -> { atom_upper N NS }, "  Jumper on net ", wr NS, nl, wire_list T.
+
+wire_lines_flex [] -> "  none", nl.
+wire_lines_flex [jmp N _ _ JHA JHB _ _ | T] ->
+  wire_list_flex [jmp N 0 0 JHA JHB 0 0 | T].
+
+wire_list_flex [] -> [].
+wire_list_flex [jmp N _ _ JHA JHB _ _ | T] ->
+  { atom_upper N NS, hole_coord_name JHA Ha, hole_coord_name JHB Hb },
+  "  Jumper on net ", wr NS, ": ", wr Ha, " -> ", wr Hb, nl,
+  wire_list_flex T.
 
 source_line Circuit ->
   { findall (s N K V A B) (source Circuit N K V A B) Ss },
@@ -276,6 +484,14 @@ cell P Col Half Row S <-
    ; ColA is Col - 1, member (pl N _ _ _ _ _ Row ColA Half _ _ _ _) P -> pin_label N "b" S
    ; S = ".").
 
+cell_flex P Jumpers Col Half Row S <-
+  Hole is (Half * 100 + Col) * 10 + Row,
+  (member (pl N _ _ _ _ _ _ _ _ Hole _ _ _) P -> pin_label N "a" S
+   ; member (pl N _ _ _ _ _ _ _ _ _ Hole _ _) P -> pin_label N "b" S
+   ; member (jmp N _ _ Hole _ _ _) Jumpers -> pin_label N "j" S
+   ; member (jmp N _ _ _ Hole _ _) Jumpers -> pin_label N "j" S
+   ; S = ".").
+
 board_row P Half Row ->
   { row_letter Half Row L }, "  ", wr L, " |", board_cells P Half Row 1, nl.
 
@@ -284,11 +500,22 @@ board_cells P Half Row Col ->
       { cell P Col Half Row S, Col1 is Col + 1 }, padl S 4, " ", board_cells P Half Row Col1
   ; [] ).
 
+board_row_flex P Jumpers Half Row ->
+  { row_letter Half Row L }, "  ", wr L, " |", board_cells_flex P Jumpers Half Row 1, nl.
+
+board_cells_flex P Jumpers Half Row Col ->
+  ( { Col <= 17 } ->
+      { cell_flex P Jumpers Col Half Row S, Col1 is Col + 1 }, padl S 4, " ", board_cells_flex P Jumpers Half Row Col1
+  ; [] ).
+
 board_header -> "    ", header_cols 1, nl.
 header_cols Col -> ( { Col <= 17 } -> { Col1 is Col + 1 }, padl Col 5, header_cols Col1 ; [] ).
 
 board_rows P Half Row ->
   ( { Row <= 5 } -> board_row P Half Row, { Row1 is Row + 1 }, board_rows P Half Row1 ; [] ).
+
+board_rows_flex P Jumpers Half Row ->
+  ( { Row <= 5 } -> board_row_flex P Jumpers Half Row, { Row1 is Row + 1 }, board_rows_flex P Jumpers Half Row1 ; [] ).
 
 board P ->
   { repeat_str "-----" 17 Sep },
@@ -296,6 +523,14 @@ board P ->
   board_rows P 0 1,
   nl, "    ==== centre gap ====", nl, nl,
   board_rows P 1 1,
+  "    ", wr Sep, nl, board_header.
+
+board_flex P Jumpers ->
+  { repeat_str "-----" 17 Sep },
+  board_header, "    ", wr Sep, nl,
+  board_rows_flex P Jumpers 0 1,
+  nl, "    ==== centre gap ====", nl, nl,
+  board_rows_flex P Jumpers 1 1,
   "    ", wr Sep, nl, board_header.
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
@@ -313,6 +548,20 @@ report Circuit ->
   "=== Breadboard (170-tie) ===", nl,
   board P, nl.
 
+report_flex Circuit ->
+  { comps Circuit Cs, nets Cs Ns, best_flex Cs Ns _JumpNets P Jumpers Cost },
+  "=== Circuit ", wr Circuit, " (flexible) ===", nl,
+  source_line Circuit,
+  "=== Placement (score ", wr Cost, ") ===", nl,
+  placement_lines_flex P, nl,
+  "=== Nets ===", nl,
+  net_lines_flex Ns P Jumpers, nl,
+  "=== Wires needed ===", nl,
+  wire_lines_flex Jumpers, nl,
+  "=== Breadboard (170-tie) ===", nl,
+  board_flex P Jumpers, nl.
+
 > emit (report rc)?
 > emit (report div)?
 > emit (report tri)?
+
