@@ -61,8 +61,10 @@ data Step
 data Cont
   = CDone
   | CGoals [Goal] !Int !Int !Int Cont
-  | -- | after a contract-bearing call: output check, guard flag, commit height
-    CReturn !Int !(Maybe (IORef Bool)) !(Maybe (PredKey, P.Signature, [Word'])) Cont
+  | -- | after a contract-bearing call: commit height (-1 none), guard base
+    -- (-1 none: guards at or above it are marked, and removed on commit),
+    -- output check
+    CReturn !Int !Int !(Maybe (PredKey, P.Signature, [Word'])) Cont
   | -- | condition succeeded: cut to the sentinel, run the then-goals
     CExitIf !Int [Goal] !Int !Int !Int Cont
   | -- | negated goal succeeded (sentinel, flag, depth)
@@ -95,7 +97,6 @@ data Alt
   = -- | remaining candidates, saved argument address, depth, continuation
     AltClauses !Pred [Int] !Int !Int Cont
   | AltGoals [Goal] !Int !Int !Int Cont
-  | AltGuard !PredKey !S.Det !(IORef Bool)
   | AltNot !(IORef Bool) !(IORef [SearchItem]) Cont
   | AltIf !(IORef Int) (Maybe ([Goal], Int, Int, Int)) Cont
   | AltFindAll !(IORef [(Copy, [OutputEvent])]) !(IORef [SearchItem]) Pattern !Int !Int Cont
@@ -161,6 +162,11 @@ data Machine = Machine
     mChoices :: !(IORef (IOArray Int Choice)),
     mChoiceTop :: !(IORef Int),
     mScopes :: !(IORef [Scope]),
+    -- | determinism guards: per entry the choice height at its push, its
+    -- success flag and its interned key with the required determinism
+    mGuards :: !(IORef (IOUArray Int Int)),
+    mGuardTop :: !(IORef Int),
+    mGuardKeys :: !(IORef (Map.Map PredKey Int, IM.IntMap PredKey)),
     mOutput :: !(IORef [OutputEvent]),
     mTables :: !(IORef (Map.Map Term TableEntry)),
     mDynamic :: !(IORef (Map.Map PredKey [(Term, Int)])),
@@ -190,7 +196,10 @@ runCoreWith limit program query = do
     Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason))
     Right core -> do
       choices <- newArray_ (0, 1023)
-      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef [] <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
+      guards <- newArray (0, 3 * 1024 - 1) 0
+      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef []
+        <*> newIORef guards <*> newIORef 0 <*> newIORef (Map.empty, IM.empty)
+        <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
         <*> newIORef CLP.emptyStore <*> newIORef IM.empty <*> newIORef IS.empty
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
@@ -246,6 +255,79 @@ cutTo m h = do
     truncateScopes m (chScopes removed)
     writeIORef (mChoiceTop m) h
     refreshHb m
+    trimGuardsAbove m h
+
+-- ─── determinism guards ──────────────────────────────────────────────────────
+
+guardStride :: Int
+guardStride = 3
+
+-- | Push a guard for a call entered at the current choice height.
+pushGuard :: Machine -> PredKey -> S.Det -> IO ()
+pushGuard m key det = do
+  (ids, names) <- readIORef (mGuardKeys m)
+  keyId <- case Map.lookup key ids of
+    Just i -> pure i
+    Nothing -> do
+      let i = Map.size ids
+      writeIORef (mGuardKeys m) (Map.insert key i ids, IM.insert i key names)
+      pure i
+  height <- readIORef (mChoiceTop m)
+  top <- readIORef (mGuardTop m)
+  arr <- readIORef (mGuards m)
+  size <- getNumElements arr
+  arr' <-
+    if (top + 1) * guardStride <= size
+      then pure arr
+      else do
+        grown <- newArray (0, size * 2 - 1) 0
+        forM_ [0 .. top * guardStride - 1] $ \i -> unsafeRead arr i >>= unsafeWrite grown i
+        writeIORef (mGuards m) grown
+        pure grown
+  unsafeWrite arr' (top * guardStride) height
+  unsafeWrite arr' (top * guardStride + 1) 0
+  unsafeWrite arr' (top * guardStride + 2) (keyId * 2 + (if det == S.Multi then 1 else 0))
+  writeIORef (mGuardTop m) (top + 1)
+
+-- | Record success for every guard at or above a base index.
+markGuardsFrom :: Machine -> Int -> IO ()
+markGuardsFrom m base = do
+  top <- readIORef (mGuardTop m)
+  arr <- readIORef (mGuards m)
+  forM_ [base .. top - 1] $ \i -> unsafeWrite arr (i * guardStride + 1) 1
+
+removeGuardsFrom :: Machine -> Int -> IO ()
+removeGuardsFrom m base = modifyIORef' (mGuardTop m) (min base)
+
+-- | Guards pushed above a choice height belong to calls a cut abandons.
+trimGuardsAbove :: Machine -> Int -> IO ()
+trimGuardsAbove m h = do
+  arr <- readIORef (mGuards m)
+  let go top
+        | top == 0 = pure 0
+        | otherwise = do
+            height <- unsafeRead arr ((top - 1) * guardStride)
+            if height > h then go (top - 1) else pure top
+  readIORef (mGuardTop m) >>= go >>= writeIORef (mGuardTop m)
+
+-- | The topmost guard that backtracking into the current choice height
+-- passes, removed: its key, required determinism and success flag.
+popGuardAbove :: Machine -> Int -> IO (Maybe (PredKey, S.Det, Bool))
+popGuardAbove m height = do
+  top <- readIORef (mGuardTop m)
+  if top == 0
+    then pure Nothing
+    else do
+      arr <- readIORef (mGuards m)
+      h <- unsafeRead arr ((top - 1) * guardStride)
+      if h < height
+        then pure Nothing
+        else do
+          flag <- unsafeRead arr ((top - 1) * guardStride + 1)
+          code <- unsafeRead arr ((top - 1) * guardStride + 2)
+          (_, names) <- readIORef (mGuardKeys m)
+          writeIORef (mGuardTop m) (top - 1)
+          pure (Just (names IM.! (code `div` 2), if odd code then S.Multi else S.Det, flag /= 0))
 
 refreshHb :: Machine -> IO ()
 refreshHb m = do
@@ -328,15 +410,19 @@ run' m cont = case cont of
     state <- exportState m
     pure (Yield (Found state) (backtrack m))
   CGoals goals base barrier depth next -> runGoals m goals base barrier depth next
-  CReturn commitHeight guard check next -> do
+  CReturn commitHeight guardBase check next -> do
     problem <- case check of
       Nothing -> pure Nothing
       Just (key, signature, args) -> checkOutputs m key signature args
     case problem of
       Just err -> raiseError m err
       Nothing -> do
-        forM_ guard (`writeIORef` True)
-        when (commitHeight >= 0) (cutTo m commitHeight)
+        -- The call that owns this frame and every call that merged into it
+        -- succeeded: their guards are marked, and gone once committed.
+        when (guardBase >= 0) (markGuardsFrom m guardBase)
+        when (commitHeight >= 0) $ do
+          cutTo m commitHeight
+          when (guardBase >= 0) (removeGuardsFrom m guardBase)
         run m next
   CExitIf sentinel thenGoals base barrier depth next -> do
     cutTo m sentinel
@@ -521,7 +607,7 @@ step = step'
 
 goalName :: Goal -> String
 goalName g = case g of
-  GCall _ _ -> "call"; GTabled _ _ -> "tabled"; GCallFacts k _ -> "facts " ++ show k; GAssert _ -> "assert"
+  GCall _ _ _ -> "call"; GTabled _ _ -> "tabled"; GCallFacts k _ -> "facts " ++ show k; GAssert _ -> "assert"
   GRetract _ -> "retract"; GRetractAll _ -> "retractall"; GMinimize _ _ -> "minimize"; GCallDyn _ _ _ -> "calldyn"
   GAnd _ -> "and"; GUnify _ _ -> "unify"; GEquiv _ _ -> "equiv"; GNeq _ _ -> "neq"; GIs _ _ -> "is"; GCmp _ _ _ -> "cmp"
   GTrue -> "true"; GFail -> "fail"; GCut -> "cut"; GOr _ _ -> "or"; GIf _ _ _ -> "if"; GNot _ -> "not"; GOnce _ -> "once"
@@ -535,12 +621,12 @@ step' m goal goals base barrier depth next = case goal of
   GFail -> backtrack m
   GCut -> cutTo m barrier >> continue
   GAnd inner -> runGoals m (inner ++ goals) base barrier depth next
-  GCall ref patterns -> do
+  GCall ref patterns trust -> do
     predicate <- readIORef ref
     buildArgs m base patterns 0
     pending <- arithData (mStore m)
     when (pending > 0) (normalizeArgs m (pArity predicate))
-    callPredicate m predicate (if null goals then next else CGoals goals base barrier depth next)
+    callPredicate m predicate trust (if null goals then next else CGoals goals base barrier depth next)
   GTabled ref patterns -> do
     predicate <- readIORef ref
     buildArgs m base patterns 0
@@ -863,15 +949,15 @@ leafItems m items previous cont = case items of
 -- ─── calls ───────────────────────────────────────────────────────────────────
 
 -- | Call with the arguments in the registers.
-callPredicate :: Machine -> Pred -> Cont -> IO Step
-callPredicate m predicate cont0 = do
+callPredicate :: Machine -> Pred -> Maybe Trust -> Cont -> IO Step
+callPredicate m predicate trust cont0 = do
   let s = mStore m
       key = pKey predicate
       n = pArity predicate
   top <- heapTop s
   limit <- readReg s rGCLIM
   cont <- if top > limit then collect m cont0 n else pure cont0
-  selected <- selectSignature m predicate
+  selected <- selectSignatureWith m predicate trust
   case selected of
     Left err -> raiseError m err
     Right signature -> do
@@ -881,25 +967,25 @@ callPredicate m predicate cont0 = do
             Just sig | P.sigDet sig == S.Multi -> Just S.Multi
             _ -> Nothing
       checked <- case signature of
-        Just sig -> do
+        Just sig | not (pTrustReturn predicate) -> do
           args <- mapM (readArg s) [0 .. n - 1]
           pure (Just (key, sig, args))
-        Nothing -> pure Nothing
+        _ -> pure Nothing
       let depth = contDepth cont + 1
       if depth > maxResolutionDepth
         then raiseItems m [BranchExhausted] (backtrack m)
         else do
           entry <- readIORef (mChoiceTop m)
-          guard <- case required of
-            Nothing -> pure Nothing
-            Just det -> do
-              flag <- newIORef False
-              _ <- pushChoice m (AltGuard key det flag)
-              pure (Just flag)
-          let returnCont = case (commits, guard, checked, cont) of
-                (False, Nothing, Nothing, _) -> cont
-                (True, Nothing, Nothing, CReturn _ Nothing Nothing _) -> cont
-                _ -> CReturn (if commits then entry else -1) guard checked cont
+          guardBase <- readIORef (mGuardTop m)
+          forM_ required (pushGuard m key)
+          let hasGuard = required /= Nothing
+              -- A committing return marks and removes every guard pushed
+              -- since its base, so a call needing only a commit or a guard
+              -- and no check can share such a frame.
+              returnCont = case (commits || hasGuard, checked, cont) of
+                (False, Nothing, _) -> cont
+                (True, Nothing, CReturn h _ Nothing _) | h >= 0 -> cont
+                _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
           barrier <- readIORef (mChoiceTop m)
           callClauses m predicate barrier depth returnCont
 
@@ -925,8 +1011,11 @@ tryClause m predicate ordinal barrier depth cont = do
   setFreshId s (fresh + clVars clause)
   base <- allocSlots s fresh (clVars clause)
   ok <- matchHead m base (clHead clause) 0
+  let cont' = case cont of
+        CReturn h g (Just _) next | clTrustReturn clause -> CReturn h g Nothing next
+        _ -> cont
   if ok
-    then runGoals m (clBody clause) base barrier depth cont
+    then runGoals m (clBody clause) base barrier depth cont'
     else backtrack m
 
 matchHead :: Machine -> Int -> [Pattern] -> Int -> IO Bool
@@ -1061,6 +1150,14 @@ backtrack :: Machine -> IO Step
 backtrack m = do
   top <- readIORef (mChoiceTop m)
   traceMsg ("backtrack B=" ++ show top)
+  fired <- popGuardAbove m top
+  case fired of
+    Just (key, det, succeeded) ->
+      if succeeded then backtrack m else raiseError m (DetError key det 0)
+    Nothing -> backtrackChoice m top
+
+backtrackChoice :: Machine -> Int -> IO Step
+backtrackChoice m top =
   if top == 0
     then pure Stop
     else do
@@ -1088,10 +1185,6 @@ backtrack m = do
         AltGoals goals base barrier depth cont -> do
           pop
           run m (CGoals goals base barrier depth cont)
-        AltGuard key det flag -> do
-          pop
-          seen <- readIORef flag
-          if seen then backtrack m else raiseError m (DetError key det 0)
         AltNot flag buffer cont -> do
           pop
           succeeded <- readIORef flag
@@ -1450,6 +1543,27 @@ typeCheck m check w0 = do
 
 -- ─── contracts ───────────────────────────────────────────────────────────────
 
+-- | Signature selection with a call site's proof: the proven alternative
+-- is taken without testing groundness and trusted arguments skip the sort
+-- check.
+selectSignatureWith :: Machine -> Pred -> Maybe Trust -> IO (Either SolveError (Maybe P.Signature))
+selectSignatureWith m predicate trust = case (pDecls predicate, trust) of
+  (sigs@(_ : _), Just (Trust k mask)) | k < length sigs -> do
+    let sig = sigs !! k
+    args <- mapM (readArg (mStore m)) [0 .. pArity predicate - 1]
+    problem <- firstProblem
+      [ checkSort i spec w
+      | (i, spec, w, trusted) <- zip4 [1 ..] (P.sigArgs sig) args (mask ++ repeat False), not trusted ]
+    pure (maybe (Right (Just sig)) Left problem)
+  _ -> selectSignature m predicate
+  where
+    key = pKey predicate
+    checkSort i (S.ArgSpec sort _) w = do
+      ok <- sortMatches m sort w
+      if ok then pure Nothing else Just . SortError key i sort <$> exportFor m w
+    zip4 (a : as) (b : bs) (c : cs) (d : ds) = (a, b, c, d) : zip4 as bs cs ds
+    zip4 _ _ _ _ = []
+
 selectSignature :: Machine -> Pred -> IO (Either SolveError (Maybe P.Signature))
 selectSignature m predicate = case pDecls predicate of
   [] -> pure (Right Nothing)
@@ -1652,15 +1766,12 @@ callTabled m predicate cont0 = do
         Nothing -> pure Nothing
       let depth = contDepth cont + 1
       entry <- readIORef (mChoiceTop m)
-      guard <- case required of
-        Nothing -> pure Nothing
-        Just det -> do
-          flag <- newIORef False
-          _ <- pushChoice m (AltGuard key det flag)
-          pure (Just flag)
-      let returnCont = case (commits, guard, checked) of
-            (False, Nothing, Nothing) -> cont
-            _ -> CReturn (if commits then entry else -1) guard checked cont
+      guardBase <- readIORef (mGuardTop m)
+      forM_ required (pushGuard m key)
+      let hasGuard = required /= Nothing
+          returnCont = case (commits || hasGuard, checked) of
+            (False, Nothing) -> cont
+            _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
       saved <- saveArgs s n
       (callKey, _) <- canonicalCall m (fst key) saved n
       store <- readIORef (mCLP m)
@@ -1972,7 +2083,6 @@ collect m cont nargs = do
           forM_ [saved .. saved + pArity predicate - 1] markCell
           markCont c
         AltGoals _ base _ _ c -> markBlock base >> markCont c
-        AltGuard _ _ _ -> pure ()
         AltNot _ _ c -> markCont c
         AltIf _ elseGoals c -> do
           forM_ elseGoals (\(_, base, _, _) -> markBlock base)
@@ -2088,7 +2198,6 @@ collect m cont nargs = do
           AltClauses predicate more <$> forward saved <*> pure depth <*> relocCont c
         AltGoals goals base barrier depth c ->
           AltGoals goals <$> relocBlock base <*> pure barrier <*> pure depth <*> relocCont c
-        AltGuard key det flag -> pure (AltGuard key det flag)
         AltNot flag buffer c -> AltNot flag buffer <$> relocCont c
         AltIf counter elseGoals c -> do
           elseGoals' <- case elseGoals of

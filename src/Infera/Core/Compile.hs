@@ -14,6 +14,7 @@ module Infera.Core.Compile
     CmpOp (..),
     Check (..),
     Goal (..),
+    Trust (..),
     Pred (..),
     PredRef,
     Clause (..),
@@ -36,6 +37,7 @@ import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as Map
 import Infera.Core.Store
 import Infera.Error (PredKey, SolveError (..))
+import Infera.Infer (joinSort)
 import qualified Infera.Program as P
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
@@ -75,8 +77,13 @@ data Check = CkVar | CkNonvar | CkGround | CkInt | CkFloat | CkNum | CkStr | CkA
 -- predicates compiled later (or recursively) without a runtime map lookup.
 type PredRef = IORef Pred
 
+-- | What a call site has proven about a callee's declared contract: the
+-- signature alternative the runtime may select without testing groundness,
+-- and per argument whether the entry sort check may be skipped.
+data Trust = Trust !Int [Bool]
+
 data Goal
-  = GCall !PredRef [Pattern]
+  = GCall !PredRef [Pattern] !(Maybe Trust)
   | -- | a call to a tabled predicate
     GTabled !PredRef [Pattern]
   | -- | a call to a dynamic name without clauses: its asserted facts
@@ -125,7 +132,10 @@ data Goal
 data Clause = Clause
   { clVars :: !Int,
     clHead :: [Pattern],
-    clBody :: [Goal]
+    clBody :: [Goal],
+    -- | the clause's result provably satisfies every declared alternative,
+    -- so its return check may be skipped
+    clTrustReturn :: !Bool
   }
 
 data Key = KAtm !Int | KInt !Int | KChr !Int | KFun !Word' | KBig !Integer | KFlt !Double | KStr !String
@@ -154,7 +164,9 @@ data Pred = Pred
     pInferred :: !P.Signature,
     -- | inferred semidet: the argument positions that must be ground for
     -- the call to commit after its first solution
-    pSwitch :: !(Maybe [Int])
+    pSwitch :: !(Maybe [Int]),
+    -- | every clause's return is trusted: calls push no return check
+    pTrustReturn :: !Bool
   }
 
 data CoreProgram = CoreProgram
@@ -177,8 +189,18 @@ data Ctx = Ctx
     ctxPreds :: Map.Map PredKey PredRef,
     -- | compiling a goal handed to call/N at runtime: nothing is recorded
     ctxDynamic :: Bool,
-    ctxProblems :: IORef [String]
+    ctxProblems :: IORef [String],
+    -- | slots proven ground, with their sort, at this point of the clause
+    ctxFacts :: IORef (IM.IntMap S.Sort),
+    -- | slots that may already be bound at this point of the clause
+    ctxSeen :: IORef IS.IntSet,
+    ctxCons :: Word',
+    ctxNil :: Word'
   }
+
+-- | Is every term of sort @a@ also of sort @b@?
+subSort :: S.Sort -> S.Sort -> Bool
+subSort a b = joinSort a b == b
 
 -- | Compile the whole program for one store. Constructs outside the core
 -- compile to runtime abandonment; the first one met is recorded in
@@ -192,11 +214,15 @@ compileProgram store program query = do
   refs <- forM preds $ \p -> do
     ref <- newIORef (error "predicate compiled later")
     pure (P.predKey p, ref)
+  facts <- newIORef IM.empty
+  seen <- newIORef IS.empty
   let table = Map.fromList refs
-      ctx = Ctx store program table False problems
+      ctx = Ctx store program table False problems facts seen consW nilW
   forM_ preds $ \p -> do
     compiled <- compilePred ctx p
     writeIORef (table Map.! P.predKey p) compiled
+  writeIORef facts IM.empty
+  writeIORef seen IS.empty
   goals <- compileBody ctx (S.queryGoals query)
   arith <- forM arithFunctors $ \(name, arity, op) -> do
     fid <- internFunctor (symbols store) name arity
@@ -209,7 +235,7 @@ compilePred :: Ctx -> P.Pred -> IO Pred
 compilePred ctx p = do
   let clauses = IM.elems (P.predClauses p)
       arity = snd (P.predKey p)
-  compiledClauses <- mapM (compileClause ctx) clauses
+  compiledClauses <- mapM (compileClause ctx (P.predDecls p)) clauses
   let count = length compiledClauses
   index <- mapM (\i -> buildIndex (ctxStore ctx) i compiledClauses) [0 .. arity - 1]
   pure
@@ -225,7 +251,8 @@ compilePred ctx p = do
         pSwitch =
           if P.sigDet (P.predInferred p) == S.Semidet
             then Just (filter (< arity) (P.sigSwitch (P.predInferred p)))
-            else Nothing
+            else Nothing,
+        pTrustReturn = not (null (P.predDecls p)) && all clTrustReturn compiledClauses
       }
 
 buildIndex :: Store -> Int -> [Clause] -> IO ArgIndex
@@ -302,14 +329,136 @@ candidateClauses store p
                     else pure (IM.findWithDefault (aiOpen index) w (aiFast index))
     go [] _ = pure (all' p)
 
-compileClause :: Ctx -> S.Clause -> IO Clause
-compileClause ctx clause = do
+compileClause :: Ctx -> [P.Signature] -> S.Clause -> IO Clause
+compileClause ctx sigs clause = do
   seen <- newIORef IS.empty
   headPatterns <- case S.clauseHead clause of
     Compound _ as -> mapM (compileHeadArg ctx seen) as
     _ -> pure []
+  -- Facts that hold under every declared alternative at clause entry.
+  writeIORef (ctxFacts ctx) IM.empty
+  readIORef seen >>= writeIORef (ctxSeen ctx)
+  forM_ (zip [0 ..] headPatterns) $ \(i, pattern) ->
+    case entryFact sigs i of
+      Just sort -> assumePattern ctx pattern sort
+      Nothing -> pure ()
   body <- compileBody ctx (S.clauseBody clause)
-  pure (Clause (max 1 (S.clauseNVars clause)) headPatterns body)
+  trusted <-
+    if null sigs
+      then pure False
+      else do
+        facts <- readIORef (ctxFacts ctx)
+        proven <- mapM (patternSort ctx facts) headPatterns
+        pure (and [maybe False (\sort -> all (\sig -> subSort sort (argSort sig i)) sigs) p | (i, p) <- zip [0 ..] proven])
+  pure (Clause (max 1 (S.clauseNVars clause)) headPatterns body trusted)
+
+argSort :: P.Signature -> Int -> S.Sort
+argSort sig i = case drop i (P.sigArgs sig) of
+  S.ArgSpec sort _ : _ -> sort
+  [] -> S.SAny
+
+argMode :: P.Signature -> Int -> S.Mode
+argMode sig i = case drop i (P.sigArgs sig) of
+  S.ArgSpec _ mode : _ -> mode
+  [] -> S.ModeInOut
+
+-- | The sort an argument is known to have, ground, at clause entry: it is
+-- an input in every declared alternative, with the join of their sorts.
+entryFact :: [P.Signature] -> Int -> Maybe S.Sort
+entryFact [] _ = Nothing
+entryFact sigs i
+  | all (\sig -> argMode sig i == S.ModeIn) sigs = Just (foldr (joinSort . (`argSort` i)) S.SNone sigs)
+  | otherwise = Nothing
+
+-- | The sort a callee's argument is known to have, ground, after the call:
+-- an output in every alternative, with the join of their sorts.
+outputFact :: [P.Signature] -> Int -> Maybe S.Sort
+outputFact [] _ = Nothing
+outputFact sigs i
+  | all (\sig -> argMode sig i == S.ModeOut) sigs = Just (foldr (joinSort . (`argSort` i)) S.SNone sigs)
+  | otherwise = Nothing
+
+-- | Record that a pattern is ground with the given sort: variables get the
+-- fact, list cells distribute it to head and tail.
+assumePattern :: Ctx -> Pattern -> S.Sort -> IO ()
+assumePattern ctx pattern sort = case pattern of
+  PSlot v -> modifyIORef' (ctxFacts ctx) (IM.insertWith (\_ old -> old) v sort)
+  PFirst v -> modifyIORef' (ctxFacts ctx) (IM.insertWith (\_ old -> old) v sort)
+  PWord _ -> pure ()
+  PStruct f [h, t]
+    | f == ctxCons ctx -> case sort of
+        S.SList element -> assumePattern ctx h element >> assumePattern ctx t sort
+        _ -> assumePattern ctx h S.SAny >> assumePattern ctx t S.SAny
+  PStruct _ children -> mapM_ (\c -> assumePattern ctx c S.SAny) children
+  PArith _ _ children -> mapM_ (\c -> assumePattern ctx c S.SNum) children
+
+-- | The sort of a pattern that is provably ground under the facts.
+patternSort :: Ctx -> IM.IntMap S.Sort -> Pattern -> IO (Maybe S.Sort)
+patternSort ctx facts pattern = case pattern of
+  PSlot v -> pure (IM.lookup v facts)
+  PFirst v -> pure (IM.lookup v facts)
+  PWord w -> Just <$> constantSort ctx w
+  PStruct f [h, t]
+    | f == ctxCons ctx -> do
+        sh <- patternSort ctx facts h
+        st <- patternSort ctx facts t
+        pure $ case (sh, st) of
+          (Just a, Just (S.SList b)) -> Just (S.SList (joinSort a b))
+          (Just _, Just _) -> Just S.SAny
+          _ -> Nothing
+  PStruct _ children -> do
+    sorts <- mapM (patternSort ctx facts) children
+    pure (if all (/= Nothing) sorts then Just S.SAny else Nothing)
+  PArith _ _ children -> do
+    sorts <- mapM (patternSort ctx facts) children
+    pure $ if any (== Nothing) sorts then Nothing
+      else Just (if all (== Just S.SInt) sorts then S.SInt else S.SNum)
+
+constantSort :: Ctx -> Word' -> IO S.Sort
+constantSort ctx w
+  | w == ctxNil ctx = pure (S.SList S.SNone)
+  | otherwise = case tagOf w of
+      t | t == tagInt -> pure S.SInt
+        | t == tagAtm -> pure S.SAtom
+        | t == tagChr -> pure S.SChar
+        | t == tagBox -> do
+            value <- boxed (ctxStore ctx) w
+            pure $ case value of
+              BInt _ -> S.SInt
+              BFlt _ -> S.SFloat
+              BStr _ -> S.SStr
+        | otherwise -> pure S.SAny
+
+exprSort :: IM.IntMap S.Sort -> Expr -> S.Sort
+exprSort facts expr = case expr of
+  EImm _ -> S.SInt
+  EBig _ -> S.SInt
+  EFlt _ -> S.SFloat
+  EPat (PSlot v) -> maybe S.SNum numeric (IM.lookup v facts)
+  EPat (PFirst v) -> maybe S.SNum numeric (IM.lookup v facts)
+  EPat _ -> S.SNum
+  EOp _ operands -> if all ((== S.SInt) . exprSort facts) operands then S.SInt else S.SNum
+  where
+    numeric S.SInt = S.SInt
+    numeric S.SFloat = S.SFloat
+    numeric _ = S.SNum
+
+-- | Facts and seen slots are saved around sub-bodies: nothing established
+-- inside a branch holds after it, while anything bound inside may be bound.
+isolated :: Ctx -> IO a -> IO a
+isolated ctx action = do
+  facts <- readIORef (ctxFacts ctx)
+  result <- action
+  writeIORef (ctxFacts ctx) facts
+  pure result
+
+noteSlot :: Ctx -> Pattern -> IO ()
+noteSlot ctx pattern = case pattern of
+  PSlot v -> modifyIORef' (ctxSeen ctx) (IS.insert v)
+  PFirst v -> modifyIORef' (ctxSeen ctx) (IS.insert v)
+  PStruct _ children -> mapM_ (noteSlot ctx) children
+  PArith _ _ children -> mapM_ (noteSlot ctx) children
+  PWord _ -> pure ()
 
 compileHeadArg :: Ctx -> IORef IS.IntSet -> Term -> IO Pattern
 compileHeadArg ctx seen term = case term of
@@ -337,11 +486,17 @@ constantWord store term = case term of
 -- | Goal arguments: slots, constants, structures, and arithmetic structures
 -- that the reference would evaluate before the call.
 compileArg :: Ctx -> Term -> IO Pattern
-compileArg ctx term = case term of
+compileArg ctx term = do
+  pattern <- compileArg' ctx term
+  noteSlot ctx pattern
+  pure pattern
+
+compileArg' :: Ctx -> Term -> IO Pattern
+compileArg' ctx term = case term of
   Var v -> pure (PSlot v)
   Compound f as -> do
     fid <- internFunctor (symbols (ctxStore ctx)) f (length as)
-    args <- mapM (compileArg ctx) as
+    args <- mapM (compileArg' ctx) as
     pure $ case arithOp f (length as) of
       Just op -> PArith (funWord fid (length as)) op args
       Nothing -> PStruct (funWord fid (length as)) args
@@ -383,31 +538,44 @@ compileGoal ctx term = case term of
   Atom "nl" -> pure GNl
   Compound "$cut" [IntLit _] -> pure GCut
   Compound "," [_, _] -> GAnd <$> body term
-  Compound ";" [Compound "->" [c, t], e] -> GIf <$> body c <*> body t <*> (Just <$> body e)
-  Compound ";" [a, b] -> GOr <$> body a <*> body b
-  Compound "->" [c, t] -> GIf <$> body c <*> body t <*> pure Nothing
-  Compound "not" [g] -> GNot <$> body g
-  Compound "once" [g] -> GOnce <$> body g
-  Compound "forall" [c, a] -> do
+  Compound ";" [Compound "->" [c, t], e] -> isolated ctx (GIf <$> body c <*> body t <*> (Just <$> body e))
+  Compound ";" [a, b] -> isolated ctx (GOr <$> body a <*> body b)
+  Compound "->" [c, t] -> isolated ctx (GIf <$> body c <*> body t <*> pure Nothing)
+  Compound "not" [g] -> isolated ctx (GNot <$> body g)
+  Compound "once" [g] -> isolated ctx (GOnce <$> body g)
+  Compound "forall" [c, a] -> isolated ctx $ do
     cg <- body c
     ag <- body a
     pure (GNot (cg ++ [GNot ag]))
-  Compound "findall" [tmpl, g, l] -> GFindAll <$> arg tmpl <*> body g <*> arg l
+  Compound "findall" [tmpl, g, l] -> GFindAll <$> arg tmpl <*> isolated ctx (body g) <*> arg l
   Compound "call" (p : args) -> GCallDyn False <$> arg p <*> mapM arg args
-  Compound "unify" [a, b] -> GUnify <$> arg a <*> arg b
+  Compound "unify" [a, b] -> do
+    pa <- arg a
+    pb <- arg b
+    facts <- readIORef (ctxFacts ctx)
+    sb <- patternSort ctx facts pb
+    sa <- patternSort ctx facts pa
+    forM_ sb (assumePattern ctx pa)
+    forM_ sa (assumePattern ctx pb)
+    pure (GUnify pa pb)
   Compound "equiv" [a, b] -> GEquiv <$> arg a <*> arg b
   Compound "neq" [a, b] -> GNeq <$> arg a <*> arg b
-  Compound "is" [a, b] -> GIs <$> arg a <*> compileExpr ctx b
+  Compound "is" [a, b] -> do
+    pa <- arg a
+    expr <- compileExpr ctx b
+    facts <- readIORef (ctxFacts ctx)
+    assumePattern ctx pa (exprSort facts expr)
+    pure (GIs pa expr)
   Compound "gt" [a, b] -> GCmp CmpGt <$> compileExpr ctx a <*> compileExpr ctx b
   Compound "lt" [a, b] -> GCmp CmpLt <$> compileExpr ctx a <*> compileExpr ctx b
   Compound "gte" [a, b] -> GCmp CmpGte <$> compileExpr ctx a <*> compileExpr ctx b
   Compound "lte" [a, b] -> GCmp CmpLte <$> compileExpr ctx a <*> compileExpr ctx b
   Compound "var" [x] -> GCheck CkVar <$> arg x
   Compound "nonvar" [x] -> GCheck CkNonvar <$> arg x
-  Compound "ground" [x] -> GCheck CkGround <$> arg x
-  Compound "is_int" [x] -> GCheck CkInt <$> arg x
-  Compound "is_float" [x] -> GCheck CkFloat <$> arg x
-  Compound "is_num" [x] -> GCheck CkNum <$> arg x
+  Compound "ground" [x] -> checked CkGround S.SAny x
+  Compound "is_int" [x] -> checked CkInt S.SInt x
+  Compound "is_float" [x] -> checked CkFloat S.SFloat x
+  Compound "is_num" [x] -> checked CkNum S.SNum x
   Compound "is_str" [x] -> GCheck CkStr <$> arg x
   Compound "is_atom" [x] -> GCheck CkAtom <$> arg x
   Compound "is_char" [x] -> GCheck CkChar <$> arg x
@@ -418,7 +586,7 @@ compileGoal ctx term = case term of
   Compound "phrase" [nt, l] -> GPhrase <$> arg nt <*> arg l
   Compound "phrase_from_file" [nt, path] -> GPhraseFile <$> arg nt <*> arg path
   Compound "emit" [nt] -> GEmit <$> arg nt
-  Compound "minimize" [cost, g] -> GMinimize <$> arg cost <*> body g
+  Compound "minimize" [cost, g] -> GMinimize <$> arg cost <*> isolated ctx (body g)
   Compound "assert" [t] -> GAssert <$> arg t
   Compound "retract" [t] -> GRetract <$> arg t
   Compound "retractall" [t] -> GRetractAll <$> arg t
@@ -431,6 +599,10 @@ compileGoal ctx term = case term of
   where
     body t = compileBody ctx [t]
     arg = compileArg ctx
+    checked check sort x = do
+      px <- arg x
+      assumePattern ctx px sort
+      pure (GCheck check px)
     unsupported what = do
       if ctxDynamic ctx then pure () else modifyIORef' (ctxProblems ctx) (what :)
       pure (GUnsupported term)
@@ -438,7 +610,25 @@ compileGoal ctx term = case term of
       Just ref
         | Just p <- P.lookupPred (f, length as) (ctxProgram ctx), P.predIsTabled (ctxProgram ctx) p ->
             GTabled ref <$> mapM arg as
-        | otherwise -> GCall ref <$> mapM arg as
+        | otherwise -> do
+            let sigs = maybe [] P.predDecls (P.lookupPred (f, length as) (ctxProgram ctx))
+            seenBefore <- readIORef (ctxSeen ctx)
+            patterns <- mapM arg as
+            facts <- readIORef (ctxFacts ctx)
+            sorts <- mapM (patternSort ctx facts) patterns
+            let fresh pattern = case pattern of
+                  PSlot v -> not (IS.member v seenBefore)
+                  _ -> False
+                selectable sig = and [maybe False (const True) sort | (i, sort) <- zip [0 :: Int ..] sorts, argMode sig i == S.ModeIn]
+                trust = case [k | (k, sig) <- zip [0 ..] sigs, selectable sig] of
+                  (k : _) ->
+                    let sig = sigs !! k
+                     in Just (Trust k [maybe (fresh pattern) (\sort -> subSort sort (argSort sig i)) msort
+                                      | (i, pattern, msort) <- zip3 [0 ..] patterns sorts])
+                  [] -> Nothing
+            -- The callee's verified or proven contract gives its outputs.
+            forM_ (zip [0 ..] patterns) $ \(i, pattern) -> forM_ (outputFact sigs i) (assumePattern ctx pattern)
+            pure (GCall ref patterns trust)
       Nothing
         | P.nameHasFlag (ctxProgram ctx) f S.FlagDynamic -> GCallFacts (f, length as) <$> mapM arg as
         | otherwise -> pure (GError (UnknownPredicate (f, length as)))
@@ -467,4 +657,8 @@ constraintBuiltins =
 compileGoalTerm :: Store -> P.Program -> Map.Map PredKey PredRef -> Term -> IO Goal
 compileGoalTerm store program preds term = do
   problems <- newIORef []
-  compileGoal (Ctx store program preds True problems) term
+  facts <- newIORef IM.empty
+  seen <- newIORef IS.empty
+  nilW <- atmWord <$> internAtom (symbols store) "nil"
+  consW <- (\f -> funWord f 2) <$> internFunctor (symbols store) "cons" 2
+  compileGoal (Ctx store program preds True problems facts seen consW nilW) term

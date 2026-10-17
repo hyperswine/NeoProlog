@@ -13,6 +13,7 @@ module Infera.Infer
     subGoals,
     builtinDet,
     impureBuiltins,
+    joinSort,
   )
 where
 

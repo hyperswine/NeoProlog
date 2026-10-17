@@ -1,0 +1,65 @@
+<- notable.
+len : det (list int: <=) (int: =>).
+len [] 0.
+len [_ | T] N <- len T M, N is M + 1.
+app : det (list any: <=) (list any: <=) (list any: =>).
+app [] L L.
+app [H | T] L [H | R] <- app T L R.
+sum : semidet (list int: <=) (int: =>).
+sum [] 0.
+sum [X | Xs] S <- sum Xs S1, S is S1 + X.
+range : nondet (int: <=) (int: <=) (list int: =>).
+range N N [N].
+range I N [I | T] <- I < N, I1 is I + 1, range I1 N T.
+bad_out : det (int: <=) (int: =>).
+bad_out 1 one.
+bad_out N M <- N > 1, M is N - 1.
+half : det (int: <=) (float: =>).
+half N H <- H is N / 2.
+wrong_half : det (int: <=) (int: =>).
+wrong_half N H <- H is N / 2.
+alias : det (list int: <=) (list int: =>).
+alias L L.
+widen : det (list int: <=) (list any: =>).
+widen L L.
+narrow : det (list any: <=) (list int: =>).
+narrow L L.
+rev : det (list int: <=) (list int: =>).
+rev [] [].
+rev [H | T] R <- rev T RT, app RT [H] R.
+two : det (int: <=) (int: =>).
+two : det (float: <=) (float: =>).
+two X Y <- Y is X * 2.
+loud : unsafe.
+loud : det (int: <=) (int: =>).
+loud X Y <- writeln X, Y is X + 1.
+count : det (int: <=) (int: <=) (int: =>).
+count 0 Acc Acc.
+count N Acc R <- N > 0, A1 is Acc + N, N1 is N - 1, count N1 A1 R.
+> len [1, 2, 3] N?
+> len [1, a] N?
+> len X 2?
+> range 1 5 L, len L N?
+> app [1, 2] [3] R, len R N?
+> app [1, 2] [a] R, len R N?
+> sum [1, 2, 3] S?
+> bad_out 1 X?
+> bad_out 3 X?
+> half 3 H?
+> wrong_half 3 H?
+> alias [1, 2] L?
+> widen [1, 2] L?
+> narrow [1, 2] L?
+> narrow [1, a] L?
+> narrow [1 | T] L?
+> rev [1, 2, 3] R?
+> rev [1, 2, 3] R, len R N?
+> two 3 Y?
+> two 1.5 Y?
+> two a Y?
+> loud 1 Y?
+> count 50000 0 R?
+> count 3 0 R, count R 0 S?
+> range 1 300 L, rev L R, sum R S?
+> app X Y [1, 2]?
+> len [1, 2 | T] N?
