@@ -41,7 +41,7 @@ module Infera.Core.Store
     -- * Unification and equality
     unify, equiv, isGroundWord, occursIn,
     -- * Term exchange
-    importTerm, exportTerm, exportTermWith,
+    importTerm, importTermWords, exportTerm, exportTermWith,
   )
 where
 
@@ -633,14 +633,23 @@ occursIn s addr w0 = do
 -- | Build a term on the heap. Variables map through the supplied cell table;
 -- unknown variables get fresh cells and extend the table.
 importTerm :: Store -> IORef (IM.IntMap Int) -> Term -> IO Word'
-importTerm s table term = case term of
+importTerm s table term = do
+  words' <- newIORef . IM.map refWord =<< readIORef table
+  w <- importTermWords s words' term
+  final <- readIORef words'
+  writeIORef table (IM.map valOf final)
+  pure w
+
+-- | 'importTerm' with a table of arbitrary words for known variables.
+importTermWords :: Store -> IORef (IM.IntMap Word') -> Term -> IO Word'
+importTermWords s table term = case term of
   Var v -> do
     known <- readIORef table
     case IM.lookup v known of
-      Just addr -> pure (refWord addr)
+      Just w -> pure w
       Nothing -> do
         addr <- allocCells s 1
-        modifyIORef' table (IM.insert v addr)
+        modifyIORef' table (IM.insert v (refWord addr))
         pure (refWord addr)
   Atom a -> atmWord <$> internAtom (symbols s) a
   IntLit n
@@ -651,7 +660,7 @@ importTerm s table term = case term of
   StrLit str -> box s (BStr str)
   Compound f as -> do
     fid <- internFunctor (symbols s) f (length as)
-    words' <- mapM (importTerm s table) as
+    words' <- mapM (importTermWords s table) as
     structureWord s (funWord fid (length as)) words'
 
 -- | Read a term back. Unbound cells take the id their activation marker

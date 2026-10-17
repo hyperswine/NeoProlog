@@ -96,7 +96,18 @@ data Goal
     GWrite !Bool Pattern
   | GNl
   | GError SolveError
-  | -- | reached only through a dynamic goal: abandon the core run
+  | -- | a leaf builtin evaluated by the reference implementation on
+    -- exported terms, with its bindings imported back
+    GLeaf !String [Pattern]
+  | -- | @phrase NT L@
+    GPhrase Pattern Pattern
+  | -- | @phrase_from_file NT Path@
+    GPhraseFile Pattern Pattern
+  | -- | @emit NT@
+    GEmit Pattern
+  | -- | runtime only: write the character list in a slot
+    GEmitText Pattern
+  | -- | a construct outside the core: abandon the run and fall back
     GUnsupported Term
 
 data Clause = Clause
@@ -138,7 +149,9 @@ data CoreProgram = CoreProgram
     cpNil :: !Word',
     cpCons :: !Word',
     -- | arithmetic functor words and their operators
-    cpArith :: IM.IntMap ArithOp
+    cpArith :: IM.IntMap ArithOp,
+    -- | the first construct that would make a run fall back, if any
+    cpUnsupported :: Maybe String
   }
 
 newtype Unsupported = Unsupported String deriving (Show)
@@ -147,48 +160,35 @@ data Ctx = Ctx
   { ctxStore :: Store,
     ctxProgram :: P.Program,
     ctxPreds :: Map.Map PredKey PredRef,
-    -- | compiling a goal handed to call/N at runtime: unsupported goals
-    -- become runtime abandonment instead of a compile-time rejection
+    -- | compiling a goal handed to call/N at runtime: nothing is recorded
     ctxDynamic :: Bool,
     ctxProblems :: IORef [String]
   }
 
--- | Compile the whole program for one store. Right only when the program and
--- query are inside the supported subset.
+-- | Compile the whole program for one store. Constructs outside the core
+-- compile to runtime abandonment; the first one met is recorded in
+-- 'cpUnsupported' for diagnostics.
 compileProgram :: Store -> P.Program -> S.Query -> IO (Either Unsupported CoreProgram)
 compileProgram store program query = do
   let preds = P.programPreds program
-      unsupportedPred p
-        | P.predIsTabled program p = Just ("tabled predicate " ++ showKey (P.predKey p))
-        | P.predIsDynamic program p = Just ("dynamic predicate " ++ showKey (P.predKey p))
-        | otherwise = Nothing
-      dynamicNames = any (elem S.FlagDynamic) (Map.elems (P.progNameFlags program))
-  case [problem | p <- preds, Just problem <- [unsupportedPred p]] of
-    (problem : _) -> pure (Left (Unsupported problem))
-    []
-      | dynamicNames -> pure (Left (Unsupported "dynamic declarations"))
-      | otherwise -> do
-          problems <- newIORef []
-          nilW <- atmWord <$> internAtom (symbols store) "nil"
-          consW <- (\f -> funWord f 2) <$> internFunctor (symbols store) "cons" 2
-          refs <- forM preds $ \p -> do
-            ref <- newIORef (error "predicate compiled later")
-            pure (P.predKey p, ref)
-          let table = Map.fromList refs
-              ctx = Ctx store program table False problems
-          forM_ preds $ \p -> do
-            compiled <- compilePred ctx p
-            writeIORef (table Map.! P.predKey p) compiled
-          goals <- compileBody ctx (S.queryGoals query)
-          arith <- forM arithFunctors $ \(name, arity, op) -> do
-            fid <- internFunctor (symbols store) name arity
-            pure (funWord fid arity, op)
-          found <- readIORef problems
-          case found of
-            (problem : _) -> pure (Left (Unsupported problem))
-            [] -> pure (Right (CoreProgram table goals (S.queryNVars query) nilW consW (IM.fromList arith)))
-  where
-    showKey (name, arity) = name ++ "/" ++ show arity
+  problems <- newIORef []
+  nilW <- atmWord <$> internAtom (symbols store) "nil"
+  consW <- (\f -> funWord f 2) <$> internFunctor (symbols store) "cons" 2
+  refs <- forM preds $ \p -> do
+    ref <- newIORef (error "predicate compiled later")
+    pure (P.predKey p, ref)
+  let table = Map.fromList refs
+      ctx = Ctx store program table False problems
+  forM_ preds $ \p -> do
+    compiled <- compilePred ctx p
+    writeIORef (table Map.! P.predKey p) compiled
+  goals <- compileBody ctx (S.queryGoals query)
+  arith <- forM arithFunctors $ \(name, arity, op) -> do
+    fid <- internFunctor (symbols store) name arity
+    pure (funWord fid arity, op)
+  found <- reverse <$> readIORef problems
+  pure (Right (CoreProgram table goals (S.queryNVars query) nilW consW (IM.fromList arith)
+    (case found of (problem : _) -> Just problem; [] -> Nothing)))
 
 compilePred :: Ctx -> P.Pred -> IO Pred
 compilePred ctx p = do
@@ -390,11 +390,15 @@ compileGoal ctx term = case term of
   Compound "write" [x] -> GWrite False <$> arg x
   Compound "print" [x] -> GWrite False <$> arg x
   Compound "writeln" [x] -> GWrite True <$> arg x
+  Compound "phrase" [nt, l] -> GPhrase <$> arg nt <*> arg l
+  Compound "phrase_from_file" [nt, path] -> GPhraseFile <$> arg nt <*> arg path
+  Compound "emit" [nt] -> GEmit <$> arg nt
   Compound f as
-    | f `elem` referenceBuiltins -> unsupported ("builtin " ++ f ++ "/" ++ show (length as))
+    | (f, length as) `elem` leafBuiltins -> GLeaf f <$> mapM arg as
+    | f `elem` abandonedBuiltins -> unsupported ("builtin " ++ f ++ "/" ++ show (length as))
     | otherwise -> userCall f as
   Atom f
-    | f `elem` referenceBuiltins -> unsupported ("builtin " ++ f ++ "/0")
+    | f `elem` abandonedBuiltins -> unsupported ("builtin " ++ f ++ "/0")
     | otherwise -> userCall f []
   _ -> pure (GError (TypeError "callable goal" term))
   where
@@ -404,19 +408,31 @@ compileGoal ctx term = case term of
       if ctxDynamic ctx then pure () else modifyIORef' (ctxProblems ctx) (what :)
       pure (GUnsupported term)
     userCall f as = case Map.lookup (f, length as) (ctxPreds ctx) of
-      Just ref -> GCall ref <$> mapM arg as
+      Just ref
+        | Just p <- P.lookupPred (f, length as) (ctxProgram ctx), P.predIsTabled (ctxProgram ctx) p ->
+            unsupported ("tabled predicate " ++ f ++ "/" ++ show (length as))
+        | Just p <- P.lookupPred (f, length as) (ctxProgram ctx), P.predIsDynamic (ctxProgram ctx) p ->
+            unsupported ("dynamic predicate " ++ f ++ "/" ++ show (length as))
+        | otherwise -> GCall ref <$> mapM arg as
       Nothing
         | P.nameHasFlag (ctxProgram ctx) f S.FlagDynamic -> unsupported ("dynamic " ++ f)
         | otherwise -> pure (GError (UnknownPredicate (f, length as)))
 
--- Goals handled by the reference engine that this slice does not compile.
-referenceBuiltins :: [String]
-referenceBuiltins =
+-- | Builtins whose reference implementation is a pure function of their
+-- arguments (and the preloaded files): run through 'GLeaf'.
+leafBuiltins :: [(String, Int)]
+leafBuiltins =
+  [ ("str_concat", 3), ("str_length", 2), ("str_chars", 2), ("str_atom", 2), ("str_num", 2),
+    ("str_upper", 2), ("str_lower", 2), ("str_lines", 2), ("term_str", 2), ("char_code", 2),
+    ("read_file", 2), ("fmt", 4), ("wr", 3), ("sp", 2), ("nl", 2), ("seq", 3), ("padl", 4), ("padr", 4)
+  ]
+
+-- | Goals that need the constraint store, tables, dynamic facts or
+-- optimisation: the run falls back to the existing machine.
+abandonedBuiltins :: [String]
+abandonedBuiltins =
   [ "int_eq", "fd_ne", "fd_le", "fd_lt", "fd_ge", "fd_gt", "reify", "in", "label", "labeling",
-    "all_different", "all_distinct", "minimize", "phrase", "phrase_from_file", "emit",
-    "read_file", "assert", "retract", "retractall", "str_concat", "str_length", "str_chars",
-    "str_atom", "str_num", "str_upper", "str_lower", "str_lines", "term_str", "char_code",
-    "fmt", "wr", "sp", "seq", "padl", "padr"
+    "all_different", "all_distinct", "minimize", "assert", "retract", "retractall"
   ]
 
 -- | Compile a goal that a running program handed to @call/N@. The caller

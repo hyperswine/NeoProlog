@@ -16,7 +16,7 @@ module Infera.Core.Run
   )
 where
 
-import Control.Monad (foldM, forM, forM_, when)
+import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.Array ((!))
 import Data.Array.Base (getNumElements, unsafeRead, unsafeWrite)
 import Data.Bits ((.|.))
@@ -27,12 +27,14 @@ import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble,
 import qualified Infera.CLP as CLP
 import Infera.Core.Compile
 import Infera.Core.Store
-import Infera.Engine.Reference (OutputEvent (..), SearchItem (..), SolverState (..), initialState, maxResolutionDepth)
+import qualified Data.Map.Strict as Map
+import Infera.Engine.Reference (Env (..), OutputEvent (..), SearchItem (..), SolverState (..), initialState, maxResolutionDepth, mkEnv)
+import qualified Infera.Engine.Reference as Reference
 import Infera.Error (PredKey, SolveError (..))
 import qualified Infera.Program as P
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
-import Infera.Unify (emptySubst)
+import Infera.Unify (deepWalk, emptySubst)
 
 data Step
   = Stop
@@ -72,6 +74,8 @@ data Alt
   | AltNot !(IORef Bool) !(IORef [SearchItem]) Cont
   | AltIf !(IORef Int) (Maybe ([Goal], Int, Int, Int)) Cont
   | AltFindAll !(IORef [(Copy, [OutputEvent])]) !(IORef [SearchItem]) Pattern !Int !Int Cont
+  | -- | remaining reference items of a leaf builtin and its variable table
+    AltLeaf [SearchItem] !(IM.IntMap Word') Cont
 
 -- Issue scopes: a negation or findall buffers issues until its outcome is
 -- known; a condition only counts them.
@@ -84,6 +88,7 @@ data Copy = CpRef !Int | CpFresh !Int !Int | CpWord !Word' | CpStruct !Word' [Co
 data Machine = Machine
   { mStore :: !Store,
     mProgram :: !P.Program,
+    mEnv :: !Env,
     mCore :: !CoreProgram,
     mChoices :: !(IORef (IOArray Int Choice)),
     mChoiceTop :: !(IORef Int),
@@ -93,25 +98,26 @@ data Machine = Machine
 
 -- | Compile and start a query. Left names the construct that puts the
 -- program outside the supported subset; Right produces the first step.
-runCore :: P.Program -> S.Query -> IO (Either String (IO Step))
+runCore :: P.Program -> S.Query -> IO (Maybe String, IO Step)
 runCore = runCoreWith initialCollectLimit
 
 -- | Start with an explicit initial collection threshold (cells); tests use
--- a tiny one to collect at nearly every call.
-runCoreWith :: Int -> P.Program -> S.Query -> IO (Either String (IO Step))
+-- a tiny one to collect at nearly every call. The first component names
+-- the first construct that would abandon the run, if any.
+runCoreWith :: Int -> P.Program -> S.Query -> IO (Maybe String, IO Step)
 runCoreWith limit program query = do
   syms <- newSymbols
   store <- newStore syms
   writeReg store rGCLIM limit
   compiled <- compileProgram store program query
   case compiled of
-    Left (Unsupported reason) -> pure (Left reason)
+    Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason))
     Right core -> do
       choices <- newArray_ (0, 1023)
-      m <- Machine store program core <$> newIORef choices <*> newIORef 0 <*> newIORef [] <*> newIORef []
+      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef [] <*> newIORef []
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
-      pure (Right (run m (CGoals (cpQuery core) 0 0 0 CDone)))
+      pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone))
 
 -- ─── choice stack ────────────────────────────────────────────────────────────
 
@@ -291,14 +297,58 @@ step m goal goals base barrier depth next = case goal of
             shown <- exportFor m word
             raiseError m (TypeError "callable" shown)
         | otherwise -> do
-            compiled <- compileGoalTerm (mStore m) (mProgram m) (cpPreds (mCore m)) goalWith
-            cellsByVar <- readIORef aliases
-            let s = mStore m
-            fresh <- freshId s
-            block <- allocSlots s fresh (max 1 (IM.size cellsByVar))
-            forM_ (IM.toList cellsByVar) $ \(v, addr) -> writeCell s (block + v) (refWord addr)
-            height <- readIORef (mChoiceTop m)
-            runGoals m [compiled] block height depth (CGoals goals base barrier depth next)
+            runDynamic m aliases [goalWith] [] depth (CGoals goals base barrier depth next)
+  GPhrase nt l -> do
+    ntWord <- buildArg m base False nt
+    lWord <- buildArg m base False l >>= deref (mStore m)
+    input <- if tagOf lWord == tagBox
+      then do
+        value <- boxed (mStore m) lWord
+        case value of
+          BStr str -> charListWord m str
+          _ -> pure lWord
+      else pure lWord
+    aliases <- newIORef IM.empty
+    goal <- phraseTerm m aliases ntWord input
+    runDynamic m aliases [goal] [] depth (CGoals goals base barrier depth next)
+  GPhraseFile nt path -> do
+    ntWord <- buildArg m base False nt
+    pathWord <- buildArg m base False path >>= deref (mStore m)
+    located <- fileContents m pathWord
+    case located of
+      Left err -> raiseError m err
+      Right contents -> do
+        input <- charListWord m contents
+        aliases <- newIORef IM.empty
+        goal <- phraseTerm m aliases ntWord input
+        runDynamic m aliases [goal] [] depth (CGoals goals base barrier depth next)
+  GEmit nt -> do
+    let s = mStore m
+    ntWord <- buildArg m base False nt
+    fresh <- freshId s
+    chars <- allocSlots s fresh 1
+    setFreshId s (fresh + 1)
+    aliases <- newIORef IM.empty
+    goal <- phraseTerm m aliases ntWord (refWord chars)
+    table <- readIORef aliases
+    let csId = head [v | (v, w) <- IM.toList table, w == refWord chars]
+    phraseGoal <- compileGoalTerm s (mProgram m) (cpPreds (mCore m)) goal
+    runDynamic m aliases [] [GIf [phraseGoal] [GEmitText (PSlot csId)] Nothing] depth (CGoals goals base barrier depth next)
+  GEmitText pattern -> do
+    word <- buildArg m base False pattern
+    text <- charListOf m word
+    case text of
+      Just str -> emitOutput m (WriteEvent str) >> continue
+      Nothing -> do
+        shown <- exportFor m word
+        raiseError m (TypeError "character list from the DCG" shown)
+  GLeaf name patterns -> do
+    aliases <- newIORef IM.empty
+    args <- mapM (\p -> buildArg m base False p >>= exportGoal m aliases) patterns
+    table <- readIORef aliases
+    let goal = Compound name args
+        items = Reference.solveGoal (mEnv m) maxResolutionDepth (initialState (IM.size table)) goal
+    leafItems m items table (CGoals goals base barrier depth next)
   GUnify a b -> do
     wa <- buildArg m base False a
     wb <- buildArg m base False b
@@ -393,6 +443,101 @@ step m goal goals base barrier depth next = case goal of
   GUnsupported term -> pure (Abandon ("unsupported goal " ++ show term))
   where
     continue = runGoals m goals base barrier depth next
+
+-- | Run goal terms whose variables are the alias table's words, in a fresh
+-- activation block aliasing those words; extra compiled goals run after
+-- them in the same block. Cuts stay local.
+runDynamic :: Machine -> IORef (IM.IntMap Word') -> [Term] -> [Goal] -> Int -> Cont -> IO Step
+runDynamic m aliases terms extra depth cont = do
+  compiled <- mapM (compileGoalTerm (mStore m) (mProgram m) (cpPreds (mCore m))) terms
+  table <- readIORef aliases
+  let s = mStore m
+  fresh <- freshId s
+  block <- allocSlots s fresh (max 1 (IM.size table))
+  forM_ (IM.toList table) $ \(v, w) -> writeCell s (block + v) w
+  height <- readIORef (mChoiceTop m)
+  runGoals m (compiled ++ extra) block height depth cont
+
+-- | The goal that runs a DCG non-terminal between an input and @nil@.
+phraseTerm :: Machine -> IORef (IM.IntMap Word') -> Word' -> Word' -> IO Term
+phraseTerm m aliases ntWord input = do
+  nt <- exportGoal m aliases ntWord
+  table <- readIORef aliases
+  let inputId = IM.size table
+  writeIORef aliases (IM.insert inputId input table)
+  let s0 = Var inputId
+      end = Atom "nil"
+  pure $ case nt of
+    Atom f -> Compound f [s0, end]
+    Compound f as -> Compound f (as ++ [s0, end])
+    other -> Compound "call" [other, s0, end]
+
+charListWord :: Machine -> String -> IO Word'
+charListWord m str =
+  foldM (\tl c -> structure (mStore m) (cpCons (mCore m)) [chrWord (fromEnum c), tl]) (cpNil (mCore m)) (reverse str)
+
+charListOf :: Machine -> Word' -> IO (Maybe String)
+charListOf m w0 = do
+  w <- deref s w0
+  if w == cpNil (mCore m)
+    then pure (Just [])
+    else
+      if tagOf w /= tagStr
+        then pure Nothing
+        else do
+          f <- readCell s (valOf w)
+          if funKey f /= cpCons (mCore m)
+            then pure Nothing
+            else do
+              hd <- readCell s (valOf w + 1) >>= deref s
+              if tagOf hd /= tagChr
+                then pure Nothing
+                else do
+                  rest <- readCell s (valOf w + 2) >>= charListOf m
+                  pure (fmap (toEnum (valOf hd) :) rest)
+  where
+    s = mStore m
+
+fileContents :: Machine -> Word' -> IO (Either SolveError String)
+fileContents m pathWord
+  | tagOf pathWord == tagBox = do
+      value <- boxed (mStore m) pathWord
+      case value of
+        BStr path -> pure $ case Map.lookup path (envFiles (mEnv m)) of
+          Just contents -> Right contents
+          Nothing -> Left (UserError ("read_file: \"" ++ path ++ "\" was not loaded (paths must be string literals in the program or query)"))
+        _ -> Left . TypeError "file path string" <$> exportFor m pathWord
+  | otherwise = Left . TypeError "file path string" <$> exportFor m pathWord
+
+-- | Consume the reference items of a leaf builtin: each solution imports the
+-- bindings of the exported variables; later items wait in a choice point.
+leafItems :: Machine -> [SearchItem] -> IM.IntMap Word' -> Cont -> IO Step
+leafItems m items table cont = case items of
+  [] -> backtrack m
+  (item : rest) -> do
+    unless (null rest) $ () <$ pushChoice m (AltLeaf rest table cont)
+    case item of
+      Found state -> do
+        ok <- importBindings m table (CLP.stSubst (ssStore state))
+        if ok then run m cont else backtrack m
+      BranchError err -> raiseItems m [BranchError err] (backtrack m)
+      BranchExhausted -> raiseItems m [BranchExhausted] (backtrack m)
+      _ -> backtrack m
+
+importBindings :: Machine -> IM.IntMap Word' -> IM.IntMap Term -> IO Bool
+importBindings m table subst = go (IM.toList table)
+  where
+    s = mStore m
+    go [] = pure True
+    go ((v, w) : rest) = case deepWalk subst (Var v) of
+      Var same | same == v -> go rest
+      term -> do
+        cells' <- newIORef table
+        -- Variables of the imported term that alias exported ones map back
+        -- to their words; new ones get fresh cells.
+        imported <- importTermWords s cells' term
+        ok <- unify s w imported
+        if ok then go rest else pure False
 
 -- ─── calls ───────────────────────────────────────────────────────────────────
 
@@ -619,6 +764,9 @@ backtrack m = do
           case elseGoals of
             Just (goals, base, barrier, depth) | issues == 0 -> run m (CGoals goals base barrier depth cont)
             _ -> backtrack m
+        AltLeaf items table cont -> do
+          pop
+          leafItems m items table cont
         AltFindAll results buffer target base _ cont -> do
           pop
           issues <- reverse <$> readIORef buffer
@@ -1053,19 +1201,19 @@ exportState m = do
         ssOutLen = count
       }
 
--- | Export a goal for @call/N@: distinct unbound cells become variables
--- @0, 1, ...@ recorded in the alias table.
-exportGoal :: Machine -> IORef (IM.IntMap Int) -> Word' -> IO Term
+-- | Export a goal for @call/N@ and the leaf builtins: distinct unbound
+-- cells become variables @0, 1, ...@ whose words the alias table records.
+exportGoal :: Machine -> IORef (IM.IntMap Word') -> Word' -> IO Term
 exportGoal m aliases w0 = do
   w <- deref s w0
   case tagOf w of
     t | t == tagRef -> do
           table <- readIORef aliases
-          case [v | (v, addr) <- IM.toList table, addr == valOf w] of
+          case [v | (v, word) <- IM.toList table, word == w] of
             (v : _) -> pure (Var v)
             [] -> do
               let v = IM.size table
-              writeIORef aliases (IM.insert v (valOf w) table)
+              writeIORef aliases (IM.insert v w table)
               pure (Var v)
       | t == tagStr -> do
           f <- readCell s (valOf w)
@@ -1173,6 +1321,7 @@ collect m cont nargs = do
           forM_ elseGoals (\(_, base, _, _) -> markBlock base)
           markCont c
         AltFindAll results _ _ base _ c -> markBlock base >> markResults results >> markCont c
+        AltLeaf _ table c -> mapM_ markWord (IM.elems table) >> markCont c
   -- The query block is a root even when no continuation names it any
   -- more: the answer is exported from it.
   forM_ [0 .. queryCells - 1] markCell
@@ -1251,6 +1400,9 @@ collect m cont nargs = do
         AltFindAll results buffer target base depth c -> do
           relocResults results
           AltFindAll results buffer target <$> relocBlock base <*> pure depth <*> relocCont c
+        AltLeaf items table c -> do
+          table' <- traverse reloc table
+          AltLeaf items table' <$> relocCont c
   cont' <- relocCont cont
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
   -- Trail: keep entries of live cells, remember how many survive below

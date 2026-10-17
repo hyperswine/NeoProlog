@@ -62,13 +62,17 @@ parityFile file = do
             machine = observe query (Machine.solveQuery program query)
             core = fmap (observe query) (Core.solveQuery program query)
             shown = intercalate ", " (map show (queryGoals query))
+        outcome <- Core.coreOutcome program query
         case core of
           Nothing -> putStrLn ("  skip (" ++ maybe "?" id (Core.coreSupports program query) ++ "): " ++ shown) >> pure 0
           Just observed -> do
             let okReference = observed == reference
                 okMachine = observed == machine
+                how = case outcome of
+                  Right _ -> "ok  "
+                  Left reason -> "fell back (" ++ reason ++ ")"
             if okReference && okMachine
-              then putStrLn ("  ok   " ++ shown) >> pure 0
+              then putStrLn ("  " ++ how ++ " " ++ shown) >> pure 0
               else do
                 putStrLn ("  FAIL " ++ shown)
                 unless okReference $ do

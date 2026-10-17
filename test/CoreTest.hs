@@ -55,8 +55,8 @@ prop_fallback :: Property
 prop_fallback = withTests 1 . property $ do
   let source = unlines ["<- notable.", "p : dynamic.", "q X <- X = 1."]
   program <- either (\e -> annotate e >> failure) pure (loadProgramText source)
-  query <- either (\e -> annotate e >> failure) pure (parseQuery "q X?")
-  Core.coreSupports program query === Just "dynamic declarations"
+  query <- either (\e -> annotate e >> failure) pure (parseQuery "q Y, assert (p Y), p X?")
+  Core.coreSupports program query === Just "builtin assert/1"
   observe query (Core.solveQueryOrFallback program query) === observe query (Reference.solveQuery program query)
   let constrained = unlines ["<- notable.", "r X Y <- X != Y, X = 1, Y = 2."]
   program' <- either (\e -> annotate e >> failure) pure (loadProgramText constrained)

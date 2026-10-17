@@ -11,6 +11,7 @@ module Infera.Core
     solveQueryWith,
     solveQueryOrFallback,
     coreSupports,
+    coreOutcome,
   )
 where
 
@@ -21,17 +22,15 @@ import Infera.Program (Program)
 import Infera.Syntax (Query)
 import System.IO.Unsafe (unsafeInterleaveIO, unsafePerformIO)
 
--- | Solve on the core, or Nothing when the program is outside its subset.
--- A construct met at runtime that the core cannot execute abandons the run
--- and the remaining items come from the existing machine, skipping the
+-- | Solve on the core. A construct the core cannot execute abandons the
+-- run and the remaining items come from the existing machine, skipping the
 -- prefix already produced; solving is a pure function of program and
--- query, so the two prefixes agree.
+-- query, so the two prefixes agree. (Nothing is reserved for a future
+-- program-level rejection; every program currently starts on the core.)
 solveQuery :: Program -> Query -> Maybe Search
 solveQuery program query = unsafePerformIO $ do
-  started <- runCore program query
-  case started of
-    Left _ -> pure Nothing
-    Right first -> Just <$> stream (0 :: Int) first
+  (_, first) <- runCore program query
+  Just <$> stream (0 :: Int) first
   where
     stream produced next = unsafeInterleaveIO $ do
       step <- next
@@ -44,10 +43,8 @@ solveQuery program query = unsafePerformIO $ do
 -- | 'solveQuery' with an explicit initial collection threshold in cells.
 solveQueryWith :: Int -> Program -> Query -> Maybe Search
 solveQueryWith limit program query = unsafePerformIO $ do
-  started <- runCoreWith limit program query
-  case started of
-    Left _ -> pure Nothing
-    Right first -> Just <$> stream (0 :: Int) first
+  (_, first) <- runCoreWith limit program query
+  Just <$> stream (0 :: Int) first
   where
     stream produced next = unsafeInterleaveIO $ do
       step <- next
@@ -62,10 +59,21 @@ solveQueryOrFallback :: Program -> Query -> Search
 solveQueryOrFallback program query =
   maybe (Machine.solveQuery program query) id (solveQuery program query)
 
--- | Nothing when the core compiles this program and query, otherwise the
--- construct that keeps it on the existing machine.
+-- | Nothing when every construct of this program and query runs on the
+-- core, otherwise the first one that would make a run fall back.
 coreSupports :: Program -> Query -> Maybe String
-coreSupports program query = unsafePerformIO $ do
-  started <- runCore program query
-  pure (either Just (const Nothing) started)
+coreSupports program query = unsafePerformIO (fst <$> runCore program query)
 {-# NOINLINE coreSupports #-}
+
+-- | Run a query to completion on the core alone: the item count, or the
+-- reason the run was abandoned.
+coreOutcome :: Program -> Query -> IO (Either String Int)
+coreOutcome program query = do
+  (_, first) <- runCore program query
+  let go count next = do
+        step <- next
+        case step of
+          Stop -> pure (Right count)
+          Yield _ continue -> go (count + 1 :: Int) continue
+          Abandon reason -> pure (Left reason)
+  go 0 first

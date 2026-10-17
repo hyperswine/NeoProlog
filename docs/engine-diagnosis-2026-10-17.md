@@ -245,6 +245,27 @@ records, `Either`/`Maybe` arithmetic results and `IntSet` candidate
 selection. Residency grows with deterministic work because the store has
 no collector yet, as expected for this step.
 
+### Progress after the first slice (same day)
+
+* Ground memo bits, a precomputed index, an integer fast path, argument
+  registers and a non-allocating goal loop took naive reverse 3000 from
+  0.79 s to 0.33 s (about 5M inferences per second); loop 90000 to 0.009 s,
+  fib 25 to 0.040 s, queens to 0.011 s.
+* A mark-compact collector of the cell store runs at call boundaries when
+  the heap exceeds an adaptive threshold. The parity group replays every
+  query collecting at nearly every call. Reverse 3000 now holds 57 MB
+  instead of 135 MB (the retained part is the program's own `range` choice
+  points) at 0.46 s; a million-iteration loop holds 8.6 MB.
+* Programs are no longer rejected whole: a tabled or dynamic predicate, a
+  constraint goal, `minimize` or a dynamic-fact goal abandons the core run
+  when reached, and the facade continues on the existing machine, skipping
+  the prefix already produced. Leaf builtins (strings, characters,
+  formatting, DCG text helpers, file reads) run through the reference
+  implementation on exported terms with bindings imported back; `phrase`,
+  `phrase_from_file`, `emit` and `call/N` run natively in alias blocks.
+  Across `examples/`, 47 of 85 inline queries complete on the core and
+  every query agrees with the reference after fallback.
+
 ### Next
 
 1. Hot-path allocation: argument registers instead of lists, immediate-int
