@@ -1,5 +1,10 @@
 # Engine roadmap: from a lazy-list resolver to an abstract machine
 
+This records the earlier machine/bytecode implementation and its migration
+gates. The public query engine has since moved to `Infera.Core`; start with
+the [current engine guide](README.md) and
+[performance overview](../performance/README.md) for its present behavior.
+
 This is the plan for replacing the resolution core of Infera in two steps:
 
 1. **An explicit abstract machine** (`Infera.Machine`): mutable bindings with a
@@ -12,7 +17,7 @@ This is the plan for replacing the resolution core of Infera in two steps:
 
 Everything above the engine keeps its public behaviour: the parser,
 declarations and inference
-([Infer.hs](../src/Infera/Infer.hs)), the purity gate, the CLP(Z) store's
+([Infer.hs](../../src/Infera/Infer.hs)), the purity gate, the CLP(Z) store's
 propagation logic, DCG translation, the REPL, `infera check`, the LSP and the
 test suite. The engine's public surface is kept so that nothing downstream
 changes: `solveQuery` returns `Search`, a lazy list of `SearchItem` values
@@ -36,7 +41,7 @@ checked timed runs per workload and engine:
 | `fib 25`, untabled | 0.463 s | 0.046 s | 0.076 s |
 | first valid 8-queens placement | 0.111 s | 0.017 s | 0.052 s |
 
-[Raw samples and workload hashes](engine-baseline-2026-10-16.jsonl) record
+[Raw samples and workload hashes](../performance/data/jsonl/engine-baseline-2026-10-16.jsonl) record
 the runner and executable paths. This is a local macOS arm64 baseline, not
 a controlled CI threshold: Infera engine revision
 `b08d850de8b11f7982f1054910df36a7ad9a3b89`, GHC 9.8.2, default Cabal library
@@ -47,7 +52,7 @@ warmups are validated and excluded from the samples. Re-record on the same
 controlled runner/build configuration before judging a future regression.
 Inference counts must also be checked before reporting an inference rate;
 wall-clock timings alone do not establish one. The baseline reference engine
-([Engine/Reference.hs](../src/Infera/Engine/Reference.hs)) is a lazy list of solutions built from
+([Engine/Reference.hs](../../src/Infera/Engine/Reference.hs)) is a lazy list of solutions built from
 Haskell closures:
 
 * every call renames the clause (copies head and body), unifies into an
@@ -70,35 +75,35 @@ that contract is established.
 ### Implementation status
 
 The local implementation now routes the existing public
-[`Infera.Engine`](../src/Infera/Engine.hs) API through
-[`Infera.Machine.Control`](../src/Infera/Machine/Control.hs).
+[`Infera.Engine`](../../src/Infera/Engine.hs) API through
+[`Infera.Machine.Control`](../../src/Infera/Machine/Control.hs).
 `solveGoal`, `solveGoals`, `solveQuery`, `solveAll` and `runInfera` retain their
 signatures and result types. The original resolver lives in
-[`Infera.Engine.Reference`](../src/Infera/Engine/Reference.hs) as the independent
+[`Infera.Engine.Reference`](../../src/Infera/Engine/Reference.hs) as the independent
 parity oracle for both roadmap steps. No machine resolution path calls the
 reference interpreter. **Step 1's historical local exit gates passed on
 2026-10-16; Step 2 now has opt-in compiled activation, specialized head matching,
 temporary register reuse, per-goal body allocation, compiled core control and
 cut barriers, immutable predicate caches, resolved direct calls and dense operand
 dispatch.**
-The [Step 1 acceptance report](engine-step1-acceptance-2026-10-16.md) records
+The [Step 1 acceptance report](../performance/reports/engine-step1-acceptance-2026-10-16.md) records
 that snapshot's checks and measurements. The
-[Step 2 foundation report](engine-step2-foundation-2026-10-16.md) records the
+[Step 2 foundation report](../performance/reports/engine-step2-foundation-2026-10-16.md) records the
 subsequent regression repair and initial compiler gate. The
-[head/register report](engine-step2-head-register-2026-10-16.md) covers later
+[head/register report](../performance/reports/engine-step2-head-register-2026-10-16.md) covers later
 specialized matching and allocation work.
 
-The subsequent [application recheck](performance.md#current-native-engine-recheck---2026-10-16)
+The subsequent [application recheck](../performance/README.md#current-native-engine-recheck---2026-10-16)
 found a material native regression: 16x16 ordinary minefield generation exceeded
 30 seconds, versus 0.116s at the optimized reference stage. The regression is
 fixed: accepted binding extensions avoid repeatedly validating old graphs,
 call normalization retains shared heap graphs, and constrained calls stay on
 the active driver. The larger setup/generation workload now has its own
 validated runner and CI coverage. Current evidence and measurement scope are
-in the [foundation report](engine-step2-foundation-2026-10-16.md); historical
+in the [foundation report](../performance/reports/engine-step2-foundation-2026-10-16.md); historical
 timings remain provenance, rather than current-source throughput acceptance.
 
-[`Heap`](../src/Infera/Machine/Heap.hs) supplies paged mutable cells, a trail,
+[`Heap`](../../src/Infera/Machine/Heap.hs) supplies paged mutable cells, a trail,
 occurs-checked unification, typed constant/functor interning and immutable
 copy-on-write snapshots. The driver owns explicit task and choice stacks for
 indexed clauses, conjunction, disjunction and scoped cuts. Shared
@@ -109,7 +114,7 @@ successful return. Declared `det`/`multi` failure obligations survive retries.
 Native deferred cuts preserve foreign-marker ordering and committing barriers.
 
 `start`/`resume` expose immutable suspended execution. The
-[`Bridge`](../src/Infera/Machine/Bridge.hs) preserves caller logical IDs,
+[`Bridge`](../../src/Infera/Machine/Bridge.hs) preserves caller logical IDs,
 cross-root sharing and the complete persistent solver state, including CLP
 queues, output, tables and dynamic facts. Raw substitution links remain raw:
 deep expansion can change shallow matching of control expressions. Every
@@ -131,14 +136,14 @@ output from successful answers. `minimize` keeps the complete winning state,
 retains the first on ties, and rejects incomplete or errored searches as proofs
 of an optimum.
 
-[`Builtins`](../src/Infera/Machine/Builtins.hs) implements the remaining
+[`Builtins`](../../src/Infera/Machine/Builtins.hs) implements the remaining
 ordinary builtins and dynamic-fact operations. Finite builtin algorithms
 return native immutable result iterators; their tails are consumed only on
 retry. Output logs and canonical dynamic facts remain persistent branch-local
 values restored with the whole branch. Compact array logs or mutation journals
 are future representation optimizations, not prerequisites for correctness.
 
-[`Machine.CLP`](../src/Infera/Machine/CLP.hs) connects heap binding transactions
+[`Machine.CLP`](../../src/Infera/Machine/CLP.hs) connects heap binding transactions
 to the complete persistent `Infera.CLP` store. Changed logical variables wake
 the existing propagators, and propagated singleton bindings return to the heap.
 Failure restores the heap transaction and prior variable/store version.
@@ -149,7 +154,7 @@ and `tri` optima, byte-identical reporting, generated placements against
 independent grid and exhaustive-labeling models, and the wider disconnected
 case.
 
-[`Machine.Table`](../src/Infera/Machine/Table.hs) implements the general
+[`Machine.Table`](../../src/Infera/Machine/Table.hs) implements the general
 variant fixedpoint and the existing narrowly proved delta path. Clause bodies
 run through native driver callbacks; keys and answers contain immutable
 canonical terms, never heap handles. A table fixedpoint is a native immutable
@@ -162,7 +167,7 @@ iterator cannot complete an unfinished producer. Entries are branch-local;
 there is no cross-rollback global table cache. Constrained calls and answers
 fall back to plain native clause evaluation.
 
-[`Tail`](../src/Infera/Machine/Tail.hs) proves a closed first-order call graph
+[`Tail`](../../src/Infera/Machine/Tail.hs) proves a closed first-order call graph
 using native arithmetic, equality, guards and pure user predicates. This now
 includes mutual recursion and prefix helpers. Reachable tabled, dynamic or
 unsafe predicates, control/meta goals, effects, CLP posting and internal cut
@@ -197,7 +202,7 @@ ineligible calls retain the existing resolution-depth limit.
 Loader metadata now maps predicate/clause ordinals and original body terms to
 file/UTF-16 source spans, including qualified imports and expanded DCGs.
 Ambiguous repeated goals and generated code fall back to their owning clause
-span. The opt-in [`Trace`](../src/Infera/Machine/Trace.hs) stream and
+span. The opt-in [`Trace`](../../src/Infera/Machine/Trace.hs) stream and
 `resumeTraced` batches expose `Call`, `Exit`, `Redo`, `Fail`, `Cut` and
 `Exception` events with logical frame chains and located errors. Table producer
 callbacks also relay source locations and frames. Ordinary solving does not
@@ -227,23 +232,23 @@ fresh-process RTS residency and peak process RSS are separate acceptance data.
 Earlier measurement files remain historical provenance, with their recorded
 source fingerprints and build profiles:
 
-* The [initial native CLP comparison](engine-native-clp-2026-10-16.tsv) and
-  [initial tail/breadboard recheck](engine-tail-breadboard-2026-10-16.tsv) check
+* The [initial native CLP comparison](../performance/data/tsv/engine-native-clp-2026-10-16.tsv) and
+  [initial tail/breadboard recheck](../performance/data/tsv/engine-tail-breadboard-2026-10-16.tsv) check
   exact breadboard answers; the small native cases were slower than the
   reference, without establishing a stable regression threshold.
-* The [initial scalar tail samples](engine-tail-2026-10-16.jsonl) record
+* The [initial scalar tail samples](../performance/data/jsonl/engine-tail-2026-10-16.jsonl) record
   10k, 100k and 1m calls with bounded measured machine state and approximately
   81.5 MiB peak process RSS on the local GHC 9.8.2 `-O2` macOS arm64 build.
-* The [free/structured tail samples](engine-tail-structured-2026-10-16.jsonl)
+* The [free/structured tail samples](../performance/data/jsonl/engine-tail-structured-2026-10-16.jsonl)
   extend that early gate to shared structured inputs and free results, with
   roughly 85 MiB peak RSS at the same sizes. Those runs were single local
   samples, rather than repeated throughput estimates.
-* The [breadboard recheck after structured tail reuse](engine-structured-tail-breadboard-2026-10-16.tsv)
+* The [breadboard recheck after structured tail reuse](../performance/data/tsv/engine-structured-tail-breadboard-2026-10-16.tsv)
   again validates all four cases and records native medians roughly 2–6 times
   the reference.
 
 These files precede the public-engine switch and general live-checkpoint
-collection. The historical Step 1 [residency samples](engine-step1-tail-2026-10-16.jsonl)
+collection. The historical Step 1 [residency samples](../performance/data/jsonl/engine-step1-tail-2026-10-16.jsonl)
 record 28 checked fresh processes: repeated million-call mutual recursion,
 live choices and findall, plus helpers, structured arguments, CLP, completed
 tables and dynamic facts. Peak RSS stays between 126.8 and 127.9 MiB; measured
@@ -255,12 +260,12 @@ smaller historical fingerprint inputs.
 The residency gate caught disabled trace metadata retaining retired callers,
 lazy success-guard updates and repeated unchanged cut-barrier clamps. Strict
 optional trace fields, eager owned-guard updates and no-op commits remove those
-histories. The historical Step 1 [breadboard comparison](engine-step1-breadboard-2026-10-16.tsv)
+histories. The historical Step 1 [breadboard comparison](../performance/data/tsv/engine-step1-breadboard-2026-10-16.tsv)
 validates exact answers and independent optima; native medians were roughly
 1.3–4.6 times the reference on these small cases. No general throughput gain
 is established. These costs remain the target of step 2.
 
-The historical Step 1 [CLI matrix](engine-step1-cli-2026-10-16.jsonl) validates reverse,
+The historical Step 1 [CLI matrix](../performance/data/jsonl/engine-step1-cli-2026-10-16.jsonl) validates reverse,
 loop, Fibonacci and queens with one warmup and three timed runs each, using
 an explicit 60-second per-process budget. Reverse's median is 32.551 seconds;
 the earlier 30-second and 120-second timeouts are preserved in the acceptance
@@ -589,10 +594,10 @@ and the `startWithBackend`, `startMeasuredWithBackend`,
 `solveQueryWithBackend` entry points. Public `Infera.Engine` calls and the
 existing machine entry points still use the interpreted native driver.
 
-[`Infera.Compile`](../src/Infera/Compile.hs) emits a flat, postorder register
+[`Infera.Compile`](../../src/Infera/Compile.hs) emits a flat, postorder register
 program for facts and clause bodies: `UseVariable`, `PutConstant`, `PutOwner`
 and `PutCompound`. It also emits preorder `HeadVariable`, `HeadConstant` and
-`HeadCompound` matching instructions. [`Machine.Bytecode`](../src/Infera/Machine/Bytecode.hs)
+`HeadCompound` matching instructions. [`Machine.Bytecode`](../../src/Infera/Machine/Bytecode.hs)
 reserves stable local roots and matches known caller shapes directly, avoiding
 duplicate head constructors. When a caller target is free, it constructs only
 that source subtree and uses ordinary occurs-checked heap unification.
@@ -670,19 +675,19 @@ original program and plans. Direct `predClauses` edits safely recompile stale
 entries once per query; rebuilding `predClauseCache` restores cross-query reuse.
 Table producers retain their existing head/template path, with their native
 body callbacks selecting the requested backend. The historical
-[foundation report](engine-step2-foundation-2026-10-16.md) distinguishes this
+[foundation report](../performance/reports/engine-step2-foundation-2026-10-16.md) distinguishes this
 initial slice from the remaining WAM-style design. Its initial validated
 samples established compiled execution and parity without establishing a
 throughput gain over the interpreted driver. The
-[head/register report](engine-step2-head-register-2026-10-16.md) records
+[head/register report](../performance/reports/engine-step2-head-register-2026-10-16.md) records
 subsequent implementation and validation. The
-[lifetime report](engine-step2-lifetimes-2026-10-16.md) records incremental body
+[lifetime report](../performance/reports/engine-step2-lifetimes-2026-10-16.md) records incremental body
 construction, temporary register reuse and their acceptance results. The
-[control report](engine-step2-control-2026-10-16.md) records compiled control
+[control report](../performance/reports/engine-step2-control-2026-10-16.md) records compiled control
 continuations, cut barriers and the next default-backend gates. The
-[cache/dispatch report](engine-step2-cache-2026-10-16.md) records the subsequent
+[cache/dispatch report](../performance/reports/engine-step2-cache-2026-10-16.md) records the subsequent
 implementation, cold/warm measurements and remaining migration gates.
-The [operand report](engine-step2-operands-2026-10-16.md) records subsequent
+The [operand report](../performance/reports/engine-step2-operands-2026-10-16.md) records subsequent
 dense local layouts, simple-plan fast paths, transaction-owned node allocation
 and guarded invocation fusion.
 
@@ -808,7 +813,7 @@ source-grounded candidates, not established causes of the measured regressions.
 Profile normal execution on a controlled runner before claiming a speedup.
 
 1. **Typed builtin arguments implemented for 18 fixed arithmetic/CLP calls.**
-   [The typed builtin report](engine-step2-builtin-operands-2026-10-17.md) records
+   [The typed builtin report](../performance/reports/engine-step2-builtin-operands-2026-10-17.md) records
    shared multi-root argument plans, direct heap unification and scalar-result
    `is`, with the source invocation retained for tracing and malformed calls.
    Each operation owns argument allocations and the CLP/heap result together.
@@ -820,7 +825,7 @@ Profile normal execution on a controlled runner before claiming a speedup.
    New counters identify typed calls and omitted wrappers separately from the
    generic invocation and traced fallback paths.
 2. **Opaque controls and tail transfer implemented.**
-   [The opaque control report](engine-step2-opaque-controls-2026-10-17.md) records
+   [The opaque control report](../performance/reports/engine-step2-opaque-controls-2026-10-17.md) records
    split arithmetic/once/negation/conditional benchmarks and matched measurements.
    Successful once/conditional/emit scopes keep the current child's heap and
    bindings when a monotone heap epoch proves the parent's prefix addresses

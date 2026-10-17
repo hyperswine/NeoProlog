@@ -54,4 +54,4 @@ function visibleDiagnostics(diagnostics, settings) {
     ? diagnostics.filter(d => d.severity === 1 || !String(d.code).startsWith('perf-')) : diagnostics
 }
 
-module.exports = { compilerDiagnostics, visibleDiagnostics }
+module.exports = { compilerDiagnostics, visibleDiagnostics, canonicalFile }

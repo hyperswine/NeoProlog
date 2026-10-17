@@ -8,7 +8,7 @@ establish a bytecode throughput improvement or complete Step 2.
 
 ## Step 1 follow-up
 
-The [previous native recheck](performance-step1-2026-10-16.jsonl) timed out
+The [previous native recheck](../data/jsonl/performance-step1-2026-10-16.jsonl) timed out
 while generating a 16x16 minefield with 50 bombs and at most two bombs in every
 overlapping 2x2 window. Profiling isolated these costs:
 
@@ -70,24 +70,24 @@ in this loaded-program comparison. Breadboard checks retain exact answers,
 reporting and independent optimum checks; these small cases also remain slower
 on the native machine. No general throughput advantage is claimed.
 
-Raw data: [minefield](engine-step2-minefield-2026-10-16.jsonl),
-[breadboard](engine-step2-breadboard-2026-10-16.tsv). Historical files are retained
+Raw data: [minefield](../data/jsonl/engine-step2-minefield-2026-10-16.jsonl),
+[breadboard](../data/tsv/engine-step2-breadboard-2026-10-16.tsv). Historical files are retained
 with their original source fingerprints and timing scopes.
 
-The [fresh CLI matrix](engine-step2-cli-2026-10-16.jsonl) uses the same local
+The [fresh CLI matrix](../data/jsonl/engine-step2-cli-2026-10-16.jsonl) uses the same local
 `-O2` build with one checked warmup and three checked processes, including
 startup, loading and output. Reverse improves from 32.551 to 19.369 seconds,
 loop from 0.752 to 0.485, untabled Fibonacci from 4.168 to 2.694 and queens
 from 1.311 to 0.578. General native throughput still trails the pre-migration
 baseline, whose library profile differed. The
-[application recheck](performance-step2-2026-10-16.jsonl) records ordinary
+[application recheck](../data/jsonl/performance-step2-2026-10-16.jsonl) records ordinary
 16x16 generation at 0.476 seconds, setup at 0.451, seeded generation at 5.844,
 all-pairs closure at 0.091 and wide breadboard placement at 0.044. These CLI
 timings have a different scope from the loaded-program table above.
 
 ## First Step 2 slice
 
-[`Infera.Compile`](../src/Infera/Compile.hs) compiles supported first-order
+[`Infera.Compile`](../../../src/Infera/Compile.hs) compiles supported first-order
 clauses into an opaque, validated `ClauseCode`: flat postorder instructions
 allocate variables, scalar constants and compounds into local registers.
 Original body templates remain available for source lookup. Local variable IDs,
@@ -95,14 +95,14 @@ repeated-variable sharing, scalar types and exact float bits are preserved.
 Clauses with control/meta goals, uncallable goals, malformed variable IDs or
 nested body cuts retain the existing interpreter path.
 
-[`Infera.Machine.Bytecode`](../src/Infera/Machine/Bytecode.hs) instantiates those
+[`Infera.Machine.Bytecode`](../../../src/Infera/Machine/Bytecode.hs) instantiates those
 instructions directly on the heap. It reserves the same fresh logical IDs as
 the interpreter, then executes flat instructions without traversing renamed
 source `Term` trees. Activation is atomic, including allocation, interning and
 logical roots. Head matching still uses the existing occurs-checked native
 unifier and persistent CLP transaction.
 
-[`Control`](../src/Infera/Machine/Control.hs) exposes `Interpreted` and `Bytecode`
+[`Control`](../../../src/Infera/Machine/Control.hs) exposes `Interpreted` and `Bytecode`
 through `startWithBackend`, `startMeasuredWithBackend`,
 `startTracedWithBackend`, `startGoalsWithBackend` and `solveQueryWithBackend`.
 Existing entry points continue to choose `Interpreted`. The compiled cache is
@@ -133,7 +133,7 @@ Independent arithmetic/list models and complete ordered Reference observations
 pass. Untimed measured probes verify 20,001 / 601 compiled activations,
 310,004 / 11,104 instructions and 20,000 / 600 direct calls respectively, so
 success cannot be attributed to falling back entirely to the interpreter.
-[Raw samples and scope](engine-step2-bytecode-2026-10-16.tsv).
+[Raw samples and scope](../data/tsv/engine-step2-bytecode-2026-10-16.tsv).
 
 ## Native residency recheck
 
@@ -150,7 +150,7 @@ fixes, rather than a million-iteration acceptance gate for Bytecode. Compiled
 execution currently has the generated heap/snapshot/three-engine comparisons
 and the smaller benchmark probes described above. Retaining previous answers
 or growing live output deliberately retains caller-owned memory.
-[Raw residency samples](engine-step2-tail-2026-10-16.jsonl).
+[Raw residency samples](../data/jsonl/engine-step2-tail-2026-10-16.jsonl).
 
 ## Validation and CI
 
@@ -186,7 +186,7 @@ compiled control continuations and index/dispatch specialization. Each must
 retain ordered parity and the established rollback/ownership/trace contracts.
 Compare current-source interpreted and compiled execution before changing the
 default. Full Step 2 completion remains governed by the
-[roadmap](engine-roadmap.md#step-2-bytecode).
+[roadmap](../../engine/roadmap.md#step-2-bytecode).
 
 ## Reproduce
 

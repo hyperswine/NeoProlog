@@ -30,7 +30,7 @@ A stale `dist-newstyle` executable from 2026-10-16 11:48 (before the Step 1
 public switch) ran the same three workloads 3-7x faster than the current
 source. The current machine is a throughput regression against that build,
 which agrees with the pre-migration CLI baseline recorded in
-[performance.md](performance.md).
+[performance.md](../performance/README.md).
 
 ## Profile
 
@@ -51,7 +51,7 @@ single function dominates. The entries group by cause:
 ## Where the work comes from
 
 Every user predicate call in
-[Control.hs](../src/Infera/Machine/Control.hs) `callPredicate` does the
+[Control.hs](../../src/Infera/Machine/Control.hs) `callPredicate` does the
 following before any clause is tried:
 
 1. Exports the goal from the heap to a `Term` (`Bridge.exportRawTerms`), then
@@ -69,7 +69,7 @@ following before any clause is tried:
    `Bridge.bindingChanges`), even when the program posts no constraints. The
    heap is not the source of truth; it is one of two.
 4. Runs builtins on `Term`s: `is` and comparisons in
-   [Builtins.hs](../src/Infera/Machine/Builtins.hs) receive exported terms,
+   [Builtins.hs](../../src/Infera/Machine/Builtins.hs) receive exported terms,
    walk the substitution, evaluate, and return a `Unify` that is imported back
    into the heap.
 5. Freezes the heap at every choice point and opaque scope. A freeze copies
@@ -345,19 +345,17 @@ structure construction (22%), head matching (14%), goal dispatch (9%) and
 unification (8%); the remaining allocation is boxed results of small
 `IO Int` helpers, which is ordinary GHC tuning rather than design.
 
-### Next
+### Reverse follow-up and current next steps
 
-1. Hot-path allocation: argument registers instead of lists, immediate-int
-   fast paths for `is` and comparisons, a first-argument switch instead of
-   `IntSet` intersections, and keeping the cell array out of an `IORef` on
-   the inner loops. These are ordinary WAM engineering and are where the
-   remaining 8x to Scryer lives.
-2. A compacting collector for the cell store at safe points, so
-   deterministic loops run in bounded residency.
-3. Coverage: per-predicate fallback instead of per-program, so a tabled
-   or dynamic predicate does not exclude the rest of a program; then
-   strings, `neq` as a suspended constraint, CLP posting through the
-   existing store, tabling, dynamic facts, DCG IO, tracing. Each addition is
-   gated by the same parity test.
-4. Switching the public default once the whole test suite passes on the
-   core with fallback, then retiring the Step 1 machine.
+The [reverse follow-up](../performance/reports/engine-reverse-2026-10-17.md) optimizes structure
+construction, head matching and collection against `e3082b3`: loaded CPU
+falls from 0.457 s to 0.365 s and GHC allocation falls 38%. The complete
+391-property suite and all 296 forced-collection inline queries pass.
+The report records the remaining SWI/Scryer gap and individual measurements.
+
+Argument registers, immediate arithmetic, indexed selection, a compacting
+collector, language coverage and the public-engine switch are implemented
+as described above. Remaining work is further profile-guided specialization
+of construction/matching and the driver, plus migrating tracing and the
+goal-level APIs before retiring the old machine. Compare loaded batches
+before making throughput claims from startup-inclusive CLI times.

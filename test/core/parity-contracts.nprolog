@@ -58,7 +58,9 @@ count N Acc R <- N > 0, A1 is Acc + N, N1 is N - 1, count N1 A1 R.
 > two 1.5 Y?
 > two a Y?
 > loud 1 Y?
-> count 50000 0 R?
+# Keep differential checks small: the legacy machine retains one guard per
+# activation. CoreTest checks the 50,000-call result independently as well.
+> count 1000 0 R?
 > count 3 0 R, count R 0 S?
 > range 1 300 L, rev L R, sum R S?
 > app X Y [1, 2]?

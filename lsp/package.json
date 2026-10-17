@@ -2,7 +2,7 @@
   "name": "infera-lsp",
   "displayName": "Infera",
   "description": "Language support for Infera v2 (.nprolog / .infera): highlighting, hover, navigation, completion, diagnostics and module-aware go-to-definition.",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "publisher": "hyperswine",
   "license": "GPL-3.0-only",
   "repository": {

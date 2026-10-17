@@ -28,7 +28,8 @@ const { execFile } = require('child_process')
 const { pathToFileURL, fileURLToPath } = require('url')
 
 const analysis = require('./analysis')
-const { compilerDiagnostics, visibleDiagnostics } = require('./checker')
+const { compilerDiagnostics, visibleDiagnostics, canonicalFile } = require('./checker')
+const { checkerInputs, executableIdentity } = require('./inputs')
 const { CONF_NAMES, findModuleContext, parseConf } = require('./modules')
 const { tokenize, analyzeDocument, BUILTIN_DOCS, DECL_DOCS, BUILTIN_PREDICATES, KEYWORD_ATOMS, DET_WORDS, FLAG_WORDS, SORT_WORDS, TOKEN_TYPES, TOKEN_MODIFIERS, TT, TM } = analysis
 
@@ -92,9 +93,16 @@ const checkerRuns = new Map()
 const checkerTimers = new Map()
 const checkerProcesses = new Map()
 const documentVersions = new Map()
+const documentSources = new Map()
+const inputSnapshots = new Map()
+const checkedResults = new Map() // uri -> input/compiler key and unfiltered diagnostics
+const checkerReasons = new Map()
 let checkerSerial = 0
 
 function refreshDocument(document) {
+  if (documentSources.get(document.uri) === document.getText() && documentCache.has(document.uri)) {
+    return documentCache.get(document.uri)
+  }
   const a = analyzeDocument(document.getText())
   documentCache.set(document.uri, a)
   return a
@@ -121,7 +129,7 @@ async function getSettings() {
   }
 }
 
-function invalidateCheck(uri) {
+function invalidateCheck(uri, clear = true) {
   const run = ++checkerSerial
   checkerRuns.set(uri, run)
   clearTimeout(checkerTimers.get(uri))
@@ -129,17 +137,53 @@ function invalidateCheck(uri) {
   const child = checkerProcesses.get(uri)
   checkerProcesses.delete(uri)
   if (child) child.kill()
-  checkerDiagnostics.delete(uri)
+  if (clear) checkerDiagnostics.delete(uri)
   return run
 }
 
-function queueCheck(uri, reason, delay = 200) {
-  const run = invalidateCheck(uri)
+function checkerPath(uri) {
+  return uriToPath(uri) || (uri.startsWith('untitled:')
+    ? path.join(workspaceFolderPaths[0] || process.cwd(), `.infera-${encodeURIComponent(uri)}.nprolog`) : null)
+}
+
+function snapshotInputs(document) {
+  const file = checkerPath(document.uri)
+  if (!file) return null
+  const buffers = documents.all().filter(doc => doc.uri !== document.uri && uriToPath(doc.uri))
+    .map(doc => ({ path: uriToPath(doc.uri), text: doc.getText() }))
+  return checkerInputs(file, document.getText(), buffers)
+}
+
+function queueCheck(uri, reason, delay = 200, force = false) {
+  const document = documents.get(uri)
+  if (!document) return
+  const inputs = snapshotInputs(document)
+  if (!inputs) return
+  const unchanged = inputSnapshots.get(uri)?.signature === inputs.signature
+  // A save immediately following a change need not kill and restart the
+  // same pending check. Configuration changes must still revisit settings.
+  if (!force && unchanged && (checkerTimers.has(uri) || checkerProcesses.has(uri))) {
+    if (reason === 'save' && checkerTimers.has(uri)) checkerReasons.set(uri, reason)
+    return
+  }
+  inputSnapshots.set(uri, inputs)
+  const run = invalidateCheck(uri, force || !unchanged)
+  checkerReasons.set(uri, reason)
   publish(uri)
   checkerTimers.set(uri, setTimeout(() => {
     checkerTimers.delete(uri)
-    runChecker(uri, run, reason)
+    runChecker(uri, run, checkerReasons.get(uri))
   }, delay))
+}
+
+function queueDependents(filePath, exceptUri, reason) {
+  if (!filePath) return
+  const changed = canonicalFile(filePath)
+  for (const doc of documents.all()) {
+    if (doc.uri === exceptUri) continue
+    const inputs = inputSnapshots.get(doc.uri) || snapshotInputs(doc)
+    if (inputs?.dependencies.has(changed)) queueCheck(doc.uri, reason)
+  }
 }
 
 function checkerFailure(uri, message) {
@@ -152,11 +196,9 @@ function checkerFailure(uri, message) {
 async function runChecker(uri, run, reason) {
   // Untitled documents have no disk identity yet. Give the compiler a virtual
   // path in the workspace for import context; source always comes from stdin.
-  const filePath = uriToPath(uri) || (uri.startsWith('untitled:')
-    ? path.join(workspaceFolderPaths[0] || process.cwd(), `.infera-${encodeURIComponent(uri)}.nprolog`) : null)
+  const filePath = checkerPath(uri)
   if (!filePath || !documents.get(uri) || checkerRuns.get(uri) !== run) return
-  const version = documents.get(uri)?.version
-  const current = () => documents.get(uri)?.version === version && checkerRuns.get(uri) === run
+  const current = () => !!documents.get(uri) && checkerRuns.get(uri) === run
   let temporary
   try {
     const settings = await getSettings()
@@ -164,9 +206,15 @@ async function runChecker(uri, run, reason) {
     const enabled = reason === 'save' ? settings.checkOnSave
       : reason === 'change' ? settings.checkOnChange : settings.checkOnSave || settings.checkOnChange
     if (!enabled) return
-    const source = documents.get(uri).getText()
-    const buffers = documents.all().filter(doc => doc.uri !== uri && uriToPath(doc.uri))
-      .map(doc => ({ path: uriToPath(doc.uri), text: doc.getText() }))
+    const inputs = inputSnapshots.get(uri)
+    const { source, buffers, cwd } = inputs
+    const key = JSON.stringify([inputs.signature, executableIdentity(settings.executable)])
+    const cached = checkedResults.get(uri)
+    if (cached?.key === key) {
+      checkerDiagnostics.set(uri, visibleDiagnostics(cached.diagnostics, settings))
+      publish(uri)
+      return
+    }
     const args = ['check', '--json', '--stdin', filePath]
     if (buffers.length) {
       temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'infera-buffers-'))
@@ -177,7 +225,6 @@ async function runChecker(uri, run, reason) {
       }
     }
     if (!current()) return
-    const { cwd } = findModuleContext(path.dirname(filePath))
     await new Promise(resolve => {
       const child = execFile(settings.executable, args, { cwd, timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (checkerProcesses.get(uri) === child) checkerProcesses.delete(uri)
@@ -186,6 +233,14 @@ async function runChecker(uri, run, reason) {
           if (err && (err.killed || typeof err.code !== 'number')) throw err
           const diags = compilerDiagnostics(stdout, filePath)
           if (err && !diags.some(d => d.severity === DiagnosticSeverity.Error)) throw err
+          // A disk dependency can change even without a delivered watcher
+          // notification. Never cache a result against a different snapshot.
+          if (snapshotInputs(documents.get(uri)).signature !== inputs.signature) {
+            queueCheck(uri, reason, 0)
+            resolve()
+            return
+          }
+          checkedResults.set(uri, { key, diagnostics: diags })
           checkerDiagnostics.set(uri, visibleDiagnostics(diags, settings))
           publish(uri)
         } catch (failure) {
@@ -364,7 +419,7 @@ connection.onDidChangeConfiguration(change => {
   if (!hasConfigurationCapability) {
     globalSettings = { ...DEFAULT_SETTINGS, ...((change.settings && change.settings.infera) || {}) }
   }
-  for (const doc of documents.all()) queueCheck(doc.uri, 'open', 0)
+  for (const doc of documents.all()) queueCheck(doc.uri, 'open', 0, true)
 })
 
 // ─── Document events ───────────────────────────────────────────────────────────
@@ -375,47 +430,54 @@ documents.onDidOpen(e => {
 })
 
 documents.onDidChangeContent(change => {
+  const unchanged = documentSources.get(change.document.uri) === change.document.getText()
   const p = uriToPath(change.document.uri)
   if (p) externalCache.delete(p)
   refreshDocument(change.document)
   refreshSemanticTokens()
   const initial = !documentVersions.has(change.document.uri)
   documentVersions.set(change.document.uri, change.document.version)
+  documentSources.set(change.document.uri, change.document.getText())
+  if (unchanged) { publish(change.document.uri); return }
   queueCheck(change.document.uri, initial ? 'open' : 'change')
-  for (const doc of documents.all()) {
-    if (doc.uri !== change.document.uri) queueCheck(doc.uri, 'change')
-  }
+  queueDependents(p, change.document.uri, 'change')
 })
 
-documents.onDidSave(async () => {
-  const versions = new Map(documents.all().map(doc => [doc.uri, doc.version]))
+documents.onDidSave(async e => {
+  const version = e.document.version
   const settings = await getSettings()
   // A disabled save check must not cancel an enabled live check, for example
   // when an editor autosaves immediately after sending a content change.
   if (!settings.checkOnSave) return
-  for (const doc of documents.all()) {
-    if (versions.get(doc.uri) === doc.version) queueCheck(doc.uri, 'save', 0)
-  }
+  if (documents.get(e.document.uri)?.version !== version) return
+  queueCheck(e.document.uri, 'save', 0)
+  queueDependents(uriToPath(e.document.uri), e.document.uri, 'save')
 })
 
 documents.onDidClose(e => {
   documentCache.delete(e.document.uri)
   documentVersions.delete(e.document.uri)
+  documentSources.delete(e.document.uri)
+  inputSnapshots.delete(e.document.uri)
+  checkedResults.delete(e.document.uri)
+  checkerReasons.delete(e.document.uri)
   invalidateCheck(e.document.uri)
   checkerRuns.delete(e.document.uri)
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] })
   refreshSemanticTokens()
-  for (const doc of documents.all()) queueCheck(doc.uri, 'open')
+  queueDependents(uriToPath(e.document.uri), e.document.uri, 'open')
 })
 
 connection.onDidChangeWatchedFiles(event => {
+  let configuration = false
   for (const change of event.changes) {
     const p = uriToPath(change.uri)
-    if (p && CONF_NAMES.includes(path.basename(p))) confCache.delete(p)
+    if (p && CONF_NAMES.includes(path.basename(p))) { confCache.delete(p); configuration = true }
     if (p) externalCache.delete(p)
+    if (p) queueDependents(p, null, 'open')
   }
   refreshSemanticTokens()
-  for (const doc of documents.all()) queueCheck(doc.uri, 'open')
+  if (configuration) for (const doc of documents.all()) queueCheck(doc.uri, 'open')
 })
 
 // ─── Hover ─────────────────────────────────────────────────────────────────────
@@ -430,7 +492,8 @@ connection.onHover(({ textDocument, position }) => {
   if (token && ['op', 'bang', 'dcgneck', 'semi'].includes(token.type)) {
     const kind = a.declWordKinds.get(`${token.line}:${token.col}`)
     const doc = kind ? DECL_DOCS[token.text] : BUILTIN_DOCS[token.text]
-    if (doc) return { contents: { kind: MarkupKind.Markdown,
+    if (doc) return { range: Range.create(token.line, token.col, token.line, token.col + token.text.length),
+      contents: { kind: MarkupKind.Markdown,
       value: `**${kind || 'Operator'}:** \`${token.text}\`\n\n${doc}` } }
   }
   const info = getWordAt(lines, position)

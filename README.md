@@ -353,20 +353,26 @@ registered or moved module can have a different key from an older example.
 
 ## Editor support
 
-[lsp/](lsp/) contains a VS Code extension with a language server: semantic
+[lsp/](lsp) contains a VS Code extension with a language server: semantic
 highlighting, hover (built-ins, declared signatures), go to definition and
 references (including `mod:pred` through `neoprolog.conf`), completion,
 document symbols, and diagnostics (undefined predicates, arity mismatches,
 declaration problems, singleton variables and parser errors). All validation
 comes from the compiler through `infera check --json --stdin`; open, edited and
 saved buffers use the same messages, codes, severities and source ranges.
-Unsaved imports are included, and outdated checks are cancelled. Untitled
+Only the changed buffer and its transitive importers are scheduled for checks.
+Unchanged source, dependency and module-map contents reuse cached compiler
+diagnostics; duplicate saves and watcher events do not rerun the compiler.
+Only relevant unsaved imports are included, and outdated checks are cancelled.
+CLP operators such as `#=`, `#!=` and `#<=` provide hover documentation with
+propagation behavior and executable examples. Untitled
 buffers use the workspace as their import context. `infera.checkOnChange`
 controls live checks (enabled by default); `infera.checkOnSave` controls checks
 on save. A missing or incompatible compiler produces an explicit availability
 warning; navigation and highlighting continue without a separate validator.
 
-Extension version **2.0.2** displays the compiler's four `perf-*` suggestions
+Extension version **2.0.4** includes dependency-aware diagnostic caching and
+detailed CLP operator hovers. The compiler's four `perf-*` suggestions appear
 as informational diagnostics, using the editor's theme colors.
 `infera.performanceHints` is enabled by default; disabling it hides performance
 suggestions while retaining correctness diagnostics. Declared `unsafe` and
@@ -381,48 +387,20 @@ describe effects and declarations without adding warnings for intentional use.
 cd lsp && npm install && npm run install-extension
 ```
 
-## Roadmap
+## Engine and documentation
 
-The public `Infera.Engine` now runs an explicit abstract machine with a trail,
-choice-point stacks, last-call optimisation, heap reclamation and tracing.
-`Infera.Engine.Reference` retains the previous resolver for comparisons through
-the bytecode transition. Step 2 now has opt-in compiled clause activation,
-specialized head matching, per-goal body allocation, temporary register reuse,
-compiled core controls/cut barriers, lazy predicate-owned plans and resolved
-ordinary user calls, dense operand layouts and transaction-owned data allocation;
-the public
-solver still selects the
-interpreted native driver. [docs/engine-roadmap.md](docs/engine-roadmap.md)
-tracks the remaining argument/environment register design, indexing
-instructions and operand dispatch work. The
-[foundation report](docs/engine-step2-foundation-2026-10-16.md) records the
-minefield regression repair and initial compiler slice; the
-[head/register report](docs/engine-step2-head-register-2026-10-16.md) covers the
-subsequent matcher and allocation changes. The
-[lifetime report](docs/engine-step2-lifetimes-2026-10-16.md) covers temporary
-register reuse and pending body continuations. The
-[control report](docs/engine-step2-control-2026-10-16.md) covers compiled
-branches, opaque searches and cut barriers. The
-[cache/dispatch report](docs/engine-step2-cache-2026-10-16.md) covers immutable
-code reuse, edit correctness and cold/warm scaling. The
-[operand report](docs/engine-step2-operands-2026-10-16.md) covers dense local
-dispatch, simple operand fast paths, deferred protected-root sets and matched
-batch measurements. The [typed builtin report](docs/engine-step2-builtin-operands-2026-10-17.md)
-covers multi-root arithmetic/CLP operands, operation-owned rollback and measured
-wrapper avoidance. The [opaque control report](docs/engine-step2-opaque-controls-2026-10-17.md)
-covers successful child-heap handoff, completed pure-control frame retirement
-and checked comparisons with installed SWI and Scryer. Bytecode is the intended eventual
-default; the roadmap records its correctness and performance migration gates.
-The checked external control/core comparison still misses the roughly 2×
-SWI-or-Scryer target, so public entry points continue to use Interpreted.
-Historically eligible first-order tail transfers
-reuse their depth budget; newly proved pure control transfers retire frames
-while retaining the logical budget. Other nested calls
-retain the 100 000 activation limit and explicit exhaustion reporting.
-`bench/run.sh` runs checked engine benchmarks. Earlier relative-speed numbers
-from the unchecked harness are historical observations, not validated baselines.
-The roadmap preserves historical local baselines with checked warmups and
-samples; current changes need source/profile-matched measurements.
+Normal CLI and REPL queries run on the core resolution engine: compiled head
+and body plans, tagged heap cells, argument registers, a conditional trail,
+explicit continuations and compacting collection. Tracing and the goal-level
+library APIs still use the earlier machine. Unsupported core constructs
+restart on that machine and skip already-delivered search items.
+
+Start with the [documentation index](docs/README.md) or the
+[current engine guide](docs/engine/README.md). The
+[performance overview](docs/performance/README.md) links to checked results,
+dated reports and raw measurements. The
+[engine roadmap](docs/engine/roadmap.md) records the earlier machine/bytecode
+plan; its historical backend decisions do not describe the current default.
 
 ## Layout
 
@@ -485,13 +463,12 @@ bench/check-tail-memory.py fresh-process residency gate, including CI quick mode
 bench/machine-minefield.hs validated larger minefield setup/generation regression runner
 bench/machine-bytecode.hs serial checked reference/interpreted/bytecode comparison
 bench/machine-cache.hs fresh-process cold/warm predicate-cache comparison
-docs/engine-roadmap.md  plan for the abstract machine and bytecode engine
-docs/engine-step2-foundation-2026-10-16.md regression repair and opt-in compiler evidence
-docs/engine-step2-head-register-2026-10-16.md specialized head matching and register allocation
-docs/engine-step2-lifetimes-2026-10-16.md per-goal body construction and logical root lifetimes
-docs/engine-step2-control-2026-10-16.md compiled controls/cuts and default-backend migration gates
-docs/engine-step2-cache-2026-10-16.md predicate caching, dispatch and cold/warm evidence
-docs/engine-step2-operands-2026-10-16.md dense operands, owned allocation and performance evidence
+docs/README.md          documentation index
+docs/engine/            current engine guide, contracts and implementation history
+docs/performance/       performance overview and dated reports
+docs/performance/data/  raw JSONL and TSV benchmark records
+docs/website/           published language/tooling reference
+docs/dash/              Dash docset builder and feed
 lsp/                    VS Code extension and language server
 ```
 
@@ -518,180 +495,17 @@ remain identical. Generated programs vary guards, mixed literal types, nested
 and aliased heads, declaration alternatives, long dependencies, controls and
 cuts; positive controls keep useful conditional semidet optimisations enabled.
 
-The [machine heap](src/Infera/Machine/Heap.hs) uses paged cells and a trail with
-immutable copy-on-write snapshots. Five generated
-properties run 300 cases each against the existing unifier, checking term
-round trips, ordered binding attempts, nested rollback, independent resumed
-branches and allocations after checkpoints. Fixed cases cover occurs checks,
-atomic failure, variable scope, typed scalars, NaN, signed zero, stale handles
-and heap/trail page growth.
+Core acceptance compares ordered answers, output, errors and exhaustion
+against both the reference resolver and the earlier machine, and replays
+fixtures with frequent collection. Dedicated regressions cover declared tail
+recursion and collection workspace growth. The
+[reverse report](docs/performance/reports/engine-reverse-2026-10-17.md) records
+the completed 391-property suite, all 296 example/parity queries, 61 LSP tests
+and 34 benchmark-harness tests.
 
-The public solver delegates to `Infera.Machine.Control` for indexed ordinary
-clause execution, explicit tasks and backtracking choices, scoped cuts and
-first-success commitments after output checks. Its immutable `start`/`resume`
-boundary returns the existing `SearchItem` and `SolverState` types. Fourteen
-control/bridge properties include 600 generated comparisons of ordered
-answers and issues, plus retained/interleaved snapshots and adapter state.
-Native scope frames now handle `call`, `once`, `not`, if-then-else and
-`findall`, including isolated cuts, ordered issue handling and complete state
-retention or rollback. Nine more properties add 300 generated nested-control
-comparisons, findall sharing/fresh-ID/output checks, retry guards and lazy
-resume checks.
-
-Native CLP integration now keeps constrained clause calls, unification,
-constraint posting, `label` and `labeling [min Cost]` on the machine driver.
-Bindings wake the existing persistent propagators; propagated singletons
-update the heap. Failed transactions, labeling alternatives and nested scopes
-restore the heap, logical variable map and complete store together. Generated
-tests compare ordered observations with the reference and bounded results with
-independent models, including aliasing, domain holes, reification, absolute
-values, large integers, branch-and-bound ties and immutable resumed searches.
-Imported solver states preserve their original free-variable representatives
-so domains and watched constraints continue to refer to the correct IDs.
-General `minimize Cost Goal`, `forall`, file-backed DCGs, ordinary builtins and
-dynamic fact operations also execute through native machine dispatch. Native
-variant tables run their producer bodies on the driver, preserve complete
-canonical answer/dependency state and retain the existing fixedpoint and
-truncation behavior. The retained reference remains the oracle for generated
-comparisons; production calls use the machine through the same public API.
-
-The shipped breadboard placer is the native CLP acceptance example: `rc`,
-`div` and `tri` optima match the reference, and the `tri` report is compared
-byte for byte through native `phrase`/`emit` wrappers. Generated narrow grids
-compare native and reference exhaustive labeling with an independent physical
-grid enumerator; a wide case places three disconnected parts over columns
-1 through 16. These checks validate holes, electrical nodes, shorts, jumper
-counts, ground costs and the independent optimum.
-
-The historical CLP integration gate passed 162 properties, including 13 native
-CLP and four native breadboard properties. Initial validated
-[breadboard samples](docs/engine-native-clp-2026-10-16.tsv) put the experimental
-machine about 2–7 times slower than the reference on these small cases.
-This is binding/search integration evidence; a speed improvement remains a
-later gate. The measurements exclude loading and CLI startup.
-
-The machine reuses tail calls across a closed first-order graph of native
-arithmetic, equality, guards and pure user predicates, including mutual
-recursion and calls through helpers. Undeclared calls can carry free or structured
-arguments, including shared variables and result terms. Ground declared
-arguments can reuse frames when their contracts remain valid and no
-`det`/`multi` required-success obligation survives. It retires redundant returns and
-cut owners, and periodically rebuilds the active heap from reachable bindings.
-Collection also reclaims completed non-tail activations at ordinary execution
-boundaries. Raw graph copying preserves shared suffixes and alias syntax;
-undeclared returns discard argument roots without delayed checks.
-Live alternatives and opaque scopes own independent frozen snapshots; restoring
-a snapshot restores its matching bindings, control, complete CLP store, tables,
-dynamic facts and output. Selected sub-search states are synchronized into the
-restored parent heap. Query variables and raw control syntax are retained;
-unreachable internal activation bindings are reclaimed. Active constraint,
-table and dynamic metadata survives collection. Declared input, sort and output
-checks remain enforced. Nonground declared arguments and `det`/`multi` failure
-obligations retain their ordinary return frames; cuts and effects remain outside
-the source proof. `startGoals` retains
-its explicit fuel limit; eligible calls through `start` reuse their depth
-budget. `startMeasured` adds opt-in execution counters.
-
-Fresh-process [tail measurements](docs/engine-tail-2026-10-16.jsonl) complete
-one million iterations in 11.84 seconds without instrumentation. Peak RSS
-stays about 81.5 MiB at 10k, 100k and 1m iterations; measured live counts stay
-at 4 tasks, 2 cut owners, 1,038 cells and 138 bindings. RSS includes program
-loading and fingerprinting. These historical samples establish the initial
-scalar-loop memory gate. Broader fresh-process samples for free results and
-fixed structured arguments are recorded separately in
-[structured tail measurements](docs/engine-tail-structured-2026-10-16.jsonl).
-Both new cases complete one million calls; peak RSS stays around 85 MiB at
-10k, 100k and 1m calls, with maximum machine cell counts of 1,029 and 1,033.
-Growing result terms remain live, and repeated structural traversal can add
-substantial work. Those samples predate collection with live alternatives and
-opaque scopes. The historical
-[breadboard recheck](docs/engine-structured-tail-breadboard-2026-10-16.tsv)
-also predates the public facade switch and places the machine behind the
-reference on these small cases. Later Step 1 samples are tracked in the
-roadmap; current compiler evidence is in the control report. These
-historical results establish no general performance improvement.
-
-The historical Step 1 gate passed 278 Haskell properties (20,698 property test
-cases), 37 editor/LSP tests, 20 harness tests and CLI/trace acceptance. The
-[step 1 acceptance report](docs/engine-step1-acceptance-2026-10-16.md) records
-that snapshot's local exit gates and remaining step 2 throughput work. Its
-generated comparisons cover native builtins, table producers, mutual/helper
-tail calls, collection with live
-choices and nested scopes, retained snapshots and trace source/frame metadata.
-Existing independent models, breadboard optima/report checks, contract errors,
-ordered answers, duplicate preservation, residual constraints and output
-remain acceptance criteria.
-
-The first Step 2 slice is available through
-`Infera.Machine.Control.solveQueryWithBackend Bytecode` and the corresponding
-`start*WithBackend` checkpoint APIs. Existing entry points default to
-`Interpreted`. Compiled head instructions inspect known caller structures
-without building duplicate head graphs; free caller targets build only the
-required source subtree before ordinary occurs-checked unification. All head
-writes reach CLP together after the complete structural match succeeds.
-After head matching and propagation accept, body terms are constructed one
-reached goal at a time. Source locals map to compact operand positions once at
-compilation; materialization validates their original raw logical roots, then
-reads repeated operands by dense position, using bounded list reads for up to
-four locals and arrays for larger layouts. Source-facing instruction views and
-fresh IDs remain unchanged. Simple locals, scalars and all-local constructors
-avoid temporary arrays. The materializer owns one rollback transaction for its
-whole plan; checked scalar/constructor helpers avoid redundant nested marks.
-Public heap builders retain their atomic behavior. Eighteen fixed arithmetic
-and CLP builtins now share one multi-root argument plan and dispatch without
-a callable wrapper; `unify` consumes raw handles and `is` imports only its
-evaluated result. Tracing and malformed arities retain their source invocation
-path. Local variables retain
-their logical identities;
-temporary constructor/scalar registers are reused after their last read.
-Scalar sharing preserves exact bits. Pending code keeps suffix-live logical
-IDs so collection can retire completed locals without losing future uses.
-No mutable register or heap address escapes into a pending body frame. Body
-syntax retains original local IDs. Known user calls dispatch directly, while
-contracts, tables and backtracking retain the native driver's semantics.
-Conjunction, disjunction, cuts, `call`, `once`, negation, if-then-else and
-`findall` use pure compiled control continuations and the native choice/scope
-driver. Untaken branches allocate no control wrappers or leaf graphs. Body
-cuts rewrite recursively, including inside data; head data stays literal.
-Dynamic/noncallable leaves and less-common meta/DCG operations use native
-runtime handlers through invocation plans. Lazy clause plans now belong to
-immutable predicate versions and are shared across queries. Exact source
-witnesses prevent stale plans after public record edits; selected results are
-memoized per query. Resolved calls carry their predicate and runtime metadata,
-avoiding repeated lookups and dynamic-name scans. The full argument/environment
-register design remains future work. Ordinary untraced/unmeasured invocations
-dispatch directly below the collection threshold; collection, tracing and
-measurement retain the existing queued boundary. Opaque searches keep lazy
-protected-ID sets and convert them only when collection needs a list. Table
-producer heads still use their existing template path; native producer bodies
-select the requested backend. Compiler and
-backend tests compare raw scalar bits, ordered observations, source frames and
-repeated/interleaved resumes. The
-[foundation report](docs/engine-step2-foundation-2026-10-16.md) records the
-historical initial compiler gate: 315 Haskell properties (22,180 property test
-cases), 37 editor/LSP tests, 20 harness tests and CLI acceptance passed. Its
-initial comparison established working compiled dispatch and parity without
-establishing a throughput gain. Subsequent implementation and validation are
-recorded separately in the
-[head/register report](docs/engine-step2-head-register-2026-10-16.md),
-[lifetime report](docs/engine-step2-lifetimes-2026-10-16.md) and
-[control report](docs/engine-step2-control-2026-10-16.md) and
-[cache/dispatch report](docs/engine-step2-cache-2026-10-16.md) and
-[operand report](docs/engine-step2-operands-2026-10-16.md).
-The current gate passed 370 Haskell properties (25,723 cases), 47 LSP tests,
-20 harness tests and CLI acceptance. Ordinary compiled execution skips
-instruction statistics; measured variants distinguish accepted-head work from
-reached body construction. The allocation changes establish smaller temporary
-arrays and skipped future graphs; throughput results remain mixed. All 30
-compiled residency samples and the six-sample interpreted recheck pass.
-
-The historical Step 1 [fresh-process residency gate](docs/engine-step1-tail-2026-10-16.jsonl)
-passed 28 checked samples, including repeated million-call mutual recursion,
-live choices/findall, helpers, structured inputs and live CLP/table/dynamic
-state. Peak RSS stayed around 127–128 MiB, including startup and source
-fingerprinting; measured active heaps stayed at or below 1,037 cells. CI runs a
-mutual/helper subset through `bench/check-tail-memory.py --quick` to catch
-retained host-language history as well as growing machine state.
+The older machine remains covered for tracing, fallback and goal-level APIs.
+Its detailed [machine/bytecode validation history](docs/engine/legacy-machine-validation.md)
+is kept separately from the current execution guide.
 
 ```sh
 cabal build all
@@ -699,7 +513,7 @@ cabal test --test-show-details=direct
 npm ci --prefix lsp
 INFERA_BIN="$(cabal list-bin exe:infera)" npm test --prefix lsp
 python3 test/cli.py "$(cabal list-bin exe:infera)"
-python3 -m unittest discover -s test -p bench_harness_test.py
+python3 -m unittest discover -s test -p '*bench_harness_test.py'
 ```
 
 The engine benchmark harness checks successful execution and independent expected
@@ -727,7 +541,7 @@ Performance tests compare the constraint store with a frozen full-scan reference
 and eligible delta tabling with ordered observations from the general evaluator.
 Breadboard scoring and optima have independent arithmetic and exhaustive models.
 Run `python3 test/bench.py "$(cabal list-bin exe:infera)"` for validated local
-timings; see [benchmark results and scope](docs/performance.md). Timing thresholds
+timings; see [benchmark results and scope](docs/performance/README.md). Timing thresholds
 are not correctness gates.
 
 The optional machine/reference breadboard benchmark loads and checks the

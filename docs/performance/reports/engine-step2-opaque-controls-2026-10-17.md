@@ -62,7 +62,7 @@ timing. Harness checks were repeated after the external protocol repair and
 passed before the completed external rerun. Cross-platform CI remains a
 separate gate; these changes are uncommitted.
 
-The [broader bytecode acceptance runner](engine-step2-opaque-controls-bytecode-2026-10-17.tsv)
+The [broader bytecode acceptance runner](../data/tsv/engine-step2-opaque-controls-bytecode-2026-10-17.tsv)
 passed all **27 engine/case rows and nine positive compiled probes** across
 nine fixtures. Eight probes record positive typed-builtin counts with equal
 wrappers avoided. The early-fail fixture correctly records zero typed calls,
@@ -71,9 +71,9 @@ runner's existing pre-timing compiled probes make it a separate warm
 acceptance check; its timings are not pooled into the matched measurements.
 
 All **36 fresh-process residency checks** passed: the
-[full Bytecode matrix](engine-step2-opaque-controls-tail-2026-10-17.jsonl)
+[full Bytecode matrix](../data/jsonl/engine-step2-opaque-controls-tail-2026-10-17.jsonl)
 contains 30 processes and the
-[Interpreted quick comparison](engine-step2-opaque-controls-native-tail-2026-10-17.jsonl)
+[Interpreted quick comparison](../data/jsonl/engine-step2-opaque-controls-native-tail-2026-10-17.jsonl)
 contains six. Every record fully drained its query, retained the frozen
 runtime hash and met the existing RSS/RTS maximum-live bound of 1.5 times
 prefix maxima. The matrix includes mutual recursion, retained choices,
@@ -187,8 +187,8 @@ were unchanged at the end of the pass. No build, test or runtime/runner/fixture
 edit overlapped timing, and no outliers or process samples were discarded
 from these completed matched passes. Documentation was updated independently.
 
-The [cache evidence](engine-step2-opaque-controls-cache-2026-10-17.jsonl) and
-[breadboard evidence](engine-step2-opaque-controls-breadboard-2026-10-17.jsonl)
+The [cache evidence](../data/jsonl/engine-step2-opaque-controls-cache-2026-10-17.jsonl) and
+[breadboard evidence](../data/jsonl/engine-step2-opaque-controls-breadboard-2026-10-17.jsonl)
 retain commands, source/fixture hashes, raw timing samples, ordered result
 fingerprints and post-timing metrics. Both stages used identical updated
 runners under local macOS arm64/GHC 9.8 with optimization enabled. Warm cache
@@ -311,7 +311,7 @@ and **Scryer cargo 0.10.0**. An initial attempt was interrupted after observing
 Scryer's indented output and grouped inference counts. Its **12 records** cover four
 completed cases: eight successful Infera/SWI rows and four Scryer parser
 errors. All are preserved in the
-[initial evidence](engine-step2-opaque-controls-external-initial-2026-10-17.jsonl).
+[initial evidence](../data/jsonl/engine-step2-opaque-controls-external-initial-2026-10-17.jsonl).
 The entire incomplete initial attempt is excluded from performance tables,
 and all nine cases are rerun under the repaired parser. This protocol repair
 does not change the frozen runtime or the completed matched-stage measurements.
@@ -348,7 +348,7 @@ same-engine stage pairs.
 | Fibonacci 25 | 5 | 2,317.739 | 10.40000 | 28.20000 | 82.1x |
 | Eight queens, first solution | 10 | 572.377 | 2.40000 (coarse) | 5.40000 | 106.0x |
 
-The [final external evidence](engine-step2-opaque-controls-external-2026-10-17.jsonl)
+The [final external evidence](../data/jsonl/engine-step2-opaque-controls-external-2026-10-17.jsonl)
 retains every sample, result, command, binary/source hash, engine version and
 timing-quality flag. No samples were dropped from this completed rerun.
 Scryer exposes no loaded wall clock in this runner; all conclusions here use
@@ -368,10 +368,10 @@ Bytecode therefore remains opt-in.
 
 Ground-integer expression plans for `is/2` and ordinary numeric comparisons
 are a source-grounded next candidate. The current
-[operand materializer](../src/Infera/Machine/Bytecode.hs) still builds a heap
+[operand materializer](../../../src/Infera/Machine/Bytecode.hs) still builds a heap
 graph for an arithmetic expression. The
-[typed builtin driver](../src/Infera/Machine/Control.hs) exports that graph
-back to `Term`; the [shared arithmetic handler](../src/Infera/Machine/Builtins.hs)
+[typed builtin driver](../../../src/Infera/Machine/Control.hs) exports that graph
+back to `Term`; the [shared arithmetic handler](../../../src/Infera/Machine/Builtins.hs)
 walks the persistent substitution and evaluates it. `is/2` then imports its
 scalar result and performs native unification. The arithmetic-only fixture
 repeats two `is` operations and one ordinary comparison per loop iteration.
@@ -384,7 +384,7 @@ attributing the measured engine gap to that work, and it does not promise a
 2x target. Predicate calls, head matching, fresh-variable allocation and the
 persistent substitution mirror would remain. Native arithmetic writes already
 avoid extra CLP reconciliation when no watched variable changes, as shown by
-the [native CLP boundary](../src/Infera/Machine/CLP.hs). Incremental CLP change
+the [native CLP boundary](../../../src/Infera/Machine/CLP.hs). Incremental CLP change
 tracking remains a separate candidate for breadboard and other constraint
 workloads; it would not by itself remove the ordinary arithmetic fixture's
 remaining execution costs.

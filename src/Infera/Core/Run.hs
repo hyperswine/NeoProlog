@@ -154,6 +154,13 @@ data Scope = SBuffer !(IORef [SearchItem]) | SCount !(IORef Int)
 -- entry are kept by reference; younger free variables become fresh.
 data Copy = CpRef !Int | CpFresh !Int !Int | CpWord !Word' | CpStruct !Word' [Copy]
 
+-- Scratch storage belongs to one query, and contains no logical roots.
+-- Reuse it across collections; every active entry is rewritten before read.
+data GCWorkspace = GCWorkspace
+  { gcForward :: !(IOUArray Int Int),
+    gcTrailForward :: !(IOUArray Int Int)
+  }
+
 data Machine = Machine
   { mStore :: !Store,
     mProgram :: !P.Program,
@@ -175,7 +182,8 @@ data Machine = Machine
     -- | cells of variables the store may mention, by logical id
     mVarCells :: !(IORef (IM.IntMap Int)),
     -- | addresses of watched variables (branch-local)
-    mWatched :: !(IORef IS.IntSet)
+    mWatched :: !(IORef IS.IntSet),
+    mGCWorkspace :: !(IORef (Maybe GCWorkspace))
   }
 
 -- | Compile and start a query. Left names the construct that puts the
@@ -200,7 +208,7 @@ runCoreWith limit program query = do
       m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef []
         <*> newIORef guards <*> newIORef 0 <*> newIORef (Map.empty, IM.empty)
         <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
-        <*> newIORef CLP.emptyStore <*> newIORef IM.empty <*> newIORef IS.empty
+        <*> newIORef CLP.emptyStore <*> newIORef IM.empty <*> newIORef IS.empty <*> newIORef Nothing
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
       writeIORef (mVarCells m) (IM.fromList [(i, i) | i <- [0 .. cpQueryVars core - 1]])
@@ -1022,8 +1030,18 @@ matchHead :: Machine -> Int -> [Pattern] -> Int -> IO Bool
 matchHead _ _ [] _ = pure True
 matchHead m base (pattern : patterns) !i = do
   arg <- readArg (mStore m) i
-  ok <- unifyPattern m base pattern arg
+  ok <- case pattern of
+    PFirst k -> writeFirst (mStore m) (base + k) arg >> pure True
+    PSlot k -> unify (mStore m) (refWord (base + k)) arg
+    PWord w -> unify (mStore m) w arg
+    _ -> unifyPattern m base pattern arg
   if ok then matchHead m base patterns (i + 1) else pure False
+
+-- The first head occurrence is an unreferenced activation slot. Its value
+-- can be installed without a binding transaction or trail entry.
+writeFirst :: Store -> Int -> Word' -> IO ()
+writeFirst s addr word = deref s word >>= writeCell s addr
+{-# INLINE writeFirst #-}
 
 -- | Build call arguments into the registers.
 buildArgs :: Machine -> Int -> [Pattern] -> Int -> IO ()
@@ -1047,24 +1065,44 @@ unifyPattern m base pattern word = case pattern of
   PSlot i -> unify s (refWord (base + i)) word
   -- An unreferenced fresh cell: no dereference, trail, occurs check or
   -- store record is needed. A self-reference stays a variable.
-  PFirst i -> do
-    d <- deref s word
-    if tagOf d == tagRef && valOf d == base + i then pure True else writeCell s (base + i) d >> pure True
+  PFirst i -> writeFirst s (base + i) word >> pure True
   PWord w -> unify s w word
+  _ -> unifyCompound m base pattern word
+  where
+    s = mStore m
+{-# INLINE unifyPattern #-}
+
+unifyCompound :: Machine -> Int -> Pattern -> Word' -> IO Bool
+unifyCompound m base pattern word = case pattern of
   PStruct functor children -> do
     d <- deref s word
     case tagOf d of
       t | t == tagRef -> do
             built <- buildArg m base False pattern
-            cyclic <- occursIn s (valOf d) built
+            -- First occurrences still denote fresh activation slots; only
+            -- reused slots can carry the older input variable into this
+            -- structure. Check those words, rather than walking the graph
+            -- we just constructed. Keep the general check if the age proof
+            -- is unavailable.
+            cyclic <- if valOf d < base
+              then occursPattern s base (valOf d) pattern
+              else occursIn s (valOf d) built
             if cyclic then pure False else bind s (valOf d) built >> pure True
         | t == tagStr -> do
             f <- readCell s (valOf d)
-            if funKey f /= functor then pure False else matchChildren (valOf d + 1) children
+            if funKey f /= functor then pure False else case children of
+              [PFirst h, PFirst tl] -> do
+                hd <- readCell s (valOf d + 1)
+                tailWord <- readCell s (valOf d + 2)
+                writeFirst s (base + h) hd
+                writeFirst s (base + tl) tailWord
+                pure True
+              _ -> matchChildren (valOf d + 1) children
         | otherwise -> pure False
   PArith {} -> do
     built <- buildArg m base False pattern
     unify s built word
+  _ -> unifyPattern m base pattern word
   where
     s = mStore m
     matchChildren _ [] = pure True
@@ -1072,6 +1110,19 @@ unifyPattern m base pattern word = case pattern of
       w <- readCell s i
       ok <- unifyPattern m base child w
       if ok then matchChildren (i + 1) rest else pure False
+
+occursPattern :: Store -> Int -> Int -> Pattern -> IO Bool
+occursPattern s base target pattern = case pattern of
+  PFirst _ -> pure False
+  PSlot i -> occursIn s target (refWord (base + i))
+  PWord w -> occursIn s target w
+  PStruct _ children -> anyChild children
+  PArith _ _ children -> anyChild children
+  where
+    anyChild [] = pure False
+    anyChild (child : rest) = do
+      hit <- occursPattern s base target child
+      if hit then pure True else anyChild rest
 
 -- | Build a goal argument. With @normalize@, arithmetic structures whose
 -- operands are ground numbers are evaluated, as the reference does for
@@ -1081,11 +1132,28 @@ buildArg m base normalize pattern = case pattern of
   PSlot i -> pure (refWord (base + i))
   PFirst i -> pure (refWord (base + i))
   PWord w -> pure w
+  _ -> buildCompound m base normalize pattern
+{-# INLINE buildArg #-}
+
+buildCompound :: Machine -> Int -> Bool -> Pattern -> IO Word'
+buildCompound m base normalize pattern = case pattern of
+  -- A first-occurrence head variable is still unbound. It proves this
+  -- constructor non-ground without inspecting either child.
+  PStruct functor [a, PFirst b] -> do
+    wa <- buildArg m base normalize a
+    structure2WithGround s functor False wa (refWord (base + b))
+  PStruct functor [PFirst a, b] -> do
+    wb <- buildArg m base normalize b
+    structure2WithGround s functor False (refWord (base + a)) wb
+  PStruct functor [a, b] -> do
+    wa <- buildArg m base normalize a
+    wb <- buildArg m base normalize b
+    structure2 s functor wa wb
   PStruct functor children -> do
     let n = funArity functor
     addr <- reserveCells s (n + 1)
     writeCell s addr functor
-    ground <- fill (addr + 1) children
+    ground <- fill (addr + 1) children True
     when ground (writeCell s addr (functor .|. groundBit))
     pure (strWord addr)
   PArith functor op children -> do
@@ -1103,19 +1171,19 @@ buildArg m base normalize pattern = case pattern of
       Nothing -> do
         bumpArithData s
         structure s functor words'
+  _ -> buildArg m base normalize pattern
   where
     s = mStore m
-    fill _ [] = pure True
-    fill !i (child : rest) = do
+    fill _ [] !ground = pure ground
+    fill !i (child : rest) !ground = do
       w <- case child of
         PSlot k -> pure (refWord (base + k))
         PFirst k -> pure (refWord (base + k))
         PWord cw -> pure cw
         _ -> buildArg m base normalize child
       writeCell s i w
-      g <- groundNowWord s w
-      ok <- fill (i + 1) rest
-      pure (g && ok)
+      g <- if ground then groundNowWord s w else pure False
+      fill (i + 1) rest g
 
 structure :: Store -> Word' -> [Word'] -> IO Word'
 structure = structureWord
@@ -1959,6 +2027,28 @@ checkInvariants m cont = do
 
 -- ─── collection ──────────────────────────────────────────────────────────────
 
+collectionWorkspace :: Machine -> Int -> Int -> IO GCWorkspace
+collectionWorkspace m top trailLen = do
+  previous <- readIORef (mGCWorkspace m)
+  workspace <- case previous of
+    Nothing -> allocate (top + 1) (trailLen + 1)
+    Just old -> do
+      capacity <- getNumElements (gcForward old)
+      trailCapacity <- getNumElements (gcTrailForward old)
+      if top < capacity
+        then if trailLen < trailCapacity
+          then pure old
+          else do
+            trailForward <- newArray_ (0, max (trailLen + 1) (trailCapacity * 2) - 1)
+            pure old {gcTrailForward = trailForward}
+        else allocate (max (top + 1) (capacity * 2)) (max (trailLen + 1) trailCapacity)
+  writeIORef (mGCWorkspace m) (Just workspace)
+  pure workspace
+  where
+    allocate capacity trailCapacity = GCWorkspace
+      <$> newArray_ (0, capacity - 1)
+      <*> newArray_ (0, trailCapacity - 1)
+
 -- | Mark-compact collection of the cell store at a call boundary. Roots are
 -- the first @nargs@ argument registers, the current continuation, every
 -- choice point's alternatives and continuation, and findall results. Live
@@ -1972,9 +2062,13 @@ collect m cont nargs = do
   top <- heapTop s
   traceMsg ("GC at H=" ++ show top)
   arr <- readIORef (cells s)
+  trailLen <- trailTop s
+  workspace <- collectionWorkspace m top trailLen
+  -- The bitmaps are small and newArray clears them in bulk. Reusing them
+  -- would require a slower bit-by-bit clear; reuse the word-sized arrays.
   marks <- newArray (0, top) False :: IO (IOUArray Int Bool)
-  -- Cells with a trail entry can become unbound again; their ids matter.
   trailed <- newArray (0, top) False :: IO (IOUArray Int Bool)
+  -- Cells with a trail entry can become unbound again; their ids matter.
   do
     trailArr0 <- readIORef (trail s)
     trailLen0 <- trailTop s
@@ -1986,22 +2080,22 @@ collect m cont nargs = do
               when (addr < top) (unsafeWrite trailed addr True)
               noteTrail (if odd entry then i - 2 else i - 1)
     noteTrail (trailLen0 - 1)
+  -- Slot zero is the stack height, kept unboxed just like the addresses.
   stackRef <- newIORef =<< (newArray (0, 4095) 0 :: IO (IOUArray Int Int))
-  stackTop <- newIORef (0 :: Int)
   let push a = do
         st <- readIORef stackRef
-        i <- readIORef stackTop
+        i <- unsafeRead st 0
         size <- getNumElements st
         st' <-
-          if i < size
+          if i + 1 < size
             then pure st
             else do
               grown <- newArray (0, size * 2 - 1) 0
-              forM_ [0 .. i - 1] $ \j -> unsafeRead st j >>= unsafeWrite grown j
+              forM_ [0 .. i] $ \j -> unsafeRead st j >>= unsafeWrite grown j
               writeIORef stackRef grown
               pure grown
-        unsafeWrite st' i a
-        writeIORef stackTop (i + 1)
+        unsafeWrite st' (i + 1) a
+        unsafeWrite st' 0 (i + 1)
       markCell a = do
         seen <- unsafeRead marks a
         if seen then pure () else unsafeWrite marks a True >> push a >> markBlockOf a
@@ -2039,13 +2133,13 @@ collect m cont nargs = do
         | tagOf w == tagStr = markStructure (valOf w)
         | otherwise = pure ()
       drain = do
-        i <- readIORef stackTop
+        st <- readIORef stackRef
+        i <- unsafeRead st 0
         if i == 0
           then pure ()
           else do
-            st <- readIORef stackRef
-            a <- unsafeRead st (i - 1)
-            writeIORef stackTop (i - 1)
+            a <- unsafeRead st i
+            unsafeWrite st 0 (i - 1)
             w <- unsafeRead arr a
             if tagOf w == tagRef
               then (if valOf w /= a then markCell (valOf w) else pure ())
@@ -2108,7 +2202,7 @@ collect m cont nargs = do
   forM_ [0 .. choiceTop - 1] $ \i -> readChoice m i >>= markAlt . chAlt
   drain
   -- Forwarding: fwd a = live cells below a.
-  fwd <- newArray (0, top) 0 :: IO (IOUArray Int Int)
+  let fwd = gcForward workspace
   let count !a !n
         | a > top = pure ()
         | otherwise = do
@@ -2137,30 +2231,39 @@ collect m cont nargs = do
   -- Trail: keep entries of live cells, remember how many survive below
   -- each original index for the choice points' marks.
   trailArr <- readIORef (trail s)
-  trailLen <- trailTop s
-  keptBelow <- newArray (0, trailLen) 0 :: IO (IOUArray Int Int)
-  kept <- newIORef (0 :: Int)
-  let classify i acc
-        | i < 0 = pure acc
+  let keptBelow = gcTrailForward workspace
+  -- Parse backwards because an old-value word has no entry tag. Record
+  -- entry widths in the forwarding array, then compact forwards, replacing
+  -- each width with its prefix count. No boxed list of trail entries is
+  -- needed, and destinations never overwrite an unread source entry.
+  let classify !i
+        | i < 0 = pure ()
         | otherwise = do
             entry <- unsafeRead trailArr i
-            if odd entry then classify (i - 2) ((i - 1, 2, entry) : acc) else classify (i - 1) ((i, 1, entry) : acc)
-  entries <- classify (trailLen - 1) []
-  forM_ entries $ \(start, len, entry) -> do
-    k <- readIORef kept
-    forM_ [start .. start + len - 1] $ \j -> unsafeWrite keptBelow j k
-    let addr = entry `div` 2
-    live <- unsafeRead marks addr
-    when live $ do
-      addr' <- forward addr
-      if len == 1
-        then unsafeWrite trailArr k (addr' * 2)
-        else do
-          old <- unsafeRead trailArr start
-          unsafeWrite trailArr k old
-          unsafeWrite trailArr (k + 1) (addr' * 2 + 1)
-      writeIORef kept (k + len)
-  keptTotal <- readIORef kept
+            let len = if odd entry then 2 else 1
+            unsafeWrite keptBelow (i + 1 - len) len
+            classify (i - len)
+      compactTrail !start !k
+        | start >= trailLen = pure k
+        | otherwise = do
+            len <- unsafeRead keptBelow start
+            entry <- unsafeRead trailArr (start + len - 1)
+            old <- if len == 2 then unsafeRead trailArr start else pure 0
+            unsafeWrite keptBelow start k
+            when (len == 2) (unsafeWrite keptBelow (start + 1) k)
+            live <- liveCell (entry `div` 2)
+            if live
+              then do
+                addr' <- forward (entry `div` 2)
+                if len == 1
+                  then unsafeWrite trailArr k (addr' * 2)
+                  else do
+                    unsafeWrite trailArr k old
+                    unsafeWrite trailArr (k + 1) (addr' * 2 + 1)
+                compactTrail (start + len) (k + len)
+              else compactTrail (start + len) k
+  classify (trailLen - 1)
+  keptTotal <- compactTrail 0 0
   unsafeWrite keptBelow trailLen keptTotal
   setTrailTop s keptTotal
   -- Relocate control records before sliding: they read markers via old

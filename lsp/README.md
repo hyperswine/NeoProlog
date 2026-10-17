@@ -10,7 +10,9 @@ Language support for [Infera v2](https://github.com/hyperswine/NeoProlog)
   `phrase` targets. Effectful built-in calls are also underlined. Overloads are
   distinguished by arity; strings, comments and ordinary data atoms are excluded.
 - Hover: built-in docs, predicate clause counts and declared signatures,
-  declaration keywords, imported modules.
+  declaration keywords, imported modules. CLP operators (`#=`, `#!=`, `#<`,
+  `#>`, `#<=`, `#>=`) describe integer constraints and propagation with examples;
+  hover anywhere on the operator.
 - Go to definition / find references / document symbols, including
   `mod:pred` calls resolved through `neoprolog.conf`.
 - Completion: local predicates, module aliases (`mod:` completes the
@@ -23,6 +25,12 @@ Language support for [Infera v2](https://github.com/hyperswine/NeoProlog)
   Messages, codes, severities and source ranges match command-line checks.
   Imported errors link to their owning file, and superseded checks are cancelled.
   Untitled buffers use the workspace as their import context.
+- Dependency-aware checks: edits schedule only the changed document and its
+  transitive importers. Repeated saves, identical content updates and unchanged
+  watcher notifications reuse diagnostics. Cache identity includes source and
+  dependency contents, the module configuration and compiler identity. Only
+  relevant unsaved imports are sent as snapshots; changing hint visibility
+  refilters cached diagnostics without rerunning the compiler.
 - Compiler performance suggestions use informational diagnostics, with the
   editor's blue styling. They suggest opportunities such as tail recursion,
   posting constraints before labeling, and useful clause indexing; they do not

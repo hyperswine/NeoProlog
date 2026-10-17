@@ -37,7 +37,7 @@ module Infera.Core.Store
     readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, initialCollectLimit, markerBase, markerVars,
     drainBound, recordBoundCell,
     deref, bind, unwindTrail, trailIf, trailValueIf,
-    structureWord,
+    structureWord, structure2, structure2WithGround,
     box, boxed,
     -- * Unification and equality
     unify, equiv, isGroundWord, occursIn,
@@ -270,6 +270,7 @@ freshId s = unsafeRead (regs s) rFRESH
 {-# INLINE heapTop #-}
 {-# INLINE trailTop #-}
 {-# INLINE hb #-}
+{-# INLINE freshId #-}
 
 setHeapTop, setTrailTop, setHb, setOutLen, setFreshId :: Store -> Int -> IO ()
 setHeapTop s = unsafeWrite (regs s) rH
@@ -280,6 +281,7 @@ setFreshId s = unsafeWrite (regs s) rFRESH
 {-# INLINE setHeapTop #-}
 {-# INLINE setTrailTop #-}
 {-# INLINE setHb #-}
+{-# INLINE setFreshId #-}
 
 -- | Count arithmetic structures constructed as data. While it is zero, no
 -- call argument can contain one and the normalisation walk is skipped.
@@ -347,6 +349,7 @@ groundNowWord s w = case tagOf w of
         if tagOf d == tagRef then pure False else groundNowWord s d
     | t == tagStr -> funGround <$> readCell s (valOf w)
     | otherwise -> pure True
+{-# INLINE groundNowWord #-}
 
 -- | Reserve @n@ unbound variable cells and return the first address.
 allocCells :: Store -> Int -> IO Int
@@ -391,6 +394,7 @@ allocSlots s logicalBase n = do
   go (top + 1)
   setHeapTop s (top + n + 1)
   pure (top + 1)
+{-# INLINE allocSlots #-}
 
 -- | The reference id of a variable cell, found through its block marker.
 logicalId :: Store -> Int -> IO (Maybe Int)
@@ -408,8 +412,12 @@ logicalId s addr = do
 structureWord :: Store -> Word' -> [Word'] -> IO Word'
 structureWord s functor args = do
   ground <- allGround args
-  addr <- pushCell s (if ground then functor .|. groundBit else functor)
-  mapM_ (pushCell s) args
+  addr <- reserveCells s (funArity functor + 1)
+  arr <- readIORef (cells s)
+  unsafeWrite arr addr (if ground then functor .|. groundBit else functor)
+  let fill !_ [] = pure ()
+      fill !i (w : ws) = unsafeWrite arr i w >> fill (i + 1) ws
+  fill (addr + 1) args
   pure (strWord addr)
   where
     allGround [] = pure True
@@ -422,6 +430,27 @@ structureWord s functor args = do
             if tagOf d == tagRef then pure False else groundNow d
         | t == tagStr -> funGround <$> readCell s (valOf w)
         | otherwise -> pure True
+
+-- | The common two-argument constructor (including cons), with one heap
+-- reservation and no intermediate argument list. Keep the raw references:
+-- shallow control syntax and rollback depend on their identity.
+structure2 :: Store -> Word' -> Word' -> Word' -> IO Word'
+structure2 s functor a b = do
+  ga <- groundNowWord s a
+  ground <- if ga then groundNowWord s b else pure False
+  structure2WithGround s functor ground a b
+{-# INLINE structure2 #-}
+
+-- | A constructor whose groundness is already known by its caller.
+structure2WithGround :: Store -> Word' -> Bool -> Word' -> Word' -> IO Word'
+structure2WithGround s functor ground a b = do
+  addr <- reserveCells s 3
+  arr <- readIORef (cells s)
+  unsafeWrite arr addr (if ground then functor .|. groundBit else functor)
+  unsafeWrite arr (addr + 1) a
+  unsafeWrite arr (addr + 2) b
+  pure (strWord addr)
+{-# INLINE structure2WithGround #-}
 
 -- | Follow reference chains. The result is either a non-REF word or the
 -- REF of an unbound cell.

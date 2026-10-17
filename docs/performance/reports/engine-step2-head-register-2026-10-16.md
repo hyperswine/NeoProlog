@@ -8,14 +8,14 @@ opt-in; the public `Infera.Engine` still selects the interpreted native driver.
 
 ## Implementation
 
-[`Compile`](../src/Infera/Compile.hs) emits a flat preorder head program:
+[`Compile`](../../../src/Infera/Compile.hs) emits a flat preorder head program:
 `HeadVariable`, `HeadConstant` and `HeadCompound`. Compound instructions retain
 their arity, construction slot and subtree width. A separate immutable postorder
 construction plan has constant-time indexed access, shared across activations.
 Generated compiler checks independently decode both programs and verify widths,
 register dependencies, exact source identities and scalar bits.
 
-[`Bytecode.activate`](../src/Infera/Machine/Bytecode.hs) matches that program
+[`Bytecode.activate`](../../../src/Infera/Machine/Bytecode.hs) matches that program
 against the caller heap. Known compound shapes are inspected directly, without
 constructing a duplicate head. A free caller target constructs only the required
 source subtree and uses ordinary occurs-checked unification. Typed scalar
@@ -104,7 +104,7 @@ The structured-list case is faster in these samples, while helper dispatch and
 the structured-head case remain slower. No general throughput win is
 established, and the public default remains unchanged. These small local runs
 are reports rather than portable CI thresholds.
-[Raw samples](engine-step2-head-register-2026-10-16.tsv).
+[Raw samples](../data/tsv/engine-step2-head-register-2026-10-16.tsv).
 
 Untimed measured probes prove compiled execution occurred. The structured-head
 case executes 210,004 head instructions and avoids 80,001 duplicate head
@@ -114,10 +114,10 @@ construction plan uses 84 pooled slots instead of 135 source-node slots, a
 roots are counted separately. This is register sharing and lazy allocation,
 rather than full argument/environment lifetime trimming.
 
-The [initial matcher samples](engine-step2-head-register-initial-2026-10-16.tsv)
+The [initial matcher samples](../data/tsv/engine-step2-head-register-initial-2026-10-16.tsv)
 are retained with their own fingerprint. They motivated removing per-leaf
 checkpoints and normal-mode statistic writes. The
-[foundation samples](engine-step2-bytecode-2026-10-16.tsv) remain historical and
+[foundation samples](../data/tsv/engine-step2-bytecode-2026-10-16.tsv) remain historical and
 use a smaller loaded fixture; do not derive cross-version speed ratios from
 those different programs and source snapshots.
 
@@ -134,12 +134,12 @@ Peak RSS ranges from 125.95 to 128.11 MiB. Measured active heaps stay at or belo
 1,033 cells, with at most five tasks and two choices. The tail matrix's largest
 temporary array has 11 slots, excluding stable logical roots. Retaining earlier
 answers or growing output deliberately retains caller-owned memory.
-[Raw compiled residency samples](engine-step2-head-tail-2026-10-16.jsonl).
+[Raw compiled residency samples](../data/jsonl/engine-step2-head-tail-2026-10-16.jsonl).
 
 The default interpreted backend also passed the six-sample mutual/helper quick
 matrix against the same runtime source. Its peak RSS ranges from 125.92 to
 127.92 MiB, with at most 1,030 measured active heap cells.
-[Raw default-backend recheck](engine-step2-head-native-tail-2026-10-16.jsonl).
+[Raw default-backend recheck](../data/jsonl/engine-step2-head-native-tail-2026-10-16.jsonl).
 
 ## Real CLP acceptance
 
@@ -160,7 +160,7 @@ accepted compiled activations, 43,825 head instructions and 14,772 avoided head
 constructors. This prevents an entirely interpreted fallback from satisfying
 compiled CLP acceptance. Differences between the native backends are small
 relative to sample variability; both remain slower than Reference.
-[Raw minefield samples and probe](engine-step2-head-minefield-2026-10-16.jsonl).
+[Raw minefield samples and probe](../data/jsonl/engine-step2-head-minefield-2026-10-16.jsonl).
 
 ## CI follow-up
 

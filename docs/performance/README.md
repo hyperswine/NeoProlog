@@ -1,8 +1,23 @@
 # Performance measurements
 
+See the [current engine guide](../engine/README.md),
+[dated report index](reports/README.md), and
+[raw data conventions](data/README.md). The newest results appear first;
+the earlier sections preserve measurements from previous engine stages.
+
+## Reverse construction, matching and collection - 2026-10-17
+
+The [reverse follow-up](reports/engine-reverse-2026-10-17.md) records a 20% reduction
+in loaded-program CPU time, 38% less GHC allocation and 17% less maximum
+residency against `e3082b3`. Checked CLI reverse falls from 0.507 s to
+0.414 s, versus SWI 0.068 s and Scryer 0.174 s. The full 391-property
+Haskell suite, 296 forced-collection example/parity queries, CLI acceptance,
+61 LSP tests and 34 harness tests pass. Individual samples and provenance
+are linked from the report.
+
 ## Diagnosis and the new core - 2026-10-17
 
-The [engine diagnosis](engine-diagnosis-2026-10-17.md) profiles the current
+The [engine diagnosis](../engine/engine-diagnosis-2026-10-17.md) profiles the current
 machine (15-45 KB of allocation per inference, a flat profile, 50-200x the
 CPU of Scryer), attributes the cost to the representation, and records the
 first slice of the replacement core in `src/Infera/Core/`: unboxed tagged
@@ -28,7 +43,7 @@ list case, but slower on helper dispatch and structured heads. No general
 throughput win is established. The interpreted native driver remains the public
 default. All 28 compiled residency samples pass, including million-iteration
 loops with live alternatives, opaque scopes and CLP state.
-The [head/register report](engine-step2-head-register-2026-10-16.md) records
+The [head/register report](reports/engine-step2-head-register-2026-10-16.md) records
 current source-matched samples, validation and remaining work.
 
 ## Native follow-up and first bytecode slice - 2026-10-16
@@ -38,7 +53,7 @@ The large-minefield regression is fixed. Constrained table calls now evaluate
 their plain fallback on the active driver. Monotone native-store synchronization
 avoids revalidating unchanged historical substitutions, and graph normalization
 preserves shared grid/list suffixes. The
-[foundation report](engine-step2-foundation-2026-10-16.md) records the contracts,
+[foundation report](reports/engine-step2-foundation-2026-10-16.md) records the contracts,
 correctness tests, bounded-residency recheck and first opt-in bytecode slice.
 
 Fresh CLI measurements use the same local GHC 9.8.2 `-O2` library/executable
@@ -58,8 +73,8 @@ reports rather than portable CI thresholds.
 | Untabled fib 25 | 4.168 s | 2.694 s |
 | First valid 8-queens placement | 1.311 s | 0.578 s |
 
-Raw current samples: [applications](performance-step2-2026-10-16.jsonl) and
-[CLI matrix](engine-step2-cli-2026-10-16.jsonl). The previous raw files below
+Raw current samples: [applications](data/jsonl/performance-step2-2026-10-16.jsonl) and
+[CLI matrix](data/jsonl/engine-step2-cli-2026-10-16.jsonl). The previous raw files below
 remain historical provenance. Despite the recovery, general native execution
 still trails the pre-migration baseline on reverse, loop, Fibonacci and queens;
 that baseline used a different library optimization profile.
@@ -70,13 +85,13 @@ The separate loaded-program minefield benchmark records native setup at
 checks exact Reference parity; ordinary generation additionally checks the
 bomb count and every overlapping window independently. These timings exclude
 startup/parsing/loading and must not be compared directly to CLI samples.
-[Raw loaded-program samples](engine-step2-minefield-2026-10-16.jsonl).
+[Raw loaded-program samples](data/jsonl/engine-step2-minefield-2026-10-16.jsonl).
 
 The first Step 2 compiler/VM slice preserves results but establishes no
 measurable throughput gain over the interpreted native driver. It remains
 opt-in while specialized head instructions, registers, control/indexing code
 and load-time caches are developed.
-[Three-engine samples](engine-step2-bytecode-2026-10-16.tsv).
+[Three-engine samples](data/tsv/engine-step2-bytecode-2026-10-16.tsv).
 
 <a id="current-native-engine-recheck---2026-10-16"></a>
 
@@ -86,7 +101,7 @@ After the public solver switched to the Step 1 native machine, three of these
 application workloads were rerun with the current `-O2` library and executable,
 RTS `-N1`, three requested fresh CLI samples and a 30-second process budget.
 The ordinary minefield timed out on its first sample; no timing is inferred
-from that failure. [Raw results for that snapshot](performance-step1-2026-10-16.jsonl)
+from that failure. [Raw results for that snapshot](data/jsonl/performance-step1-2026-10-16.jsonl)
 record the runtime source hash and build profile.
 
 | Workload | Before the earlier optimizations (s) | Optimized reference (s) | Native before follow-up (s) |
@@ -98,9 +113,9 @@ record the runtime source hash and build profile.
 The earlier CLP/tabling application gains remain visible for graph closure and
 wide placement, but the native engine gives some of them back and introduces
 a major large-minefield regression. General execution also regresses against
-the [pre-migration CLI baseline](engine-baseline-2026-10-16.jsonl): reverse
+the [pre-migration CLI baseline](data/jsonl/engine-baseline-2026-10-16.jsonl): reverse
 6.188s -> 32.551s, loop 0.268s -> 0.752s, Fibonacci 0.463s -> 4.168s and queens
-0.111s -> 1.311s. [CLI results for that snapshot](engine-step1-cli-2026-10-16.jsonl)
+0.111s -> 1.311s. [CLI results for that snapshot](data/jsonl/engine-step1-cli-2026-10-16.jsonl)
 validate all four workloads. The historical baseline used a different library
 optimization profile, so these are recorded local observations, not controlled
 portable regression ratios.
@@ -120,7 +135,7 @@ prior inference work. These are working-tree measurements, not release claims.
 
 Each successful entry is the median of three fresh CLI processes, including
 startup, parsing, loading, solving and output. The first launch after rebuilding
-had extra overhead; all samples are retained in the [raw results](performance-2026-10-15.jsonl). Timings
+had extra overhead; all samples are retained in the [raw results](data/jsonl/performance-2026-10-15.jsonl). Timings
 are not cold-start guarantees or CI thresholds. Timeout cases stop after the
 first eight-second timeout.
 

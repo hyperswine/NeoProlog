@@ -12,3 +12,4 @@ nprolog.conf
 output/
 docs/dash/dist/
 .claude/
+__pycache__/

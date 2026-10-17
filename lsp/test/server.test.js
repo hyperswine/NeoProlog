@@ -185,6 +185,179 @@ test('CLP comparisons, control operators and declaration modes expose their hove
   }
 })
 
+test('CLP hover includes propagation examples across the complete operator range', async t => {
+  const { uri } = fixture(t)
+  const operators = ['#=', '#!=', '#<', '#>', '#<=', '#>=']
+  const lines = operators.map(op => `p X Y <- X ${op} Y.`)
+  const { notify, request } = await client(t, '/missing-infera', { checkOnSave: false, checkOnChange: false })
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: lines.join('\n') } })
+  for (const [line, op] of operators.entries()) {
+    const start = lines[line].indexOf(op)
+    for (let offset = 0; offset < op.length; offset++) {
+      const response = await request('textDocument/hover', { textDocument: { uri }, position: { line, character: start + offset } })
+      assert.ok(response.result.contents.value.includes('Example:'), op)
+      assert.deepEqual(response.result.range, { start: { line, character: start }, end: { line, character: start + op.length } })
+      if (op === '#=') assert.match(response.result.contents.value, /Unlike `is`/)
+    }
+  }
+})
+
+function countingChecker(root, diagnostics = []) {
+  const executable = path.join(root, 'counting-checker'), log = path.join(root, 'checks.jsonl')
+  fs.writeFileSync(executable, '#!/usr/bin/env node\n'
+    + `const fs = require('fs'), args = process.argv.slice(2); let source = '';\n`
+    + `process.stdin.on('data', chunk => { source += chunk });\n`
+    + `process.stdin.on('end', () => {\n`
+    + `const buffers = []; for (let i = 4; i < args.length; i += 3) buffers.push({ path: args[i+1], text: fs.readFileSync(args[i+2], 'utf8') });\n`
+    + `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ file: args[3], source, buffers }) + '\\n');\n`
+    + `console.log(${JSON.stringify(JSON.stringify(diagnostics))}); });\n`, { mode: 0o755 })
+  const calls = file => {
+    const rows = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []
+    return file ? rows.filter(row => row.file === file) : rows
+  }
+  return { executable, calls }
+}
+
+test('unchanged content saves and watcher events reuse checks; edits leave unrelated files alone', async t => {
+  const { root, file, uri } = fixture(t)
+  const other = path.join(root, 'other.nprolog'), otherUri = pathToFileURL(other).href
+  const { executable, calls } = countingChecker(root)
+  const { notify } = await client(t, executable)
+  for (const [f, u, text] of [[file, uri, 'main.\n'], [other, otherUri, 'other.\n']]) {
+    fs.writeFileSync(f, text)
+    notify('textDocument/didOpen', { textDocument: { uri: u, languageId: 'infera', version: 1, text } })
+  }
+  await until(() => calls(file).length === 1 && calls(other).length === 1)
+  for (let i = 0; i < 3; i++) notify('textDocument/didSave', { textDocument: { uri } })
+  notify('textDocument/didChange', { textDocument: { uri, version: 2 }, contentChanges: [{ text: 'main.\n' }] })
+  notify('workspace/didChangeWatchedFiles', { changes: [{ uri, type: 2 }, { uri: otherUri, type: 2 }] })
+  await new Promise(resolve => setTimeout(resolve, 500))
+  assert.equal(calls(file).length, 1)
+  assert.equal(calls(other).length, 1)
+  notify('textDocument/didChange', { textDocument: { uri, version: 3 }, contentChanges: [{ text: 'changed.\n' }] })
+  notify('textDocument/didSave', { textDocument: { uri } })
+  await until(() => calls(file).length === 2)
+  await new Promise(resolve => setTimeout(resolve, 300))
+  assert.equal(calls(file).length, 2)
+  assert.equal(calls(other).length, 1)
+})
+
+test('only transitive importers recheck and receive relevant unsaved snapshots', async t => {
+  const { root, file, uri } = fixture(t)
+  const lib = path.join(root, 'lib.nprolog'), leaf = path.join(root, 'leaf.nprolog')
+  const leafUri = pathToFileURL(leaf).href, other = path.join(root, 'other.nprolog'), otherUri = pathToFileURL(other).href
+  fs.writeFileSync(path.join(root, 'neoprolog.conf'), 'lib#test lib.nprolog\nleaf#test leaf.nprolog\n')
+  fs.writeFileSync(lib, '<- import "leaf#test".\nlib.\n')
+  fs.writeFileSync(leaf, 'leaf.\n')
+  const { executable, calls } = countingChecker(root)
+  const { notify } = await client(t, executable)
+  for (const [f, u, text] of [[file, uri, '<- import "lib#test".\nmain.\n'], [other, otherUri, 'other.\n'], [leaf, leafUri, 'leaf.\n']]) {
+    fs.writeFileSync(f, text)
+    notify('textDocument/didOpen', { textDocument: { uri: u, languageId: 'infera', version: 1, text } })
+  }
+  await until(() => calls(file).length === 1 && calls(leaf).length === 1 && calls(other).length === 1)
+  notify('textDocument/didChange', { textDocument: { uri: leafUri, version: 2 }, contentChanges: [{ text: 'unsaved.\n' }] })
+  await until(() => calls(file).length === 2 && calls(leaf).length === 2)
+  assert.deepEqual(calls(file).at(-1).buffers, [{ path: leaf, text: 'unsaved.\n' }])
+  assert.equal(calls(other).length, 1)
+  notify('textDocument/didClose', { textDocument: { uri: leafUri } })
+  await until(() => calls(file).length === 3)
+  assert.deepEqual(calls(file).at(-1).buffers, [])
+  assert.equal(calls(other).length, 1)
+})
+
+test('missing disk imports and configuration changes invalidate cached checks', async t => {
+  const { root, file, uri } = fixture(t)
+  const lib = path.join(root, 'lib.nprolog'), libUri = pathToFileURL(lib).href
+  const conf = path.join(root, 'neoprolog.conf'), confUri = pathToFileURL(conf).href
+  fs.writeFileSync(conf, 'lib#test lib.nprolog\n')
+  const { executable, calls } = countingChecker(root), { notify } = await client(t, executable)
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: '<- import "lib#test".\nmain.\n' } })
+  await until(() => calls(file).length === 1)
+  fs.writeFileSync(lib, 'lib.\n')
+  notify('workspace/didChangeWatchedFiles', { changes: [{ uri: libUri, type: 1 }] })
+  await until(() => calls(file).length === 2)
+  fs.unlinkSync(lib)
+  notify('workspace/didChangeWatchedFiles', { changes: [{ uri: libUri, type: 3 }] })
+  await until(() => calls(file).length === 3)
+  fs.writeFileSync(conf, 'lib#test elsewhere.nprolog\n')
+  notify('workspace/didChangeWatchedFiles', { changes: [{ uri: confUri, type: 2 }] })
+  await until(() => calls(file).length === 4)
+})
+
+test('hint visibility reuses unfiltered diagnostics while compiler changes invalidate the cache', async t => {
+  const { root, file, uri } = fixture(t)
+  const row = { file, code: 'perf-example', severity: 'information', message: 'hint',
+    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } }
+  const { executable, calls } = countingChecker(root, [row])
+  const { notify, messages } = await client(t, executable)
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: 'main.\n' } })
+  const last = () => messages.filter(m => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri).at(-1)?.params.diagnostics
+  await until(() => last()?.some(d => d.code === row.code))
+  notify('workspace/didChangeConfiguration', { settings: { infera: { executable, performanceHints: false } } })
+  await until(() => last()?.length === 0)
+  notify('workspace/didChangeConfiguration', { settings: { infera: { executable, performanceHints: true } } })
+  await until(() => last()?.some(d => d.code === row.code))
+  assert.equal(calls(file).length, 1)
+  fs.utimesSync(executable, new Date(), new Date(Date.now() + 10000))
+  notify('textDocument/didSave', { textDocument: { uri } })
+  await until(() => calls(file).length === 2)
+})
+
+test('save-only checks still run after an edit queued with live checking disabled', async t => {
+  const { root, file, uri } = fixture(t)
+  const { executable, calls } = countingChecker(root), { notify } = await client(t, executable, { checkOnChange: false })
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: 'main.\n' } })
+  await until(() => calls(file).length === 1)
+  notify('textDocument/didChange', { textDocument: { uri, version: 2 }, contentChanges: [{ text: 'changed.\n' }] })
+  notify('textDocument/didSave', { textDocument: { uri } })
+  await until(() => calls(file).length === 2)
+})
+
+test('an in-flight importer cannot publish results for an older dependency buffer', async t => {
+  const { root, file, uri } = fixture(t)
+  const lib = path.join(root, 'lib.nprolog'), libUri = pathToFileURL(lib).href
+  fs.writeFileSync(lib, 'old.\n')
+  fs.writeFileSync(path.join(root, 'neoprolog.conf'), 'lib#test lib.nprolog\n')
+  const executable = path.join(root, 'delayed-import-checker'), marker = path.join(root, 'importer-started')
+  const row = { file, code: 'stale-dependency', severity: 'warning', message: 'old dependency',
+    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } }
+  fs.writeFileSync(executable, '#!/usr/bin/env node\n'
+    + `const fs = require('fs'), args = process.argv.slice(2); process.stdin.resume();\n`
+    + `process.stdin.on('end', () => { if (args[3] !== ${JSON.stringify(file)}) { console.log('[]'); return }\n`
+    + `let text = fs.readFileSync(${JSON.stringify(lib)}, 'utf8');\n`
+    + `for (let i = 4; i < args.length; i += 3) if (args[i+1] === ${JSON.stringify(lib)}) text = fs.readFileSync(args[i+2], 'utf8');\n`
+    + `fs.writeFileSync(${JSON.stringify(marker)}, text);\n`
+    + `if (text.includes('old')) setTimeout(() => console.log(${JSON.stringify(JSON.stringify([row]))}), 600); else console.log('[]'); });\n`, { mode: 0o755 })
+  const { notify, messages } = await client(t, executable)
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: '<- import "lib#test".\nmain.\n' } })
+  notify('textDocument/didOpen', { textDocument: { uri: libUri, languageId: 'infera', version: 1, text: 'old.\n' } })
+  await until(() => fs.existsSync(marker))
+  const from = messages.length
+  notify('textDocument/didChange', { textDocument: { uri: libUri, version: 2 }, contentChanges: [{ text: 'new.\n' }] })
+  await until(() => fs.readFileSync(marker, 'utf8') === 'new.\n')
+  await new Promise(resolve => setTimeout(resolve, 800))
+  assert.ok(!messages.slice(from).some(m => m.method === 'textDocument/publishDiagnostics'
+    && m.params.uri === uri && m.params.diagnostics.some(d => d.code === row.code)))
+})
+
+test('checker failures are retried on an unchanged save', async t => {
+  const { root, file, uri } = fixture(t)
+  const executable = path.join(root, 'recovering-checker'), recovered = path.join(root, 'recovered')
+  fs.writeFileSync(executable, '#!/usr/bin/env node\n'
+    + `process.stdin.resume(); process.stdin.on('end', () => {\n`
+    + `if (require('fs').existsSync(${JSON.stringify(recovered)})) console.log('[]'); else process.exit(1); });\n`, { mode: 0o755 })
+  const { notify, messages } = await client(t, executable)
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: 'main.\n' } })
+  await until(() => messages.some(m => m.method === 'textDocument/publishDiagnostics'
+    && m.params.uri === uri && m.params.diagnostics.some(d => d.code === 'checker-unavailable')))
+  const from = messages.length
+  fs.writeFileSync(recovered, '')
+  notify('textDocument/didSave', { textDocument: { uri } })
+  await until(() => messages.slice(from).some(m => m.method === 'textDocument/publishDiagnostics'
+    && m.params.uri === uri && m.params.diagnostics.length === 0))
+})
+
 test('nested module navigation uses the same nearest config and relative paths as checking', {
   skip: !process.env.INFERA_BIN, timeout: 20000
 }, async t => {

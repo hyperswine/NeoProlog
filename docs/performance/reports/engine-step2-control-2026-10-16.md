@@ -113,7 +113,7 @@ Reference search streams pass for every case.
 Large skipped bodies improve over interpreted native execution, while several
 small hot loops remain slower. Structured-list and findall differences are
 small in these samples. Throughput remains mixed, so default migration gates
-are not yet met. [Raw first-order/control samples](engine-step2-control-2026-10-16.tsv).
+are not yet met. [Raw first-order/control samples](../data/tsv/engine-step2-control-2026-10-16.tsv).
 
 ## Real CLP acceptance
 
@@ -130,7 +130,7 @@ benchmark separately proves direct control execution.
 | Wide disconnected | 0.010449 s | 0.013450 s | 0.015470 s |
 
 The compiled path remains slower on these small circuits.
-[Raw breadboard samples](engine-step2-control-breadboard-2026-10-16.tsv).
+[Raw breadboard samples](../data/tsv/engine-step2-control-breadboard-2026-10-16.tsv).
 
 The 16x16 minefield with 50 bombs and at most two bombs in every overlapping
 2x2 window also passes. Searches fully drain, match exact Reference answers
@@ -149,7 +149,7 @@ instructions and 14,604 reached invocation leaves. The verified grid's
 fingerprint is unchanged. Its active heap peaks at 3,907 cells and its largest
 temporary array has 11 registers. Both native backends remain slower than
 Reference, and bytecode is slower than interpreted in these samples.
-[Raw minefield samples and probe](engine-step2-control-minefield-2026-10-16.jsonl).
+[Raw minefield samples and probe](../data/jsonl/engine-step2-control-minefield-2026-10-16.jsonl).
 
 ## Residency
 
@@ -172,12 +172,12 @@ The new compiled-continuation sample verifies one million tail transfers,
 two scopes, 1,025 heap cells and one temporary register. Its normal and measured
 fresh processes both satisfy the residency policy. Caller-owned growing
 answers and retained checkpoints retain their intended memory.
-[Raw compiled residency samples](engine-step2-control-tail-2026-10-16.jsonl).
+[Raw compiled residency samples](../data/jsonl/engine-step2-control-tail-2026-10-16.jsonl).
 
 The six-sample interpreted mutual/helper recheck passes against the same
 runtime source. Its measured active heaps remain at or below 1,030 cells,
 with at most four tasks and one choice.
-[Raw default-backend recheck](engine-step2-control-native-tail-2026-10-16.jsonl).
+[Raw default-backend recheck](../data/jsonl/engine-step2-control-native-tail-2026-10-16.jsonl).
 
 ## Default migration
 
