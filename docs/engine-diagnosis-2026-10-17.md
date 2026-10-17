@@ -336,6 +336,14 @@ Collecting at four times the live size (above the floor) instead of twice
 brought reverse to 0.47 s of process time for a few MB more residency.
 Building the library at `-O2` (as CI does) gains a further 5% on reverse and
 nothing on the other workloads, so the default profile is unchanged.
+Inlining slot and constant arguments, precomputing the inferred switch
+positions, and writing first-occurrence head variables instead of unifying
+them then took the in-process figures to reverse 3000 0.42 s with
+collection (0.32 s without), loop 90000 0.011 s, fib 25 0.047 s and queens
+0.011 s. The profile of reverse without collection is now argument and
+structure construction (22%), head matching (14%), goal dispatch (9%) and
+unification (8%); the remaining allocation is boxed results of small
+`IO Int` helpers, which is ordinary GHC tuning rather than design.
 
 ### Next
 
