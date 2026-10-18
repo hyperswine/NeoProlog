@@ -15,6 +15,7 @@ import Infera hiding (Answer, solveQuery)
 import qualified Infera.CLP as CLP
 import qualified Infera.Core.Run as Run
 import qualified Infera.Core.Store as Store
+import Infera.Engine.Alpha (alphaOutput, alphaTerms, alphaText)
 import qualified Infera.Engine.Reference as Reference
 
 unit :: PropertyT IO () -> Property
@@ -42,8 +43,8 @@ problemBits problem = case problem of
   other -> other
 
 data Observation
-  = Answer [Term] Int [String] [OutputEvent]
-  | Problem SolveError
+  = Answer [Term] [String] String
+  | Problem String
   | Exhausted
   | Cut Int
   | Incomplete Term
@@ -56,10 +57,10 @@ observe query = map item
       let substitution = CLP.stSubst (ssStore state)
           answer = Reference.projectAnswer query state
        in Answer
-            [bits (deepWalk substitution (Var variable))
-              | variable <- [0 .. queryNVars query - 1]]
-            (ssFresh state) (Reference.answerResiduals answer) (ssOutput state)
-    item (BranchError problem) = Problem (problemBits problem)
+            (alphaTerms (queryNVars query) [bits (deepWalk substitution (Var variable))
+              | variable <- [0 .. queryNVars query - 1]])
+            (Reference.answerResiduals answer) (alphaOutput (ssOutput state))
+    item (BranchError problem) = Problem (alphaText (show (problemBits problem)))
     item BranchExhausted = Exhausted
     item (CutMarker owner) = Cut owner
     item (ConsumedIncomplete key) = Incomplete (bits key)

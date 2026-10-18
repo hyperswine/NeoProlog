@@ -5,6 +5,17 @@ See the [current engine guide](../engine/README.md),
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
+## Plain calls and the choice stack - 2026-10-19
+
+The [control stacks report](../engine/control-stacks-2026-10-19.md) records
+checked loaded-query CPU 9-16% below `1a97539` on reverse, loop, Fibonacci
+and queens, with 27-40% less GHC allocation. Engines are now compared up to
+renaming of variables, which removed the Core's fresh-id bookkeeping and
+exposed a `findall` copy bug in the reference and legacy machine, now fixed.
+An unboxed continuation-frame stack was measured 5-14% slower than keeping
+continuations as GHC values and was not adopted. A current profile places
+most Core time in head matching, term construction, arithmetic and dispatch.
+
 ## Reusable Core slots and tail frames - 2026-10-18
 
 The [profile and reuse report](reports/engine-slots-2026-10-18.md) records one

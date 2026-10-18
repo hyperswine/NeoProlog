@@ -302,13 +302,16 @@ prop_findall_identity_and_fresh_reuse = unit $ do
     [ ("findall X true L, X = shared?", ["X = shared, L = [shared]"]),
       ("X = (box Y), findall X true L, Y = shared?", ["X = box shared, Y = shared, L = [box shared]"]),
       ("findall X fail L?", ["L = []"]),
+      -- A solution's own variables are renamed apart from later ones: binding
+      -- a variable created after the findall does not reach into its copy.
       ("findall X (local X) L, local Y, Y = (pair linked linked)?",
-        ["L = [pair linked linked], Y = pair linked linked"])
+        ["L = [pair _0 _0], Y = pair linked linked"])
     ] $ \(text, expected) -> do
       (query, items) <- compareText program text
       expectAnswers query items expected
+      -- The copy's variable takes one fresh id and the later call another.
       if "local" `isInfixOf` text
-        then map Reference.ssFresh (foundStates items) === [queryNVars query + 1]
+        then map Reference.ssFresh (foundStates items) === [queryNVars query + 2]
         else pure ()
   (query, items) <- compareText emptyProgram
     "findall (pair X Y) (Y = X ; true) L, X = shared?"

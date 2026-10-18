@@ -84,12 +84,13 @@ data Cont
   | -- | a candidate of a minimize scope: cost pattern, base, state ref
     CExitMinimize Pattern !Int !(IORef Minimum)
 
+-- | One choice point, as a value. The stack itself is stored in 'Choices';
+-- this record is built only on cold paths (collection, invariant checks).
 data Choice = Choice
   { chH :: !Int,
     chTR :: !Int,
     chOut :: !Int,
     chScopes :: !Int,
-    chFresh :: !Int,
     -- | branch-local tables
     chTables :: Map.Map Term TableEntry,
     -- | branch-local dynamic facts
@@ -131,9 +132,6 @@ data Minimum = Minimum
   { mnEntryHeap :: !Int,
     mnEntryTrail :: !Int,
     mnEntryOut :: !Int,
-    -- | The winning branch's next logical ID, independent of the entry
-    -- choice point restored while exploring or returning the minimum.
-    mnBestFresh :: !Int,
     mnBest :: Maybe (Integer, [(Int, Copy)], [OutputEvent], Map.Map Term TableEntry, Map.Map PredKey [(Term, Int)], CLP.Store, IS.IntSet)
   }
 
@@ -166,13 +164,40 @@ data Fix = Fix
     fxUnsafe :: !Bool
   }
 
+-- | The choice stack. The marks (heap, trail, output length and scope
+-- depth) are unboxed; the alternative and the branch-local state are
+-- pointers stored in boxed arrays. Pushing a choice allocates only its
+-- alternative.
+data Choices = Choices
+  { csMarks :: !(IOUArray Int Int),
+    csAlts :: !(IOArray Int Alt),
+    csTables :: !(IOArray Int (Map.Map Term TableEntry)),
+    csDynamic :: !(IOArray Int (Map.Map PredKey [(Term, Int)])),
+    csStore :: !(IOArray Int (Maybe Mutable.Mark)),
+    csWatched :: !(IOArray Int IS.IntSet)
+  }
+
+markStride, markH, markTR, markOut, markScopes :: Int
+markStride = 4
+markH = 0
+markTR = 1
+markOut = 2
+markScopes = 3
+
+-- Machine counters, unboxed: the choice height, the guard height and the
+-- number of open issue scopes.
+counterChoices, counterGuards, counterScopes :: Int
+counterChoices = 0
+counterGuards = 1
+counterScopes = 2
+
 -- Issue scopes: a negation or findall buffers issues until its outcome is
 -- known; a condition only counts them.
 data Scope = SBuffer !(IORef [SearchItem]) | SCount !(IORef Int)
 
 -- A findall solution copied out of the heap. Cells older than the findall
 -- entry are kept by reference; younger free variables become fresh.
-data Copy = CpRef !Int | CpFresh !Int !Int | CpWord !Word' | CpStruct !Word' [Copy]
+data Copy = CpRef !Int | CpFresh !Int !(Maybe Int) | CpWord !Word' | CpStruct !Word' [Copy]
 
 -- Scratch storage belongs to one query, and contains no logical roots.
 -- Reuse it across collections; every active entry is rewritten before read.
@@ -186,13 +211,12 @@ data Machine = Machine
     mProgram :: !P.Program,
     mEnv :: !Env,
     mCore :: !CoreProgram,
-    mChoices :: !(IORef (IOArray Int Choice)),
-    mChoiceTop :: !(IORef Int),
+    mChoices :: !(IORef Choices),
+    mCounters :: !(IOUArray Int Int),
     mScopes :: !(IORef [Scope]),
     -- | determinism guards: per entry the choice height at its push, its
     -- success flag and its interned key with the required determinism
     mGuards :: !(IORef (IOUArray Int Int)),
-    mGuardTop :: !(IORef Int),
     mGuardKeys :: !(IORef (Map.Map PredKey Int, IM.IntMap PredKey)),
     mOutput :: !(IORef [OutputEvent]),
     mTables :: !(IORef (Map.Map Term TableEntry)),
@@ -252,11 +276,12 @@ startCore measured measureSlots limit program query = do
   case compiled of
     Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason), collectionStats store, pure (0, 0, 0), pure (0, 0, 0))
     Right core -> do
-      choices <- newArray_ (0, 1023)
+      choices <- newChoices 1024
+      counters <- newArray (0, 3) 0
       guards <- newArray (0, 3 * 1024 - 1) 0
       slots <- if measureSlots then Just <$> newIORef (0, 0, 0) else pure Nothing
-      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef []
-        <*> newIORef guards <*> newIORef 0 <*> newIORef (Map.empty, IM.empty)
+      m <- Machine store program (mkEnv program) core <$> newIORef choices <*> pure counters <*> newIORef []
+        <*> newIORef guards <*> newIORef (Map.empty, IM.empty)
         <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
         <*> newIORef Nothing <*> pure measured <*> newIORef IM.empty <*> newIORef IS.empty <*> newIORef Nothing <*> pure slots
       _ <- allocCells store (max 1 (cpQueryVars core))
@@ -303,7 +328,7 @@ compactConstraints m = do
   case current of
     Nothing -> pure ()
     Just (kernel, _) -> do
-      top <- readIORef (mChoiceTop m)
+      top <- choiceTop m
       when (top == 0) $ do
         root <- Mutable.commit kernel
         writeIORef (mCLP m) (Just (kernel, root))
@@ -321,45 +346,104 @@ pushChoiceWithStore m store alt = do
   h <- heapTop s
   tr <- trailTop s
   out <- outLen s
-  fresh <- freshId s
-  tables <- readIORef (mTables m)
-  dynamic <- readIORef (mDynamic m)
-  watched <- readIORef (mWatched m)
-  scopes <- length <$> readIORef (mScopes m)
-  top <- readIORef (mChoiceTop m)
-  arr <- readIORef (mChoices m)
-  size <- getNumElements arr
-  arr' <-
-    if top < size
-      then pure arr
-      else do
-        grown <- newArray_ (0, size * 2 - 1)
-        forM_ [0 .. top - 1] $ \i -> unsafeRead arr i >>= unsafeWrite grown i
-        writeIORef (mChoices m) grown
-        pure grown
-  unsafeWrite arr' top (Choice h tr out scopes fresh tables dynamic store watched alt)
-  writeIORef (mChoiceTop m) (top + 1)
+  scopes <- unsafeRead (mCounters m) counterScopes
+  top <- choiceTop m
+  cs <- choicesFor m top
+  let marks = csMarks cs
+      at = top * markStride
+  unsafeWrite marks (at + markH) h
+  unsafeWrite marks (at + markTR) tr
+  unsafeWrite marks (at + markOut) out
+  unsafeWrite marks (at + markScopes) scopes
+  unsafeWrite (csAlts cs) top alt
+  readIORef (mTables m) >>= unsafeWrite (csTables cs) top
+  readIORef (mDynamic m) >>= unsafeWrite (csDynamic cs) top
+  unsafeWrite (csStore cs) top store
+  readIORef (mWatched m) >>= unsafeWrite (csWatched cs) top
+  setChoiceTop m (top + 1)
   setHb s h
   pure top
 
+newChoices :: Int -> IO Choices
+newChoices n =
+  Choices <$> newArray (0, n * markStride - 1) 0 <*> newArray_ (0, n - 1) <*> newArray_ (0, n - 1)
+    <*> newArray_ (0, n - 1) <*> newArray_ (0, n - 1) <*> newArray_ (0, n - 1)
+
+-- | The stack with room for an entry at @top@, grown by doubling.
+choicesFor :: Machine -> Int -> IO Choices
+choicesFor m top = do
+  cs <- readIORef (mChoices m)
+  size <- getNumElements (csAlts cs)
+  if top < size
+    then pure cs
+    else do
+      grown <- newChoices (size * 2)
+      let copy :: IOArray Int a -> IOArray Int a -> IO ()
+          copy from to = forM_ [0 .. top - 1] $ \i -> unsafeRead from i >>= unsafeWrite to i
+      forM_ [0 .. top * markStride - 1] $ \i -> unsafeRead (csMarks cs) i >>= unsafeWrite (csMarks grown) i
+      copy (csAlts cs) (csAlts grown)
+      copy (csTables cs) (csTables grown)
+      copy (csDynamic cs) (csDynamic grown)
+      copy (csStore cs) (csStore grown)
+      copy (csWatched cs) (csWatched grown)
+      writeIORef (mChoices m) grown
+      pure grown
+
+choiceTop, guardTop :: Machine -> IO Int
+choiceTop m = unsafeRead (mCounters m) counterChoices
+guardTop m = unsafeRead (mCounters m) counterGuards
+{-# INLINE choiceTop #-}
+{-# INLINE guardTop #-}
+
+setChoiceTop, setGuardTop :: Machine -> Int -> IO ()
+setChoiceTop m = unsafeWrite (mCounters m) counterChoices
+setGuardTop m = unsafeWrite (mCounters m) counterGuards
+{-# INLINE setChoiceTop #-}
+{-# INLINE setGuardTop #-}
+
+-- | One unboxed mark of choice @i@.
+choiceMark :: Machine -> Int -> Int -> IO Int
+choiceMark m i field = do
+  cs <- readIORef (mChoices m)
+  unsafeRead (csMarks cs) (i * markStride + field)
+{-# INLINE choiceMark #-}
+
 readChoice :: Machine -> Int -> IO Choice
 readChoice m i = do
-  arr <- readIORef (mChoices m)
-  unsafeRead arr i
+  cs <- readIORef (mChoices m)
+  let at = i * markStride
+  Choice
+    <$> unsafeRead (csMarks cs) (at + markH)
+    <*> unsafeRead (csMarks cs) (at + markTR)
+    <*> unsafeRead (csMarks cs) (at + markOut)
+    <*> unsafeRead (csMarks cs) (at + markScopes)
+    <*> unsafeRead (csTables cs) i
+    <*> unsafeRead (csDynamic cs) i
+    <*> unsafeRead (csStore cs) i
+    <*> unsafeRead (csWatched cs) i
+    <*> unsafeRead (csAlts cs) i
 
 writeChoice :: Machine -> Int -> Choice -> IO ()
 writeChoice m i ch = do
-  arr <- readIORef (mChoices m)
-  unsafeWrite arr i ch
+  cs <- readIORef (mChoices m)
+  let at = i * markStride
+  unsafeWrite (csMarks cs) (at + markH) (chH ch)
+  unsafeWrite (csMarks cs) (at + markTR) (chTR ch)
+  unsafeWrite (csMarks cs) (at + markOut) (chOut ch)
+  unsafeWrite (csMarks cs) (at + markScopes) (chScopes ch)
+  unsafeWrite (csTables cs) i (chTables ch)
+  unsafeWrite (csDynamic cs) i (chDynamic ch)
+  unsafeWrite (csStore cs) i (chStore ch)
+  unsafeWrite (csWatched cs) i (chWatched ch)
+  unsafeWrite (csAlts cs) i (chAlt ch)
 
 -- | Remove every choice at or above @h@ and its scopes.
 cutTo :: Machine -> Int -> IO ()
 cutTo m h = do
-  top <- readIORef (mChoiceTop m)
+  top <- choiceTop m
   when (h < top) $ do
-    removed <- readChoice m h
-    truncateScopes m (chScopes removed)
-    writeIORef (mChoiceTop m) h
+    choiceMark m h markScopes >>= truncateScopes m
+    setChoiceTop m h
     refreshHb m
     trimGuardsAbove m h
     compactConstraints m
@@ -379,8 +463,8 @@ pushGuard m key det = do
       let i = Map.size ids
       writeIORef (mGuardKeys m) (Map.insert key i ids, IM.insert i key names)
       pure i
-  height <- readIORef (mChoiceTop m)
-  top <- readIORef (mGuardTop m)
+  height <- choiceTop m
+  top <- guardTop m
   arr <- readIORef (mGuards m)
   size <- getNumElements arr
   arr' <-
@@ -394,17 +478,17 @@ pushGuard m key det = do
   unsafeWrite arr' (top * guardStride) height
   unsafeWrite arr' (top * guardStride + 1) 0
   unsafeWrite arr' (top * guardStride + 2) (keyId * 2 + (if det == S.Multi then 1 else 0))
-  writeIORef (mGuardTop m) (top + 1)
+  setGuardTop m (top + 1)
 
 -- | Record success for every guard at or above a base index.
 markGuardsFrom :: Machine -> Int -> IO ()
 markGuardsFrom m base = do
-  top <- readIORef (mGuardTop m)
+  top <- guardTop m
   arr <- readIORef (mGuards m)
   forM_ [base .. top - 1] $ \i -> unsafeWrite arr (i * guardStride + 1) 1
 
 removeGuardsFrom :: Machine -> Int -> IO ()
-removeGuardsFrom m base = modifyIORef' (mGuardTop m) (min base)
+removeGuardsFrom m base = guardTop m >>= setGuardTop m . min base
 
 -- | Guards pushed above a choice height belong to calls a cut abandons.
 trimGuardsAbove :: Machine -> Int -> IO ()
@@ -415,13 +499,13 @@ trimGuardsAbove m h = do
         | otherwise = do
             height <- unsafeRead arr ((top - 1) * guardStride)
             if height > h then go (top - 1) else pure top
-  readIORef (mGuardTop m) >>= go >>= writeIORef (mGuardTop m)
+  guardTop m >>= go >>= setGuardTop m
 
 -- | The topmost guard that backtracking into the current choice height
 -- passes, removed: its key, required determinism and success flag.
 popGuardAbove :: Machine -> Int -> IO (Maybe (PredKey, S.Det, Bool))
 popGuardAbove m height = do
-  top <- readIORef (mGuardTop m)
+  top <- guardTop m
   if top == 0
     then pure Nothing
     else do
@@ -433,26 +517,29 @@ popGuardAbove m height = do
           flag <- unsafeRead arr ((top - 1) * guardStride + 1)
           code <- unsafeRead arr ((top - 1) * guardStride + 2)
           (_, names) <- readIORef (mGuardKeys m)
-          writeIORef (mGuardTop m) (top - 1)
+          setGuardTop m (top - 1)
           pure (Just (names IM.! (code `div` 2), if odd code then S.Multi else S.Det, flag /= 0))
 
 refreshHb :: Machine -> IO ()
 refreshHb m = do
-  top <- readIORef (mChoiceTop m)
+  top <- choiceTop m
   if top == 0
     then setHb (mStore m) 0
     else do
-      ch <- readChoice m (top - 1)
-      setHb (mStore m) (chH ch)
+      choiceMark m (top - 1) markH >>= setHb (mStore m)
 
 truncateScopes :: Machine -> Int -> IO ()
 truncateScopes m depth = do
-  scopes <- readIORef (mScopes m)
-  let extra = length scopes - depth
-  when (extra > 0) (writeIORef (mScopes m) (drop extra scopes))
+  current <- unsafeRead (mCounters m) counterScopes
+  let extra = current - depth
+  when (extra > 0) $ do
+    modifyIORef' (mScopes m) (drop extra)
+    unsafeWrite (mCounters m) counterScopes depth
 
 pushScope :: Machine -> Scope -> IO ()
-pushScope m scope = modifyIORef' (mScopes m) (scope :)
+pushScope m scope = do
+  modifyIORef' (mScopes m) (scope :)
+  unsafeRead (mCounters m) counterScopes >>= unsafeWrite (mCounters m) counterScopes . (+ 1)
 
 -- ─── issues ──────────────────────────────────────────────────────────────────
 
@@ -584,8 +671,7 @@ run' m cont = case cont of
           dynamic <- readIORef (mDynamic m)
           store <- constraintSnapshot m
           watched <- readIORef (mWatched m)
-          winnerFresh <- freshId s
-          writeIORef ref mn {mnBestFresh = winnerFresh, mnBest = Just (n, bound, produced, tables, dynamic, store, watched)}
+          writeIORef ref mn {mnBest = Just (n, bound, produced, tables, dynamic, store, watched)}
         backtrack m
   CExitTable fixRef -> do
     fx <- readIORef fixRef
@@ -653,12 +739,12 @@ reconciled m continue = do
       result <- Mutable.applyBindings kernel changes
       acceptMutable m kernel before result continue
 
--- | The logical id of a variable cell: query cells by position, others
--- through their block marker.
+-- | The name of a variable cell: query cells by position, others by their
+-- stable name ('nameCell').
 cellId :: Machine -> Int -> IO Int
 cellId m addr
   | addr < cpQueryVars (mCore m) = pure addr
-  | otherwise = maybe addr id <$> logicalId (mStore m) addr
+  | otherwise = nameCell (mStore m) addr
 
 -- | Adopt a store returned by the reference: bind every variable it newly
 -- bound (without recording those writes again) and refresh the watched
@@ -722,7 +808,8 @@ installConstraintBindings m = installBindings
         case IM.lookup v known of
           Just addr -> pure (refWord addr)
           Nothing -> do
-            addr <- allocSlots s v 1
+            addr <- allocCells s 1
+            nameCellAs s addr v
             modifyIORef' (mVarCells m) (IM.insert v addr)
             current <- readIORef (mCLP m)
             case current of
@@ -787,7 +874,7 @@ step' m goal goals base barrier depth next = case goal of
     entryHeap <- heapTop s
     entryTrail <- trailTop s
     entryOut <- outLen s
-    ref <- newIORef (Minimum entryHeap entryTrail entryOut 0 Nothing)
+    ref <- newIORef (Minimum entryHeap entryTrail entryOut Nothing)
     buffer <- newIORef []
     let rest = CGoals goals base barrier depth next
     sentinel <- pushChoice m (AltMinimize ref buffer rest)
@@ -871,9 +958,7 @@ step' m goal goals base barrier depth next = case goal of
   GEmit nt -> do
     let s = mStore m
     ntWord <- buildArg m base False nt
-    fresh <- freshId s
-    chars <- allocSlots s fresh 1
-    setFreshId s (fresh + 1)
+    chars <- allocSlots s 1
     aliases <- newIORef IM.empty
     goal <- phraseTerm m aliases ntWord (refWord chars)
     table <- readIORef aliases
@@ -967,6 +1052,11 @@ step' m goal goals base barrier depth next = case goal of
   GFindAll template inner target -> do
     results <- newIORef []
     buffer <- newIORef []
+    -- The template's variables exist before the findall, as they do in the
+    -- reference's renamed clause: give unbound activation slots their
+    -- stable cells now, below the entry mark, so every solution shares
+    -- them instead of copying a cell promoted inside one branch.
+    when (base > 0) (stabilize (mStore m) base template)
     entryHeap <- heapTop (mStore m)
     entryOut <- outLen (mStore m)
     let rest = CGoals goals base barrier depth next
@@ -989,6 +1079,15 @@ step' m goal goals base barrier depth next = case goal of
   where
     continue = runGoals m goals base barrier depth next
 
+-- | Give an activation slot named by a pattern its stable cell if it is
+-- still an unbound local (see 'operandAt').
+stabilize :: Store -> Int -> Pattern -> IO ()
+stabilize s base pattern = case pattern of
+  PSlot k -> () <$ operandAt s base k
+  PStruct _ children -> mapM_ (stabilize s base) children
+  PArith _ _ children -> mapM_ (stabilize s base) children
+  _ -> pure ()
+
 -- | Run goal terms whose variables are the alias table's words, in a fresh
 -- activation block aliasing those words; extra compiled goals run after
 -- them in the same block. Cuts stay local.
@@ -997,10 +1096,9 @@ runDynamic m aliases terms extra depth cont = do
   compiled <- mapM (compileGoalTerm (mStore m) (mProgram m) (cpPreds (mCore m))) terms
   table <- readIORef aliases
   let s = mStore m
-  fresh <- freshId s
-  block <- allocSlots s fresh (max 1 (IM.size table))
+  block <- allocSlots s (max 1 (IM.size table))
   forM_ (IM.toList table) $ \(v, w) -> writeCell s (block + v) w
-  height <- readIORef (mChoiceTop m)
+  height <- choiceTop m
   runGoals m (compiled ++ extra) block height depth cont
 
 -- | The goal that runs a DCG non-terminal between an input and @nil@.
@@ -1056,7 +1154,7 @@ fileContents m pathWord
 
 -- | Run a goal on the reference engine with the current store and adopt
 -- each solution's store and bindings; later solutions wait in a choice
--- point. Variables are exported with their logical ids, so store state
+-- point. Variables are exported with their stable names, so store state
 -- stays consistent across goals.
 delegate :: Machine -> Term -> Cont -> IO Step
 delegate m goal cont = case goal of
@@ -1130,7 +1228,7 @@ nativeMinimum m cost variables cont = do
   entryHeap <- heapTop s
   entryTrail <- trailTop s
   entryOut <- outLen s
-  ref <- newIORef (Minimum entryHeap entryTrail entryOut 0 Nothing)
+  ref <- newIORef (Minimum entryHeap entryTrail entryOut Nothing)
   issues <- newIORef []
   _ <- pushChoice m (AltMinimize ref issues cont)
   pushScope m (SBuffer issues)
@@ -1224,7 +1322,47 @@ leafItems m items previous cont = case items of
 
 -- | Call with the arguments in the registers.
 callPredicate :: Machine -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
-callPredicate m frame predicate trust cont0 = do
+callPredicate m frame predicate trust cont0 = case pDecls predicate of
+  [] -> callPlain m frame predicate cont0
+  _ -> callDeclared m frame predicate trust cont0
+{-# INLINE callPredicate #-}
+
+-- | A call to a predicate without declared contracts: there is no
+-- signature to select, no guard to push and no return to check. Only an
+-- inferred switch can make it commit after its first solution.
+callPlain :: Machine -> Int -> Pred -> Cont -> IO Step
+callPlain m frame predicate cont0 = do
+  let s = mStore m
+  top <- heapTop s
+  limit <- readReg s rGCLIM
+  if top > limit
+    then collect m cont0 (pArity predicate) >>= enter 0
+    else enter frame cont0
+  where
+    enter frame' cont = do
+      let depth = contDepth cont + 1
+      if depth > maxResolutionDepth
+        then raiseItems m [BranchExhausted] (backtrack m)
+        else do
+          entry <- choiceTop m
+          commits <- case pSwitch predicate of
+            Nothing -> pure False
+            Just positions -> switchGround (mStore m) positions
+          returnCont <-
+            if not commits
+              then pure cont
+              else case cont of
+                -- A committing frame already removes every choice and guard
+                -- above its own, older entry.
+                CReturn h _ Nothing _ | h >= 0 -> pure cont
+                _ -> do
+                  guardBase <- guardTop m
+                  pure (CReturn entry guardBase Nothing cont)
+          callClausesWithFrame m frame' predicate entry depth returnCont
+
+-- | A call to a predicate with declared contracts.
+callDeclared :: Machine -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
+callDeclared m frame predicate trust cont0 = do
   let s = mStore m
       key = pKey predicate
       n = pArity predicate
@@ -1249,8 +1387,8 @@ callPredicate m frame predicate trust cont0 = do
       if depth > maxResolutionDepth
         then raiseItems m [BranchExhausted] (backtrack m)
         else do
-          entry <- readIORef (mChoiceTop m)
-          guardBase <- readIORef (mGuardTop m)
+          entry <- choiceTop m
+          guardBase <- guardTop m
           forM_ required (pushGuard m key)
           let hasGuard = required /= Nothing
               -- A committing return marks and removes every guard pushed
@@ -1260,7 +1398,7 @@ callPredicate m frame predicate trust cont0 = do
                 (False, Nothing, _) -> cont
                 (True, Nothing, CReturn h _ Nothing _) | h >= 0 -> cont
                 _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
-          barrier <- readIORef (mChoiceTop m)
+          barrier <- choiceTop m
           callClausesWithFrame m (if top > limit then 0 else frame) predicate barrier depth returnCont
 
 -- A local operand can be overwritten only after all its outgoing arguments
@@ -1316,16 +1454,14 @@ tryClauseWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Int -> Cont -> IO 
 tryClauseWithFrame m frame predicate ordinal barrier depth cont = do
   let clause = pClauses predicate ! ordinal
       s = mStore m
-  fresh <- freshId s
-  setFreshId s (fresh + clVars clause)
   capacity <- tailFrame s frame cont
   if capacity >= clVars clause
     then do
-      resetFrame s fresh frame capacity (clInitSlots clause)
+      resetFrame s frame capacity (clInitSlots clause)
       recordSlots m True (clVars clause)
       enterClause m clause frame barrier depth cont
     else do
-      base <- allocFrame s fresh (clVars clause) (clInitSlots clause)
+      base <- allocFrame s (clVars clause) (clInitSlots clause)
       recordSlots m False (clVars clause)
       enterClause m clause base barrier depth cont
 
@@ -1569,7 +1705,7 @@ normalizeWord m w0 = do
 
 backtrack :: Machine -> IO Step
 backtrack m = do
-  top <- readIORef (mChoiceTop m)
+  top <- choiceTop m
   traceMsg ("backtrack B=" ++ show top)
   fired <- popGuardAbove m top
   case fired of
@@ -1583,24 +1719,25 @@ backtrackChoice m top =
     then pure Stop
     else do
       let index = top - 1
-      choice <- readChoice m index
-      let s = mStore m
-      unwindTrail s (chTR choice)
-      setHeapTop s (chH choice)
-      truncateOutput m (chOut choice)
-      truncateScopes m (chScopes choice)
-      setFreshId s (chFresh choice)
-      writeIORef (mTables m) (chTables choice)
-      writeIORef (mDynamic m) (chDynamic choice)
-      restoreConstraints m (chStore choice)
-      writeIORef (mWatched m) (chWatched choice)
+          s = mStore m
+      cs <- readIORef (mChoices m)
+      let at = index * markStride
+      unsafeRead (csMarks cs) (at + markTR) >>= unwindTrail s
+      unsafeRead (csMarks cs) (at + markH) >>= setHeapTop s
+      unsafeRead (csMarks cs) (at + markOut) >>= truncateOutput m
+      unsafeRead (csMarks cs) (at + markScopes) >>= truncateScopes m
+      unsafeRead (csTables cs) index >>= writeIORef (mTables m)
+      unsafeRead (csDynamic cs) index >>= writeIORef (mDynamic m)
+      unsafeRead (csStore cs) index >>= restoreConstraints m
+      unsafeRead (csWatched cs) index >>= writeIORef (mWatched m)
       writeReg s rBOUND 0
-      case chAlt choice of
+      alt <- unsafeRead (csAlts cs) index
+      case alt of
         AltClauses predicate (ordinal : more) saved depth cont -> do
           loadArgs s saved (pArity predicate)
           if null more
-            then writeIORef (mChoiceTop m) index >> refreshHb m
-            else writeChoice m index choice {chAlt = AltClauses predicate more saved depth cont}
+            then setChoiceTop m index >> refreshHb m
+            else unsafeWrite (csAlts cs) index (AltClauses predicate more saved depth cont)
           tryClause m predicate ordinal index depth cont
         AltClauses _ [] _ _ _ -> pop >> backtrack m
         AltGoals goals base barrier depth cont -> do
@@ -1661,14 +1798,12 @@ backtrackChoice m top =
             else case mnBest mn of
               Nothing -> backtrack m
               Just (_, bound, produced, tables, dynamic, store, _) -> do
-                currentFresh <- freshId s
-                setFreshId s (max currentFresh (mnBestFresh mn))
                 -- The old entry store must not record the writes that
                 -- reconstruct an already-propagated winning state.
                 writeReg s rCLP 0
                 fresh <- newIORef IM.empty
                 forM_ bound $ \(addr, copy) -> do
-                  w <- rebuildCopyWith m fresh copy
+                  w <- rebuildCopyWith m True fresh copy
                   bind s addr w
                 rebuilt <- readIORef fresh
                 previousCells <- readIORef (mVarCells m)
@@ -1693,8 +1828,8 @@ backtrackChoice m top =
                 run m cont
   where
     pop = do
-      top <- readIORef (mChoiceTop m)
-      writeIORef (mChoiceTop m) (top - 1)
+      top <- choiceTop m
+      setChoiceTop m (top - 1)
       refreshHb m
 
 -- ─── findall copies ──────────────────────────────────────────────────────────
@@ -1707,9 +1842,10 @@ minimumCopyCells rebuilt = go IM.empty
   where
     go !known [] = known
     go !known (copy : rest) = case copy of
-      CpFresh ordinal logical -> case IM.lookup ordinal rebuilt of
+      CpFresh ordinal (Just logical) -> case IM.lookup ordinal rebuilt of
         Just addr -> go (IM.insert logical addr known) rest
         Nothing -> go known rest
+      CpFresh _ Nothing -> go known rest
       CpStruct _ children -> go known (children ++ rest)
       CpRef _ -> go known rest
       CpWord _ -> go known rest
@@ -1732,7 +1868,7 @@ copyOutWith m fresh entryHeap word = do
                   then pure (CpRef (valOf w))
                   else do
                     table <- readIORef fresh
-                    logical <- maybe (valOf w) id <$> logicalId s (valOf w)
+                    logical <- logicalId s (valOf w)
                     case IM.lookup (valOf w) table of
                       Just k -> pure (CpFresh k logical)
                       Nothing -> do
@@ -1752,14 +1888,17 @@ rebuildList :: Machine -> [Copy] -> IO Word'
 rebuildList m copies = do
   items <- forM copies $ \copy -> do
     fresh <- newIORef IM.empty
-    rebuildCopyWith m fresh copy
+    rebuildCopyWith m False fresh copy
   foldM (\tl hd -> structure s (cpCons (mCore m)) [hd, tl]) (cpNil (mCore m)) (reverse items)
   where
     s = mStore m
 
 -- | Rebuild a copy on the heap; fresh variables share the supplied table.
-rebuildCopyWith :: Machine -> IORef (IM.IntMap Int) -> Copy -> IO Word'
-rebuildCopyWith m fresh copy = case copy of
+-- With @keepNames@ a rebuilt variable takes back its original name: a
+-- minimum winner's constraint store still refers to it by that name.
+-- Findall solutions are independent copies and stay unnamed.
+rebuildCopyWith :: Machine -> Bool -> IORef (IM.IntMap Int) -> Copy -> IO Word'
+rebuildCopyWith m keepNames fresh copy = case copy of
   CpRef addr -> pure (refWord addr)
   CpWord w -> pure w
   CpFresh k logical -> do
@@ -1767,10 +1906,13 @@ rebuildCopyWith m fresh copy = case copy of
     case IM.lookup k table of
       Just addr -> pure (refWord addr)
       Nothing -> do
-        addr <- allocSlots s logical 1
+        addr <- allocCells s 1
+        case logical of
+          Just v | keepNames -> nameCellAs s addr v
+          _ -> pure ()
         writeIORef fresh (IM.insert k addr table)
         pure (refWord addr)
-  CpStruct f children -> mapM (rebuildCopyWith m fresh) children >>= structure s f
+  CpStruct f children -> mapM (rebuildCopyWith m keepNames fresh) children >>= structure s f
   where
     s = mStore m
 
@@ -2125,16 +2267,15 @@ switchGround s (i : rest) = do
 
 -- ─── exchange with the public state ──────────────────────────────────────────
 
--- | Export a term with the reference engine's variable names: query
--- variables by position, activation variables through their markers, and
--- anything else after the current fresh id.
+-- | Export a term: query variables by position, any other variable by its
+-- stable name, which it receives here if it has none yet.
 exportFor :: Machine -> Word' -> IO Term
 exportFor m word = do
   let n = cpQueryVars (mCore m)
       s = mStore m
   names <- newIORef (IM.fromList [(i, i) | i <- [0 .. n - 1]])
   next <- newIORef =<< freshId s
-  term <- exportTermWith s names next word
+  term <- exportTermWith s True names next word
   -- Remember where each exported variable lives for the constraint store.
   seen <- readIORef names
   when (IM.size seen > n) $
@@ -2150,7 +2291,7 @@ exportState m = do
   names <- newIORef (IM.fromList [(i, i) | i <- [0 .. n - 1]])
   next <- newIORef =<< freshId s
   bindings <- forM [0 .. n - 1] $ \i -> do
-    term <- exportTermWith s names next (refWord i)
+    term <- exportTermWith s True names next (refWord i)
     pure (i, term)
   fresh <- freshId s
   events <- readIORef (mOutput m)
@@ -2232,8 +2373,8 @@ callTabled m predicate cont0 = do
           pure (Just (key, sig, args))
         Nothing -> pure Nothing
       let depth = contDepth cont + 1
-      entry <- readIORef (mChoiceTop m)
-      guardBase <- readIORef (mGuardTop m)
+      entry <- choiceTop m
+      guardBase <- guardTop m
       forM_ required (pushGuard m key)
       let hasGuard = required /= Nothing
           returnCont = case (commits || hasGuard, checked) of
@@ -2333,7 +2474,7 @@ finishIteration m fixRef = do
     then do
       writeIORef (mTables m) (fxTables fx)
       loadArgs (mStore m) (fxArgs fx) (pArity (fxPred fx))
-      entry <- readIORef (mChoiceTop m)
+      entry <- choiceTop m
       callClauses m (fxPred fx) entry (fxDepth fx) (fxCont fx)
     else if converged || gaveUp
     then do
@@ -2362,9 +2503,7 @@ consumeAnswers m answers saved arity cont = case answers of
   ((answer, count, produced) : rest) -> do
     unless (null rest) $ () <$ pushChoice m (AltAnswers rest saved arity cont)
     let s = mStore m
-    fresh <- freshId s
-    block <- allocSlots s fresh (max 1 count)
-    setFreshId s (fresh + count)
+    block <- allocSlots s (max 1 count)
     table <- newIORef (IM.fromList [(v, refWord (block + v)) | v <- [0 .. count - 1]])
     mapM_ (emitOutput m) produced
     let args = case answer of Compound _ as -> as; _ -> []
@@ -2386,9 +2525,7 @@ retractFacts m facts key saved cont = case facts of
   ((index, fact, count) : rest) -> do
     unless (null rest) $ () <$ pushChoice m (AltRetract rest key saved cont)
     let s = mStore m
-    fresh <- freshId s
-    block <- allocSlots s fresh (max 1 count)
-    setFreshId s (fresh + count)
+    block <- allocSlots s (max 1 count)
     table <- newIORef (IM.fromList [(v, refWord (block + v)) | v <- [0 .. count - 1]])
     imported <- importTermWords s table fact
     target <- readCell s saved
@@ -2421,7 +2558,7 @@ checkInvariants m cont = do
             when (addr < top && even e && w == refWord addr) (traceMsg ("INVARIANT: trail entry " ++ show i ++ " for unbound cell " ++ show addr))
             walk (if odd e then i - 2 else i - 1)
   walk (trTop - 1)
-  choiceTop <- readIORef (mChoiceTop m)
+  choiceTop <- choiceTop m
   choices <- forM [0 .. choiceTop - 1] (readChoice m)
   let hs = map chH choices
       trs = map chTR choices
@@ -2601,7 +2738,7 @@ collect m cont nargs = do
     forM_ [0 .. pendingCount0 - 1] $ \i -> do
       addr <- unsafeRead pending i
       when (addr >= 0 && addr < top) (markCell addr)
-  choiceTop <- readIORef (mChoiceTop m)
+  choiceTop <- choiceTop m
   forM_ [0 .. choiceTop - 1] $ \i -> do
     choice <- readChoice m i
     markAlt (chAlt choice)
@@ -2770,30 +2907,12 @@ collect m cont nargs = do
       keep <- liveCell addr
       if keep then (: []) <$> forward addr else pure []
     writeChoice m i choice {chH = h', chTR = tr', chAlt = alt', chWatched = IS.fromList (concat watchedList)}
-  -- Preserve identities independently of frame layout. This pass reads
-  -- every old marker once, rather than scanning back from each surviving
-  -- slot. It also carries forward identities detached by earlier GCs.
+  -- Names move with their surviving cells; sliding keeps address order.
   knownIds <- readIORef (logicalIds s)
-  let retainIds !addr !end !offset acc
-        | addr >= top = pure acc
-        | otherwise = do
-            word <- unsafeRead arr addr
-            if tagOf word == tagFun && markerVars word > 0
-              then retainIds (addr + 1) (addr + markerVars word) (markerBase word - addr - 1) acc
-              else do
-                keep <- liveCell addr
-                let ident = case IM.lookup addr knownIds of
-                      Just v -> Just v
-                      Nothing | addr <= end -> Just (offset + addr)
-                      _ -> Nothing
-                acc' <- case (keep, ident) of
-                  (True, Just v) -> do
-                    addr' <- forward addr
-                    pure ((addr', v) : acc)
-                  _ -> pure acc
-                retainIds (addr + 1) end offset acc'
-  retainedIds <- retainIds 0 (-1) 0 []
-  replaceLogicalIds s newTop (IM.fromDistinctAscList (reverse retainedIds))
+  retainedIds <- fmap concat . forM (IM.toAscList knownIds) $ \(addr, v) -> do
+    keep <- liveCell addr
+    if keep then (\addr' -> [(addr', v)]) <$> forward addr else pure []
+  replaceLogicalIds s newTop (IM.fromDistinctAscList retainedIds)
   slide 0
   setHeapTop s newTop
   recordCollection s top newTop

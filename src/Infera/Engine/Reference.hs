@@ -25,6 +25,7 @@ module Infera.Engine.Reference
     -- * Solving
     solveGoals,
     solveGoal,
+    renameApart,
     solveQuery,
 
     -- * Answers
@@ -42,7 +43,7 @@ where
 
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
-import Data.List (foldl', intercalate, nub, sortOn)
+import Data.List (foldl', intercalate, mapAccumL, nub, sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -563,14 +564,31 @@ findAll :: Env -> Int -> SolverState -> Term -> Term -> Term -> Search
 findAll env fuel st tmpl g l =
   let sub = opaque (solveGoal env fuel st g)
       founds = [st' | Found st' <- sub]
-      results = [deepWalk (subst st') tmpl | st' <- founds]
+      -- Each solution is a copy: variables created inside the findall are
+      -- renamed apart, per solution and from everything created after it.
+      -- Variables that existed before the findall stay shared.
+      (results, fresh') = renameApart (ssFresh st) [deepWalk (subst st') tmpl | st' <- founds]
       pass = passThrough sub
       -- output produced by the collected solutions, in order
       outputs = concat [reverse (take (ssOutLen st' - ssOutLen st) (ssOutput st')) | st' <- founds]
-      st1 = foldl' (flip emit) st outputs
+      st1 = (foldl' (flip emit) st outputs) {ssFresh = fresh'}
    in case [e | e@(BranchError _) <- pass] of
         (e : _) -> [i | i@(ConsumedIncomplete _) <- pass] ++ [e]
         [] -> pass ++ checked st1 (storeUnify (ssStore st1) l (mkList results Nothing))
+
+-- | Rename the variables at or above @start@ in each term to fresh ids,
+-- with a separate namespace per term; returns the next free id.
+renameApart :: VarId -> [Term] -> ([Term], VarId)
+renameApart start terms = let (final, renamed) = mapAccumL one start terms in (renamed, final)
+  where
+    one next t =
+      let inside = nub [v | v <- termVarIds t, v >= start]
+          table = IM.fromList (zip inside [next ..])
+          rename term = case term of
+            Var v -> Var (IM.findWithDefault v v table)
+            Compound f as -> Compound f (map rename as)
+            _ -> term
+       in (next + length inside, rename t)
 
 -- | Keep only the least-cost answer, retaining the first on ties. The goal's
 -- bindings and output survive only for that answer. An error or incomplete

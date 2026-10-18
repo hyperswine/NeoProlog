@@ -15,19 +15,19 @@ import Infera hiding (solveQuery)
 import qualified Infera.Core as Core
 import qualified Infera.Core.Compile as Compile
 import qualified Infera.Core.Store as Store
+import Infera.Engine.Alpha (alphaText)
 import qualified Infera.Engine.Reference as Reference
 
-data Observed = Observed [String] [String] Bool [Int] deriving (Eq, Show)
+data Observed = Observed [String] [String] Bool deriving (Eq, Show)
 
 observe :: Query -> Search -> Observed
 observe query items =
   let summary = summarizeSearch query items
    in Observed
-        [showAnswer answer ++ concatMap renderOutputEvent (reverse (answerOutput answer))
+        [alphaText (showAnswer answer ++ concatMap renderOutputEvent (reverse (answerOutput answer)))
           | answer <- summaryAnswers summary]
-        (map showSolveError (summaryErrors summary))
+        (map (alphaText . showSolveError) (summaryErrors summary))
         (summaryExhausted summary)
-        [Reference.ssFresh state | Reference.Found state <- items]
 
 programOf :: String -> PropertyT IO Program
 programOf = either (\err -> annotate err >> failure) pure . loadProgramText

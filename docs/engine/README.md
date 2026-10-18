@@ -12,8 +12,10 @@ is Haskell, with mutable execution inside an immutable lazy answer API.
    builds head patterns, body plans, predicate references and indexes for
    that query's program. Plans are currently built per query.
 3. The [driver](../../src/Infera/Core/Run.hs) executes those plans with
-   argument registers, explicit continuations and choice points. Eligible
-   tail calls reuse continuations and, when safe, activation operand slots.
+   argument registers, explicit continuations and an unboxed choice stack.
+   Eligible tail calls reuse continuations and, when safe, activation
+   operand slots. Predicates without declared contracts take a plain call
+   path.
 4. The [store](../../src/Infera/Core/Store.hs) represents values as tagged
    words. Variables are references, compounds have contiguous cells, and
    bignums, floats and strings use a boxed table. Bindings are trailed when
@@ -48,6 +50,9 @@ Tracing and library `solveGoal`/`solveGoals` entry points still use
 the [facade](../../src/Infera/Core.hs) restarts the query on that machine and
 skips already-delivered search items; it does not transfer the live heap.
 `Infera.Engine.Reference` remains the correctness oracle used by tests.
+Engines are compared up to renaming of the variables inside each answer
+([`Infera.Engine.Alpha`](../../src/Infera/Engine/Alpha.hs)); the Core names a
+variable only when it first leaves the heap.
 
 The earlier machine and its opt-in bytecode backend remain available for
 those paths and comparisons. They are not the normal CLI/REPL query engine.
@@ -58,6 +63,7 @@ those paths and comparisons. They are not the normal CLI/REPL query engine.
 * [Contract proofs and performance](contracts-performance-2026-10-17.md)
 * [Mutable CLP propagation](mutable-clp-2026-10-18.md)
 * [Domain-consistent offset equalities](offset-equality-2026-10-18.md)
+* [Answers up to renaming, plain calls and the choice stack](control-stacks-2026-10-19.md)
 * [Reusable operand slots and tail frames](reusable-slots-2026-10-18.md)
 * [Four major Core designs](major-design-2026-10-18.md)
 * [Latest performance overview](../performance/README.md)

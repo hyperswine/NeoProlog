@@ -81,6 +81,7 @@ library
         Infera.Infer
         Infera.Purity
         Infera.Engine
+        Infera.Engine.Alpha
         Infera.Engine.Reference
         Infera.Core
         Infera.Core.Store

@@ -13,6 +13,7 @@ import GHC.Fingerprint (fingerprintString)
 import GHC.Stats
 import Infera hiding (main, solveQuery)
 import qualified Infera.Core as Core
+import Infera.Engine.Alpha (alphaBindings, alphaOutput, alphaText)
 import qualified Infera.Engine.Reference as Reference
 import System.CPUTime (getCPUTime)
 import System.Directory (doesDirectoryExist, listDirectory)
@@ -117,16 +118,16 @@ fixture name = case name of
         ["reach X Y <- edge X Y.", "reach X Y <- reach X Z, edge Z Y."]))
       "reach 0 Result?" (Ring size))
 
-data Observation = OAnswer [(String, Term)] [String] [OutputEvent]
-  | OError SolveError | OExhausted | OCut Int | ODependency Term
+data Observation = OAnswer [(String, Term)] [String] String
+  | OError String | OExhausted | OCut Int | ODependency Term
   deriving (Eq, Show)
 
 observe :: Query -> Search -> [Observation]
 observe query = map item
   where
     item (Found state) = let answer = projectAnswer query state in
-      OAnswer (answerBindings answer) (answerResiduals answer) (answerOutput answer)
-    item (BranchError problem) = OError problem
+      OAnswer (alphaBindings (queryNVars query) (answerBindings answer)) (answerResiduals answer) (alphaOutput (answerOutput answer))
+    item (BranchError problem) = OError (alphaText (show problem))
     item BranchExhausted = OExhausted
     item (CutMarker owner) = OCut owner
     item (ConsumedIncomplete key) = ODependency key

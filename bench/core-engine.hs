@@ -11,6 +11,7 @@ import Data.List (intercalate)
 import GHC.Clock (getMonotonicTimeNSec)
 import Infera hiding (main, solveQuery)
 import qualified Infera.Core as Core
+import Infera.Engine.Alpha (alphaText)
 import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Machine.Control as Machine
 import System.CPUTime (getCPUTime)
@@ -43,15 +44,16 @@ main = do
     _ -> hPutStrLn stderr "usage: core-engine parity FILE... | core-engine time [--core] FILE \"query?\" [RUNS]" >> exitFailure
 
 -- | The observable result of a query: rendered answers with their output,
--- the distinct errors, and the exhaustion flag.
+-- the distinct errors, and the exhaustion flag, up to renaming of the
+-- variables inside each answer.
 data Observed = Observed [String] [String] Bool deriving (Eq, Show)
 
 observe :: Query -> Search -> Observed
 observe query items =
   let summary = summarizeSearch query items
    in Observed
-        [showAnswer a ++ outputOf a | a <- summaryAnswers summary]
-        (map showSolveError (summaryErrors summary))
+        [alphaText (showAnswer a ++ outputOf a) | a <- summaryAnswers summary]
+        (map (alphaText . showSolveError) (summaryErrors summary))
         (summaryExhausted summary)
   where
     outputOf a = case answerOutput a of

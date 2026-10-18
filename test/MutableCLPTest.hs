@@ -14,6 +14,7 @@ import Infera hiding (Answer, Domain, solveQuery)
 import qualified Infera.CLP as P
 import qualified Infera.CLP.Mutable as M
 import qualified Infera.Core.Run as Run
+import Infera.Engine.Alpha (alphaBindings, alphaOutput, alphaText)
 import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Unify as Unify
 import System.Timeout (timeout)
@@ -353,16 +354,16 @@ prop_commit_reclaims_history = withTests 1 . property $ do
   frozen <- evalIO (M.freeze streaming)
   frozen === final
 
-data Event = Answer [(String, Term)] [String] [OutputEvent] Int
-  | Problem SolveError | Exhausted | Cut Int | Incomplete Term
+data Event = Answer [(String, Term)] [String] String
+  | Problem String | Exhausted | Cut Int | Incomplete Term
   deriving (Eq, Show)
 
 observe :: Query -> Search -> [Event]
 observe query = map event
   where
     event (Found state) = let answer = projectAnswer query state in
-      Answer (answerBindings answer) (answerResiduals answer) (answerOutput answer) (ssFresh state)
-    event (BranchError err) = Problem err
+      Answer (alphaBindings (queryNVars query) (answerBindings answer)) (answerResiduals answer) (alphaOutput (answerOutput answer))
+    event (BranchError err) = Problem (alphaText (show err))
     event BranchExhausted = Exhausted
     event (CutMarker owner) = Cut owner
     event (ConsumedIncomplete key) = Incomplete key

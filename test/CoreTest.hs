@@ -1,7 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | Ordered parity of the core engine with the reference and the machine on
 -- the checked-in parity programs: every inline query must produce the same
--- rendered answers, output, distinct errors and exhaustion flag.
+-- rendered answers, output, distinct errors and exhaustion flag, up to
+-- renaming of the variables inside each answer.
 module CoreTest (coreGroup) where
 
 import Control.Monad (forM_, unless)
@@ -9,6 +10,7 @@ import Data.String (fromString)
 import Hedgehog
 import Infera hiding (solveQuery)
 import qualified Infera.Core as Core
+import Infera.Engine.Alpha (alphaText)
 import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Machine.Control as Machine
 
@@ -22,8 +24,8 @@ observe :: Query -> Search -> Observed
 observe query items =
   let summary = summarizeSearch query items
    in Observed
-        [showAnswer a ++ outputOf a | a <- summaryAnswers summary]
-        (map showSolveError (summaryErrors summary))
+        [alphaText (showAnswer a ++ outputOf a) | a <- summaryAnswers summary]
+        (map (alphaText . showSolveError) (summaryErrors summary))
         (summaryExhausted summary)
   where
     outputOf a = case answerOutput a of

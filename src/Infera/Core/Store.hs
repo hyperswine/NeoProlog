@@ -33,10 +33,10 @@ module Infera.Core.Store
     heapTop, setHeapTop, trailTop, setTrailTop, hb, setHb,
     outLen, setOutLen, arithData, bumpArithData, freshId, setFreshId,
     readCell, writeCell, pushCell, allocCells, allocSlots, allocFrame, operandWord, operandAt,
-    resetSlots, resetFrame, markerWord, logicalId,
+    resetSlots, resetFrame, markerWord, logicalId, nameCell, nameCellAs,
     replaceLogicalIds, collectionStats, recordCollection,
     readArg, writeArg, saveArgs, loadArgs, reserveCells, groundNowWord,
-    readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, initialCollectLimit, markerBase, markerVars,
+    readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, initialCollectLimit, markerVars,
     drainBound, recordBoundCell,
     deref, bind, unwindTrail, trailIf, trailValueIf,
     structureWord, structure2, structure2WithGround,
@@ -211,8 +211,8 @@ data Store = Store
     argRegs :: !(IOUArray Int Int),
     -- | cells bound since the last reconciliation with the constraint store
     bound :: !(IORef (IOUArray Int Int)),
-    -- | Exact logical identities of the live activation slots detached by
-    -- collection. Fresh activations still use their compact block marker.
+    -- | The names of the variable cells that have left the heap, by
+    -- address (see 'nameCell').
     logicalIds :: !(IORef (IM.IntMap Int)),
     symbols :: !Symbols
   }
@@ -270,7 +270,7 @@ trailTop s = unsafeRead (regs s) rTR
 hb s = unsafeRead (regs s) rHB
 outLen s = unsafeRead (regs s) rOUT
 arithData s = unsafeRead (regs s) rARITH
--- | The reference engine's next fresh variable id along this branch.
+-- | The next unused variable name. It never moves back within a query.
 freshId s = unsafeRead (regs s) rFRESH
 {-# INLINE heapTop #-}
 {-# INLINE trailTop #-}
@@ -378,34 +378,28 @@ allocCells s n = do
 
 -- | A marker cell precedes every block of activation variables. Functor
 -- words never occur as values, so a marker is unambiguous when scanning
--- down from a variable cell. Its value is the reference engine's id of the
--- first variable of the block, which keeps exported variable names equal.
--- The marker packs the block size above bit 40 so collection can retain
--- each surviving slot's logical identity independently of its frame.
-markerWord :: Int -> Int -> Word'
-markerWord logicalBase n = mkWord tagFun (logicalBase .|. (n `shiftL` 40))
+-- down from a variable cell. It packs the block size above bit 40, which
+-- tail-call frame reuse reads as the block's capacity. Variable identity
+-- is not positional: see 'nameCell'.
+markerWord :: Int -> Word'
+markerWord n = mkWord tagFun (n `shiftL` 40)
 {-# INLINE markerWord #-}
-
-markerBase :: Word' -> Int
-markerBase w = valOf w .&. (2 ^ (40 :: Int) - 1)
 
 markerVars :: Word' -> Int
 markerVars w = valOf w `shiftR` 40
 
 -- | Reserve @n@ variable cells preceded by a marker; returns the address of
 -- the first variable.
-allocSlots :: Store -> Int -> Int -> IO Int
-allocSlots s logicalBase n = do
+allocSlots :: Store -> Int -> IO Int
+allocSlots s n = do
   top <- heapTop s
   ensureCells s (top + n + 1)
   arr <- readIORef (cells s)
-  unsafeWrite arr top (markerWord logicalBase n)
+  unsafeWrite arr top (markerWord n)
   let go !i
         | i > top + n = pure ()
         | otherwise = unsafeWrite arr i (refWord i) >> go (i + 1)
   go (top + 1)
-  -- Allocation only grows the suffix; sparse identities need pruning
-  -- solely when a rollback or collection lowers the heap top.
   unsafeWrite (regs s) rH (top + n + 1)
   pure (top + 1)
 {-# INLINE allocSlots #-}
@@ -414,12 +408,12 @@ allocSlots s logicalBase n = do
 -- offsets. Every omitted slot must be written by its first head occurrence
 -- before a matcher or head constructor reads it. The compiled layout is
 -- shared across calls; stable logical-variable allocations use 'allocSlots'.
-allocFrame :: Store -> Int -> Int -> [Int] -> IO Int
-allocFrame s logicalBase count initialize = do
+allocFrame :: Store -> Int -> [Int] -> IO Int
+allocFrame s count initialize = do
   top <- heapTop s
   ensureCells s (top + count + 1)
   arr <- readIORef (cells s)
-  unsafeWrite arr top (markerWord logicalBase count)
+  unsafeWrite arr top (markerWord count)
   let base = top + 1
       go [] = pure ()
       go (offset : offsets) = do
@@ -433,11 +427,9 @@ allocFrame s logicalBase count initialize = do
 
 -- | Read an activation operand without exposing its storage cell. A value
 -- already installed in the slot can be shared directly; a still-unbound
--- local must first acquire a stable logical-variable cell outside the
--- reusable activation. Promotion preserves the reference engine's fresh
--- identity and does not consume another fresh id. Redirecting the operand
--- is an ordinary binding, so an older choice restores its self-reference
--- before reclaiming the promoted cell.
+-- local must first acquire a stable variable cell outside the reusable
+-- activation. Redirecting the operand is an ordinary binding, so an older
+-- choice restores its self-reference before reclaiming the promoted cell.
 --
 -- Query cells and captured 'PWord' operands are logical variables already:
 -- callers pass only the addresses of live activation operands here.
@@ -446,18 +438,16 @@ operandWord s addr = do
   value <- readCell s addr >>= deref s
   if value == refWord addr
     then do
-      ident <- maybe addr id <$> logicalId s addr
-      stable <- allocSlots s ident 1
+      stable <- allocCells s 1
       let word = refWord stable
       bind s addr word
       pure word
     else pure value
 {-# INLINE operandWord #-}
 
--- | The operand accessor for a fresh contiguous activation. Its marker
--- gives a local's logical identity directly, avoiding a backward scan when
--- an unbound operand is promoted. Captured plans detached by collection use
--- ready words instead, and must never call this function with a dummy base.
+-- | The operand accessor for a fresh contiguous activation. Captured plans
+-- detached by collection use ready words instead, and must never call this
+-- function with a dummy base.
 operandAt :: Store -> Int -> Int -> IO Word'
 operandAt s base offset = do
   let addr = base + offset
@@ -467,8 +457,7 @@ operandAt s base offset = do
   value <- readCell s addr
   if value == refWord addr
     then do
-      marker <- readCell s (base - 1)
-      stable <- allocSlots s (markerBase marker + offset) 1
+      stable <- allocCells s 1
       let word = refWord stable
       bind s addr word
       pure word
@@ -481,31 +470,30 @@ operandAt s base offset = do
 -- refers to these operand cells. Escaped logical variables have their own
 -- cells, allocated by 'operandWord'. The physical capacity may exceed the
 -- next clause's variable count; unused slots remain inaccessible.
---
--- The uncommon compacted-block case discards the old sparse identities and
--- exposes this marker to identity lookup again. Ordinary repeated tail
--- calls stay in the fresh suffix and avoid traversing the identity map.
-resetSlots :: Store -> Int -> Int -> Int -> IO ()
-resetSlots s logicalBase base capacity = resetFrame s logicalBase base capacity [0 .. capacity - 1]
+resetSlots :: Store -> Int -> Int -> IO ()
+resetSlots s base capacity = resetFrame s base capacity [0 .. capacity - 1]
 {-# INLINE resetSlots #-}
 
 -- | Reset an unreachable tail activation with a compiled initialization
 -- layout. The reachability and choice-boundary requirements of 'resetSlots'
 -- apply. Omitted offsets must be initialized by first head occurrences before
 -- they are read, exactly as for 'allocFrame'.
-resetFrame :: Store -> Int -> Int -> Int -> [Int] -> IO ()
-resetFrame s logicalBase base capacity initialize = do
-  ids <- readIORef (logicalIds s)
-  case IM.lookupGE base ids of
-    Just (addr, _) | addr < base + capacity ->
-      let (before, _, remaining) = IM.splitLookup base ids
-          (_, _, after) = IM.splitLookup (base + capacity - 1) remaining
-       in writeIORef (logicalIds s) (IM.union before after)
-    _ -> pure ()
+resetFrame :: Store -> Int -> Int -> [Int] -> IO ()
+resetFrame s base capacity initialize = do
+  -- An unbound operand is promoted before it escapes, so its slot is not
+  -- normally named. Forget any name in the range all the same: a reused
+  -- address is a different variable.
   boundary <- unsafeRead (regs s) rIDENT
-  when (base < boundary) (unsafeWrite (regs s) rIDENT (base - 1))
+  when (base < boundary) $ do
+    ids <- readIORef (logicalIds s)
+    case IM.lookupGE base ids of
+      Just (addr, _) | addr < base + capacity ->
+        let (before, _, remaining) = IM.splitLookup base ids
+            (_, _, after) = IM.splitLookup (base + capacity - 1) remaining
+         in writeIORef (logicalIds s) (IM.union before after)
+      _ -> pure ()
   arr <- readIORef (cells s)
-  unsafeWrite arr (base - 1) (markerWord logicalBase capacity)
+  unsafeWrite arr (base - 1) (markerWord capacity)
   let go [] = pure ()
       go (offset : offsets) = do
         let addr = base + offset
@@ -514,39 +502,48 @@ resetFrame s logicalBase base capacity initialize = do
   go initialize
 {-# INLINE resetFrame #-}
 
--- | The reference id of a variable cell: sparse identity after collection,
--- otherwise the marker of a fresh activation block.
+-- | The name of a variable cell, if it has one. Query cells are named by
+-- the caller; any other cell is named when it first leaves the heap (an
+-- export, a constraint, a copy), and keeps that name while it lives.
 logicalId :: Store -> Int -> IO (Maybe Int)
-logicalId s addr = do
-  ids <- readIORef (logicalIds s)
-  case IM.lookup addr ids of
-    Just ident -> pure (Just ident)
-    Nothing -> do
-      -- Older compacted cells have no marker. Restrict the scan to the
-      -- freshly allocated suffix, whose blocks still have their markers.
-      boundary <- unsafeRead (regs s) rIDENT
-      arr <- readIORef (cells s)
-      let go !i
-            | i < boundary = pure Nothing
-            | otherwise = do
-                w <- unsafeRead arr i
-                if tagOf w == tagFun
-                  then pure $ if addr <= i + markerVars w
-                    then Just (markerBase w + addr - i - 1)
-                    else Nothing
-                  else go (i - 1)
-      go (addr - 1)
+logicalId s addr = IM.lookup addr <$> readIORef (logicalIds s)
+{-# INLINE logicalId #-}
 
--- Register 12 bounds the prefix whose activation markers have been
--- replaced by sparse identities; the remaining registers are GC counters.
+-- | The name of a variable cell, giving it the next fresh one if it has
+-- none. Names are never reused within a query: the fresh counter does not
+-- move back on backtracking, so a name that outlives its branch on a
+-- surviving cell cannot collide with a later one.
+nameCell :: Store -> Int -> IO Int
+nameCell s addr = do
+  known <- logicalId s addr
+  case known of
+    Just v -> pure v
+    Nothing -> do
+      v <- freshId s
+      setFreshId s (v + 1)
+      nameCellAs s addr v
+      pure v
+
+-- | Give a cell a known name: one the constraint store or a copied answer
+-- already uses for this variable.
+nameCellAs :: Store -> Int -> Int -> IO ()
+nameCellAs s addr v = do
+  modifyIORef' (logicalIds s) (IM.insert addr v)
+  boundary <- unsafeRead (regs s) rIDENT
+  when (addr >= boundary) (unsafeWrite (regs s) rIDENT (addr + 1))
+  current <- freshId s
+  when (v >= current) (setFreshId s (v + 1))
+
+-- Register 12 is one past the highest named address (pruning on a lower
+-- heap top is needed only below it); the remaining registers are GC counters.
 rIDENT, rGCCOUNT, rGCLIVE, rGCRECLAIM :: Int
 rIDENT = 12
 rGCCOUNT = 13
 rGCLIVE = 14
 rGCRECLAIM = 15
 
--- | Install identities while collection's original addresses are still
--- available. The compacted prefix ends at the supplied heap top.
+-- | Install the names of the cells that survived a collection, at their
+-- new addresses, below the supplied heap top.
 replaceLogicalIds :: Store -> Int -> IM.IntMap Int -> IO ()
 replaceLogicalIds s boundary ids = do
   writeIORef (logicalIds s) ids
@@ -757,17 +754,12 @@ unify s a0 b0 = do
     else case (tagOf a, tagOf b) of
       (ta, tb)
         | ta == tagRef && tb == tagRef -> do
-            -- Promotion and tail-frame reuse decouple physical addresses
-            -- from logical age. Keep the reference engine's smaller fresh
-            -- id as representative, with addresses as a tie-breaker for
-            -- cells that have no marker identity.
-            let aa = valOf a
-                ba = valOf b
-            ai <- maybe aa id <$> logicalId s aa
-            bi <- maybe ba id <$> logicalId s ba
-            if (ai, aa) > (bi, ba)
-              then bind s aa b >> pure True
-              else bind s ba a >> pure True
+            -- Bind the younger cell to the older one, as a WAM does: the
+            -- older cell outlives it on backtracking and collection keeps
+            -- address order, so no reference can outlive its target.
+            if valOf a > valOf b
+              then bind s (valOf a) b >> pure True
+              else bind s (valOf b) a >> pure True
         | ta == tagRef -> bindChecked (valOf a) b tb
         | tb == tagRef -> bindChecked (valOf b) a ta
         | ta == tagStr && tb == tagStr -> do
@@ -904,11 +896,12 @@ importTermWords s table term = case term of
     words' <- mapM (importTermWords s table) as
     structureWord s (funWord fid (length as)) words'
 
--- | Read a term back. Unbound cells take the id their activation marker
--- gives them; cells without a marker are named by first occurrence from
--- @next@.
-exportTermWith :: Store -> IORef (IM.IntMap VarId) -> IORef VarId -> Word' -> IO Term
-exportTermWith s names next w0 = do
+-- | Read a term back. Unbound cells already in @names@ keep that name.
+-- With @stable@, any other cell is named by 'nameCell' and keeps the name;
+-- without, it is numbered by first occurrence from @next@ for this export
+-- only.
+exportTermWith :: Store -> Bool -> IORef (IM.IntMap VarId) -> IORef VarId -> Word' -> IO Term
+exportTermWith s stable names next w0 = do
   w <- deref s w0
   case tagOf w of
     t | t == tagRef -> do
@@ -916,13 +909,13 @@ exportTermWith s names next w0 = do
           case IM.lookup (valOf w) known of
             Just v -> pure (Var v)
             Nothing -> do
-              marked <- logicalId s (valOf w)
-              v <- case marked of
-                Just v -> pure v
-                Nothing -> do
-                  v <- readIORef next
-                  writeIORef next (v + 1)
-                  pure v
+              v <-
+                if stable
+                  then nameCell s (valOf w)
+                  else do
+                    v <- readIORef next
+                    writeIORef next (v + 1)
+                    pure v
               modifyIORef' names (IM.insert (valOf w) v)
               pure (Var v)
       | t == tagInt -> pure (IntLit (toInteger (valOf w)))
@@ -937,7 +930,7 @@ exportTermWith s names next w0 = do
       | t == tagStr -> do
           f <- readCell s (valOf w)
           (name, arity) <- functorName (symbols s) (funId f)
-          as <- mapM (\i -> readCell s (valOf w + i) >>= exportTermWith s names next) [1 .. arity]
+          as <- mapM (\i -> readCell s (valOf w + i) >>= exportTermWith s stable names next) [1 .. arity]
           pure (Compound name as)
       | otherwise -> fail "exportTerm: functor word outside a structure"
 
@@ -945,4 +938,4 @@ exportTerm :: Store -> Word' -> IO Term
 exportTerm s w = do
   names <- newIORef IM.empty
   next <- newIORef 0
-  exportTermWith s names next w
+  exportTermWith s False names next w

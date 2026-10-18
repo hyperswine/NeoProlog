@@ -1650,9 +1650,11 @@ finish environment heap child = case runningScope child of
         [] -> do
           let branch = runningBranch parent
               entry = branchState branch
-              state = entry {ssOutput = outputs ++ ssOutput entry, ssOutLen = ssOutLen entry + length outputs}
+              -- Solutions are copies, renamed apart as in the reference.
+              (copies, fresh) = Reference.renameApart (ssFresh entry) (reverse results)
+              state = entry {ssOutput = outputs ++ ssOutput entry, ssOutLen = ssOutLen entry + length outputs, ssFresh = fresh}
           (bindings, addresses) <- checked (Bridge.importTerms heap (branchBindings branch)
-            [Compound "unify" [target, mkList (reverse results) Nothing]])
+            [Compound "unify" [target, mkList copies Nothing]])
           goal <- single addresses
           let prepared = parent {runningBranch = branch {branchBindings = bindings, branchState = state}}
           drive environment heap (withTasks (map Emit issues ++ [Run goal fuel scopes]) prepared)

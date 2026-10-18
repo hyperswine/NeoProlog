@@ -13,28 +13,30 @@ import qualified Infera.CLP as CLP
 import qualified Infera.Core as Core
 import qualified Infera.Core.Run as Run
 import qualified Infera.Core.Store as Store
+import Infera.Engine.Alpha (alphaOutput, alphaTerms, alphaText)
 import qualified Infera.Engine.Reference as Reference
 
 unit :: PropertyT IO () -> Property
 unit = withTests 1 . property
 
 data Observation
-  = Answer [Term] Int [String] [OutputEvent]
-  | Problem SolveError
+  = Answer [Term] [String] String
+  | Problem String
   | Other String
   deriving (Eq, Show)
 
--- Compare logical IDs in projected heap terms as well as their rendered
--- residuals; rendering alone can rename a wrong internal ID out of sight.
+-- Compare projected heap terms as well as their rendered residuals,
+-- up to a consistent renaming of the internal variables of each answer;
+-- rendering alone could hide a wrongly shared variable.
 observed :: Query -> Search -> [Observation]
 observed query = map item
   where
     item (Found state) =
       let subst = CLP.stSubst (ssStore state)
           answer = Reference.projectAnswer query state
-       in Answer [deepWalk subst (Var v) | v <- [0 .. queryNVars query - 1]]
-            (ssFresh state) (Reference.answerResiduals answer) (ssOutput state)
-    item (BranchError problem) = Problem problem
+       in Answer (alphaTerms (queryNVars query) [deepWalk subst (Var v) | v <- [0 .. queryNVars query - 1]])
+            (Reference.answerResiduals answer) (alphaOutput (ssOutput state))
+    item (BranchError problem) = Problem (alphaText (show problem))
     item BranchExhausted = Other "exhausted"
     item (CutMarker owner) = Other ("cut " ++ show owner)
     item (ConsumedIncomplete key) = Other ("incomplete " ++ show key)
@@ -105,15 +107,21 @@ prop_sparse_identity_rollback = unit $ do
     store <- Store.newStore symbols
     _ <- Store.allocCells store 3
     Store.replaceLogicalIds store 3 (IM.fromList [(0, 101), (1, 203), (2, 307)])
+    Store.setFreshId store 308
     first <- mapM (Store.logicalId store) [0 .. 2]
+    -- Names above a rolled-back heap top are forgotten; fresh slots are
+    -- unnamed until something names them.
     Store.setHeapTop store 1
-    slot <- Store.allocSlots store 991 2
+    slot <- Store.allocSlots store 2
+    named <- Store.nameCell store slot
     second <- mapM (Store.logicalId store) [0, slot, slot + 1]
+    -- The fresh counter never moves back: a later name is new.
     Store.setHeapTop store 0
     _ <- Store.allocCells store 2
+    again <- Store.nameCell store 1
     third <- mapM (Store.logicalId store) [0, 1]
-    pure (first, second, third)
-  result === ([Just 101, Just 203, Just 307], [Just 101, Just 991, Just 992], [Nothing, Nothing])
+    pure (first, named, second, again, third)
+  result === ([Just 101, Just 203, Just 307], 308, [Just 101, Just 308, Nothing], 309, [Nothing, Just 309])
 
 prop_dead_graph_reclaimed :: Property
 prop_dead_graph_reclaimed = unit $ do

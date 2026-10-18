@@ -16,6 +16,7 @@ import qualified Hedgehog.Range as Range
 import Infera hiding (solveQuery)
 import qualified Infera.Core as Core
 import qualified Infera.Core.Delta as Delta
+import Infera.Engine.Alpha (alphaOutput, alphaText)
 import qualified Infera.Engine.Reference as Reference
 
 unit :: PropertyT IO () -> Property
@@ -27,13 +28,13 @@ legacyTables program = program {progPreds = Map.map disable (progPreds program)}
     disable predicate = predicate {predClauses = IM.map prefix (predClauses predicate)}
     prefix clause = clause {clauseBody = Atom "true" : clauseBody clause}
 
-type Observation = ([(String, [OutputEvent])], [String], Bool)
+type Observation = ([(String, String)], [String], Bool)
 
 observe :: Query -> Reference.Search -> Observation
 observe query items =
   let summary = summarizeSearch query items
-   in ([(showAnswer answer, answerOutput answer) | answer <- summaryAnswers summary],
-       map showSolveError (summaryErrors summary), summaryExhausted summary)
+   in ([(alphaText (showAnswer answer), alphaOutput (answerOutput answer)) | answer <- summaryAnswers summary],
+       map (alphaText . showSolveError) (summaryErrors summary), summaryExhausted summary)
 
 compareTables :: String -> String -> PropertyT IO QuerySummary
 compareTables source text = do
