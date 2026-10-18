@@ -73,3 +73,5 @@ cut_first X <- X in 1..3, label [X], !, pause.
 > X in 1..2, offset X Y, pause, Y #!= 2?
 > findall (pair X Y) (offset X Y, pause) Values, pause?
 > (offset X Y, X = 9 ; X in 2..3, number X), pause?
+> [X, Y] in 1..4, Y #= X + 1, (X #!= 2, pause ; Y #!= 2, pause), pause, label [X, Y]?
+> [X, Y] in 1..6, Y #= 7 - X, X #!= 3, pause, Y #!= 2, pause?

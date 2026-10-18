@@ -75,10 +75,12 @@ queens_clp N Qs <-
 
 # Two queens D rows apart must not be D columns apart.  Each pair is posted
 # with its offset as a constant, so a queen fixed by labeling removes exactly
-# the squares it attacks from every other row.  (Naming the diagonals with
-# auxiliary variables U #= Q + I and posting all_different on them is weaker
-# here: linear equalities propagate bounds, not holes in the middle of a
-# domain, so the attacked squares would stay in the queens' own domains.)
+# the squares it attacks from every other row.  Naming the diagonals with
+# auxiliary variables U #= Q + I, D #= Q - I and posting all_different on Us
+# and Ds prunes the same squares: an equality between two variables is
+# domain-consistent, so a value all_different removes from U leaves Q's domain
+# as well.  That encoding posts more constraints, and here it is a few times
+# slower than the pairwise one at N = 60 while visiting the same boards.
 diagonals [].
 diagonals [Q | Qs] <- off_diagonal Q Qs 1, diagonals Qs.
 

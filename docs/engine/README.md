@@ -57,6 +57,7 @@ those paths and comparisons. They are not the normal CLI/REPL query engine.
 * [Diagnosis and core migration](engine-diagnosis-2026-10-17.md)
 * [Contract proofs and performance](contracts-performance-2026-10-17.md)
 * [Mutable CLP propagation](mutable-clp-2026-10-18.md)
+* [Domain-consistent offset equalities](offset-equality-2026-10-18.md)
 * [Four major Core designs](major-design-2026-10-18.md)
 * [Latest performance overview](../performance/README.md)
 * [Reverse construction, matching and collection](../performance/reports/engine-reverse-2026-10-17.md)

@@ -43,6 +43,9 @@ module Infera.CLP
     ReductionOutcome (..),
     Reduced (..),
     reduce,
+    -- * Shared by the mutable kernel's native linear reducer
+    unitPair,
+    shiftDomain,
   )
 where
 
@@ -564,6 +567,10 @@ reduce st c = case c of
                          else Right (ReducedOK Drop (putDomain v d st))
                  else Right (ReducedOK Drop st)
           | otherwise -> Right (ReducedOK (Keep (CLinear rel le')) st)
+        RelEq
+          | Just (k', x, y) <- unitPair le' -> case propagateUnitPair st k' x y of
+              Nothing -> Right ReducedFail
+              Just st' -> Right (ReducedOK (Keep (CLinear rel le')) st')
         _ -> case propagateBounds st rel le' of
           Nothing -> Right ReducedFail
           Just st'
@@ -646,6 +653,42 @@ propagateBounds st0 rel (LinExpr coefs k)
        in if domainEmpty d
             then Nothing
             else go (if d == d0 then st else putDomain v d st) mins' maxs' rest
+
+-- ─── OFFSET EQUALITIES ───────────────────────────────────────────────────────
+
+-- | An equality between two variables with unit coefficients,
+-- @cx*x + cy*y + k = 0@. Such an equality is a bijection between the two
+-- domains, so each domain can be intersected with the image of the other and
+-- holes cross the equality in both directions. Larger linear sums keep bounds
+-- propagation: their solution sets are not images of a single domain.
+unitPair :: LinExpr -> Maybe (Integer, (VarId, Integer), (VarId, Integer))
+unitPair (LinExpr coefs k) = case IM.toList coefs of
+  [(x, cx), (y, cy)] | abs cx == 1, abs cy == 1 -> Just (k, (x, cx), (y, cy))
+  _ -> Nothing
+
+-- | The image of a domain under @v -> a + s*v@ with @s@ in {-1, 1}.
+shiftDomain :: Integer -> Integer -> Domain -> Domain
+shiftDomain a s (Domain lo hi holes)
+  | s > 0 = Domain (bAdd (Fin a) lo) (bAdd (Fin a) hi) (Set.mapMonotonic (+ a) holes)
+  | otherwise =
+      Domain (bAdd (Fin a) (bNeg hi)) (bAdd (Fin a) (bNeg lo))
+        (Set.fromDistinctAscList (map (a -) (Set.toDescList holes)))
+
+-- | Domain consistency for @cx*x + cy*y + k = 0@ with unit coefficients:
+-- @x = a + s*y@ and @y = s*x - s*a@. The result is a subset of what bounds
+-- propagation gives, so this only strengthens pruning.
+propagateUnitPair :: Store -> Integer -> (VarId, Integer) -> (VarId, Integer) -> Maybe Store
+propagateUnitPair st k (x, cx) (y, cy)
+  | domainEmpty dx' || domainEmpty dy' = Nothing
+  | otherwise = Just (update y dy dy' (update x dx dx' st))
+  where
+    s = negate (cx * cy)
+    a = negate (cx * k)
+    dx = getDomain st x
+    dy = getDomain st y
+    dx' = intersectDomain dx (shiftDomain a s dy)
+    dy' = intersectDomain dy (shiftDomain (negate (s * a)) s dx')
+    update v old new acc = if new == old then acc else putDomain v new acc
 
 -- ─── REIFIED RELATIONS AND ABSOLUTE VALUES ──────────────────────────────────
 

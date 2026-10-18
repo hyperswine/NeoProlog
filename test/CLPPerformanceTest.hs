@@ -5,7 +5,8 @@
 -- not its internal queue or the exact spelling of an equivalent residual.
 module CLPPerformanceTest (clpPerformanceGroup) where
 
-import Data.List (intercalate, nub, sort)
+import Data.List (intercalate, isInfixOf, nub, sort)
+import qualified Data.Set as Set
 import Hedgehog hiding (Var)
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
@@ -168,6 +169,70 @@ prop_global_distinct_model = withTests 200 $ property $ do
   actual <- solve names (intercalate ", " (goals ++ ["all_different " ++ list, "label " ++ list]) ++ "?")
   actual === expected
 
+-- An equality between two unit-coefficient variables is domain-consistent:
+-- a hole punched on either side crosses to the other, whichever side the
+-- relation was posted from and in either order, matching a brute-force model.
+-- The persistent store is checked directly; the Core path is checked through
+-- its labeled answers and its rendered residual domains.
+prop_offset_equality_domains :: Property
+prop_offset_equality_domains = withTests 300 $ property $ do
+  xLo <- forAll (Gen.integral (Range.constant (-4) 4))
+  xWidth <- forAll (Gen.integral (Range.constant 1 6))
+  offset <- forAll (Gen.integral (Range.constant (-5) 5))
+  reflected <- forAll Gen.bool
+  -- Place Y's interval near the image of X's so that most cases have support.
+  yShift <- forAll (Gen.integral (Range.constant (-3) 3))
+  yWidth <- forAll (Gen.integral (Range.constant 1 8))
+  let yLo = (if reflected then offset - (xLo + xWidth) else xLo + offset) + yShift
+  xHoles <- forAll (Gen.list (Range.constant 0 3) (Gen.integral (Range.constant xLo (xLo + xWidth))))
+  yHoles <- forAll (Gen.list (Range.constant 0 3) (Gen.integral (Range.constant (yLo - 1) (yLo + yWidth + 1))))
+  relationFirst <- forAll Gen.bool
+  let xHi = xLo + xWidth
+      yHi = yLo + yWidth
+      image x = if reflected then offset - x else x + offset
+      xs = [x | x <- [xLo .. xHi], x `notElem` xHoles,
+                let y = image x, y >= yLo, y <= yHi, y `notElem` yHoles]
+      ys = sort (map image xs)
+      rhs = if reflected then Compound "minus" [IntLit offset, Var 0] else Compound "plus" [Var 0, IntLit offset]
+      holes = [addRelation RelNe (Var 0) (IntLit h) | h <- xHoles] ++ [addRelation RelNe (Var 1) (IntLit h) | h <- yHoles]
+      relation = addRelation RelEq (Var 1) rhs
+      steps = addDomain (Var 0) (Fin xLo) (Fin xHi) : addDomain (Var 1) (Fin yLo) (Fin yHi)
+        : (if relationFirst then relation : holes else holes ++ [relation])
+      store = foldl (\r step -> continue step r) (Right (Just emptyStore)) steps
+      values st v = case storeWalk st (Var v) of
+        IntLit n -> Just [n]
+        _ -> domainOf st v >>= domainValues
+  classify "no solution" (null xs)
+  classify "fixed" (length xs == 1)
+  case store of
+    Left err -> annotateShow err >> failure
+    Right Nothing -> xs === []
+    Right (Just st) -> do
+      values st 0 === Just xs
+      values st 1 === Just ys
+  let relationText = if reflected then "Y #= " ++ show offset ++ " - X" else "Y #= X + " ++ show offset
+      holeText = ["X #!= " ++ show h | h <- xHoles] ++ ["Y #!= " ++ show h | h <- yHoles]
+      domainText = ["X in " ++ show xLo ++ ".." ++ show xHi, "Y in " ++ show yLo ++ ".." ++ show yHi]
+      goals = domainText ++ (if relationFirst then relationText : holeText else holeText ++ [relationText])
+      query = intercalate ", " goals
+  labeled <- solve ["X", "Y"] (query ++ ", label [X, Y]?")
+  labeled === sort [[x, image x] | x <- xs]
+  -- Before labeling, the residual domains name exactly the supported values.
+  let shown = runInfera "" (query ++ "?")
+      expectedDomain name vs = case vs of
+        [v] -> name ++ " = " ++ show v
+        _ -> name ++ " in " ++ showDomain (foldr punch (Domain (Fin (minimum vs)) (Fin (maximum vs)) mempty) [minimum vs .. maximum vs])
+          where punch v d = if v `elem` vs then d else d {domHoles = Set.insert v (domHoles d)}
+  case xs of
+    [] -> shown === Right ["false."]
+    _ -> do
+      answer <- evalEither shown
+      annotateShow answer
+      length answer === 1
+      let mentioned text = any (text `isInfixOf`) answer
+      assert (mentioned (expectedDomain "X" xs))
+      assert (mentioned (expectedDomain "Y" ys))
+
 prop_propagation_regressions :: Property
 prop_propagation_regressions = withTests 1 $ property $ do
   -- Hall failure and Hall pruning happen before labeling.
@@ -234,5 +299,6 @@ clpPerformanceGroup = Group "CLP performance correctness"
     ("reification_model", prop_reification_model),
     ("absolute_model", prop_absolute_model),
     ("global_distinct_model", prop_global_distinct_model),
+    ("offset_equality_domains", prop_offset_equality_domains),
     ("propagation_regressions", prop_propagation_regressions)
   ]

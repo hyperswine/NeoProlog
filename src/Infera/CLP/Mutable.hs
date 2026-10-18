@@ -621,6 +621,9 @@ reduce ms c = case c of
             liftIO (putDomain ms v d)
           pure Drop
         RelNe -> pure (Keep (CLinear rel reduced))
+        RelEq | Just (k', x, y) <- P.unitPair reduced -> do
+          propagateUnitPair ms k' x y
+          pure (Keep (CLinear rel reduced))
         _ -> do
           propagateBounds ms rel reduced
           pure (if IM.size coefs == 1 then Drop else Keep (CLinear rel reduced))
@@ -716,6 +719,20 @@ propagateBounds ms rel (LinExpr coefs k) = do
       require (not (domainEmpty d))
       when (d /= old) (liftIO (putDomain ms v d))
       go mins' maxs' rest
+
+-- Two unit-coefficient variables: the same domain-consistent image
+-- intersection as the persistent reducer, so holes cross the equality.
+propagateUnitPair :: MutableStore -> Integer -> (VarId, Integer) -> (VarId, Integer) -> M ()
+propagateUnitPair ms k (x, cx) (y, cy) = do
+  dx <- liftIO (getDomain ms x)
+  dy <- liftIO (getDomain ms y)
+  let s = negate (cx * cy)
+      a = negate (cx * k)
+      dx' = intersectDomain dx (P.shiftDomain a s dy)
+      dy' = intersectDomain dy (P.shiftDomain (negate (s * a)) s dx')
+  require (not (domainEmpty dx') && not (domainEmpty dy'))
+  when (dx' /= dx) (liftIO (putDomain ms x dx'))
+  when (dy' /= dy) (liftIO (putDomain ms y dy'))
 
 getDomain :: MutableStore -> VarId -> IO Domain
 getDomain ms v = maybe fullDomain id <$> domainOf ms v
