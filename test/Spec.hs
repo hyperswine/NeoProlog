@@ -44,6 +44,7 @@ import MutableCLPTest (mutableCLPGroup)
 import CoreDecisionTest (coreDecisionGroup)
 import CoreDeltaTest (coreDeltaGroup)
 import CoreLivenessTest (coreLivenessGroup)
+import CoreSlotsTest (coreSlotsGroup)
 import MachineTypedBuiltinTest (machineTypedBuiltinGroup)
 import MachineOpaqueScopeTest (machineOpaqueScopeGroup)
 import System.Environment (getArgs)
@@ -80,6 +81,7 @@ groups =
     ("core-decisions", coreDecisionGroup),
     ("core-delta", coreDeltaGroup),
     ("core-liveness", coreLivenessGroup),
+    ("core-slots", coreSlotsGroup),
     ("machine-typed-builtin", machineTypedBuiltinGroup),
     ("machine-opaque-scope", machineOpaqueScopeGroup)
   ]

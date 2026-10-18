@@ -120,7 +120,7 @@ prop_dead_graph_reclaimed = unit $ do
   loaded <- evalIO (loadFile "test/core/parity-liveness.nprolog")
   (program, _) <- evalEither loaded
   forM_ [100, 300] $ \size -> do
-    query <- evalEither (parseQuery ("dead_sibling " ++ show size ++ " Out?"))
+    query <- evalEither (parseQuery ("dead_sibling " ++ show size ++ " Out, churn 4000?"))
     (items, (collections, live, reclaimed)) <- evalIO $ do
       (_, first, stats) <- Run.runCoreWithStats 1 program query
       let drain action = do

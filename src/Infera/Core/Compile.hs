@@ -133,6 +133,10 @@ data Goal
 
 data Clause = Clause
   { clVars :: !Int,
+    -- | Slots not initialized by a first head occurrence. Head construction
+    -- initializes its first occurrences in the same left-to-right order as
+    -- matching, so allocation need not clear those cells beforehand.
+    clInitSlots :: [Int],
     clHead :: [Pattern],
     clBody :: [Goal],
     -- | the clause's result provably satisfies every declared alternative,
@@ -517,7 +521,16 @@ compileClause ctx sigs clause = do
         facts <- readIORef (ctxFacts ctx)
         proven <- mapM (patternSort ctx facts) headPatterns
         pure (and [maybe False (\sort -> all (\sig -> subSort sort (argSort sig i)) sigs) p | (i, p) <- zip [0 ..] proven])
-  pure (Clause (max 1 (S.clauseNVars clause)) headPatterns body trusted)
+  let count = max 1 (S.clauseNVars clause)
+      headWrites = IS.fromList (concatMap firstSlots headPatterns)
+      initialize = filter (`IS.notMember` headWrites) [0 .. count - 1]
+  pure (Clause count initialize headPatterns body trusted)
+  where
+    firstSlots pattern = case pattern of
+      PFirst offset -> [offset]
+      PStruct _ children -> concatMap firstSlots children
+      PArith _ _ children -> concatMap firstSlots children
+      _ -> []
 
 argSort :: P.Signature -> Int -> S.Sort
 argSort sig i = case drop i (P.sigArgs sig) of

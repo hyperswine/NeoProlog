@@ -8,6 +8,10 @@ build 0 [].
 build N [N | T] <- N > 0, M is N - 1, build M T.
 spin 0.
 spin N <- N > 0, M is N - 1, spin M.
+# Allocation pressure independent of activation allocation: an optimized
+# ground spin can now reuse its frame without triggering another collection.
+churn 0.
+churn N <- N > 0, Junk = (pair a b), M is N - 1, churn M.
 
 # The surviving unbound variable must retain its exact logical id while
 # its unused siblings, including a large graph, can be discarded.

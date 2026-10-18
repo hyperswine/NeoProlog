@@ -5,6 +5,8 @@ the [engine guide](../../engine/README.md) for the default architecture.
 
 | Stage | Report |
 | --- | --- |
+| Current core: profiles, operand slots and tail frames | [Reusable slots, 2026-10-18](engine-slots-2026-10-18.md) |
+| Current core: external engine comparison | [SWI and Scryer, 2026-10-18](engine-external-2026-10-18.md) |
 | Current core: mutable CLP propagation | [Mutable constraints, 2026-10-18](engine-mutable-clp-2026-10-18.md) |
 | Current core: constraints, decisions, liveness and delta tables | [Four designs, 2026-10-18](engine-major-2026-10-18.md) |
 | Current core: construction, matching and collection | [Reverse optimization, 2026-10-17](engine-reverse-2026-10-17.md) |

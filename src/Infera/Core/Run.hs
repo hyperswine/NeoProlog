@@ -15,6 +15,7 @@ module Infera.Core.Run
     runCoreWith,
     runCoreWithStats,
     runCoreWithPropagationStats,
+    runCoreWithSlotStats,
   )
 where
 
@@ -204,7 +205,8 @@ data Machine = Machine
     mVarCells :: !(IORef (IM.IntMap Int)),
     -- | addresses of watched variables (branch-local)
     mWatched :: !(IORef IS.IntSet),
-    mGCWorkspace :: !(IORef (Maybe GCWorkspace))
+    mGCWorkspace :: !(IORef (Maybe GCWorkspace)),
+    mSlotStats :: !(Maybe (IORef (Int, Int, Int)))
   }
 
 -- | Compile and start a query. Left names the construct that puts the
@@ -224,36 +226,44 @@ runCoreWith limit program query = do
 -- this action; counters change only when collection actually runs.
 runCoreWithStats :: Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int))
 runCoreWithStats limit program query = do
-  (reason, first, collections, _) <- startCore False limit program query
+  (reason, first, collections, _, _) <- startCore False False limit program query
   pure (reason, first, collections)
 
 -- | Optional counters prove that acceptance examples use mutable propagation.
 -- Normal execution leaves per-reduction counters disabled.
 runCoreWithPropagationStats :: Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int))
 runCoreWithPropagationStats limit program query = do
-  (reason, first, _, propagation) <- startCore True limit program query
+  (reason, first, _, propagation, _) <- startCore True False limit program query
   pure (reason, first, propagation)
 
-startCore :: Bool -> Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int), IO (Int, Int, Int))
-startCore measured limit program query = do
+-- | Allocated activation frames, reused tail frames and reused slot cells.
+-- Normal solving leaves these per-clause counters disabled.
+runCoreWithSlotStats :: Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int))
+runCoreWithSlotStats limit program query = do
+  (reason, first, _, _, slots) <- startCore False True limit program query
+  pure (reason, first, slots)
+
+startCore :: Bool -> Bool -> Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int), IO (Int, Int, Int), IO (Int, Int, Int))
+startCore measured measureSlots limit program query = do
   syms <- newSymbols
   store <- newStore syms
   writeReg store rGCLIM limit
   compiled <- compileProgram store program query
   case compiled of
-    Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason), collectionStats store, pure (0, 0, 0))
+    Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason), collectionStats store, pure (0, 0, 0), pure (0, 0, 0))
     Right core -> do
       choices <- newArray_ (0, 1023)
       guards <- newArray (0, 3 * 1024 - 1) 0
+      slots <- if measureSlots then Just <$> newIORef (0, 0, 0) else pure Nothing
       m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef []
         <*> newIORef guards <*> newIORef 0 <*> newIORef (Map.empty, IM.empty)
         <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
-        <*> newIORef Nothing <*> pure measured <*> newIORef IM.empty <*> newIORef IS.empty <*> newIORef Nothing
+        <*> newIORef Nothing <*> pure measured <*> newIORef IM.empty <*> newIORef IS.empty <*> newIORef Nothing <*> pure slots
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
       writeIORef (mVarCells m) (IM.fromList [(i, i) | i <- [0 .. cpQueryVars core - 1]])
       let propagation = readIORef (mCLP m) >>= maybe (pure (0, 0, 0)) (Mutable.statistics . fst)
-      pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone), collectionStats store, propagation)
+      pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone), collectionStats store, propagation, maybe (pure (0, 0, 0)) readIORef slots)
 
 constraintKernel :: Machine -> IO Mutable.MutableStore
 constraintKernel m = do
@@ -755,7 +765,8 @@ step' m goal goals base barrier depth next = case goal of
     buildArgs m base patterns 0
     pending <- arithData (mStore m)
     when (pending > 0) (normalizeArgs m (pArity predicate))
-    callPredicate m predicate trust (if null goals then next else CGoals goals base barrier depth next)
+    let cont = if null goals then next else CGoals goals base barrier depth next
+    callPredicate m (if null goals then base else 0) predicate trust cont
   GTabled ref patterns -> do
     predicate <- readIORef ref
     buildArgs m base patterns 0
@@ -908,7 +919,7 @@ step' m goal goals base barrier depth next = case goal of
     if fast
       then do
         quick <- readReg (mStore m) rVAL
-        wt <- buildArg m base False target
+        wt <- numericTarget m base target
         ok <- unify (mStore m) wt (intWord quick)
         if ok then continue else backtrack m
       else do
@@ -919,7 +930,7 @@ step' m goal goals base barrier depth next = case goal of
             shown <- exprTerm m base expr
             raiseError m (InstantiationError shown)
           Right (Just number) -> do
-            wt <- buildArg m base False target
+            wt <- numericTarget m base target
             wv <- numberWord (mStore m) number
             ok <- unify (mStore m) wt wv
             if ok then continue else backtrack m
@@ -1212,8 +1223,8 @@ leafItems m items previous cont = case items of
 -- ─── calls ───────────────────────────────────────────────────────────────────
 
 -- | Call with the arguments in the registers.
-callPredicate :: Machine -> Pred -> Maybe Trust -> Cont -> IO Step
-callPredicate m predicate trust cont0 = do
+callPredicate :: Machine -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
+callPredicate m frame predicate trust cont0 = do
   let s = mStore m
       key = pKey predicate
       n = pArity predicate
@@ -1250,16 +1261,48 @@ callPredicate m predicate trust cont0 = do
                 (True, Nothing, CReturn h _ Nothing _) | h >= 0 -> cont
                 _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
           barrier <- readIORef (mChoiceTop m)
-          callClauses m predicate barrier depth returnCont
+          callClausesWithFrame m (if top > limit then 0 else frame) predicate barrier depth returnCont
+
+-- A local operand can be overwritten only after all its outgoing arguments
+-- have been materialised. Choices protect older frames through their heap
+-- mark; suspended plans protect the frame explicitly. Collection detaches
+-- plans into PWord operands and invalidates the offered frame.
+tailFrame :: Store -> Int -> Cont -> IO Int
+tailFrame s base cont
+  | base <= 0 || not (dead cont) = pure 0
+  | otherwise = do
+      oldest <- hb s
+      if base - 1 < oldest then pure 0 else do
+        marker <- readCell s (base - 1)
+        pure $ if tagOf marker == tagFun then markerVars marker else 0
+  where
+    dead CDone = True
+    -- Activations are allocated above their callers; in-place tail reuse
+    -- preserves that order. A nonempty older caller therefore also proves
+    -- that all its ancestors predate this frame. Detached plans use base 0.
+    dead (CGoals gs other _ _ next)
+      | null gs = dead next
+      | other == base = False
+      | other < base = True
+      | otherwise = dead next
+    dead (CReturn _ _ _ next) = dead next
+    dead (CExitIf _ _ other _ _ next) = other /= base && dead next
+    dead (CExitNot _ _ _) = True
+    dead (CExitFindAll _ _ _ other _ _ _) = other /= base
+    dead (CExitTable _) = False
+    dead (CExitMinimize _ other _) = other /= base
 
 -- | Select and try the clauses of a predicate against the registers.
 callClauses :: Machine -> Pred -> Int -> Int -> Cont -> IO Step
-callClauses m predicate barrier depth returnCont = do
+callClauses m = callClausesWithFrame m 0
+
+callClausesWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
+callClausesWithFrame m frame predicate barrier depth returnCont = do
   let s = mStore m
   candidates <- candidateClauses s predicate
   case candidates of
     [] -> backtrack m
-    [ordinal] -> tryClause m predicate ordinal barrier depth returnCont
+    [ordinal] -> tryClauseWithFrame m frame predicate ordinal barrier depth returnCont
     (ordinal : more) -> do
       saved <- saveArgs s (pArity predicate)
       choice <- pushChoice m (AltClauses predicate more saved depth returnCont)
@@ -1267,12 +1310,35 @@ callClauses m predicate barrier depth returnCont = do
 
 -- | Try one clause against the argument registers.
 tryClause :: Machine -> Pred -> Int -> Int -> Int -> Cont -> IO Step
-tryClause m predicate ordinal barrier depth cont = do
+tryClause m = tryClauseWithFrame m 0
+
+tryClauseWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Int -> Cont -> IO Step
+tryClauseWithFrame m frame predicate ordinal barrier depth cont = do
   let clause = pClauses predicate ! ordinal
       s = mStore m
   fresh <- freshId s
   setFreshId s (fresh + clVars clause)
-  base <- allocSlots s fresh (clVars clause)
+  capacity <- tailFrame s frame cont
+  if capacity >= clVars clause
+    then do
+      resetFrame s fresh frame capacity (clInitSlots clause)
+      recordSlots m True (clVars clause)
+      enterClause m clause frame barrier depth cont
+    else do
+      base <- allocFrame s fresh (clVars clause) (clInitSlots clause)
+      recordSlots m False (clVars clause)
+      enterClause m clause base barrier depth cont
+
+recordSlots :: Machine -> Bool -> Int -> IO ()
+recordSlots m reused count = case mSlotStats m of
+  Nothing -> pure ()
+  Just stats -> modifyIORef' stats $ \(allocated, reusedFrames, reusedCells) ->
+    if reused then (allocated, reusedFrames + 1, reusedCells + count)
+      else (allocated + 1, reusedFrames, reusedCells)
+{-# INLINE recordSlots #-}
+
+enterClause :: Machine -> Clause -> Int -> Int -> Int -> Cont -> IO Step
+enterClause m clause base barrier depth cont = do
   ok <- matchHead m base (clHead clause) 0
   let cont' = case cont of
         CReturn h g (Just _) next | clTrustReturn clause -> CReturn h g Nothing next
@@ -1280,6 +1346,7 @@ tryClause m predicate ordinal barrier depth cont = do
   if ok
     then runGoals m (clBody clause) base barrier depth cont'
     else backtrack m
+{-# INLINE enterClause #-}
 
 matchHead :: Machine -> Int -> [Pattern] -> Int -> IO Bool
 matchHead _ _ [] _ = pure True
@@ -1287,7 +1354,7 @@ matchHead m base (pattern : patterns) !i = do
   arg <- readArg (mStore m) i
   ok <- case pattern of
     PFirst k -> writeFirst (mStore m) (base + k) arg >> pure True
-    PSlot k -> unify (mStore m) (refWord (base + k)) arg
+    PSlot k -> slotWord (mStore m) base k >>= \w -> unify (mStore m) w arg
     PWord w -> unify (mStore m) w arg
     _ -> unifyPattern m base pattern arg
   if ok then matchHead m base patterns (i + 1) else pure False
@@ -1303,7 +1370,17 @@ buildArgs :: Machine -> Int -> [Pattern] -> Int -> IO ()
 buildArgs _ _ [] _ = pure ()
 buildArgs m base (pattern : patterns) !i = do
   case pattern of
-    PSlot k -> writeArg (mStore m) i (refWord (base + k))
+    PSlot k
+      | base == 0 -> writeArg (mStore m) i (refWord k)
+      | otherwise -> do
+          let s = mStore m
+              addr = base + k
+          word <- readCell s addr
+          -- Fuse the common copy into the argument register, avoiding a
+          -- boxed intermediate result from the promotion branch.
+          if word == refWord addr
+            then operandAt s base k >>= writeArg s i
+            else writeArg s i word
     PWord w -> writeArg (mStore m) i w
     _ -> buildArg m base True pattern >>= writeArg (mStore m) i
   buildArgs m base patterns (i + 1)
@@ -1317,7 +1394,7 @@ normalizeArgs m n = forM_ [0 .. n - 1] $ \i -> do
 -- an unbound variable.
 unifyPattern :: Machine -> Int -> Pattern -> Word' -> IO Bool
 unifyPattern m base pattern word = case pattern of
-  PSlot i -> unify s (refWord (base + i)) word
+  PSlot i -> slotWord s base i >>= \w -> unify s w word
   -- An unreferenced fresh cell: no dereference, trail, occurs check or
   -- store record is needed. A self-reference stays a variable.
   PFirst i -> writeFirst s (base + i) word >> pure True
@@ -1334,14 +1411,12 @@ unifyCompound m base pattern word = case pattern of
     case tagOf d of
       t | t == tagRef -> do
             built <- buildArg m base False pattern
-            -- First occurrences still denote fresh activation slots; only
-            -- reused slots can carry the older input variable into this
-            -- structure. Check those words, rather than walking the graph
-            -- we just constructed. Keep the general check if the age proof
-            -- is unavailable.
-            cyclic <- if valOf d < base
-              then occursPattern s base (valOf d) pattern
-              else occursIn s (valOf d) built
+            -- PFirst denotes a newly introduced logical variable, even in
+            -- a recycled frame. It cannot contain an incoming argument.
+            -- Only repeated head variables/PWord operands can carry the
+            -- target into the constructor. Physical address age no longer
+            -- proves logical age after promotion and frame reuse.
+            cyclic <- occursPattern s base (valOf d) pattern
             if cyclic then pure False else bind s (valOf d) built >> pure True
         | t == tagStr -> do
             f <- readCell s (valOf d)
@@ -1384,11 +1459,32 @@ occursPattern s base target pattern = case pattern of
 -- user predicate calls.
 buildArg :: Machine -> Int -> Bool -> Pattern -> IO Word'
 buildArg m base normalize pattern = case pattern of
-  PSlot i -> pure (refWord (base + i))
-  PFirst i -> pure (refWord (base + i))
+  PSlot i -> slotWord (mStore m) base i
+  PFirst i -> do
+    -- First-write head slots are otherwise uninitialised. A constructor
+    -- for an unbound incoming argument introduces their variables here.
+    writeCell (mStore m) (base + i) (refWord (base + i))
+    slotWord (mStore m) base i
   PWord w -> pure w
   _ -> buildCompound m base normalize pattern
 {-# INLINE buildArg #-}
+
+-- Query roots and relocated plans retain stable cells. Activation operands
+-- hold values; an unbound value acquires a stable variable only on escape.
+slotWord :: Store -> Int -> Int -> IO Word'
+slotWord s base offset
+  | base == 0 = pure (refWord offset)
+  | otherwise = operandAt s base offset
+{-# INLINE slotWord #-}
+
+-- A numeric result cannot retain a pointer to its target operand. Keeping
+-- it local avoids promoting the counter temporary on every loop iteration.
+numericTarget :: Machine -> Int -> Pattern -> IO Word'
+numericTarget m base pattern = case pattern of
+  PSlot i -> pure (refWord (base + i))
+  PFirst i -> pure (refWord (base + i))
+  _ -> buildArg m base False pattern
+{-# INLINE numericTarget #-}
 
 buildCompound :: Machine -> Int -> Bool -> Pattern -> IO Word'
 buildCompound m base normalize pattern = case pattern of
@@ -1396,10 +1492,12 @@ buildCompound m base normalize pattern = case pattern of
   -- constructor non-ground without inspecting either child.
   PStruct functor [a, PFirst b] -> do
     wa <- buildArg m base normalize a
-    structure2WithGround s functor False wa (refWord (base + b))
+    wb <- buildArg m base normalize (PFirst b)
+    structure2WithGround s functor False wa wb
   PStruct functor [PFirst a, b] -> do
+    wa <- buildArg m base normalize (PFirst a)
     wb <- buildArg m base normalize b
-    structure2WithGround s functor False (refWord (base + a)) wb
+    structure2WithGround s functor False wa wb
   PStruct functor [a, b] -> do
     wa <- buildArg m base normalize a
     wb <- buildArg m base normalize b
@@ -1432,8 +1530,8 @@ buildCompound m base normalize pattern = case pattern of
     fill _ [] !ground = pure ground
     fill !i (child : rest) !ground = do
       w <- case child of
-        PSlot k -> pure (refWord (base + k))
-        PFirst k -> pure (refWord (base + k))
+        PSlot k -> slotWord s base k
+        PFirst k -> buildArg m base normalize (PFirst k)
         PWord cw -> pure cw
         _ -> buildArg m base normalize child
       writeCell s i w

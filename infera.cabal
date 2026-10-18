@@ -31,7 +31,9 @@ extra-source-files: infera.conf examples/*.nprolog test/cli.py test/bench.py
                     test/core/*.nprolog
                     docs/dash/build.js docs/dash/Infera.xml
                     test/bench_harness_test.py test/runtime_bench_harness_test.py
+                    test/core_external_bench_harness_test.py
                     bench/run.sh bench/run.py bench/runtime-compare.py bench/runtime-compare.pl
+                    bench/core-external.pl bench/core_external.py
                     bench/bench.nprolog bench/bench.pl bench/check-tail-memory.py
 tested-with:        GHC == 9.8.2
 
@@ -123,7 +125,7 @@ test-suite infera-test
     hs-source-dirs:   test
     main-is:          Spec.hs
     other-modules:    InferaTest CorrectnessTest MinesweeperTest InferenceTest CoreTest
-                      CoreConstraintTest CoreDecisionTest CoreDeltaTest CoreLivenessTest MutableCLPTest
+                      CoreConstraintTest CoreDecisionTest CoreDeltaTest CoreLivenessTest CoreSlotsTest MutableCLPTest
                       CLPPerformanceTest ReferenceCLP BreadboardTest TablingTest
                       MachineHeapTest MachineControlTest MachineSubsearchTest
                       MachineCLPTest MachineBreadboardTest

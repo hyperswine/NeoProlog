@@ -32,7 +32,8 @@ module Infera.Core.Store
     newStore,
     heapTop, setHeapTop, trailTop, setTrailTop, hb, setHb,
     outLen, setOutLen, arithData, bumpArithData, freshId, setFreshId,
-    readCell, writeCell, pushCell, allocCells, allocSlots, markerWord, logicalId,
+    readCell, writeCell, pushCell, allocCells, allocSlots, allocFrame, operandWord, operandAt,
+    resetSlots, resetFrame, markerWord, logicalId,
     replaceLogicalIds, collectionStats, recordCollection,
     readArg, writeArg, saveArgs, loadArgs, reserveCells, groundNowWord,
     readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, initialCollectLimit, markerBase, markerVars,
@@ -409,6 +410,110 @@ allocSlots s logicalBase n = do
   pure (top + 1)
 {-# INLINE allocSlots #-}
 
+-- | Allocate a clause activation, clearing only the supplied variable
+-- offsets. Every omitted slot must be written by its first head occurrence
+-- before a matcher or head constructor reads it. The compiled layout is
+-- shared across calls; stable logical-variable allocations use 'allocSlots'.
+allocFrame :: Store -> Int -> Int -> [Int] -> IO Int
+allocFrame s logicalBase count initialize = do
+  top <- heapTop s
+  ensureCells s (top + count + 1)
+  arr <- readIORef (cells s)
+  unsafeWrite arr top (markerWord logicalBase count)
+  let base = top + 1
+      go [] = pure ()
+      go (offset : offsets) = do
+        let addr = base + offset
+        unsafeWrite arr addr (refWord addr)
+        go offsets
+  go initialize
+  unsafeWrite (regs s) rH (top + count + 1)
+  pure base
+{-# INLINE allocFrame #-}
+
+-- | Read an activation operand without exposing its storage cell. A value
+-- already installed in the slot can be shared directly; a still-unbound
+-- local must first acquire a stable logical-variable cell outside the
+-- reusable activation. Promotion preserves the reference engine's fresh
+-- identity and does not consume another fresh id. Redirecting the operand
+-- is an ordinary binding, so an older choice restores its self-reference
+-- before reclaiming the promoted cell.
+--
+-- Query cells and captured 'PWord' operands are logical variables already:
+-- callers pass only the addresses of live activation operands here.
+operandWord :: Store -> Int -> IO Word'
+operandWord s addr = do
+  value <- readCell s addr >>= deref s
+  if value == refWord addr
+    then do
+      ident <- maybe addr id <$> logicalId s addr
+      stable <- allocSlots s ident 1
+      let word = refWord stable
+      bind s addr word
+      pure word
+    else pure value
+{-# INLINE operandWord #-}
+
+-- | The operand accessor for a fresh contiguous activation. Its marker
+-- gives a local's logical identity directly, avoiding a backward scan when
+-- an unbound operand is promoted. Captured plans detached by collection use
+-- ready words instead, and must never call this function with a dummy base.
+operandAt :: Store -> Int -> Int -> IO Word'
+operandAt s base offset = do
+  let addr = base + offset
+  -- Non-self references were installed from already stable operands. They
+  -- can be passed on as references: eagerly dereferencing here adds a walk
+  -- that the consuming matcher/builtin would otherwise perform once.
+  value <- readCell s addr
+  if value == refWord addr
+    then do
+      marker <- readCell s (base - 1)
+      stable <- allocSlots s (markerBase marker + offset) 1
+      let word = refWord stable
+      bind s addr word
+      pure word
+    else pure value
+{-# INLINE operandAt #-}
+
+-- | Reinitialize an otherwise unreachable activation for a tail call.
+-- The caller must prove that every slot is at or above the newest choice
+-- boundary, and that no argument, continuation, constraint or live term
+-- refers to these operand cells. Escaped logical variables have their own
+-- cells, allocated by 'operandWord'. The physical capacity may exceed the
+-- next clause's variable count; unused slots remain inaccessible.
+--
+-- The uncommon compacted-block case discards the old sparse identities and
+-- exposes this marker to identity lookup again. Ordinary repeated tail
+-- calls stay in the fresh suffix and avoid traversing the identity map.
+resetSlots :: Store -> Int -> Int -> Int -> IO ()
+resetSlots s logicalBase base capacity = resetFrame s logicalBase base capacity [0 .. capacity - 1]
+{-# INLINE resetSlots #-}
+
+-- | Reset an unreachable tail activation with a compiled initialization
+-- layout. The reachability and choice-boundary requirements of 'resetSlots'
+-- apply. Omitted offsets must be initialized by first head occurrences before
+-- they are read, exactly as for 'allocFrame'.
+resetFrame :: Store -> Int -> Int -> Int -> [Int] -> IO ()
+resetFrame s logicalBase base capacity initialize = do
+  ids <- readIORef (logicalIds s)
+  case IM.lookupGE base ids of
+    Just (addr, _) | addr < base + capacity ->
+      let (before, _, remaining) = IM.splitLookup base ids
+          (_, _, after) = IM.splitLookup (base + capacity - 1) remaining
+       in writeIORef (logicalIds s) (IM.union before after)
+    _ -> pure ()
+  boundary <- unsafeRead (regs s) rIDENT
+  when (base < boundary) (unsafeWrite (regs s) rIDENT (base - 1))
+  arr <- readIORef (cells s)
+  unsafeWrite arr (base - 1) (markerWord logicalBase capacity)
+  let go [] = pure ()
+      go (offset : offsets) = do
+        let addr = base + offset
+        unsafeWrite arr addr (refWord addr)
+        go offsets
+  go initialize
+{-# INLINE resetFrame #-}
+
 -- | The reference id of a variable cell: sparse identity after collection,
 -- otherwise the marker of a fresh activation block.
 logicalId :: Store -> Int -> IO (Maybe Int)
@@ -651,9 +756,18 @@ unify s a0 b0 = do
     then pure True
     else case (tagOf a, tagOf b) of
       (ta, tb)
-        | ta == tagRef && tb == tagRef ->
-            -- Bind the younger cell to the older one.
-            if valOf a > valOf b then bind s (valOf a) b >> pure True else bind s (valOf b) a >> pure True
+        | ta == tagRef && tb == tagRef -> do
+            -- Promotion and tail-frame reuse decouple physical addresses
+            -- from logical age. Keep the reference engine's smaller fresh
+            -- id as representative, with addresses as a tie-breaker for
+            -- cells that have no marker identity.
+            let aa = valOf a
+                ba = valOf b
+            ai <- maybe aa id <$> logicalId s aa
+            bi <- maybe ba id <$> logicalId s ba
+            if (ai, aa) > (bi, ba)
+              then bind s aa b >> pure True
+              else bind s ba a >> pure True
         | ta == tagRef -> bindChecked (valOf a) b tb
         | tb == tagRef -> bindChecked (valOf b) a ta
         | ta == tagStr && tb == tagStr -> do

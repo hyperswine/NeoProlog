@@ -1,0 +1,117 @@
+<- notable.
+
+pause.
+id X X.
+pick a.
+pick b.
+spin 0.
+spin N <- N > 0, M is N - 1, spin M.
+
+count : det (int: <=) (int: <=) (int: =>).
+count 0 Acc Acc.
+count N Acc Out <- N > 0, Next is Acc + N, M is N - 1, count M Next Out.
+
+app [] L L.
+app [H | T] L [H | R] <- app T L R.
+rev [] [].
+rev [H | T] R <- rev T RT, app RT [H] R.
+
+# Tail calls may outlive the activation that created these free variables.
+# Repeated fields retain aliases, and distinct fields keep distinct IDs.
+escape N Out <- Out = (pair X X), spin N.
+escape_distinct N Out <- Out = (wide X Y X Z), spin N.
+escape_list N Out <- Out = [X, Y, X], spin N.
+escape_alias N Left Right <- Left = X, Right = X, spin N.
+bind X <- X = held.
+closure N Goal <- Goal = (bind X), spin N.
+branch N Out <- Out = (pair X Y), (X = a ; X = b), spin N.
+pending N Out <- Out = (pair X Y), spin N, X = first, Y = second.
+head_fail (pair X X) Out <- Out = (box X), spin 30.
+
+# A first head occurrence can be written directly when its constructor is
+# already present. Building a constructor for a free input instead needs
+# fresh cells before its repeated fields are read.
+head_pair (pair X X) X <- spin 20.
+head_nested (outer (inner X Y) X Y) Out <- Out = (pair X Y), spin 20.
+head_tail N Out <- Pair = (pair X X), spin N, head_pair Pair Out.
+nested_tail N Out <- Tree = (outer (inner X Y) X Y), spin N, head_nested Tree Out.
+
+cut_tail : unsafe.
+cut_tail N Out <- (Out = a ; Out = b), !, spin N.
+bad : det (int: <=) (int: =>).
+bad N Out <- spin N, Out = wrong.
+
+# The CLP store can retain locals that no remaining goal refers to.
+constraint_box N Out <- X in 1..3, Out = (box X), spin N.
+constraint_pair N Out <- [X, Y] in 1..3, X #= Y, Out = (pair X Y), spin N.
+
+edge a b. edge b c. edge c d.
+reach : table.
+reach X Y <- edge X Y.
+reach X Y <- reach X Z, spin 4, edge Z Y.
+
+stored : dynamic.
+dynamic_tail : unsafe.
+dynamic_tail N Out <- assert (stored (pair X X)), spin N, stored Out.
+
+> count 120 0 Result?
+> count 40 0 Result, count 4 Result Next?
+> rev [a, b, c, d] Out?
+> rev [X, Y, X] Out, X = a?
+> app Left Right [a, b, c]?
+> escape 40 Out?
+> escape 40 Out, Out = (pair a a)?
+> escape 40 Out, Out = (pair a b)?
+> escape_distinct 40 Out?
+> escape_distinct 40 Out, Out = (wide a b a c)?
+> escape_list 40 Out, Out = [a, b, a]?
+> escape_alias 40 Left Right, Left = a, Right = b?
+> closure 40 Goal, call Goal, Goal = (bind X)?
+> pending 40 Out?
+> branch 20 Out?
+> (branch 20 Out, Out = (pair a bad), fail ; escape 20 Out)?
+> (head_fail (pair a b) Out ; escape 20 Out)?
+> cut_tail 40 Out?
+> (cut_tail 40 Out, Out = b ; Out = recovered)?
+> once (branch 20 Out), Out = (pair a X)?
+> not (escape 20 Out, Out = (pair a b)), escape 20 After?
+> (escape 20 Out, Out = (pair a b) -> Result = bad ; escape 20 Result)?
+> (branch 20 Out -> Out = (pair a X) ; Out = missing)?
+> findall Out (branch 20 Out) Values?
+> findall Out (escape_distinct 20 Out, pick X) Values?
+> minimize Cost (Cost = 1, escape_distinct 20 Out), escape_distinct 20 After?
+> minimize Cost (Cost = 1, escape 20 Out), Out = (pair a a)?
+> (minimize Cost (Cost = 1, escape 20 Out), Out = (pair a b) ; escape 20 Out)?
+> constraint_box 20 Out, pause, Out = (box X), label [X]?
+> constraint_pair 20 Out, pause, Out = (pair X Y), (X = 2 ; Y = 3), pause?
+> findall Out (constraint_box 20 Out) Values?
+> minimize Cost (Cost = 1, constraint_box 20 Out), pause, (Out = (box 4) ; Out = (box 2))?
+> X in 1..2, str_concat A B "ab", spin 20, label [X]?
+> (str_concat A B "ab", spin 20, A = "a", fail ; escape 20 Out)?
+> reach a Out, spin 20?
+> findall Out (reach a Out, spin 20) Values?
+> dynamic_tail 20 Out, spin 20, Out = (pair a a)?
+> (dynamic_tail 20 Out, Out = (pair a b) ; dynamic_tail 20 Out)?
+> bad 20 Out?
+> (bad 20 Out ; escape 20 Out)?
+> escape_distinct 20 Out, Out = (wide (-0.0) 1.5 (-0.0) 1152921504606846976)?
+> head_pair Pair Out?
+> head_pair (pair X X) Out?
+> head_pair (pair X Y) Out?
+> head_pair (pair a a) Out?
+> head_pair (pair a b) Out?
+> head_pair X X?
+> head_pair (pair X (box X)) Out?
+> (head_pair (pair a b) Out ; head_pair Pair Out)?
+> head_tail 20 Out?
+> head_tail 20 Out, Out = (box X)?
+> head_nested Tree Out?
+> head_nested (outer (inner X Y) X Y) Out?
+> head_nested (outer (inner X Y) X Z) Out?
+> head_nested (outer (inner X Y) Y X) Out?
+> head_nested (outer (inner X Y) (box X) Y) Out?
+> head_nested X X?
+> Tree = (outer (inner X Y) X Y), head_nested Tree Out, X = (box Y)?
+> (head_nested (outer (inner a b) b a) Out ; head_nested Tree Out)?
+> nested_tail 20 Out?
+> nested_tail 20 Out, Out = (pair X (box X))?

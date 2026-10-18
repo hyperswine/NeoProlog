@@ -5,6 +5,30 @@ See the [current engine guide](../engine/README.md),
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
+## Reusable Core slots and tail frames - 2026-10-18
+
+The [profile and reuse report](reports/engine-slots-2026-10-18.md) records one
+fresh activation and 90,000 reused tail frames in the checked loop. CPU improves
+4.3% there, but reverse takes 12.1% more CPU and GHC allocation rises on both.
+The measured slot-reuse snapshot takes 1.21x Scryer on loop and 3.19x on reverse; SWI remains
+5.42-11.33x faster on these cases. Breadboard and Minesweeper are near baseline.
+The measured snapshot passed 440 properties, 477 forced-collection parity queries,
+CLI acceptance, 61 editor tests and 56 harness tests. The combined tree after
+subsequent diagnostic/CLP updates passes 443 properties and 487 parity queries
+with a fresh isolated build. This iteration establishes reuse, not a general
+throughput win.
+
+## Before slot reuse: Core versus SWI and Scryer - 2026-10-18
+
+The [fresh external comparison](reports/engine-external-2026-10-18.md) records
+GC-inclusive loaded-query CPU at 1.26-2.77x Scryer and 3.92-10.09x SWI on
+reverse, loop, Fibonacci and queens. Three of four meet the roughly-2x target
+relative to Scryer; reverse remains outside it. End-to-end CLI times are closer
+because startup/loading are included. The report keeps those scopes separate,
+corrects SWI's GC-excluding compatibility timer, and records source/binary
+identities, checked results and complete raw samples. External CLP and tabling
+performance remain unmeasured.
+
 ## Mutable CLP propagation - 2026-10-18
 
 The [mutable propagation report](reports/engine-mutable-clp-2026-10-18.md)

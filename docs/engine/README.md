@@ -13,7 +13,7 @@ is Haskell, with mutable execution inside an immutable lazy answer API.
    that query's program. Plans are currently built per query.
 3. The [driver](../../src/Infera/Core/Run.hs) executes those plans with
    argument registers, explicit continuations and choice points. Eligible
-   tail calls reuse continuations.
+   tail calls reuse continuations and, when safe, activation operand slots.
 4. The [store](../../src/Infera/Core/Store.hs) represents values as tagged
    words. Variables are references, compounds have contiguous cells, and
    bignums, floats and strings use a boxed table. Bindings are trailed when
@@ -58,6 +58,7 @@ those paths and comparisons. They are not the normal CLI/REPL query engine.
 * [Contract proofs and performance](contracts-performance-2026-10-17.md)
 * [Mutable CLP propagation](mutable-clp-2026-10-18.md)
 * [Domain-consistent offset equalities](offset-equality-2026-10-18.md)
+* [Reusable operand slots and tail frames](reusable-slots-2026-10-18.md)
 * [Four major Core designs](major-design-2026-10-18.md)
 * [Latest performance overview](../performance/README.md)
 * [Reverse construction, matching and collection](../performance/reports/engine-reverse-2026-10-17.md)
