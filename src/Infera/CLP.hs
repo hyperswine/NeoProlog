@@ -39,6 +39,10 @@ module Infera.CLP
     isConstrained,
     domainOf,
     storeWalk,
+    -- * Single-step reducer for the mutable scheduler's complex slow path
+    ReductionOutcome (..),
+    Reduced (..),
+    reduce,
   )
 where
 
@@ -508,9 +512,9 @@ settleDirty st
               | otherwise -> Right (Just acc)
             other -> Left (CLPTypeError other)
 
-data Outcome = Keep Constraint | Drop
+data ReductionOutcome = Keep Constraint | Drop
 
-data Reduced = ReducedFail | ReducedOK Outcome Store
+data Reduced = ReducedFail | ReducedOK ReductionOutcome Store
 
 reduce :: Store -> Constraint -> Either SolveError Reduced
 reduce st c = case c of

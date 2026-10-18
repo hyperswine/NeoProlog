@@ -5,6 +5,17 @@ See the [current engine guide](../engine/README.md),
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
+## Mutable CLP propagation - 2026-10-18
+
+The [mutable propagation report](reports/engine-mutable-clp-2026-10-18.md)
+records native mutable domains, linear reduction and scheduling with undo
+marks and immutable answer snapshots. Checked 16x16 Minesweeper generation
+falls from 33.7 ms to 22.3 ms with 39% less allocation. Breadboard allocates
+2-14% less but takes 7-13% more CPU; complex reducers still use a persistent
+bridge. All 429 properties and 416 forced-collection parity queries pass.
+The report includes native-path counters, deterministic memory evidence and
+remaining rollback-history limits.
+
 ## Four Core designs - 2026-10-18
 
 The [first implementation report](reports/engine-major-2026-10-18.md) records

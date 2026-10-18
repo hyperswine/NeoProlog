@@ -74,6 +74,7 @@ library
         Infera.Machine.Trace.Types
         Infera.Arith
         Infera.CLP
+        Infera.CLP.Mutable
         Infera.Program
         Infera.Infer
         Infera.Purity
@@ -122,7 +123,7 @@ test-suite infera-test
     hs-source-dirs:   test
     main-is:          Spec.hs
     other-modules:    InferaTest CorrectnessTest MinesweeperTest InferenceTest CoreTest
-                      CoreConstraintTest CoreDecisionTest CoreDeltaTest CoreLivenessTest
+                      CoreConstraintTest CoreDecisionTest CoreDeltaTest CoreLivenessTest MutableCLPTest
                       CLPPerformanceTest ReferenceCLP BreadboardTest TablingTest
                       MachineHeapTest MachineControlTest MachineSubsearchTest
                       MachineCLPTest MachineBreadboardTest

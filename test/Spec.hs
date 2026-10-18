@@ -40,6 +40,7 @@ import MachineCacheTest (machineCacheGroup)
 import MachineOperandTest (machineOperandGroup)
 import CoreTest (coreGroup)
 import CoreConstraintTest (coreConstraintGroup)
+import MutableCLPTest (mutableCLPGroup)
 import CoreDecisionTest (coreDecisionGroup)
 import CoreDeltaTest (coreDeltaGroup)
 import CoreLivenessTest (coreLivenessGroup)
@@ -75,6 +76,7 @@ groups =
     ("machine-operands", machineOperandGroup),
     ("core-engine", coreGroup),
     ("core-native-clp", coreConstraintGroup),
+    ("mutable-clp", mutableCLPGroup),
     ("core-decisions", coreDecisionGroup),
     ("core-delta", coreDeltaGroup),
     ("core-liveness", coreLivenessGroup),

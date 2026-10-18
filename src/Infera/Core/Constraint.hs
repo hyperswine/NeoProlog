@@ -4,11 +4,14 @@
 module Infera.Core.Constraint
   ( post, labelVariables, minimumVariables, LabelStep (..), selectLabel,
     minimumCost, boundMinimum,
+    postMutable, labelVariablesMutable, minimumVariablesMutable,
+    selectLabelMutable, minimumCostMutable, boundMinimumMutable,
   ) where
 
 import Data.List (nub, sortOn)
 import Infera.Arith (evalIntExpr)
 import Infera.CLP
+import qualified Infera.CLP.Mutable as Mutable
 import Infera.Error (SolveError (..))
 import Infera.Syntax (Term (..), VarId, unfoldCons)
 import Infera.Unify (deepWalk, walk, termVars)
@@ -105,3 +108,98 @@ minimumCost store cost = case evalIntExpr (stSubst store) cost of
   Left err -> Left err
   Right Nothing -> Left (InstantiationError (deepWalk (stSubst store) cost))
   Right (Just value) -> Right value
+
+-- The mutable driver uses the same builtin contracts without freezing its
+-- domains, scheduler or residual list between search nodes.
+postMutable :: Mutable.MutableStore -> String -> [Term] -> Maybe (IO (Either SolveError Bool))
+postMutable store name arguments = case (name, arguments) of
+  ("neq", [a, b]) -> Just (Mutable.addDiseq store a b)
+  ("int_eq", [a, b]) -> relation RelEq a b
+  ("fd_ne", [a, b]) -> relation RelNe a b
+  ("fd_le", [a, b]) -> relation RelLe a b
+  ("fd_lt", [a, b]) -> relation RelLe (plusOne a) b
+  ("fd_ge", [a, b]) -> relation RelLe b a
+  ("fd_gt", [a, b]) -> relation RelLe (plusOne b) a
+  ("in", [target, range]) -> Just $ do
+    range' <- Mutable.deepWalk store range
+    case range' of
+      Compound "range" [lo, hi]
+        | Just lower <- parseBound lo, Just upper <- parseBound hi -> do
+            target' <- Mutable.deepWalk store target
+            let targets = case target' of
+                  list@(Compound "cons" _) -> fst (unfoldCons list)
+                  term -> [term]
+            Mutable.addDomains store targets lower upper
+      other -> pure (Left (TypeError "range (Lo..Hi)" other))
+  ("all_different", [list]) -> Just (different list)
+  ("all_distinct", [list]) -> Just (different list)
+  ("reify", [raw, truth]) -> Just $ do
+    value <- Mutable.walk store raw
+    case value of
+      Compound "int_eq" [a, b] -> Mutable.addReified store RelEq a b truth
+      Compound "fd_ne" [a, b] -> Mutable.addReified store RelNe a b truth
+      Compound "fd_le" [a, b] -> Mutable.addReified store RelLe a b truth
+      Compound "fd_lt" [a, b] -> Mutable.addReified store RelLe (plusOne a) b truth
+      Compound "fd_ge" [a, b] -> Mutable.addReified store RelLe b a truth
+      Compound "fd_gt" [a, b] -> Mutable.addReified store RelLe (plusOne b) a truth
+      other@(Var _) -> pure (Left (InstantiationError other))
+      other -> pure (Left (TypeError "integer relation (#=, #!=, #<, #<=, #>, #>=)" other))
+  _ -> Nothing
+  where
+    relation rel a b = Just (Mutable.addRelation store rel a b)
+    different raw = do
+      value <- Mutable.deepWalk store raw
+      case unfoldCons value of
+        (xs, Nothing) -> Mutable.addAllDifferent store xs
+        _ -> pure (Left (InstantiationError value))
+    plusOne a = Compound "plus" [a, IntLit 1]
+    parseBound (IntLit n) = Just (Fin n)
+    parseBound (Atom "inf") = Just NegInf
+    parseBound (Atom "sup") = Just PosInf
+    parseBound _ = Nothing
+
+labelVariablesMutable :: Mutable.MutableStore -> Term -> IO [VarId]
+labelVariablesMutable store raw =
+  nub . concatMap termVars . fst . unfoldCons <$> Mutable.deepWalk store raw
+
+minimumVariablesMutable :: Mutable.MutableStore -> Term -> IO (Either SolveError [VarId])
+minimumVariablesMutable store raw = do
+  list <- Mutable.deepWalk store raw
+  pure $ case unfoldCons list of
+    (_, Just _) -> Left (TypeError "proper list of integer variables" list)
+    (xs, Nothing)
+      | any invalid xs -> Left (TypeError "list of integer variables" list)
+      | otherwise -> Right (nub (concatMap termVars xs))
+  where
+    invalid (Var _) = False
+    invalid (IntLit _) = False
+    invalid _ = True
+
+selectLabelMutable :: Bool -> Mutable.MutableStore -> [VarId] -> IO (Either SolveError LabelStep)
+selectLabelMutable minimizing store variables = do
+  roots <- mapM (Mutable.walk store . Var) variables
+  let pending
+        | minimizing = nub [w | Var w <- roots]
+        | otherwise = [v | (v, Var w) <- zip variables roots, w == v]
+  sizes <- mapM (\v -> do domain <- Mutable.domainOf store v; pure (v, domain >>= domainSize)) pending
+  case pending of
+    [] -> pure (Right LabelDone)
+    _ -> case [v | (v, Nothing) <- sizes] of
+      v : _ -> pure (Left (UnboundedDomain (Var v)))
+      [] -> case sortOn snd sizes of
+        (v, _) : _ -> do
+          domain <- Mutable.domainOf store v
+          pure (Right (LabelNext pending v (maybe [] id (domain >>= domainValues))))
+        [] -> pure (Right LabelDone)
+
+minimumCostMutable :: Mutable.MutableStore -> Term -> IO (Either SolveError Integer)
+minimumCostMutable store cost = do
+  substitution <- Mutable.getSubst store
+  pure $ case evalIntExpr substitution cost of
+    Left err -> Left err
+    Right Nothing -> Left (InstantiationError (deepWalk substitution cost))
+    Right (Just value) -> Right value
+
+boundMinimumMutable :: Mutable.MutableStore -> Term -> Maybe Integer -> IO (Either SolveError Bool)
+boundMinimumMutable _ _ Nothing = pure (Right True)
+boundMinimumMutable store cost (Just value) = Mutable.addRelation store RelLe cost (IntLit (value - 1))

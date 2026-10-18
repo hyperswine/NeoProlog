@@ -2,6 +2,10 @@
 
 Date: 2026-10-18
 
+This document records the first four-design slice. The subsequent
+[mutable CLP follow-up](mutable-clp-2026-10-18.md) replaces the persistent
+constraint state and synchronization path described below.
+
 This change implements a bounded first slice of four structural improvements:
 native constraint search, compiled clause decisions, precise activation
 liveness, and incremental tabling. Each targets work that the tagged-cell Core

@@ -1,0 +1,75 @@
+<- notable.
+
+# Calls between propagation and later bindings exercise collection and the
+# logical-to-physical variable map under the small-heap parity runner.
+pause.
+packet Out <- X in 1..3, Out = (box X), pause.
+
+edge a b. edge b c. edge c d.
+reach : table.
+reach X Y <- edge X Y.
+reach X Y <- reach X Z, edge Z Y.
+
+# A tabled call that mentions constrained variables must keep the ordinary
+# evaluation boundary, including constraints introduced inside the call.
+number : table.
+number 1. number 2. number 3.
+offset : table.
+offset X Y <- [X, Y] in 1..4, Y #= X + 1, label [X, Y], pause.
+
+cut_first : unsafe.
+cut_first X <- X in 1..3, label [X], !, pause.
+
+# Domains, aliases, holes and ordered residual constraints.
+> [X, Y, Z] in 0..4, X #= Y, Z #!= X, pause, label [Y, Z, X], pause?
+> X in 0..5, X #!= 1, X #!= 3, pause, (X = 1 ; X = 4), pause?
+> [X, Y] in 0..3, X #= Y, pause, (X #< 2, label [Y] ; X #>= 2, label [X]), pause?
+> [X, Y, Z] in 0..3, all_different [X, Y, Z], pause, X = 1, label [Y, Z], pause?
+> [X, Y] in 0..3, all_different [X, Y + 1], pause, label [X, Y]?
+> [X, Y, B] in 0..2, reify (X #< Y) B, pause, B = 1, label [X, Y], pause?
+> [X, Y] in 0..2, reify (X #= Y) B, B = 0, pause, label [X, Y], pause?
+> [X, Y] in -2..2, D #= abs (X - Y), D #>= 2, pause, label [X, Y, D]?
+> [X, Y] in 0..3, P #= X * Y, P #= 2, pause, label [X, Y], pause?
+
+# Contradictions and arithmetic errors retain their ordering. A later
+# alternative must restore both the substitution and the scheduler state.
+> X in 0..2, Y #= 1 / (X * (X - 1)), pause, (X = 0 ; X = 2), pause?
+> X in 0..2, Y #= 1 / (X * (X - 1)), labeling [min X] [X, Y]?
+> [X, bad] in 2..1?
+> X in 0..2, Y #= abs (X - X), pause, X = bad?
+> X in 0..2, reify (X #> 0) B, pause, (B = 3 ; B = 1, label [X]), pause?
+
+# Each control sentinel restores its entry state before the continuation.
+> X in 1..3, not (X #< 2, pause, fail), pause, label [X]?
+> X in 1..3, (X #> 3, pause -> R = then ; pause, X = 2, R = else), pause?
+> X in 1..3, (X #> 1, pause -> label [X] ; X = 1), pause?
+> X in 1..3, findall Y (Y = X, label [Y], pause) Values, pause, X = 2?
+> X in 1..3, findall Y (Y in 1..3, Y #> X, label [Y], pause) Values, pause, label [X]?
+> X in 1..3, once (label [X], pause), pause?
+> (cut_first X, X = 2 ; X = recovered), pause?
+
+# A reconstructed minimum store is still subject to an enclosing rollback.
+> (X in 1..3, C #= 4 - X, labeling [min C] [X], pause, fail ; X in 4..5, label [X]), pause?
+> X in 1..3, (C #= 4 - X, labeling [min C] [X], pause, X = 1 ; label [X]), pause?
+> minimize C (X in 1..3, C #= 4 - X, label [X], pause), pause, (X = 1 ; X = 3)?
+> minimize C (C = 1, packet Out), pause, (Out = (box 4) ; Out = (box 2)), pause?
+> minimize C (X in 1..3, C #= X, minimize D (Y in 0..2, D #= 2 - Y, label [Y], pause), label [X], pause), pause?
+> minimize C (X in 1..3, C #= 4 - X, labeling [min X] [X], pause), pause?
+
+# Reference string leaves import immutable stores between mutable searches.
+# Multiple splits also force retries across the import boundary.
+> X in 1..2, str_concat A B "ab", pause, label [X], pause?
+> X in 1..3, (str_concat A B "ab", A = "a", X #> 1, label [X], pause ; X = 1), pause?
+> X in 1..3, findall (pair Y A) (Y = X, label [Y], str_concat A B "a", pause) Values, pause, X = 2?
+> minimize C (X in 1..3, C #= 4 - X, label [X], str_concat A B "ab", pause), pause?
+> (minimize C (X in 1..3, C #= X, label [X], str_concat A B "ab", pause), fail ; X in 4..5, label [X]), pause?
+
+# Ordinary tabling, pre-existing constraints on arguments and constraints
+# introduced inside a tabled predicate all share branch-local rollback.
+> reach a Y, pause?
+> X in 1..3, number X, pause?
+> X in 1..3, X #!= 2, (number X, pause ; X = 2), pause?
+> offset X Y, pause?
+> X in 1..2, offset X Y, pause, Y #!= 2?
+> findall (pair X Y) (offset X Y, pause) Values, pause?
+> (offset X Y, X = 9 ; X in 2..3, number X), pause?

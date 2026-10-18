@@ -14,6 +14,7 @@ module Infera.Core.Run
     runCore,
     runCoreWith,
     runCoreWithStats,
+    runCoreWithPropagationStats,
   )
 where
 
@@ -27,6 +28,7 @@ import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble, numericTerm)
 import qualified Infera.CLP as CLP
+import qualified Infera.CLP.Mutable as Mutable
 import qualified Infera.Core.Constraint as NativeConstraint
 import Infera.Core.Compile
 import qualified Infera.Core.Liveness as Liveness
@@ -40,7 +42,7 @@ import Infera.Error (PredKey, SolveError (..))
 import qualified Infera.Program as P
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
-import Infera.Unify (canonicalize, deepWalk, emptySubst, instantiate, unifyPlain)
+import Infera.Unify (canonicalize, emptySubst, instantiate, unifyPlain)
 import System.IO (hPutStrLn, stderr)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Environment (lookupEnv)
@@ -92,7 +94,7 @@ data Choice = Choice
     -- | branch-local dynamic facts
     chDynamic :: Map.Map PredKey [(Term, Int)],
     -- | branch-local constraint store and watched cells
-    chStore :: CLP.Store,
+    chStore :: Maybe Mutable.Mark,
     chWatched :: IS.IntSet,
     chAlt :: !Alt
   }
@@ -194,8 +196,10 @@ data Machine = Machine
     mOutput :: !(IORef [OutputEvent]),
     mTables :: !(IORef (Map.Map Term TableEntry)),
     mDynamic :: !(IORef (Map.Map PredKey [(Term, Int)])),
-    -- | the persistent constraint store (branch-local)
-    mCLP :: !(IORef CLP.Store),
+    -- | Lazily initialized mutable propagation state and its empty mark.
+    -- Choices contain trail marks; immutable stores exist only at exports.
+    mCLP :: !(IORef (Maybe (Mutable.MutableStore, Mutable.Mark))),
+    mPropagationStats :: !Bool,
     -- | cells of variables the store may mention, by logical id
     mVarCells :: !(IORef (IM.IntMap Int)),
     -- | addresses of watched variables (branch-local)
@@ -220,28 +224,89 @@ runCoreWith limit program query = do
 -- this action; counters change only when collection actually runs.
 runCoreWithStats :: Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int))
 runCoreWithStats limit program query = do
+  (reason, first, collections, _) <- startCore False limit program query
+  pure (reason, first, collections)
+
+-- | Optional counters prove that acceptance examples use mutable propagation.
+-- Normal execution leaves per-reduction counters disabled.
+runCoreWithPropagationStats :: Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int))
+runCoreWithPropagationStats limit program query = do
+  (reason, first, _, propagation) <- startCore True limit program query
+  pure (reason, first, propagation)
+
+startCore :: Bool -> Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int), IO (Int, Int, Int))
+startCore measured limit program query = do
   syms <- newSymbols
   store <- newStore syms
   writeReg store rGCLIM limit
   compiled <- compileProgram store program query
   case compiled of
-    Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason), collectionStats store)
+    Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason), collectionStats store, pure (0, 0, 0))
     Right core -> do
       choices <- newArray_ (0, 1023)
       guards <- newArray (0, 3 * 1024 - 1) 0
       m <- Machine store program (mkEnv program) core <$> newIORef choices <*> newIORef 0 <*> newIORef []
         <*> newIORef guards <*> newIORef 0 <*> newIORef (Map.empty, IM.empty)
         <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
-        <*> newIORef CLP.emptyStore <*> newIORef IM.empty <*> newIORef IS.empty <*> newIORef Nothing
+        <*> newIORef Nothing <*> pure measured <*> newIORef IM.empty <*> newIORef IS.empty <*> newIORef Nothing
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
       writeIORef (mVarCells m) (IM.fromList [(i, i) | i <- [0 .. cpQueryVars core - 1]])
-      pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone), collectionStats store)
+      let propagation = readIORef (mCLP m) >>= maybe (pure (0, 0, 0)) (Mutable.statistics . fst)
+      pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone), collectionStats store, propagation)
+
+constraintKernel :: Machine -> IO Mutable.MutableStore
+constraintKernel m = do
+  current <- readIORef (mCLP m)
+  case current of
+    Just (kernel, _) -> pure kernel
+    Nothing -> do
+      kernel <- Mutable.newWithStats (mPropagationStats m) CLP.emptyStore
+      root <- Mutable.mark kernel
+      writeIORef (mCLP m) (Just (kernel, root))
+      pure kernel
+
+constraintSnapshot :: Machine -> IO CLP.Store
+constraintSnapshot m = readIORef (mCLP m) >>= maybe (pure CLP.emptyStore) (Mutable.freeze . fst)
+
+constraintMark :: Machine -> IO (Maybe Mutable.Mark)
+constraintMark m = readIORef (mCLP m) >>= traverse (Mutable.mark . fst)
+
+restoreConstraints :: Machine -> Maybe Mutable.Mark -> IO ()
+restoreConstraints m saved = do
+  current <- readIORef (mCLP m)
+  case current of
+    Nothing -> pure ()
+    Just (kernel, root) -> do
+      Mutable.rollback kernel (maybe root id saved)
+      watched <- Mutable.watched kernel
+      writeReg (mStore m) rCLP (if IS.null watched then 0 else 1)
+
+importConstraints :: Machine -> CLP.Store -> IO ()
+importConstraints m snapshot = constraintKernel m >>= (`Mutable.replaceStore` snapshot)
+
+-- No surviving choice can refer to these marks. Reclaim deterministic
+-- propagation history at goal/answer boundaries without copying the store.
+compactConstraints :: Machine -> IO ()
+compactConstraints m = do
+  current <- readIORef (mCLP m)
+  case current of
+    Nothing -> pure ()
+    Just (kernel, _) -> do
+      top <- readIORef (mChoiceTop m)
+      when (top == 0) $ do
+        root <- Mutable.commit kernel
+        writeIORef (mCLP m) (Just (kernel, root))
 
 -- ─── choice stack ────────────────────────────────────────────────────────────
 
 pushChoice :: Machine -> Alt -> IO Int
 pushChoice m alt = do
+  saved <- constraintMark m
+  pushChoiceWithStore m saved alt
+
+pushChoiceWithStore :: Machine -> Maybe Mutable.Mark -> Alt -> IO Int
+pushChoiceWithStore m store alt = do
   let s = mStore m
   h <- heapTop s
   tr <- trailTop s
@@ -249,7 +314,6 @@ pushChoice m alt = do
   fresh <- freshId s
   tables <- readIORef (mTables m)
   dynamic <- readIORef (mDynamic m)
-  store <- readIORef (mCLP m)
   watched <- readIORef (mWatched m)
   scopes <- length <$> readIORef (mScopes m)
   top <- readIORef (mChoiceTop m)
@@ -288,6 +352,7 @@ cutTo m h = do
     writeIORef (mChoiceTop m) h
     refreshHb m
     trimGuardsAbove m h
+    compactConstraints m
 
 -- ─── determinism guards ──────────────────────────────────────────────────────
 
@@ -439,6 +504,7 @@ run m cont = case cont of
 run' :: Machine -> Cont -> IO Step
 run' m cont = case cont of
   CDone -> do
+    compactConstraints m
     state <- exportState m
     pure (Yield (Found state) (backtrack m))
   CGoals goals base barrier depth next -> runGoals m goals base barrier depth next
@@ -506,7 +572,7 @@ run' m cont = case cont of
           produced <- outputSince m (mnEntryOut mn)
           tables <- readIORef (mTables m)
           dynamic <- readIORef (mDynamic m)
-          store <- readIORef (mCLP m)
+          store <- constraintSnapshot m
           watched <- readIORef (mWatched m)
           winnerFresh <- freshId s
           writeIORef ref mn {mnBestFresh = winnerFresh, mnBest = Just (n, bound, produced, tables, dynamic, store, watched)}
@@ -516,8 +582,7 @@ run' m cont = case cont of
     (answer, count) <- canonicalCall m (fst (pKey (fxPred fx))) (fxArgs fx) (pArity (fxPred fx))
     produced <- outputSince m (fxEntryOut fx)
     tables <- readIORef (mTables m)
-    store <- readIORef (mCLP m)
-    bad <- callConstrained m store (fxArgs fx) (pArity (fxPred fx))
+    bad <- callConstrained m (fxArgs fx) (pArity (fxPred fx))
     writeIORef fixRef fx
       { fxFound = (answer, count, produced) : fxFound fx,
         fxCompleted = Map.union (fxCompleted fx) (Map.filter teComplete tables),
@@ -573,13 +638,10 @@ reconciled m continue = do
         ident <- cellId m addr
         value <- readCell s addr >>= exportFor m
         pure (ident, value)
-      store <- readIORef (mCLP m)
-      case CLP.applyBindings changes store of
-        Left err -> raiseError m err
-        Right Nothing -> backtrack m
-        Right (Just store') -> do
-          ok <- installStore m (CLP.stSubst store) store'
-          if ok then continue else backtrack m
+      kernel <- constraintKernel m
+      before <- Mutable.mark kernel
+      result <- Mutable.applyBindings kernel changes
+      acceptMutable m kernel before result continue
 
 -- | The logical id of a variable cell: query cells by position, others
 -- through their block marker.
@@ -595,14 +657,40 @@ installStore :: Machine -> IM.IntMap Term -> CLP.Store -> IO Bool
 installStore m previous store = do
   let s = mStore m
       added = IM.toList (IM.difference (CLP.stSubst store) previous)
-  writeIORef (mCLP m) store
-  writeReg s rCLP 1
-  flag <- readReg s rBOUND
-  ok <- installBindings added
-  writeReg s rBOUND flag
+  importConstraints m store
+  writeReg s rCLP 0
+  ok <- installConstraintBindings m added
   cells' <- readIORef (mVarCells m)
   writeIORef (mWatched m) (IS.fromList [addr | v <- IS.toList (CLP.stWatched store), Just addr <- [IM.lookup v cells']])
+  writeReg s rCLP (if IS.null (CLP.stWatched store) then 0 else 1)
+  when ok (compactConstraints m)
   pure ok
+
+acceptMutable :: Machine -> Mutable.MutableStore -> Mutable.Mark -> Either SolveError Bool -> IO Step -> IO Step
+acceptMutable m kernel before result continue = case result of
+  Left err -> raiseError m err
+  Right False -> backtrack m
+  Right True -> do
+    ok <- syncConstraintChanges m kernel before
+    if ok then continue else backtrack m
+
+syncConstraintChanges :: Machine -> Mutable.MutableStore -> Mutable.Mark -> IO Bool
+syncConstraintChanges m kernel before = do
+  changed <- Mutable.changesSince kernel before
+  newlyWatched <- Mutable.watchedSince kernel before
+  let s = mStore m
+  writeReg s rCLP 0
+  ok <- installConstraintBindings m changed
+  cells' <- readIORef (mVarCells m)
+  let added = IS.fromList [addr | ident <- IS.toList newlyWatched, Just addr <- [IM.lookup ident cells']]
+  modifyIORef' (mWatched m) (`IS.union` added)
+  watched <- Mutable.watched kernel
+  writeReg s rCLP (if IS.null watched then 0 else 1)
+  when ok (compactConstraints m)
+  pure ok
+
+installConstraintBindings :: Machine -> [(S.VarId, Term)] -> IO Bool
+installConstraintBindings m = installBindings
   where
     s = mStore m
     installBindings [] = pure True
@@ -611,33 +699,37 @@ installStore m previous store = do
       case IM.lookup v cells' of
         Nothing -> installBindings rest
         Just addr -> do
-          table <- newIORef (IM.map refWord cells')
-          w <- importKnown table term
+          w <- importKnown term
           cell <- readCell s addr
           ok <- unify s cell w
           when traceOn $ do
             shown <- exportFor m cell
             traceMsg ("  install " ++ show v ++ "@" ++ show addr ++ " := " ++ show term ++ " (cell held " ++ show shown ++ ") -> " ++ show ok)
-          -- Fresh variables the reference introduced keep their ids.
-          final <- readIORef table
-          forM_ (IM.toList final) $ \(ident, word) ->
-            when (tagOf word == tagRef && not (IM.member ident cells')) $
-              modifyIORef' (mVarCells m) (IM.insert ident (valOf word))
           if ok then installBindings rest else pure False
-    importKnown table term = case term of
+    importKnown term = case term of
       Var v -> do
-        known <- readIORef table
+        known <- readIORef (mVarCells m)
         case IM.lookup v known of
-          Just w -> pure w
+          Just addr -> pure (refWord addr)
           Nothing -> do
             addr <- allocSlots s v 1
-            modifyIORef' table (IM.insert v (refWord addr))
+            modifyIORef' (mVarCells m) (IM.insert v addr)
+            current <- readIORef (mCLP m)
+            case current of
+              Nothing -> pure ()
+              Just (kernel, _) -> do
+                watched <- Mutable.watched kernel
+                when (IS.member v watched) (modifyIORef' (mWatched m) (IS.insert addr))
             pure (refWord addr)
       Compound f as -> do
         fid <- internFunctor (symbols s) f (length as)
-        words' <- mapM (importKnown table) as
+        words' <- mapM importKnown as
         structureWord s (funWord fid (length as)) words'
-      _ -> importTermWords s table term
+      Atom name -> atmWord <$> internAtom (symbols s) name
+      IntLit n -> numberWord s (NVInt n)
+      FloatLit value -> numberWord s (NVFloat value)
+      CharLit value -> pure (chrWord (fromEnum value))
+      StrLit value -> box s (BStr value)
 
 step :: Machine -> Goal -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
 step = step'
@@ -956,27 +1048,44 @@ fileContents m pathWord
 -- point. Variables are exported with their logical ids, so store state
 -- stays consistent across goals.
 delegate :: Machine -> Term -> Cont -> IO Step
-delegate m goal cont = do
-  store <- readIORef (mCLP m)
-  case goal of
-    Compound name args | Just result <- NativeConstraint.post store name args ->
-      acceptConstraint m result (run m cont)
-    Compound "label" [list] -> nativeLabel m (NativeConstraint.labelVariables store list) cont
-    Compound "labeling" [list] -> nativeLabel m (NativeConstraint.labelVariables store list) cont
-    Compound "labeling" [options, list] -> case deepWalk (CLP.stSubst store) options of
-      Compound "cons" [Compound "min" [cost], Atom "nil"] ->
-        case NativeConstraint.minimumVariables store list of
+delegate m goal cont = case goal of
+  Compound name args | mutableBuiltin name args -> do
+    kernel <- constraintKernel m
+    case NativeConstraint.postMutable kernel name args of
+      Nothing -> delegateReference m goal cont
+      Just action -> do
+        before <- Mutable.mark kernel
+        result <- action
+        acceptMutable m kernel before result (run m cont)
+  Compound "label" [list] -> label list
+  Compound "labeling" [list] -> label list
+  Compound "labeling" [options, list] -> do
+    kernel <- constraintKernel m
+    options' <- Mutable.deepWalk kernel options
+    case options' of
+      Compound "cons" [Compound "min" [cost], Atom "nil"] -> do
+        checked <- NativeConstraint.minimumVariablesMutable kernel list
+        case checked of
           Left err -> raiseError m err
           Right variables -> nativeMinimum m cost variables cont
       other -> raiseError m (TypeError "labeling options [min Cost]" other)
-    _ -> delegateReference m goal cont
+  _ -> delegateReference m goal cont
+  where
+    label list = do
+      kernel <- constraintKernel m
+      variables <- NativeConstraint.labelVariablesMutable kernel list
+      nativeLabel m variables cont
+    mutableBuiltin name arguments = case arguments of
+      [_] -> name `elem` ["all_different", "all_distinct"]
+      [_, _] -> name `elem` ["neq", "int_eq", "fd_ne", "fd_le", "fd_lt", "fd_ge", "fd_gt", "in", "reify"]
+      _ -> False
 
--- Leaf compatibility remains available for strings, formatting and file IO;
--- constraint posting and search never construct a reference Search here.
+-- Immutable compatibility is confined to the leaf boundary. Importing its
+-- selected result is trailed, so older Core choices can still restore it.
 delegateReference :: Machine -> Term -> Cont -> IO Step
 delegateReference m goal cont = do
   let s = mStore m
-  store <- readIORef (mCLP m)
+  store <- constraintSnapshot m
   fresh <- freshId s
   let state = (initialState fresh) {ssStore = store}
       items = Reference.solveGoal (mEnv m) maxResolutionDepth state goal
@@ -985,19 +1094,11 @@ delegateReference m goal cont = do
     traceMsg ("delegate " ++ show goal ++ " fresh=" ++ show fresh ++ " cells=" ++ show [(v, a) | v <- S.termVarIds goal, Just a <- [IM.lookup v cells']])
   leafItems m items (CLP.stSubst store) cont
 
-acceptConstraint :: Machine -> Either SolveError (Maybe CLP.Store) -> IO Step -> IO Step
-acceptConstraint m result continue = case result of
-  Left err -> raiseError m err
-  Right Nothing -> backtrack m
-  Right (Just store) -> do
-    previous <- CLP.stSubst <$> readIORef (mCLP m)
-    ok <- installStore m previous store
-    if ok then continue else backtrack m
-
 nativeLabel :: Machine -> [S.VarId] -> Cont -> IO Step
 nativeLabel m variables cont = do
-  store <- readIORef (mCLP m)
-  case NativeConstraint.selectLabel False store variables of
+  kernel <- constraintKernel m
+  selected <- NativeConstraint.selectLabelMutable False kernel variables
+  case selected of
     Left err -> raiseError m err
     Right NativeConstraint.LabelDone -> run m cont
     Right (NativeConstraint.LabelNext pending variable values) ->
@@ -1007,8 +1108,10 @@ nativeLabelValues :: Machine -> [S.VarId] -> S.VarId -> [Integer] -> Cont -> IO 
 nativeLabelValues m _ _ [] _ = backtrack m
 nativeLabelValues m variables variable (value : rest) cont = do
   unless (null rest) $ () <$ pushChoice m (AltLabel variables variable rest cont)
-  store <- readIORef (mCLP m)
-  acceptConstraint m (CLP.storeBind store variable value) (nativeLabel m variables cont)
+  kernel <- constraintKernel m
+  before <- Mutable.mark kernel
+  result <- Mutable.storeBind kernel variable value
+  acceptMutable m kernel before result (nativeLabel m variables cont)
 
 nativeMinimum :: Machine -> Term -> [S.VarId] -> Cont -> IO Step
 nativeMinimum m cost variables cont = do
@@ -1018,11 +1121,9 @@ nativeMinimum m cost variables cont = do
   entryOut <- outLen s
   ref <- newIORef (Minimum entryHeap entryTrail entryOut 0 Nothing)
   issues <- newIORef []
-  sentinel <- pushChoice m (AltMinimize ref issues cont)
+  _ <- pushChoice m (AltMinimize ref issues cont)
   pushScope m (SBuffer issues)
-  -- The sentinel owns the winner and all errors, exactly as minimize does.
-  -- Native choices below it restore the heap, domains and watches together.
-  sentinel `seq` nativeMinimumNode m cost variables ref cont
+  nativeMinimumNode m cost variables ref cont
 
 minimumBound :: IORef Minimum -> IO (Maybe Integer)
 minimumBound ref = do
@@ -1033,46 +1134,64 @@ minimumBound ref = do
 
 nativeMinimumNode :: Machine -> Term -> [S.VarId] -> IORef Minimum -> Cont -> IO Step
 nativeMinimumNode m cost variables ref cont = do
-  store <- readIORef (mCLP m)
+  kernel <- constraintKernel m
   incumbent <- minimumBound ref
-  acceptConstraint m (NativeConstraint.boundMinimum cost incumbent store) $ do
-    bounded <- readIORef (mCLP m)
-    case NativeConstraint.selectLabel True bounded variables of
+  before <- Mutable.mark kernel
+  result <- NativeConstraint.boundMinimumMutable kernel cost incumbent
+  acceptMutable m kernel before result $ do
+    selected <- NativeConstraint.selectLabelMutable True kernel variables
+    case selected of
       Left err -> raiseError m err
-      Right NativeConstraint.LabelDone -> case NativeConstraint.minimumCost bounded cost of
-        Left err -> raiseError m err
-        Right value -> do
-          word <- numberWord (mStore m) (NVInt value)
-          run m (CExitMinimize (PWord word) 0 ref)
-      Right (NativeConstraint.LabelNext pending variable _) ->
-        case CLP.domainOf bounded variable of
+      Right NativeConstraint.LabelDone -> do
+        checked <- NativeConstraint.minimumCostMutable kernel cost
+        case checked of
+          Left err -> raiseError m err
+          Right value -> do
+            word <- numberWord (mStore m) (NVInt value)
+            run m (CExitMinimize (PWord word) 0 ref)
+      Right (NativeConstraint.LabelNext pending variable _) -> do
+        domain <- Mutable.domainOf kernel variable
+        case domain of
           Just (CLP.Domain (CLP.Fin lower) _ _) ->
             nativeMinimumValues m pending variable lower cost ref cont
           _ -> raiseError m (UnboundedDomain (Var variable))
 
 nativeMinimumValues :: Machine -> [S.VarId] -> S.VarId -> Integer -> Term -> IORef Minimum -> Cont -> IO Step
 nativeMinimumValues m variables variable lower cost ref cont = do
-  store <- readIORef (mCLP m)
+  kernel <- constraintKernel m
+  before <- Mutable.mark kernel
   incumbent <- minimumBound ref
-  let restricted = CLP.addDomain (Var variable) (CLP.Fin lower) CLP.PosInf store
-        >>= maybe (Right Nothing) (NativeConstraint.boundMinimum cost incumbent)
-  case restricted of
-    Left err -> raiseError m err
-    Right Nothing -> backtrack m
-    Right (Just bounded) ->
-      let values = case deepWalk (CLP.stSubst bounded) (Var variable) of
-            IntLit value -> [value]
-            _ -> maybe [] id (CLP.domainOf bounded variable >>= CLP.domainValues)
-       in case values of
-         [] -> backtrack m
-         value : _ -> case CLP.storeBind bounded variable value of
-           -- An error stops this variable's exploration, while a failed
-           -- value and an explored child permit the next value. This differs
-           -- from ordinary label's stream of independent alternatives.
-           Left err -> raiseError m err
-           Right result -> do
-             _ <- pushChoice m (AltOptimize variables variable (value + 1) cost ref cont)
-             acceptConstraint m (Right result) (nativeMinimumNode m cost variables ref cont)
+  restricted <- Mutable.addDomain kernel (Var variable) (CLP.Fin lower) CLP.PosInf
+  bounded <- case restricted of
+    Right True -> NativeConstraint.boundMinimumMutable kernel cost incumbent
+    other -> pure other
+  let restore = Mutable.rollback kernel before
+      stop checked = restore >> case checked of
+        Left err -> raiseError m err
+        _ -> backtrack m
+  case bounded of
+    Left err -> stop (Left err)
+    Right False -> stop (Right False)
+    Right True -> do
+      value <- Mutable.walk kernel (Var variable)
+      domain <- Mutable.domainOf kernel variable
+      let values = case value of
+            IntLit number -> [number]
+            _ -> maybe [] id (domain >>= CLP.domainValues)
+      case values of
+        [] -> stop (Right False)
+        number : _ -> do
+          assigned <- Mutable.storeBind kernel variable number
+          case assigned of
+            -- Errors stop this variable's exploration. A failed value or
+            -- completed child permits retry from the original prefix.
+            Left err -> stop (Left err)
+            Right valid -> do
+              _ <- pushChoiceWithStore m (Just before)
+                (AltOptimize variables variable (number + 1) cost ref cont)
+              if valid
+                then acceptMutable m kernel before (Right True) (nativeMinimumNode m cost variables ref cont)
+                else restore >> backtrack m
 
 leafItems :: Machine -> [SearchItem] -> IM.IntMap Term -> Cont -> IO Step
 leafItems m items previous cont = case items of
@@ -1375,7 +1494,7 @@ backtrackChoice m top =
       setFreshId s (chFresh choice)
       writeIORef (mTables m) (chTables choice)
       writeIORef (mDynamic m) (chDynamic choice)
-      writeIORef (mCLP m) (chStore choice)
+      restoreConstraints m (chStore choice)
       writeIORef (mWatched m) (chWatched choice)
       writeReg s rBOUND 0
       case chAlt choice of
@@ -1468,7 +1587,7 @@ backtrackChoice m top =
                 mapM_ (emitOutput m) produced
                 writeIORef (mTables m) tables
                 writeIORef (mDynamic m) dynamic
-                writeIORef (mCLP m) store
+                importConstraints m store
                 writeIORef (mWatched m) restoredWatched
                 writeReg s rCLP (if IS.null (CLP.stWatched store) then 0 else 1)
                 -- The winner's store already holds these bindings.
@@ -1938,7 +2057,7 @@ exportState m = do
   fresh <- freshId s
   events <- readIORef (mOutput m)
   count <- outLen s
-  store <- readIORef (mCLP m)
+  store <- constraintSnapshot m
   tables <- readIORef (mTables m)
   dynamic <- readIORef (mDynamic m)
   let subst = IM.fromList [(i, term) | (i, term) <- bindings, term /= Var i]
@@ -2024,8 +2143,7 @@ callTabled m predicate cont0 = do
             _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
       saved <- saveArgs s n
       (callKey, _) <- canonicalCall m (fst key) saved n
-      store <- readIORef (mCLP m)
-      constrained <- callConstrained m store saved n
+      constrained <- callConstrained m saved n
       tables <- readIORef (mTables m)
       if constrained
         then do
@@ -2049,10 +2167,15 @@ callTabled m predicate cont0 = do
             startIteration m fixRef
 
 -- | Does the saved call mention a constrained variable?
-callConstrained :: Machine -> CLP.Store -> Int -> Int -> IO Bool
-callConstrained m store saved arity = do
-  args <- forM [0 .. arity - 1] $ \i -> readCell (mStore m) (saved + i) >>= exportFor m
-  pure (any (CLP.isConstrained store) (concatMap S.termVarIds args))
+callConstrained :: Machine -> Int -> Int -> IO Bool
+callConstrained m saved arity = do
+  current <- readIORef (mCLP m)
+  case current of
+    Nothing -> pure False
+    Just (kernel, _) -> do
+      watched <- Mutable.watched kernel
+      args <- forM [0 .. arity - 1] $ \i -> readCell (mStore m) (saved + i) >>= exportFor m
+      pure (any (`IS.member` watched) (concatMap S.termVarIds args))
 
 -- | One fixpoint iteration. Proven linear recursion consumes only the last
 -- round's fresh answers; other shapes retain the complete partial table.
