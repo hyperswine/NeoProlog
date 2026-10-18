@@ -20,6 +20,8 @@ module Infera.Core.Compile
     Clause (..),
     ArgIndex (..),
     DecisionIndex (..),
+    Candidates (..),
+    candidateList,
     Key (..),
     CoreProgram (..),
     Unsupported (..),
@@ -30,10 +32,14 @@ module Infera.Core.Compile
   )
 where
 
-import Control.Monad (filterM, forM, forM_)
+import Control.Monad (forM, forM_)
 import Data.Array (Array, listArray)
+import qualified Data.Array.IArray as IA
+import Data.Array.Base (numElements, unsafeAt)
+import Data.Array.Unboxed (UArray)
 import Data.IORef
 import Data.List (nub)
+import Data.Maybe (isJust)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as Map
@@ -147,14 +153,28 @@ data Clause = Clause
 data Key = KAtm !Int | KInt !Int | KChr !Int | KFun !Word' | KBig !Integer | KFlt !Double | KStr !String
   deriving (Eq, Ord, Show)
 
+-- | Selected clause ordinals, ascending. Every index result is built once
+-- at compile time, and a singleton is the predicate's shared value for that
+-- ordinal, so a call that only looks results up allocates nothing.
+data Candidates
+  = NoCandidate
+  | OneCandidate !Int
+  | -- | two or more
+    Candidates !(UArray Int Int)
+
+candidateList :: Candidates -> [Int]
+candidateList NoCandidate = []
+candidateList (OneCandidate i) = [i]
+candidateList (Candidates xs) = [unsafeAt xs k | k <- [0 .. numElements xs - 1]]
+
 -- | Per-position clause selection: immediate keys (atom, integer, character
 -- and functor words) map to the ascending candidates sharing that key or
 -- open at the position; boxed keys go through a value map; an unbound or
 -- unknown key yields the open clauses.
 data ArgIndex = ArgIndex
-  { aiFast :: !(IM.IntMap [Int]),
-    aiBoxed :: !(Map.Map Key [Int]),
-    aiOpen :: [Int],
+  { aiFast :: !(IM.IntMap Candidates),
+    aiBoxed :: !(Map.Map Key Candidates),
+    aiOpen :: !Candidates,
     -- | some clause has a key at this position
     aiSelective :: !Bool
   }
@@ -177,7 +197,12 @@ data Pred = Pred
     pClauseCount :: !Int,
     pIndex :: [ArgIndex],
     pDecisions :: [DecisionIndex],
-    pIntGuards :: !(IM.IntMap IntGuard),
+    -- | the leading immediate-integer guard of each clause, if any
+    pIntGuards :: !(Array Int (Maybe IntGuard)),
+    pHasGuards :: !Bool,
+    -- | every clause, and each ordinal alone
+    pAll :: !Candidates,
+    pOne :: !(Array Int Candidates),
     pIndexed :: !Bool,
     pDecls :: [P.Signature],
     pInferred :: !P.Signature,
@@ -256,15 +281,16 @@ compilePred ctx p = do
       arity = snd (P.predKey p)
   compiledClauses <- mapM (compileClause ctx (P.predDecls p)) clauses
   let count = length compiledClauses
-  index <- mapM (\i -> buildIndex (ctxStore ctx) i compiledClauses) [0 .. arity - 1]
+  let ones = listArray (0, max 0 (count - 1)) (map OneCandidate [0 .. count - 1])
+      shared = toCandidates ones
+  index <- mapM (\i -> buildIndex (ctxStore ctx) shared i compiledClauses) [0 .. arity - 1]
   let paths = take (if count > 1 then 32 else 0) . nub $
         [(i, path) | clause <- compiledClauses, (i, pattern) <- zip [0 ..] (clHead clause),
           path <- nestedPaths 3 pattern]
   decisions <- forM paths $ \(i, path) -> do
-    decision <- buildIndexAt (ctxStore ctx) i path compiledClauses
+    decision <- buildIndexAt (ctxStore ctx) shared i path compiledClauses
     pure (DecisionIndex i path decision)
-  let guards = IM.fromList [(i, guard) | (i, clause) <- zip [0 ..] compiledClauses,
-        Just guard <- [leadingIntGuard clause]]
+  let guards = map leadingIntGuard compiledClauses
   pure
     Pred
       { pKey = P.predKey p,
@@ -273,7 +299,10 @@ compilePred ctx p = do
         pClauseCount = count,
         pIndex = index,
         pDecisions = [decision | decision@(DecisionIndex _ _ idx) <- decisions, aiSelective idx],
-        pIntGuards = guards,
+        pIntGuards = listArray (0, max 0 (count - 1)) (if null guards then [Nothing] else guards),
+        pHasGuards = any isJust guards,
+        pAll = shared [0 .. count - 1],
+        pOne = ones,
         pIndexed = P.predIsIndexed (ctxProgram ctx) p,
         pDecls = P.predDecls p,
         pInferred = P.predInferred p,
@@ -284,11 +313,17 @@ compilePred ctx p = do
         pTrustReturn = not (null (P.predDecls p)) && all clTrustReturn compiledClauses
       }
 
-buildIndex :: Store -> Int -> [Clause] -> IO ArgIndex
-buildIndex store position = buildIndexAt store position []
+-- | Ascending ordinals as a selection result, sharing the singletons.
+toCandidates :: Array Int Candidates -> [Int] -> Candidates
+toCandidates _ [] = NoCandidate
+toCandidates ones [i] = ones `unsafeAt` i
+toCandidates _ xs = Candidates (IA.listArray (0, length xs - 1) xs)
 
-buildIndexAt :: Store -> Int -> [Int] -> [Clause] -> IO ArgIndex
-buildIndexAt store position path clauses = do
+buildIndex :: Store -> ([Int] -> Candidates) -> Int -> [Clause] -> IO ArgIndex
+buildIndex store shared position = buildIndexAt store shared position []
+
+buildIndexAt :: Store -> ([Int] -> Candidates) -> Int -> [Int] -> [Clause] -> IO ArgIndex
+buildIndexAt store shared position path clauses = do
   keyed <- forM (zip [0 ..] clauses) $ \(ordinal, clause) -> do
     key <- case patternAtPath (position : path) (clHead clause) of
       Just pattern -> patternKey store pattern
@@ -296,10 +331,10 @@ buildIndexAt store position path clauses = do
     pure (ordinal :: Int, key)
   let open = IS.fromList [ordinal | (ordinal, Nothing) <- keyed]
       grouped = Map.fromListWith IS.union [(key, IS.singleton ordinal) | (ordinal, Just key) <- keyed]
-      withOpen members = IS.toAscList (IS.union members open)
+      withOpen members = shared (IS.toAscList (IS.union members open))
       fast = IM.fromList [(w, withOpen members) | (key, members) <- Map.toList grouped, Just w <- [immediateKey key]]
       boxedKeys = Map.fromList [(key, withOpen members) | (key, members) <- Map.toList grouped, immediateKey key == Nothing]
-  pure (ArgIndex fast boxedKeys (IS.toAscList open) (not (Map.null grouped)))
+  pure (ArgIndex fast boxedKeys (shared (IS.toAscList open)) (not (Map.null grouped)))
 
 patternAtPath :: [Int] -> [Pattern] -> Maybe Pattern
 patternAtPath [] _ = Nothing
@@ -387,118 +422,223 @@ keyOfWord store w = case tagOf w of
 -- Refinement makes no bindings and never evaluates an expression. It is
 -- disabled while a constraint store is active: head bindings may wake a
 -- constraint before a later head mismatch or failed guard is reached.
-candidateClauses :: Store -> Pred -> IO [Int]
-candidateClauses store p
-  | not (pIndexed p) = pure (all' p)
+--
+-- Index results are precomputed and shared; only an intersection or guard
+-- filter leaving two or more clauses, neither of its inputs, builds a new
+-- result, and a boxed key allocates its lookup key.
+candidateClauses :: Store -> Pred -> IO Candidates
+candidateClauses !store p
+  | not (pIndexed p) = pure (pAll p)
   | otherwise = do
       constrained <- readReg store rCLP
-      selected <- principal (constrained == 0) (pIndex p) 0 Nothing
-      if constrained /= 0 || atMostOne selected
-        then pure selected
-        else do
-          refined <- deeper (pDecisions p) selected
-          if IM.null (pIntGuards p)
-            then pure refined
-            else filterM keepGuard refined
+      if constrained /= 0
+        then principalKeys store p False (pIndex p) 0 (pAll p)
+        else
+          if pClauseCount p <= 1
+            -- A pure single candidate is tried directly: its head performs
+            -- every check an index could, and a mismatch binds nothing
+            -- that survives the failure.
+            then pure (pAll p)
+            else do
+              selected <- principalKeys store p True (pIndex p) 0 (pAll p)
+              case selected of
+                Candidates _ -> do
+                  refined <- decisionKeys store p (pDecisions p) selected
+                  if pHasGuards p then keepGuards store p refined else pure refined
+                _ -> pure selected
+
+-- The selection steps are top-level functions: local ones closing over the
+-- store and predicate would be allocated on every call.
+
+-- | Once only one pure candidate remains, ordinary head/body execution
+-- performs all remaining checks without allocating another alternative.
+-- Constraints retain every principal decision: skipped head bindings can
+-- otherwise change whether an error is exposed.
+principalKeys :: Store -> Pred -> Bool -> [ArgIndex] -> Int -> Candidates -> IO Candidates
+principalKeys _ _ _ [] !_ selected = pure selected
+principalKeys store p pureCall (index : rest) !i selected
+  | not (aiSelective index) = principalKeys store p pureCall rest (i + 1) selected
+  | otherwise = do
+      w <- readArg store i >>= deref store
+      if tagOf w == tagRef
+        then principalKeys store p pureCall rest (i + 1) selected
+        else
+          if tagOf w == tagBox
+            then do
+              restricted <- lookupBoxed store index w
+              case restricted of
+                Nothing -> principalKeys store p pureCall rest (i + 1) selected
+                Just candidates -> choose candidates
+            else lookupImmediate store index w >>= choose
   where
-    all' predicate = [0 .. pClauseCount predicate - 1]
-    atMostOne [] = True
-    atMostOne [_] = True
-    atMostOne _ = False
-    -- Once only one pure candidate remains, ordinary head/body execution
-    -- performs all remaining checks without allocating another alternative.
-    -- Constraints retain every principal decision: skipped head bindings
-    -- can otherwise change whether an error is exposed.
-    principal _ _ _ (Just []) = pure []
-    principal True _ _ (Just only@[_]) = pure only
-    principal pureCall (index : rest) !i selected
-      | not (aiSelective index) = principal pureCall rest (i + 1) selected
-      | otherwise = do
-          w <- readArg store i >>= deref store
-          if tagOf w == tagRef
-            then principal pureCall rest (i + 1) selected
-            else if tagOf w == tagBox
-              then do
-                restricted <- lookupIndex index w
-                maybe (principal pureCall rest (i + 1) selected)
-                  (choose pureCall rest (i + 1) selected) restricted
-              else lookupImmediate index w >>= choose pureCall rest (i + 1) selected
-    principal _ [] _ selected = pure (maybe (all' p) id selected)
-    choose pureCall rest i previous candidates =
-      let narrowed = maybe candidates (`intersectAscending` candidates) previous
-       in if null narrowed || (pureCall && atMostOne narrowed)
-            then pure narrowed
-            else principal pureCall rest i (Just narrowed)
-    deeper _ [] = pure []
-    deeper _ only@[_] = pure only
-    deeper (DecisionIndex i path index : rest) selected = do
-      found <- argumentAtPath store i path
-      restricted <- maybe (pure Nothing) (lookupIndex index) found
-      deeper rest (maybe selected (intersectAscending selected) restricted)
-    deeper [] selected = pure selected
-    lookupIndex index w
-      | tagOf w == tagRef = pure Nothing
-      | tagOf w == tagStr = do
-          f <- readCell store (valOf w)
-          pure (Just (IM.findWithDefault (aiOpen index) (funKey f) (aiFast index)))
-      | tagOf w == tagBox = do
-          key <- keyOfWord store w
-          -- NaN has no lawful ordered-map key. Preserve the ordinary
-          -- unification path for it instead of making an index decision.
-          pure $ case key of
-            Just (KFlt d) | isNaN d -> Nothing
-            Just k -> Just (Map.findWithDefault (aiOpen index) k (aiBoxed index))
-            Nothing -> Nothing
-      | otherwise = pure (Just (IM.findWithDefault (aiOpen index) w (aiFast index)))
-    -- Principal immediate keys are the common path. Return the cached list
-    -- directly so singleton selection allocates neither a Maybe nor a list.
-    lookupImmediate index w
-      | tagOf w == tagStr = do
-          f <- readCell store (valOf w)
-          pure (IM.findWithDefault (aiOpen index) (funKey f) (aiFast index))
-      | otherwise = pure (IM.findWithDefault (aiOpen index) w (aiFast index))
-    keepGuard ordinal = case IM.lookup ordinal (pIntGuards p) of
-      Nothing -> pure True
-      Just (IntGuard op a b) -> do
-        left <- guardValue a
-        right <- guardValue b
-        pure $ case (left, right) of
-          (Just x, Just y) -> case op of
-            CmpGt -> x > y
-            CmpLt -> x < y
-            CmpGte -> x >= y
-            CmpLte -> x <= y
-          _ -> True
-    guardValue (GuardInt n) = pure (Just n)
-    guardValue (GuardArg i path) = do
-      found <- argumentAtPath store i path
-      pure $ case found of
-        Just w | tagOf w == tagInt -> Just (valOf w)
-        _ -> Nothing
+    choose !candidates = case intersectCandidates p selected candidates of
+      NoCandidate -> pure NoCandidate
+      narrowed@(OneCandidate _) | pureCall -> pure narrowed
+      narrowed -> principalKeys store p pureCall rest (i + 1) narrowed
+
+-- | Bounded constructor decisions below the principal functors.
+decisionKeys :: Store -> Pred -> [DecisionIndex] -> Candidates -> IO Candidates
+decisionKeys _ _ _ NoCandidate = pure NoCandidate
+decisionKeys _ _ _ only@(OneCandidate _) = pure only
+decisionKeys _ _ [] selected = pure selected
+decisionKeys store p (DecisionIndex i path index : rest) selected = do
+  found <- argumentAtPath store i path
+  if tagOf found == tagRef
+    then decisionKeys store p rest selected
+    else
+      if tagOf found == tagBox
+        then do
+          restricted <- lookupBoxed store index found
+          let !narrowed = maybe selected (intersectCandidates p selected) restricted
+          decisionKeys store p rest narrowed
+        else do
+          restricted <- lookupImmediate store index found
+          let !narrowed = intersectCandidates p selected restricted
+          decisionKeys store p rest narrowed
+
+-- | A boxed key's candidates. NaN has no lawful ordered-map key: preserve
+-- the ordinary unification path for it instead of making an index decision.
+lookupBoxed :: Store -> ArgIndex -> Word' -> IO (Maybe Candidates)
+lookupBoxed store index w = do
+  key <- keyOfWord store w
+  pure $ case key of
+    Just (KFlt d) | isNaN d -> Nothing
+    Just k -> Just (Map.findWithDefault (aiOpen index) k (aiBoxed index))
+    Nothing -> Nothing
+
+-- | An immediate or functor key's candidates: a precomputed shared value.
+lookupImmediate :: Store -> ArgIndex -> Word' -> IO Candidates
+lookupImmediate store index w
+  | tagOf w == tagStr = do
+      f <- readCell store (valOf w)
+      pure $! IM.findWithDefault (aiOpen index) (funKey f) (aiFast index)
+  | otherwise = pure $! IM.findWithDefault (aiOpen index) w (aiFast index)
+{-# INLINE lookupImmediate #-}
+
+-- | Drop the candidates whose leading integer guard is known to fail. A
+-- result equal to the input, empty or single is not rebuilt.
+keepGuards :: Store -> Pred -> Candidates -> IO Candidates
+keepGuards _ _ NoCandidate = pure NoCandidate
+keepGuards store p only@(OneCandidate ordinal) = do
+  ok <- guardHolds store p ordinal
+  pure $! if ok then only else NoCandidate
+keepGuards store p selected@(Candidates ordinals) = do
+  let n = numElements ordinals
+      -- survivors, and the first one
+      count !k !kept !first
+        | k >= n = finish kept first
+        | otherwise = do
+            let ordinal = ordinals `unsafeAt` k
+            ok <- guardHolds store p ordinal
+            if ok
+              then count (k + 1) (kept + 1) (if kept == 0 then ordinal else first)
+              else count (k + 1) kept first
+      finish kept first
+        | kept == n = pure selected
+        | kept == 0 = pure NoCandidate
+        | kept == 1 = pure $! pOne p `unsafeAt` first
+        | otherwise = do
+            survivors <- filterOrdinals [unsafeAt ordinals k | k <- [0 .. n - 1]]
+            pure (Candidates (IA.listArray (0, kept - 1) survivors))
+  count 0 (0 :: Int) (0 :: Int)
+  where
+    filterOrdinals [] = pure []
+    filterOrdinals (ordinal : rest) = do
+      ok <- guardHolds store p ordinal
+      if ok then (ordinal :) <$> filterOrdinals rest else filterOrdinals rest
+
+guardHolds :: Store -> Pred -> Int -> IO Bool
+guardHolds store p ordinal = case pIntGuards p `unsafeAt` ordinal of
+  Nothing -> pure True
+  Just (IntGuard op a b) -> do
+    left <- guardWord a
+    right <- guardWord b
+    pure $!
+      if tagOf left /= tagInt || tagOf right /= tagInt
+        then True
+        else
+          let x = valOf left
+              y = valOf right
+           in case op of
+                CmpGt -> x > y
+                CmpLt -> x < y
+                CmpGte -> x >= y
+                CmpLte -> x <= y
+  where
+    guardWord (GuardInt n) = pure (intWord n)
+    guardWord (GuardArg i path) = argumentAtPath store i path
+
+-- | The intersection of two ascending selections. An input equal to the
+-- result is returned itself, and a singleton is the shared one, so only a
+-- strictly smaller intersection of two or more allocates.
+intersectCandidates :: Pred -> Candidates -> Candidates -> Candidates
+-- Every selection is a subset of all clauses, the first key's starting point.
+intersectCandidates p (Candidates xs) right | numElements xs == pClauseCount p = right
+intersectCandidates _ NoCandidate _ = NoCandidate
+intersectCandidates _ _ NoCandidate = NoCandidate
+intersectCandidates _ left@(OneCandidate x) right = if memberCandidates x right then left else NoCandidate
+intersectCandidates _ left right@(OneCandidate y) = if memberCandidates y left then right else NoCandidate
+intersectCandidates p left@(Candidates xs) right@(Candidates ys)
+  | ny == pClauseCount p = left
+  | kept == ny = right
+  | kept == nx = left
+  | kept == 0 = NoCandidate
+  | kept == 1 = pOne p `unsafeAt` first
+  | otherwise = Candidates (IA.listArray (0, kept - 1) (common 0 0))
+  where
+    nx = numElements xs
+    ny = numElements ys
+    (kept, first) = count 0 0 0 0
+    count :: Int -> Int -> Int -> Int -> (Int, Int)
+    count !i !j !c !f
+      | i >= nx || j >= ny = (c, f)
+      | otherwise =
+          let x = xs `unsafeAt` i
+              y = ys `unsafeAt` j
+           in case compare x y of
+                LT -> count (i + 1) j c f
+                GT -> count i (j + 1) c f
+                EQ -> count (i + 1) (j + 1) (c + 1) (if c == 0 then x else f)
+    common !i !j
+      | i >= nx || j >= ny = []
+      | otherwise =
+          let x = xs `unsafeAt` i
+              y = ys `unsafeAt` j
+           in case compare x y of
+                LT -> common (i + 1) j
+                GT -> common i (j + 1)
+                EQ -> x : common (i + 1) (j + 1)
+
+memberCandidates :: Int -> Candidates -> Bool
+memberCandidates _ NoCandidate = False
+memberCandidates x (OneCandidate y) = x == y
+memberCandidates x (Candidates ys) = go 0
+  where
+    n = numElements ys
+    go !k
+      | k >= n = False
+      | otherwise = case compare (ys `unsafeAt` k) x of
+          LT -> go (k + 1)
+          EQ -> True
+          GT -> False
 
 -- | Read at most the compiled path length. An unbound ancestor, a constant
--- or a different constructor arity cannot provide a child discriminator.
+-- or a different constructor arity cannot provide a child discriminator;
+-- such a path reads as an unbound word, which no index or guard decides.
 -- No recursive walk of runtime data occurs, including for cyclic data.
-argumentAtPath :: Store -> Int -> [Int] -> IO (Maybe Word')
+argumentAtPath :: Store -> Int -> [Int] -> IO Word'
 argumentAtPath store position path = readArg store position >>= descend path
   where
-    descend [] word = Just <$> deref store word
+    descend [] word = deref store word
     descend (i : rest) word = do
       current <- deref store word
       if tagOf current /= tagStr
-        then pure Nothing
+        then pure (refWord 0)
         else do
           functor <- readCell store (valOf current)
           if i >= funArity functor
-            then pure Nothing
+            then pure (refWord 0)
             else readCell store (valOf current + i + 1) >>= descend rest
-
-intersectAscending :: [Int] -> [Int] -> [Int]
-intersectAscending left@(x : xs) right@(y : ys) = case compare x y of
-  LT -> intersectAscending xs right
-  EQ -> x : intersectAscending xs ys
-  GT -> intersectAscending left ys
-intersectAscending _ _ = []
 
 compileClause :: Ctx -> [P.Signature] -> S.Clause -> IO Clause
 compileClause ctx sigs clause = do

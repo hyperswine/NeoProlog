@@ -64,7 +64,7 @@ selected program key args constrained = evalIO $ do
       vars <- newIORef IM.empty
       forM_ (zip [0 ..] args) $ \(i, term) -> Store.importTerm store vars term >>= Store.writeArg store i
       Store.writeReg store Store.rCLP (if constrained then 1 else 0)
-      Compile.candidateClauses store predicate
+      Compile.candidateList <$> Compile.candidateClauses store predicate
 
 pathSource :: String
 pathSource = unlines

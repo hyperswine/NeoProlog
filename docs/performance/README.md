@@ -5,6 +5,15 @@ See the [current engine guide](../engine/README.md),
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
+## Allocation-free clause selection - 2026-10-19
+
+The [clause selection report](../engine/clause-selection-2026-10-19.md)
+records Core clause selection from precomputed, shared results, with an
+unboxed retry cursor for clause choices. Ticky shows zero selection
+allocation on reverse, loop, Fibonacci and queens. GHC allocation falls
+24-43% on those workloads and 56% on a nested-decision case. CPU is flat
+to +3% on the four major cases and 40% lower on the nested-decision case.
+
 ## Plain calls and the choice stack - 2026-10-19
 
 The [control stacks report](../engine/control-stacks-2026-10-19.md) records

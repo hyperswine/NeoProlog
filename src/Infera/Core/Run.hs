@@ -21,9 +21,11 @@ where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.Array ((!))
-import Data.Array.Base (getNumElements, unsafeRead, unsafeWrite)
+import qualified Data.Array.IArray as IA
+import Data.Array.Base (getNumElements, numElements, unsafeAt, unsafeRead, unsafeWrite)
 import Data.Bits ((.|.))
 import Data.Array.IO (IOArray, IOUArray, newArray, newArray_)
+import Data.Array.Unboxed (UArray)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
@@ -102,8 +104,9 @@ data Choice = Choice
   }
 
 data Alt
-  = -- | remaining candidates, saved argument address, depth, continuation
-    AltClauses !Pred [Int] !Int !Int Cont
+  = -- | the call's candidates, saved argument address, depth, continuation;
+    -- the next candidate's position is the choice's 'markNext'
+    AltClauses !Pred !(UArray Int Int) !Int !Int Cont
   | AltGoals [Goal] !Int !Int !Int Cont
   | AltNot !(IORef Bool) !(IORef [SearchItem]) Cont
   | AltIf !(IORef Int) (Maybe ([Goal], Int, Int, Int)) Cont
@@ -177,12 +180,14 @@ data Choices = Choices
     csWatched :: !(IOArray Int IS.IntSet)
   }
 
-markStride, markH, markTR, markOut, markScopes :: Int
-markStride = 4
+markStride, markH, markTR, markOut, markScopes, markNext :: Int
+markStride = 5
 markH = 0
 markTR = 1
 markOut = 2
 markScopes = 3
+-- | the position of the next candidate of an 'AltClauses'; others ignore it
+markNext = 4
 
 -- Machine counters, unboxed: the choice height, the guard height and the
 -- number of open issue scopes.
@@ -355,6 +360,7 @@ pushChoiceWithStore m store alt = do
   unsafeWrite marks (at + markTR) tr
   unsafeWrite marks (at + markOut) out
   unsafeWrite marks (at + markScopes) scopes
+  unsafeWrite marks (at + markNext) 1
   unsafeWrite (csAlts cs) top alt
   readIORef (mTables m) >>= unsafeWrite (csTables cs) top
   readIORef (mDynamic m) >>= unsafeWrite (csDynamic cs) top
@@ -1436,15 +1442,17 @@ callClauses m = callClausesWithFrame m 0
 
 callClausesWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
 callClausesWithFrame m frame predicate barrier depth returnCont = do
-  let s = mStore m
+  let !s = mStore m
   candidates <- candidateClauses s predicate
   case candidates of
-    [] -> backtrack m
-    [ordinal] -> tryClauseWithFrame m frame predicate ordinal barrier depth returnCont
-    (ordinal : more) -> do
+    NoCandidate -> backtrack m
+    OneCandidate ordinal -> tryClauseWithFrame m frame predicate ordinal barrier depth returnCont
+    Candidates ordinals -> do
       saved <- saveArgs s (pArity predicate)
-      choice <- pushChoice m (AltClauses predicate more saved depth returnCont)
-      tryClause m predicate ordinal (min barrier choice) depth returnCont
+      let !alt = AltClauses predicate ordinals saved depth returnCont
+      choice <- pushChoice m alt
+      let !barrier' = min barrier choice
+      tryClause m predicate (ordinals `unsafeAt` 0) barrier' depth returnCont
 
 -- | Try one clause against the argument registers.
 tryClause :: Machine -> Pred -> Int -> Int -> Int -> Cont -> IO Step
@@ -1476,7 +1484,7 @@ recordSlots m reused count = case mSlotStats m of
 enterClause :: Machine -> Clause -> Int -> Int -> Int -> Cont -> IO Step
 enterClause m clause base barrier depth cont = do
   ok <- matchHead m base (clHead clause) 0
-  let cont' = case cont of
+  let !cont' = case cont of
         CReturn h g (Just _) next | clTrustReturn clause -> CReturn h g Nothing next
         _ -> cont
   if ok
@@ -1733,13 +1741,13 @@ backtrackChoice m top =
       writeReg s rBOUND 0
       alt <- unsafeRead (csAlts cs) index
       case alt of
-        AltClauses predicate (ordinal : more) saved depth cont -> do
+        AltClauses predicate ordinals saved depth cont -> do
+          next <- unsafeRead (csMarks cs) (at + markNext)
           loadArgs s saved (pArity predicate)
-          if null more
+          if next + 1 >= numElements ordinals
             then setChoiceTop m index >> refreshHb m
-            else unsafeWrite (csAlts cs) index (AltClauses predicate more saved depth cont)
-          tryClause m predicate ordinal index depth cont
-        AltClauses _ [] _ _ _ -> pop >> backtrack m
+            else unsafeWrite (csMarks cs) (at + markNext) (next + 1)
+          tryClause m predicate (ordinals `unsafeAt` next) index depth cont
         AltGoals goals base barrier depth cont -> do
           pop
           run m (CGoals goals base barrier depth cont)
@@ -2438,7 +2446,8 @@ startIteration m fixRef = do
         [ordinal] -> tryClause m (fxPred fx) ordinal (sentinel + 1) (fxDepth fx) (CExitTable fixRef)
         ordinal : more -> do
           saved <- saveArgs s (pArity (fxPred fx))
-          choice <- pushChoice m (AltClauses (fxPred fx) more saved (fxDepth fx) (CExitTable fixRef))
+          let ordinals = IA.listArray (0, length more) (ordinal : more)
+          choice <- pushChoice m (AltClauses (fxPred fx) ordinals saved (fxDepth fx) (CExitTable fixRef))
           tryClause m (fxPred fx) ordinal (min (sentinel + 1) choice) (fxDepth fx) (CExitTable fixRef)
       _ -> callClauses m (fxPred fx) (sentinel + 1) (fxDepth fx) (CExitTable fixRef)
 
