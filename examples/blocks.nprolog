@@ -1,0 +1,166 @@
+# ─── Blocks world ────────────────────────────────────────────────────────────
+#
+# Blocks rest on a table or on one another.  A robot arm moves one block at a
+# time: the block must be clear, with nothing on top of it, and it goes onto
+# the table or onto another clear block.  A state says where every block
+# rests, listing the blocks in a fixed order so that equal states are equal
+# terms:
+#
+#     [on a table, on b table, on c a]        c
+#                                             a  b
+#
+# A goal lists the facts that must hold; blocks it does not mention may end up
+# anywhere.
+#
+#   plan Start Goal Moves      a shortest plan, by breadth-first search
+#   reachable Start State      every state the arm can produce from Start
+#
+# Run from the repository root:  infera examples/blocks.nprolog
+
+# ── Moves ────────────────────────────────────────────────────────────────────
+
+# move State Move Next: Move takes block X off Y and puts it on Z.
+move State (move X Y Z) Next <-
+  member (on X Y) State, clear X State,
+  destination X Y Z State,
+  put X Z State Next.
+
+# Nothing rests on X.
+clear X State <- not (member (on _ X) State).
+
+# The table always has room.  A block destination must be clear, and it can
+# be neither the moving block nor the block it already rests on.
+destination _ Y table _ <- Y != table.
+destination X Y Z State <-
+  member (on Z _) State, Z != X, Z != Y, clear Z State.
+
+# put X Z State Next: Next is State with X resting on Z.
+put X Z [on X _ | Rest] [on X Z | Rest].
+put X Z [on B S | Rest] [on B S | Rest1] <- B != X, put X Z Rest Rest1.
+
+# Every fact of the goal holds in the state.
+satisfies State Goal <- forall (member F Goal) (member F State).
+
+# ── Shortest plans ───────────────────────────────────────────────────────────
+
+# The queue holds states with the moves that reached them, newest move first.
+# Seen holds every state queued so far, so each state is expanded at most once
+# and the search ends even though every move can be undone.  The first state
+# taken from the queue that satisfies the goal was reached by fewest moves.
+plan Start Goal Moves <-
+  search [node Start []] [Start] Goal Reversed,
+  reverse Reversed Moves.
+
+# A tabled call would use the whole queue as its key and store each
+# intermediate queue, so the search loop opts out of default tabling.
+search : notable.
+search [node State Path | Queue] Seen Goal Moves <-
+  ( satisfies State Goal -> Moves = Path
+  ; findall (node Next [M | Path]) (move State M Next) Children,
+    unseen Children Seen Seen1 Fresh,
+    append Queue Fresh Queue1,
+    search Queue1 Seen1 Goal Moves ).
+
+# unseen Nodes Seen Seen1 Fresh: Fresh keeps the nodes whose state is not in
+# Seen, and Seen1 adds their states to it.
+unseen [] Seen Seen [].
+unseen [node S P | Ns] Seen Seen1 Fresh <-
+  ( member S Seen -> unseen Ns Seen Seen1 Fresh
+  ; Fresh = [node S P | Rest], unseen Ns [S | Seen] Seen1 Rest ).
+
+# run Moves Start End: End is the state after making Moves from Start.
+run [] S S.
+run [move X _ Z | Moves] S End <- put X Z S S1, run Moves S1 End.
+
+# ── Reachable states ─────────────────────────────────────────────────────────
+
+# The recursive clause is left-recursive and the move graph has cycles, so
+# ordinary depth-first resolution would never return.  Tabling, on by default
+# for this predicate, records each state once and stops at the fixpoint, when
+# a pass over the known states finds no new one.
+reachable Start Start.
+reachable Start State <- reachable Start Before, move Before _ State.
+
+states Start N <- findall S (reachable Start S) All, length All N.
+
+# ── Problems ─────────────────────────────────────────────────────────────────
+
+# The Sussman anomaly: c rests on a, and the goal is a on b on c.  Achieving
+# either goal first and then the other undoes the first one, so a planner that
+# works on one goal at a time fails; the shortest plan interleaves them.
+problem sussman [on a table, on b table, on c a] [on a b, on b c].
+
+# Turn a tower of five upside down.
+problem invert [on a b, on b c, on c d, on d e, on e table]
+               [on e d, on d c, on c b, on b a, on a table].
+
+# Two towers trade blocks: c, a, e and d, b, bottom to top.
+problem trade [on a table, on b a, on c b, on d table, on e d]
+              [on c table, on a c, on e a, on d table, on b d].
+
+# ── Drawing ──────────────────────────────────────────────────────────────────
+
+# Towers bottom to top, in the order of their bottom blocks.
+towers State Towers <- findall T (member (on B table) State, tower B State T) Towers.
+
+tower B State [B | Above] <-
+  ( member (on C B) State -> tower C State Above ; Above = [] ).
+
+# The towers side by side, top level first, above a line for the table.
+picture State -> { towers State Ts, tallest Ts 0 H }, levels H Ts, table_line Ts.
+
+levels 0 _ -> [].
+levels L Ts -> { L > 0, L1 is L - 1 }, "  ", level L Ts, nl, levels L1 Ts.
+
+level _ [] -> [].
+level L [T | Ts] -> ( { nth L T B } -> wr B ; " " ), " ", level L Ts.
+
+table_line Ts -> "  ", dashes Ts, nl.
+dashes [] -> [].
+dashes [_ | Ts] -> "--", dashes Ts.
+
+# A solved problem: the start, the numbered moves and the result.
+solution Name ->
+  { problem Name Start Goal, plan Start Goal Moves, run Moves Start End,
+    length Moves N },
+  wr Name, ": ", wr N, " moves", nl,
+  picture Start, steps Moves 1, picture End.
+
+steps [] _ -> [].
+steps [move X Y Z | Moves] I ->
+  padl I 4, ". move ", wr X, " from ", wr Y, " to ", wr Z, nl,
+  { I1 is I + 1 }, steps Moves I1.
+
+# ── Lists ────────────────────────────────────────────────────────────────────
+
+member X [X | _].
+member X [_ | T] <- member X T.
+
+append [] L L.
+append [H | T] L [H | R] <- append T L R.
+
+length [] 0.
+length [_ | T] N <- length T N1, N is N1 + 1.
+
+reverse L R <- reverse_onto L [] R.
+reverse_onto [] R R.
+reverse_onto [X | Xs] Acc R <- reverse_onto Xs [X | Acc] R.
+
+# nth I List X: X is element I, counting from 1.
+nth 1 [X | _] X.
+nth I [_ | T] X <- I > 1, I1 is I - 1, nth I1 T X.
+
+tallest [] H H.
+tallest [T | Ts] H0 H <- length T N, H1 is max H0 N, tallest Ts H1 H.
+
+# ── Demo ─────────────────────────────────────────────────────────────────────
+
+> problem sussman Start Goal, plan Start Goal Moves?
+> emit (solution sussman)?
+> emit (solution invert)?
+> emit (solution trade)?
+# Every arrangement of n blocks is reachable from every other: 13 states for
+# three blocks, 73 for four and 501 for five.
+> states [on a table, on b table, on c table] N?
+> states [on a table, on b table, on c table, on d table] N?
+> problem invert Start _, states Start N?

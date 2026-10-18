@@ -1,0 +1,284 @@
+# ─── Stable matching ─────────────────────────────────────────────────────────
+#
+# Eight leads and eight follows are to be paired for a dance class, and every
+# person has ranked everyone on the other side.  A pairing is stable when no
+# lead and follow who are not partners would both rather dance with each other
+# than with their partners; such a lead and follow "block" the pairing.
+#
+# Gale and Shapley (1962) showed that a stable pairing always exists and found
+# one by deferred acceptance: each free proposer asks the next person on their
+# list, and a receiver holds the best offer so far and turns the rest down.
+# Whatever the order of the offers, every proposer ends with the best partner
+# they have in any stable pairing, and every receiver with the worst.
+#
+#   gale_shapley Side Pairs N   deferred acceptance with Side proposing;
+#                               N counts the offers made
+#   stable Pairs                no lead and follow block Pairs
+#   stable_pairing Pairs        every stable pairing, by a search that rejects
+#                               a partial pairing as soon as it is blocked
+#
+# The second half assigns students to electives with limited seats: the same
+# algorithm with capacities, known as the college admissions problem.
+#
+# Run from the repository root:  infera examples/stable_matching.nprolog
+
+# The algorithm and the search pass growing lists from call to call, so
+# memoising their calls would only copy those lists into tables.
+<- notable.
+
+# ── Preferences ──────────────────────────────────────────────────────────────
+
+side leads [ada, ben, cal, dan, eli, finn, gus, hal].
+side follows [ivy, jo, kim, lea, mia, nia, ola, pam].
+
+prefers ada [ivy, kim, nia, jo, lea, mia, pam, ola].
+prefers ben [pam, mia, ivy, ola, lea, kim, jo, nia].
+prefers cal [ola, jo, ivy, nia, mia, pam, lea, kim].
+prefers dan [kim, mia, lea, jo, nia, pam, ola, ivy].
+prefers eli [ola, ivy, pam, mia, nia, lea, kim, jo].
+prefers finn [mia, kim, ivy, pam, nia, ola, lea, jo].
+prefers gus [pam, ola, nia, kim, mia, lea, jo, ivy].
+prefers hal [kim, ola, ivy, pam, nia, mia, jo, lea].
+
+prefers ivy [cal, finn, eli, ada, gus, ben, hal, dan].
+prefers jo [gus, ada, dan, finn, hal, ben, eli, cal].
+prefers kim [cal, eli, hal, ada, dan, ben, gus, finn].
+prefers lea [ada, hal, gus, ben, finn, eli, dan, cal].
+prefers mia [eli, gus, finn, dan, cal, ben, ada, hal].
+prefers nia [ben, finn, hal, dan, gus, cal, eli, ada].
+prefers ola [gus, hal, cal, dan, finn, ada, eli, ben].
+prefers pam [dan, finn, gus, ada, ben, hal, eli, cal].
+
+# better P X Y: P ranks X above Y.
+better P X Y <- prefers P Ranking, before X Y Ranking.
+
+# before X Y List: X and Y differ and X comes first in List.
+before X Y [X | _] <- X != Y.
+before X Y [Z | Zs] <- Z != X, Z != Y, before X Y Zs.
+
+# rank P Q K: Q is P's K-th choice.
+rank P Q K <- prefers P Ranking, position Q Ranking 1 K.
+
+position X [X | _] K K.
+position X [Y | Ys] I K <- X != Y, I1 is I + 1, position X Ys I1 K.
+
+# ── Deferred acceptance ──────────────────────────────────────────────────────
+
+# Pairs lists pair Lead Follow in the order of the leads, whichever side
+# proposes.
+gale_shapley Side Pairs N <-
+  side Side People,
+  offers People Free,
+  propose Free [] Holds 0 N,
+  pairs Side Holds Pairs.
+
+offers [] [].
+offers [P | Ps] [free P Ranking | Fs] <- prefers P Ranking, offers Ps Fs.
+
+# propose Free Holds Final N0 N: Free lists free P Unasked for every proposer
+# without a partner; Holds lists hold R P Unasked when R holds the offer of P.
+# Everyone ranks everyone, so a free proposer always has someone left to ask.
+propose [] Holds Holds N N.
+propose [free P [R | Rs] | Free] Holds Final N0 N <-
+  N1 is N0 + 1,
+  ( select (hold R Q Qs) Holds Others ->
+      ( better R P Q ->
+          # R trades up, and Q is free to ask the next person on their list.
+          propose [free Q Qs | Free] [hold R P Rs | Others] Final N1 N
+      ; propose [free P Rs | Free] Holds Final N1 N )
+  ; propose Free [hold R P Rs | Holds] Final N1 N ).
+
+pairs Side Holds Pairs <- side leads Leads, partners Leads Side Holds Pairs.
+
+partners [] _ _ [].
+partners [L | Ls] Side Holds [pair L F | Ps] <-
+  held Side L F Holds, partners Ls Side Holds Ps.
+
+held leads L F Holds <- member (hold F L _) Holds.
+held follows L F Holds <- member (hold L F _) Holds.
+
+# ── Stability ────────────────────────────────────────────────────────────────
+
+# Lead L and follow F block Pairs: they are not partners, and each ranks the
+# other above their own partner.
+blocks Pairs L F <-
+  member (pair L Mine) Pairs, member (pair Theirs F) Pairs,
+  Mine != F, better L F Mine, better F L Theirs.
+
+stable Pairs <- not (blocks Pairs _ _).
+
+# Every stable pairing, leads in order.
+stable_pairing Pairs <-
+  side leads Leads, side follows Follows,
+  extend Leads Follows [] Made, reverse Made Pairs.
+
+# extend Leads Free Made Pairs: give each remaining lead an unused follow, and
+# drop the new pair at once if it blocks with a pair already made.  A blocking
+# lead and follow always come from two different pairs, so checking each new
+# pair against the earlier ones covers every candidate exactly once.
+extend [] _ Made Made.
+extend [L | Ls] Free Made Pairs <-
+  select F Free Rest,
+  not (clash (pair L F) Made),
+  extend Ls Rest [pair L F | Made] Pairs.
+
+clash (pair L F) Made <-
+  member (pair L2 F2) Made,
+  ( better L F2 F, better F2 L L2 ; better L2 F F2, better F L2 L ).
+
+# ── Who gains ────────────────────────────────────────────────────────────────
+
+partner P Pairs Q <- member (pair P Q) Pairs.
+partner P Pairs Q <- member (pair Q P) Pairs.
+
+# no_worse Side A B: nobody on Side prefers their partner in B to their
+# partner in A.
+no_worse Side A B <-
+  side Side People,
+  forall (member P People)
+    (partner P A X, partner P B Y, not (better P Y X)).
+
+# The theorem, checked on this instance: the leads' result is the best stable
+# pairing for every lead and the worst for every follow.
+lead_optimal Pairs <- forall (stable_pairing Other) (no_worse leads Pairs Other).
+follow_pessimal Pairs <- forall (stable_pairing Other) (no_worse follows Other Pairs).
+
+# The sum of the ranks Side gives their partners: lower is better for Side.
+cost Side Pairs Total <- side Side People, rank_sum People Pairs 0 Total.
+
+rank_sum [] _ T T.
+rank_sum [P | Ps] Pairs T0 T <-
+  partner P Pairs Q, rank P Q K, T1 is T0 + K, rank_sum Ps Pairs T1 T.
+
+# ── Printing ─────────────────────────────────────────────────────────────────
+
+pairing [] -> [].
+pairing [pair L F | Ps] -> wr L, "-", wr F, " ", pairing Ps.
+
+# Every stable pairing with the rank sums of both sides.
+lattice ->
+  { findall P (stable_pairing P) All },
+  "leads follows  pairing", nl,
+  lattice_rows All.
+
+lattice_rows [] -> [].
+lattice_rows [P | Ps] ->
+  { cost leads P CL, cost follows P CF },
+  padl CL 5, padl CF 8, "  ", pairing P, nl,
+  lattice_rows Ps.
+
+proposals Side -> { gale_shapley Side Pairs N }, wr Side, " propose, ", wr N, " offers: ", pairing Pairs, nl.
+
+# ── Electives with limited seats ─────────────────────────────────────────────
+# Students list the electives they would take, best first; each elective
+# ranks the students (by year, audition or lottery) and has some seats.
+# Students propose: an elective holds its best applicants up to its seats and
+# turns the rest down.  No student is left wishing for an elective that has a
+# free seat or that ranks them above someone it admitted.
+
+seats robotics 2.
+seats drama 2.
+seats debate 1.
+seats choir 2.
+
+wants ana [robotics, debate, drama].
+wants ben [robotics, choir].
+wants cara [debate, robotics, drama, choir].
+wants dev [drama, choir].
+wants eli [robotics, drama, debate].
+wants fay [debate, drama, choir].
+wants gus [robotics, debate].
+wants hana [choir, drama, robotics].
+
+ranks robotics [gus, cara, ana, eli, ben, hana, dev, fay].
+ranks drama [dev, fay, hana, ana, cara, eli, ben, gus].
+ranks debate [fay, cara, ana, gus, eli, ben, dev, hana].
+ranks choir [hana, ben, dev, fay, cara, ana, eli, gus].
+
+admit Rosters <-
+  findall (free S Choices) (wants S Choices) Free,
+  findall (roster E []) (seats E _) Empty,
+  apply Free Empty Rosters.
+
+# apply Free Rosters Final: a roster holds seat Student Unasked entries, best
+# first by the elective's ranking.  A student turned down by every elective on
+# their list gets none.
+apply [] Rosters Rosters.
+apply [free _ [] | Free] Rosters Final <- apply Free Rosters Final.
+apply [free S [E | Es] | Free] Rosters Final <-
+  select (roster E Held) Rosters Others,
+  ranks E Order,
+  insert_seat Order (seat S Es) Held Held1,
+  seats E N, length Held1 M,
+  ( M > N ->
+      last_seat Held1 Kept (seat W Ws),
+      apply [free W Ws | Free] [roster E Kept | Others] Final
+  ; apply Free [roster E Held1 | Others] Final ).
+
+insert_seat _ New [] [New].
+insert_seat Order (seat S Es) [seat T Ts | Rest] Out <-
+  ( before S T Order -> Out = [seat S Es, seat T Ts | Rest]
+  ; Out = [seat T Ts | Out1], insert_seat Order (seat S Es) Rest Out1 ).
+
+last_seat [X] [] X.
+last_seat [X, Y | T] [X | Kept] Last <- last_seat [Y | T] Kept Last.
+
+placed Rosters S E <- member (roster E Held) Rosters, member (seat S _) Held.
+
+# S would rather have E than their own place, and E would take S.
+envy Rosters S E <-
+  wants S Choices, member E Choices,
+  ( placed Rosters S Mine -> before E Mine Choices ; true ),
+  member (roster E Held) Rosters,
+  once (would_take E S Held).
+
+# E has a free seat, or ranks S above a student it admitted.
+would_take E _ Held <- seats E N, length Held M, M < N.
+would_take E S Held <- ranks E Order, member (seat T _) Held, before S T Order.
+
+fair Rosters <- not (envy Rosters _ _).
+
+fair_admission <- admit Rosters, fair Rosters.
+
+electives ->
+  { admit Rosters, findall E (seats E _) Es },
+  roster_lines Es Rosters,
+  { findall S (wants S _, not (placed Rosters S _)) Unplaced },
+  "no elective: ", wr Unplaced, nl.
+
+roster_lines [] _ -> [].
+roster_lines [E | Es] Rosters ->
+  { seats E N, member (roster E Held) Rosters, findall S (member (seat S _) Held) Names },
+  padr E 10, wr N, " seats  ", wr Names, nl,
+  roster_lines Es Rosters.
+
+# ── Lists ────────────────────────────────────────────────────────────────────
+
+member X [X | _].
+member X [_ | T] <- member X T.
+
+select X [X | T] T.
+select X [H | T] [H | R] <- select X T R.
+
+length [] 0.
+length [_ | T] N <- length T N1, N is N1 + 1.
+
+reverse L R <- reverse_onto L [] R.
+reverse_onto [] R R.
+reverse_onto [X | Xs] Acc R <- reverse_onto Xs [X | Acc] R.
+
+# ── Demo ─────────────────────────────────────────────────────────────────────
+
+> emit (proposals leads)?
+> emit (proposals follows)?
+> gale_shapley leads Pairs _, stable Pairs, lead_optimal Pairs, follow_pessimal Pairs?
+> findall P (stable_pairing P) All, length All N?
+> emit lattice?
+# Swapping two partners of a stable pairing produces a blocking pair.
+> gale_shapley leads [pair L1 F1, pair L2 F2 | Rest] _, blocks [pair L1 F2, pair L2 F1 | Rest] L F?
+> emit electives?
+> fair_admission?
+# Seats handed out first come, first served are not stable: cara, eli and
+# gus would each rather have robotics, which ranks them above ana and ben.
+> envy [roster robotics [seat ana [], seat ben []], roster drama [seat cara [], seat dev []],
+        roster debate [seat eli []], roster choir [seat fay [], seat gus []]] S robotics?

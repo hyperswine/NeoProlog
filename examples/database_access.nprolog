@@ -1,0 +1,289 @@
+# ─── The database access problem: readers and writers ────────────────────────
+#
+# Several processes share a database.  Readers only look at it, so any number
+# may read at once; a writer changes it, so while it writes nobody else may
+# read or write.  Courtois, Heymans and Parnas posed the problem in 1971 and
+# solved it with two semaphores.  Here each protocol is a transition system,
+# and Infera checks it by exploring every interleaving of its processes:
+# tabling turns a few rules about reachable states into a small model checker.
+#
+# The database holds one record x, initially 0.  Two writers each add 1 to it
+# in two steps, reading x and then writing x + 1, and then stop.  Two readers
+# read forever.  Each protocol is checked for
+#
+#   exclusion    a writer inside the database is alone there
+#   updates      once both writers are done, x = 2: no update was lost
+#   deadlock     some process can always move
+#   overtaking   readers cannot keep a waiting writer out forever (checked
+#                for the two protocols that pass the other checks)
+#
+# and every failure is shown as a shortest run that produces it.  The
+# protocols, from broken to fair:
+#
+#   none           no synchronisation at all
+#   careless       the 1971 solution, except that writers also take the
+#                  readers' mutex while they write
+#   readers_first  the 1971 solution: the first reader in takes the room for
+#                  all readers, the last one out gives it back
+#   turnstile      everybody passes a turnstile first, and a writer holds it
+#                  while it waits, so no new reader can overtake it (from
+#                  Downey, The Little Book of Semaphores)
+#
+# Run from the repository root:  infera examples/database_access.nprolog
+
+# ── States ───────────────────────────────────────────────────────────────────
+#
+# A state is s Processes Shared.  The processes are two readers, r Step, and
+# two writers, w Step Copy, where Copy is the value the writer read.  Shared is
+# g X Readers Mutex Room Turnstile: the record, the count of readers inside,
+# and three binary semaphores, 1 when free.  A step that takes a semaphore is
+# only possible while it is free, which is how a process waits.
+
+start (s [r idle, r idle, w want 0, w want 0] (g 0 0 1 1 1)).
+
+# next P S Step S1: under protocol P, one process moves from S to S1.  Any
+# process that can move may go next; exploring every choice explores every
+# interleaving.
+next P (s Ps G) (step I Action) (s Ps1 G1) <-
+  pick Ps 1 I Proc Ps1 Proc1,
+  act P Proc G Action Proc1 G1.
+
+# pick Ps K I X Ps1 Y: X is process I of Ps (counting from K), and Ps1 is Ps
+# with Y in its place.
+pick [X | Xs] I I X [Y | Xs] Y.
+pick [X | Xs] K I P [X | Ys] Q <- K1 is K + 1, pick Xs K1 I P Ys Q.
+
+# ── Protocols ────────────────────────────────────────────────────────────────
+# act P Process Shared Action Process1 Shared1
+
+# Every protocol: inside the database a writer reads x, then writes x + 1.
+act _ (w inside _) (g X N M R T) (reads X) (w copied X) (g X N M R T).
+act _ (w copied C) (g _ N M R T) (writes X) (w written C) (g X N M R T) <- X is C + 1.
+
+# none: everybody walks straight in.
+act none (r idle) G start (r reading) G.
+act none (r reading) G stop (r idle) G.
+act none (w want C) G enter (w inside C) G.
+act none (w written C) G leave (w done C) G.
+
+# The readers of readers_first and careless arrive without a turnstile.
+act readers_first (r idle) G arrive (r enter) G.
+act careless (r idle) G arrive (r enter) G.
+
+# The lightswitch of readers_first, careless and turnstile: under the mutex,
+# the first reader in takes the room and the last reader out releases it.
+lightswitch readers_first.
+lightswitch careless.
+lightswitch turnstile.
+
+act P (r enter) (g X N 1 R T) (take mutex) (r count) (g X N 0 R T) <- lightswitch P.
+act P (r count) (g X N M R T) (readers N1) (r Next) (g X N1 M R T) <-
+  lightswitch P, N1 is N + 1,
+  ( N1 == 1 -> Next = first ; Next = admitted ).
+act P (r first) (g X N M 1 T) (take room) (r admitted) (g X N M 0 T) <- lightswitch P.
+act P (r admitted) (g X N _ R T) (release mutex) (r reading) (g X N 1 R T) <- lightswitch P.
+act P (r reading) (g X N 1 R T) (take mutex) (r uncount) (g X N 0 R T) <- lightswitch P.
+act P (r uncount) (g X N M R T) (readers N1) (r Next) (g X N1 M R T) <-
+  lightswitch P, N1 is N - 1,
+  ( N1 == 0 -> Next = last ; Next = finished ).
+act P (r last) (g X N M _ T) (release room) (r finished) (g X N M 1 T) <- lightswitch P.
+act P (r finished) (g X N _ R T) (release mutex) (r idle) (g X N 1 R T) <- lightswitch P.
+
+# readers_first: a writer takes the room for itself.
+act readers_first (w want C) (g X N M 1 T) (take room) (w inside C) (g X N M 0 T).
+act readers_first (w written C) (g X N M _ T) (release room) (w done C) (g X N M 1 T).
+
+# careless: the same, but a writer also takes the mutex once it has the room.
+act careless (w want C) (g X N M 1 T) (take room) (w locking C) (g X N M 0 T).
+act careless (w locking C) (g X N 1 R T) (take mutex) (w inside C) (g X N 0 R T).
+act careless (w written C) (g X N _ R T) (release mutex) (w leaving C) (g X N 1 R T).
+act careless (w leaving C) (g X N M _ T) (release room) (w done C) (g X N M 1 T).
+
+# turnstile: a reader passes the turnstile straight through; a writer keeps
+# it until it has finished writing.
+act turnstile (r idle) (g X N M R 1) (take turnstile) (r passing) (g X N M R 0).
+act turnstile (r passing) (g X N M R _) (release turnstile) (r enter) (g X N M R 1).
+act turnstile (w want C) (g X N M R 1) (take turnstile) (w waiting C) (g X N M R 0).
+act turnstile (w waiting C) (g X N M 1 T) (take room) (w inside C) (g X N M 0 T).
+act turnstile (w written C) (g X N M R _) (release turnstile) (w leaving C) (g X N M R 1).
+act turnstile (w leaving C) (g X N M _ T) (release room) (w done C) (g X N M 1 T).
+
+# ── Reachable states ─────────────────────────────────────────────────────────
+
+# Every state some interleaving produces.  Readers loop forever, so the state
+# graph has cycles and depth-first resolution would never return; tabling, on
+# by default for this predicate, adds each state once and stops at the
+# fixpoint.
+reachable _ S <- start S.
+reachable P S <- reachable P S0, next P S0 _ S.
+
+states P N <- findall S (reachable P S) All, length All N.
+
+# ── Properties ───────────────────────────────────────────────────────────────
+
+inside_db (r reading).
+inside_db (w inside _).
+inside_db (w copied _).
+inside_db (w written _).
+
+writing (w inside _).
+writing (w copied _).
+writing (w written _).
+
+# A writer is in the database together with someone else.
+conflict (s Ps _) <- select W Ps Others, writing W, member O Others, inside_db O.
+
+# Both writers are done, but x does not show both updates.
+lost_update (s Ps (g X _ _ _ _)) <-
+  forall (member (w Step _) Ps) (Step == done),
+  X != 2.
+
+# Nobody can move.
+stuck_state P S <- not (next P S _ _).
+
+# Writer 1, the third process, waits for the room while someone else has it.
+waiting readers_first (s [_, _, w want _, _] (g _ _ _ 0 _)).
+waiting turnstile (s [_, _, w waiting _, _] (g _ _ _ 0 _)).
+
+# A step of the other processes after which writer 1 still waits.
+passing P S Step S1 <- next P S Step S1, waiting P S1.
+
+# loop P S T: passing steps lead from S to T.  A state that loops back to
+# itself starts a run that can go round forever, the other processes always
+# moving while writer 1 waits for a room that is never free.
+loop P S T <- passing P S _ T.
+loop P S T <- loop P S U, passing P U _ T.
+
+# A loop only shows unfair treatment of the writer if the readers keep
+# finishing their reads: otherwise one reader that never stops reading would
+# keep any writer out.  So each reader must be reading somewhere on the loop
+# and idle somewhere else.  The search runs over a state paired with the
+# conditions the loop has still to meet, and ends back at the state with none
+# left; the tabled loop check first rules out states on no loop at all.
+overtaken P S Loop <-
+  reachable P S, waiting P S, loop P S S,
+  unmet S [reading 1, idle 1, reading 2, idle 2] Left,
+  run (fair_step P) (at S Left) (home S) Loop.
+
+fair_step P (at S Left) A (at S1 Left1) <- passing P S A S1, unmet S1 Left Left1.
+
+home S (at S1 []) <- S1 == S.
+
+unmet _ [] [].
+unmet S [C | Cs] Left <-
+  ( holds C S -> Left = Rest ; Left = [C | Rest] ),
+  unmet S Cs Rest.
+
+holds (reading I) (s Ps _) <- nth I Ps (r reading).
+holds (idle I) (s Ps _) <- nth I Ps (r idle).
+
+# ── Shortest runs ────────────────────────────────────────────────────────────
+
+# run Step Start Goal Steps: a shortest list of steps, by breadth-first search,
+# from Start to a state for which call Goal holds.  The tabled predicates
+# above answer whether a bad state exists; this finds the run that shows it.
+run Step Start Goal Steps <- bfs Step Goal [node Start []] [Start] Rev, reverse Rev Steps.
+
+# A tabled call would use the whole queue as its key, so bfs opts out of the
+# default tabling.
+bfs : notable.
+bfs Step Goal [node S Path | Queue] Seen Steps <-
+  ( call Goal S -> Steps = Path
+  ; findall (node S1 [A | Path]) (call Step S A S1) Children,
+    unseen Children Seen Seen1 Fresh,
+    append Queue Fresh Queue1,
+    bfs Step Goal Queue1 Seen1 Steps ).
+
+unseen [] Seen Seen [].
+unseen [node S P | Ns] Seen Seen1 Fresh <-
+  ( member S Seen -> unseen Ns Seen Seen1 Fresh
+  ; Fresh = [node S P | Rest], unseen Ns [S | Seen] Seen1 Rest ).
+
+counterexample P Goal Steps <- start S, run (next P) S Goal Steps.
+
+same S T <- S == T.
+
+# A run into an overtaken state, then a fair loop back to it.
+lasso P Prefix Loop <-
+  once (overtaken P S Loop),
+  counterexample P (same S) Prefix.
+
+# ── Report ───────────────────────────────────────────────────────────────────
+
+report P ->
+  { states P N }, wr P, ": ", wr N, " reachable states", nl,
+  exclusion P, updates P, deadlock P, overtaking P.
+
+exclusion P ->
+  ( { once (reachable P S, conflict S) } ->
+      { counterexample P conflict Steps },
+      "  exclusion fails:", nl, steps Steps
+  ; "  exclusion holds", nl ).
+
+updates P ->
+  ( { once (reachable P S, lost_update S) } ->
+      { counterexample P lost_update Steps },
+      "  an update is lost:", nl, steps Steps
+  ; "  no update is lost", nl ).
+
+deadlock P ->
+  ( { once (reachable P S, stuck_state P S) } ->
+      { counterexample P (stuck_state P) Steps },
+      "  deadlock:", nl, steps Steps
+  ; "  no deadlock", nl ).
+
+overtaking P ->
+  ( { not (waiting P _) } -> []
+  ; { lasso P Prefix Loop } ->
+      "  readers can keep writer 1 out forever:", nl, steps Prefix,
+      "    then, round and round, with both readers finishing reads:", nl,
+      steps Loop
+  ; "  a waiting writer is never overtaken forever", nl ).
+
+steps [] -> [].
+steps [step I A | Steps] -> "      ", process I, " ", action A, nl, steps Steps.
+
+process 1 -> "reader 1".
+process 2 -> "reader 2".
+process 3 -> "writer 1".
+process 4 -> "writer 2".
+
+action start -> "starts reading".
+action stop -> "stops reading".
+action enter -> "enters".
+action leave -> "leaves".
+action arrive -> "arrives".
+action (reads X) -> "reads x = ", wr X.
+action (writes X) -> "writes x = ", wr X.
+action (readers N) -> "sets readers = ", wr N.
+action (take S) -> "takes ", wr S.
+action (release S) -> "releases ", wr S.
+
+# ── Lists ────────────────────────────────────────────────────────────────────
+
+member X [X | _].
+member X [_ | T] <- member X T.
+
+select X [X | T] T.
+select X [H | T] [H | R] <- select X T R.
+
+append [] L L.
+append [H | T] L [H | R] <- append T L R.
+
+length [] 0.
+length [_ | T] N <- length T N1, N is N1 + 1.
+
+# nth I List X: X is element I, counting from 1.
+nth 1 [X | _] X.
+nth I [_ | T] X <- I > 1, I1 is I - 1, nth I1 T X.
+
+reverse L R <- reverse_onto L [] R.
+reverse_onto [] R R.
+reverse_onto [X | Xs] Acc R <- reverse_onto Xs [X | Acc] R.
+
+# ── Demo ─────────────────────────────────────────────────────────────────────
+
+> emit (report none)?
+> emit (report careless)?
+> emit (report readers_first)?
+> emit (report turnstile)?

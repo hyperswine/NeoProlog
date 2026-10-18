@@ -328,6 +328,19 @@ Seeded generation is reproducible, rather than uniform random sampling. A
 Small-board properties compare all solutions against independent exhaustive
 enumeration, with acceptance checks for the 10x10 / 50-bomb case.
 
+## Examples
+
+Classic problems, each in one commented file whose inline queries print the
+results (`infera examples/queens.nprolog`):
+
+| file | problem | technique |
+| --- | --- | --- |
+| `queens.nprolog` | N-queens three ways, solution counts, symmetry classes | generate and test, early pruning, CLP(Z) |
+| `blocks.nprolog` | blocks world: shortest plans, the Sussman anomaly, every reachable state | breadth-first search, tabling over a cyclic graph |
+| `timetable.nprolog` | a school week of teachers, courses, rooms and students | search plus CLP(Z) with reification; rules rechecked as queries |
+| `stable_matching.nprolog` | Gale-Shapley pairing, all stable pairings, electives with seats | list algorithms, a theorem checked on an instance |
+| `database_access.nprolog` | readers and writers sharing a database, four protocols | tabling as a model checker, shortest failing runs, fair loops |
+
 ## Modules
 
 ```
@@ -456,7 +469,7 @@ test/MachineCompiledControlTest.hs generated control trees, cut barriers, scopes
 test/MachineEnvironmentTest.hs branch-owned environments and graph relocation models
 test/MachineGeneralReclaimTest.hs non-tail collection with contracts, cuts and effects
 test/PerformanceDiagnosticTest.hs generated performance-advice models and precise source locations
-examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), jumpman (one rule set: verify / solve / play / generate), ...
+examples/               stdlib, v2_decls, v2_clp, v2_tabling, breadboard (CLP placer), jumpman (one rule set: verify / solve / play / generate), the classics above, ...
 Formula/infera.rb       Homebrew formula
 bench/                  engine benchmarks (infera vs swipl vs scryer)
 bench/check-tail-memory.py fresh-process residency gate, including CI quick mode

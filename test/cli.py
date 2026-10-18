@@ -189,6 +189,35 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
             assert result.returncode == 0 and not errors, (example, result, errors)
     print("Shipped-example diagnostics acceptance passed")
 
+    # The classic example programs print the answers their comments describe.
+    # Timetable checks avoid the exact slots, which depend on labeling order.
+    classics = {
+        "queens.nprolog": ["Qs = [2, 4, 6, 1, 3, 5]", "N = 92, F = 12",
+                           "   9        352           46"],
+        "blocks.nprolog": ["Moves = [move c a table, move b table c, move a table b]",
+                           "trade: 5 moves", "N = 13\n", "N = 73\n", "N = 501\n"],
+        "timetable.nprolog": ["N = 6, Rooms = [0]", "smith    6 lessons  [maths, physics]",
+                              "> checked\ntrue."],
+        "stable_matching.nprolog": [
+            "leads propose, 18 offers: ada-nia ben-lea cal-ola dan-jo eli-ivy finn-mia gus-pam hal-kim",
+            "follows propose, 15 offers: ada-jo ben-lea cal-ivy dan-pam eli-mia finn-nia gus-ola hal-kim",
+            "], N = 7\n", "no elective: [eli]", "> fair_admission\ntrue.",
+            "S = cara\nS = eli\nS = gus\n"],
+        "database_access.nprolog": [
+            "none: 148 reachable states", "careless: 365 reachable states",
+            "readers_first: 397 reachable states", "turnstile: 787 reachable states",
+            "an update is lost:", "deadlock:", "readers can keep writer 1 out forever:",
+            "a waiting writer is never overtaken forever"],
+    }
+    for name, expected in classics.items():
+        result = subprocess.run([binary, str(examples / name)], cwd=examples.parent, input="",
+                                capture_output=True, text=True, timeout=120)
+        output = result.stdout + result.stderr
+        assert result.returncode == 0 and "Error" not in output and "raised an error" not in output, (name, result)
+        missing = [text for text in expected if text not in result.stdout]
+        assert not missing, (name, missing, result.stdout)
+    print("Classic example answers acceptance passed")
+
     # A fresh checkout uses the tracked relative-path map, without a local registration.
     project = root / "portable-project"
     (project / "examples").mkdir(parents=True)

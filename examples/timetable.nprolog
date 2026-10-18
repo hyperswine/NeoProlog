@@ -1,0 +1,426 @@
+# ─── School timetable ────────────────────────────────────────────────────────
+#
+# A week of lessons for a small school: who teaches each course, and on which
+# day, in which period and in which room each lesson meets.  Facts describe
+# the school; `timetable` chooses teachers by ordinary search and then finds
+# slots and rooms with CLP(Z).  The rules:
+#
+#   1. Each course has one teacher qualified for it, and no teacher gives more
+#      lessons per week than their load allows.
+#   2. A course meets on a different day for each of its weekly lessons.
+#   3. A teacher gives at most one lesson per slot, and none on a day off.
+#   4. A room holds at most one lesson per slot.  It must be of the kind the
+#      course needs and seat every student enrolled in it.
+#   5. A student attends at most one lesson per slot.
+#   6. Friday's last period is kept free for assembly.
+#   7. Nobody, student or teacher, has more than three lessons in a day.
+#
+# The finished timetable is ground data, so the same rules can be checked
+# again as ordinary queries (`violation`), and questions such as "which rooms
+# are free on Tuesday at 10:00?" are queries over it.
+#
+# Run from the repository root:  infera examples/timetable.nprolog
+
+# Every predicate here either walks the data or searches; none benefits from
+# memoising its calls.
+<- notable.
+
+# ── The school ───────────────────────────────────────────────────────────────
+
+day 0 mon.
+day 1 tue.
+day 2 wed.
+day 3 thu.
+day 4 fri.
+
+period 0 "9:00".
+period 1 "10:00".
+period 2 "11:15".
+period 3 "13:30".
+period 4 "14:30".
+
+# room Index Name Kind Seats
+room 0 r101 classroom 6.
+room 1 r102 classroom 5.
+room 2 lab science 4.
+room 3 gym sports 12.
+
+# course Name LessonsPerWeek RoomKind
+course maths 4 classroom.
+course english 3 classroom.
+course history 2 classroom.
+course art 2 classroom.
+course music 1 classroom.
+course physics 2 science.
+course chemistry 2 science.
+course pe 2 sports.
+
+# teacher Name MostLessonsPerWeek
+teacher garcia 5.
+teacher smith 6.
+teacher jones 6.
+teacher patel 4.
+teacher chen 4.
+
+# qualified Teacher Course.  Garcia is the first candidate for maths, but maths
+# and pe together exceed Garcia's load, so the search backtracks to Smith.
+# Chen likewise cannot take english as well as art and music.
+qualified garcia maths.
+qualified smith maths.
+qualified chen english.
+qualified jones english.
+qualified jones history.
+qualified chen art.
+qualified chen music.
+qualified smith physics.
+qualified patel physics.
+qualified patel chemistry.
+qualified garcia pe.
+
+# Rule 7: lessons per day for anyone.
+most_per_day 3.
+
+day_off garcia fri.
+day_off chen mon.
+day_off chen tue.
+
+takes ana [maths, english, physics, chemistry, art].
+takes ben [maths, english, history, pe, music].
+takes cara [maths, physics, chemistry, pe, art].
+takes dev [english, history, art, music, pe].
+takes eli [maths, chemistry, history, pe].
+takes fay [english, physics, art, music, history].
+takes gus [maths, english, history, art, pe].
+takes hana [maths, english, chemistry, music, art].
+
+# ── Derived facts ────────────────────────────────────────────────────────────
+
+enrolled Course N <- findall S (takes S Cs, member Course Cs) All, length All N.
+
+# Room I suits Course when it is of the right kind and seats everyone.
+suits I Course <- course Course _ Kind, enrolled Course N, room I _ Kind Seats, Seats >= N.
+
+# ── Solving ──────────────────────────────────────────────────────────────────
+
+# A lesson is lesson Course Teacher Day Period Room Slot, where Slot numbers
+# the 25 periods of the week: Slot = 5 * Day + Period.
+timetable Lessons <-
+  findall C (course C _ _) Courses,
+  assign Courses [] Staff,
+  make_lessons Staff Lessons,
+  slots Lessons,
+  spread Courses Lessons,
+  teacher_rules Lessons,
+  room_rules Lessons,
+  student_rules Lessons,
+  labels Lessons Vars,
+  label Vars.
+
+# assign Courses Loads Staff: Staff pairs each course with a qualified teacher.
+# Loads holds load Teacher Lessons for the teachers chosen so far, so an
+# overloaded choice fails at once and the search tries the next candidate.
+assign [] _ [].
+assign [C | Cs] Loads [teaches T C | Staff] <-
+  course C N _,
+  qualified T C,
+  add_load T N Loads Loads1,
+  assign Cs Loads1 Staff.
+
+add_load T N Loads [load T M | Rest] <-
+  ( select (load T M0) Loads Rest -> true ; M0 = 0, Rest = Loads ),
+  M is M0 + N,
+  teacher T Most, M <= Most.
+
+make_lessons [] [].
+make_lessons [teaches T C | Staff] Lessons <-
+  course C N _,
+  lessons_of N C T Mine,
+  make_lessons Staff Rest,
+  append Mine Rest Lessons.
+
+lessons_of 0 _ _ [].
+lessons_of N C T [lesson C T _ _ _ _ | Ls] <-
+  N > 0, N1 is N - 1, lessons_of N1 C T Ls.
+
+# Rule 6, and the link between a slot and its day and period.
+slots [].
+slots [lesson _ _ D P _ S | Ls] <-
+  [D, P] in 0..4,
+  S #= 5 * D + P,
+  S #!= 24,
+  slots Ls.
+
+# Rule 2.  The lessons of one course are interchangeable, so ordering their
+# days strictly both spreads them out and avoids trying every reordering.
+spread [] _.
+spread [C | Cs] Lessons <-
+  include_course C Lessons Mine, days Mine Days, increasing Days,
+  spread Cs Lessons.
+
+# Rules 3 and 7.
+teacher_rules Lessons <-
+  findall T (teacher T _) Teachers,
+  each_teacher Teachers Lessons.
+
+each_teacher [] _.
+each_teacher [T | Ts] Lessons <-
+  include_teacher T Lessons Mine,
+  slots_of Mine Slots, all_different Slots,
+  days Mine Days, daily_limit Days,
+  findall D (day_off T Name, day D Name) Off,
+  avoid_all Days Off,
+  each_teacher Ts Lessons.
+
+# Rule 4.  With NRooms rooms, NRooms * Slot + Room is a different number for
+# every room and slot, so two lessons share a room and a slot exactly when
+# they share this number.
+room_rules Lessons <-
+  findall I (room I _ _ _) Rooms, length Rooms NRooms,
+  room_choices Lessons NRooms,
+  room_keys Lessons NRooms Keys,
+  all_different Keys.
+
+room_choices [] _.
+room_choices [lesson C _ _ _ R _ | Ls] NRooms <-
+  Last is NRooms - 1, R in 0..Last,
+  findall I (room I _ _ _, not (suits I C)) Unsuitable,
+  avoid R Unsuitable,
+  room_choices Ls NRooms.
+
+room_keys [] _ [].
+room_keys [lesson _ _ _ _ R S | Ls] NRooms [K | Ks] <-
+  K #= NRooms * S + R,
+  room_keys Ls NRooms Ks.
+
+# Rules 5 and 7.
+student_rules Lessons <-
+  findall S (takes S _) Students,
+  each_student Students Lessons.
+
+each_student [] _.
+each_student [S | Ss] Lessons <-
+  takes S Courses,
+  include_courses Courses Lessons Mine,
+  slots_of Mine Slots, all_different Slots,
+  days Mine Days, daily_limit Days,
+  each_student Ss Lessons.
+
+# Rule 7.  For each day, reify marks which lessons fall on it (1 or 0), and
+# their sum is capped.  When a person's day is full, the marks of their other
+# lessons become 0, which removes that day from those lessons.
+daily_limit Days <- most_per_day Most, day_limits 0 Days Most.
+
+day_limits D _ _ <- D > 4.
+day_limits D Days Most <-
+  D <= 4, marks Days D Marks, sum Marks Total, Total #<= Most,
+  D1 is D + 1, day_limits D1 Days Most.
+
+marks [] _ [].
+marks [X | Xs] D [B | Bs] <- reify (X #= D) B, marks Xs D Bs.
+
+# One linear expression, so the solver propagates the whole sum at once.
+sum [] 0.
+sum [X | Xs] (X + Rest) <- sum Xs Rest.
+
+# Label each lesson's slot and room; propagation then fixes its day and
+# period.  The order matters: labeling smallest domains first would take the
+# days first (a four-lesson course has only two possible days for each of its
+# lessons), pack every course into the start of the week and leave the slots
+# to fail one by one.  Labeling slots directly finds a timetable at once.
+labels [] [].
+labels [lesson _ _ _ _ R S | Ls] [S, R | Vs] <- labels Ls Vs.
+
+# ── Selecting lessons ────────────────────────────────────────────────────────
+# These keep the lesson terms themselves, so constraints posted on the
+# selection apply to the timetable.  (findall would copy them.)
+
+include_course _ [] [].
+include_course C [L | Ls] Mine <-
+  ( L = lesson C _ _ _ _ _ -> Mine = [L | Rest] ; Mine = Rest ),
+  include_course C Ls Rest.
+
+include_teacher _ [] [].
+include_teacher T [L | Ls] Mine <-
+  ( L = lesson _ T _ _ _ _ -> Mine = [L | Rest] ; Mine = Rest ),
+  include_teacher T Ls Rest.
+
+include_courses _ [] [].
+include_courses Cs [L | Ls] Mine <-
+  L = lesson C _ _ _ _ _,
+  ( member C Cs -> Mine = [L | Rest] ; Mine = Rest ),
+  include_courses Cs Ls Rest.
+
+days [] [].
+days [lesson _ _ D _ _ _ | Ls] [D | Ds] <- days Ls Ds.
+
+slots_of [] [].
+slots_of [lesson _ _ _ _ _ S | Ls] [S | Ss] <- slots_of Ls Ss.
+
+increasing [].
+increasing [_].
+increasing [A, B | T] <- A #< B, increasing [B | T].
+
+avoid _ [].
+avoid X [V | Vs] <- X #!= V, avoid X Vs.
+
+avoid_all [] _.
+avoid_all [X | Xs] Vs <- avoid X Vs, avoid_all Xs Vs.
+
+# ── Checking a finished timetable ────────────────────────────────────────────
+# Each clause describes one way to break a rule, without constraints, so a
+# timetable is valid when no violation can be found.
+
+valid Lessons <- not (violation Lessons _).
+
+violation Lessons (unqualified T C) <-
+  member (lesson C T _ _ _ _) Lessons, not (qualified T C).
+violation Lessons (two_teachers C) <-
+  pair Lessons (lesson C T1 _ _ _ _) (lesson C T2 _ _ _ _), T1 != T2.
+violation Lessons (overloaded T) <-
+  teacher T Most, findall C (member (lesson C T _ _ _ _) Lessons) Given,
+  length Given N, N > Most.
+violation Lessons (lesson_count C) <-
+  course C N _, findall D (member (lesson C _ D _ _ _) Lessons) Ds,
+  length Ds M, M != N.
+violation Lessons (same_day C D) <-
+  pair Lessons (lesson C _ D _ _ _) (lesson C _ D _ _ _).
+violation Lessons (teacher_clash T S) <-
+  pair Lessons (lesson _ T _ _ _ S) (lesson _ T _ _ _ S).
+violation Lessons (day_off T D) <-
+  member (lesson _ T D _ _ _) Lessons, day D Name, day_off T Name.
+violation Lessons (room_clash R S) <-
+  pair Lessons (lesson _ _ _ _ R S) (lesson _ _ _ _ R S).
+violation Lessons (unsuitable_room C R) <-
+  member (lesson C _ _ _ R _) Lessons, not (suits R C).
+violation Lessons (student_clash Student S) <-
+  pair Lessons (lesson C1 _ _ _ _ S) (lesson C2 _ _ _ _ S),
+  takes Student Cs, member C1 Cs, member C2 Cs.
+violation Lessons (assembly C) <-
+  member (lesson C _ 4 4 _ _) Lessons.
+violation Lessons (long_day Who D) <-
+  person Who, day D _, most_per_day Most,
+  findall C (member L Lessons, attends Who L, L = lesson C _ D _ _ _) Cs,
+  length Cs N, N > Most.
+
+person (student S) <- takes S _.
+person (teacher T) <- teacher T _.
+
+# pair Lessons A B: A and B are two different entries of Lessons.
+pair [A | Ls] A B <- member B Ls.
+pair [_ | Ls] A B <- pair Ls A B.
+
+# ── Queries over a timetable ─────────────────────────────────────────────────
+
+free_rooms Lessons DayName Time Free <-
+  day D DayName, period P Time,
+  findall Name (room I Name _ _, not (member (lesson _ _ D P I _) Lessons)) Free.
+
+# The people at a lesson: its students and its teacher.
+attends (student S) (lesson C _ _ _ _ _) <- takes S Cs, member C Cs.
+attends (teacher T) (lesson _ T _ _ _ _).
+
+# Every lesson Who attends, as at Day Time Course Room.
+schedule Who Lessons Entries <-
+  findall (at DayName Time C RoomName)
+    (member L Lessons, attends Who L, L = lesson C _ D P R _,
+     day D DayName, period P Time, room R RoomName _ _)
+    Entries.
+
+# ── Printing ─────────────────────────────────────────────────────────────────
+
+# The whole school, day by day: time, course, teacher and room.
+school Lessons -> school_days 0 Lessons.
+
+school_days D _ -> { D > 4 }.
+school_days D Lessons ->
+  { D <= 4, day D Name, D1 is D + 1 },
+  wr Name, nl, school_periods 0 D Lessons, school_days D1 Lessons.
+
+school_periods P _ _ -> { P > 4 }.
+school_periods P D Lessons ->
+  { P <= 4, period P Time, P1 is P + 1,
+    findall (at C T R) (member (lesson C T D P R _) Lessons) Here },
+  school_lines Here Time, school_periods P1 D Lessons.
+
+school_lines [] _ -> [].
+school_lines [at C T R | Rest] Time ->
+  { room R Room _ _ },
+  padl Time 7, "  ", padr C 11, padr T 8, wr Room, nl,
+  school_lines Rest "".
+
+# One person's week as a grid of periods by days.
+week Who Lessons -> "         ", day_heads 0, nl, week_rows 0 Who Lessons.
+
+day_heads D -> { D > 4 }.
+day_heads D -> { D <= 4, day D Name, D1 is D + 1 }, padr Name 11, day_heads D1.
+
+week_rows P _ _ -> { P > 4 }.
+week_rows P Who Lessons ->
+  { P <= 4, period P Time, P1 is P + 1 },
+  padl Time 7, "  ", week_cells 0 P Who Lessons, nl,
+  week_rows P1 Who Lessons.
+
+week_cells D _ _ _ -> { D > 4 }.
+week_cells D P Who Lessons ->
+  { D <= 4, D1 is D + 1 }, cell D P Who Lessons, week_cells D1 P Who Lessons.
+
+cell D P Who Lessons ->
+  ( { D == 4, P == 4 } -> padr "assembly" 11
+  ; { member L Lessons, L = lesson C _ D P _ _, attends Who L } -> padr C 11
+  ; padr "." 11 ).
+
+# Lessons per teacher, with their courses.
+loads Lessons -> { findall T (teacher T _) Ts }, load_lines Ts Lessons.
+
+load_lines [] _ -> [].
+load_lines [T | Ts] Lessons ->
+  { findall C (member (lesson C T _ _ _ _) Lessons) Given, length Given N,
+    distinct Given Courses },
+  padr T 8, padl N 2, " lessons  ", wr Courses, nl,
+  load_lines Ts Lessons.
+
+# Reports and questions that solve first, so a query shows only its answer.
+school_report -> { once (timetable Lessons) }, school Lessons.
+week_report Who -> { once (timetable Lessons) }, week Who Lessons.
+load_report -> { once (timetable Lessons) }, loads Lessons.
+
+checked <- once (timetable Lessons), valid Lessons.
+
+# Move the first maths lesson into the slot of the first english lesson and
+# list what the checker finds.
+moved Violations <-
+  once (timetable Lessons),
+  once (select (lesson maths T _ _ R _) Lessons Others,
+        member (lesson english _ D P _ S) Others),
+  findall V (violation [lesson maths T D P R S | Others] V) Violations.
+rooms_free DayName Time Free <- once (timetable Lessons), free_rooms Lessons DayName Time Free.
+week_of Who Entries <- once (timetable Lessons), schedule Who Lessons Entries.
+
+# ── Lists ────────────────────────────────────────────────────────────────────
+
+member X [X | _].
+member X [_ | T] <- member X T.
+
+select X [X | T] T.
+select X [H | T] [H | R] <- select X T R.
+
+append [] L L.
+append [H | T] L [H | R] <- append T L R.
+
+length [] 0.
+length [_ | T] N <- length T N1, N is N1 + 1.
+
+distinct [] [].
+distinct [X | Xs] Ys <- ( member X Xs -> Ys = Rest ; Ys = [X | Rest] ), distinct Xs Rest.
+
+# ── Demo ─────────────────────────────────────────────────────────────────────
+
+> enrolled maths N, findall R (suits R maths) Rooms?
+> emit school_report?
+> emit (week_report (student ana))?
+> emit (week_report (teacher chen))?
+> emit load_report?
+> checked?
+> moved Violations?
+> rooms_free tue "10:00" Free?
+> week_of (student eli) Week?
