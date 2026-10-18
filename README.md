@@ -257,7 +257,11 @@ minimize Cost Goal   # one minimum of a finite goal's answers
 Interval domains with holes and bounds propagation for linear constraints.
 Changed variables wake their dependent constraints, and list domains are posted
 as a batch. Linear sums use aggregate bounds instead of rescanning the sum for
-each variable. Other non-linear constraints wait until they become linear or ground. Residual
+each variable. An equality between two variables with unit coefficients
+(`Y #= X + 2`, `Y #= 7 - X`) is domain-consistent: a hole on either side is
+removed from the other, so a model that names derived quantities with
+auxiliary variables prunes as well as one that posts the relation directly.
+Other non-linear constraints wait until they become linear or ground. Residual
 domains and constraints are shown in answers (`X in 4..5`, `X + Y #= 10`).
 See `examples/v2_clp.nprolog` (SEND + MORE = MONEY, N-queens).
 
