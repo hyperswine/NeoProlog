@@ -1,0 +1,71 @@
+<- notable.
+
+pause.
+id X X.
+pick a.
+pick b.
+build 0 [].
+build N [N | T] <- N > 0, M is N - 1, build M T.
+spin 0.
+spin N <- N > 0, M is N - 1, spin M.
+
+# The surviving unbound variable must retain its exact logical id while
+# its unused siblings, including a large graph, can be discarded.
+dead_sibling N Out <- build N Junk, id Junk _, pause, spin 4000, Out = done.
+unbound Out <- Junk = [a, b, c], id Junk _, Out = (pair X Y), pause.
+alias Out <- Out = (pair X X), pause, (X = a ; X = b).
+branch Out <- Junk = (pair X Y), id Junk _, (pause, X = a, fail ; pause, Y = b), Out = (pair X Y).
+scope Out <- Out = (pair X Y), (pause, X = a -> pause, Y = b ; Y = c).
+find Out <- findall (pair X X) (pick X, pause) Out, pause.
+find_unbound Out <- findall (pair X Y) (pick X, pause) Out, pause.
+not_scope Out <- Out = (pair X Y), not (pause, X = bad, fail), pause, X = good, Y = X.
+dynamic_value : dynamic.
+dynamic_step : unsafe.
+dynamic_step Out <- assert (dynamic_value (pair X X)), pause, dynamic_value Out, pause.
+
+edge a b. edge b c. edge c d.
+reach : table.
+reach X Y <- edge X Y.
+reach X Y <- reach X Z, pause, edge Z Y.
+
+constraint_local Out <- X in 1 .. 3, Y in 2 .. 4, Y #= X + 1, Out = Y, pause, label [Y].
+constraint_alias Out <- X in 1 .. 3, Y in 1 .. 3, X #= Y, Out = (pair X Y), pause, (X = 2 ; X = 3), pause.
+constraint_undo Out <- X in 1 .. 3, Out = X, (pause, X = 1 ; pause, X #> 1, label [X]), pause.
+local_box Out <- Y in 1 .. 3, Out = (box Y).
+
+bad : det (int: <=) (int: =>).
+bad _ X <- pause, X = wrong.
+
+> unbound Out?
+> alias Out?
+> branch Out?
+> scope Out?
+> find Out?
+> find_unbound Out?
+> not_scope Out?
+> dynamic_step Out?
+> assert (dynamic_value a), (pause, retract (dynamic_value a), fail ; pause), dynamic_value X?
+> reach a X?
+> findall X (reach a X, pause) L?
+> constraint_local Out?
+> constraint_alias Out?
+> constraint_undo Out?
+> findall X (constraint_local X, pause) L?
+> (constraint_local X, pause, fail ; constraint_local X)?
+> minimize Y (X in 1 .. 3, Y in 2 .. 4, Y #= X + 1, pause, label [X, Y])?
+# A zero-variable clause still reserves one logical ID. Returning the
+# winner must preserve it before the next unbound activation is allocated.
+> minimize Cost (Cost = 1, pause, unbound Before), unbound After?
+# Separate saved roots keep distinct local variables; shared saved roots
+# still share them when the winner is reconstructed.
+> minimize Cost (Cost = 1, unbound A, unbound B), A = (pair X Y), B = (pair U V), X = a, U = b?
+> minimize Cost (Cost = 1, unbound A, B = A), A = (pair X Y), B = (pair U V), X = a, U = a?
+> minimize Cost (Cost = 1, unbound A, B = A), A = (pair X Y), B = (pair U V), X = a, U = b?
+# A copied local keeps its domain and watches through collection,
+# successful binding and a failing alternative after minimum returns.
+> minimize Cost (Cost = 1, local_box Out), pause, Out = (box 4)?
+> minimize Cost (Cost = 1, local_box Out), pause, Out = (box 2)?
+> minimize Cost (Cost = 1, local_box Out), pause?
+> minimize Cost (Cost = 1, local_box Out), pause, (Out = (box 4) ; Out = (box 2))?
+> bad 1 X?
+> (bad 1 X ; pause, X = recovered)?

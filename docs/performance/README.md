@@ -5,6 +5,16 @@ See the [current engine guide](../engine/README.md),
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
+## Four Core designs - 2026-10-18
+
+The [first implementation report](reports/engine-major-2026-10-18.md) records
+native constraint search, deeper clause decisions, precise activation liveness
+and delta tabling. Checked loaded-program samples show 7.16x faster nested
+dispatch and 23.48x faster 240-node closure; guard dispatch improves about 15%.
+Dead activation cells are reclaimed, while Breadboard and Minesweeper remain
+near baseline. Several ordinary workloads still take 2-6% more CPU. The report
+keeps those regressions, validation boundaries and remaining CLP work explicit.
+
 ## Reverse construction, matching and collection - 2026-10-17
 
 The [reverse follow-up](reports/engine-reverse-2026-10-17.md) records a 20% reduction

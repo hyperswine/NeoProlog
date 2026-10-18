@@ -33,6 +33,7 @@ module Infera.Core.Store
     heapTop, setHeapTop, trailTop, setTrailTop, hb, setHb,
     outLen, setOutLen, arithData, bumpArithData, freshId, setFreshId,
     readCell, writeCell, pushCell, allocCells, allocSlots, markerWord, logicalId,
+    replaceLogicalIds, collectionStats, recordCollection,
     readArg, writeArg, saveArgs, loadArgs, reserveCells, groundNowWord,
     readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, initialCollectLimit, markerBase, markerVars,
     drainBound, recordBoundCell,
@@ -209,6 +210,9 @@ data Store = Store
     argRegs :: !(IOUArray Int Int),
     -- | cells bound since the last reconciliation with the constraint store
     bound :: !(IORef (IOUArray Int Int)),
+    -- | Exact logical identities of the live activation slots detached by
+    -- collection. Fresh activations still use their compact block marker.
+    logicalIds :: !(IORef (IM.IntMap Int)),
     symbols :: !Symbols
   }
 
@@ -227,7 +231,7 @@ newStore syms = do
   unsafeWrite rs rGCLIM initialCollectLimit
   ar <- newArray (0, 4095) 0
   bd <- newArray (0, 255) 0
-  Store <$> newIORef cs <*> newIORef tr <*> newIORef bx <*> pure rs <*> pure ar <*> newIORef bd <*> pure syms
+  Store <$> newIORef cs <*> newIORef tr <*> newIORef bx <*> pure rs <*> pure ar <*> newIORef bd <*> newIORef IM.empty <*> pure syms
 
 readArg :: Store -> Int -> IO Word'
 readArg s = unsafeRead (argRegs s)
@@ -248,7 +252,7 @@ saveArgs s n = do
         | i >= n = pure ()
         | otherwise = unsafeRead (argRegs s) i >>= unsafeWrite arr (top + i) >> go (i + 1)
   go 0
-  setHeapTop s (top + n)
+  unsafeWrite (regs s) rH (top + n)
   pure top
 
 loadArgs :: Store -> Int -> Int -> IO ()
@@ -273,7 +277,14 @@ freshId s = unsafeRead (regs s) rFRESH
 {-# INLINE freshId #-}
 
 setHeapTop, setTrailTop, setHb, setOutLen, setFreshId :: Store -> Int -> IO ()
-setHeapTop s = unsafeWrite (regs s) rH
+setHeapTop s top = do
+  -- Only detached slots have sparse identities. Backtracking must discard
+  -- identities above its heap mark before those addresses are reused.
+  boundary <- unsafeRead (regs s) rIDENT
+  when (top < boundary) $ do
+    modifyIORef' (logicalIds s) (fst . IM.split top)
+    unsafeWrite (regs s) rIDENT top
+  unsafeWrite (regs s) rH top
 setTrailTop s = unsafeWrite (regs s) rTR
 setHb s = unsafeWrite (regs s) rHB
 setOutLen s = unsafeWrite (regs s) rOUT
@@ -326,7 +337,7 @@ pushCell s w = do
   top <- heapTop s
   ensureCells s (top + 1)
   writeCell s top w
-  setHeapTop s (top + 1)
+  unsafeWrite (regs s) rH (top + 1)
   pure top
 {-# INLINE pushCell #-}
 
@@ -336,7 +347,7 @@ reserveCells :: Store -> Int -> IO Int
 reserveCells s n = do
   top <- heapTop s
   ensureCells s (top + n)
-  setHeapTop s (top + n)
+  unsafeWrite (regs s) rH (top + n)
   pure top
 {-# INLINE reserveCells #-}
 
@@ -361,15 +372,15 @@ allocCells s n = do
         | i >= top + n = pure ()
         | otherwise = unsafeWrite arr i (refWord i) >> go (i + 1)
   go top
-  setHeapTop s (top + n)
+  unsafeWrite (regs s) rH (top + n)
   pure top
 
 -- | A marker cell precedes every block of activation variables. Functor
 -- words never occur as values, so a marker is unambiguous when scanning
 -- down from a variable cell. Its value is the reference engine's id of the
 -- first variable of the block, which keeps exported variable names equal.
--- The marker packs the block size above bit 40 so a collector can find the
--- whole block from its base.
+-- The marker packs the block size above bit 40 so collection can retain
+-- each surviving slot's logical identity independently of its frame.
 markerWord :: Int -> Int -> Word'
 markerWord logicalBase n = mkWord tagFun (logicalBase .|. (n `shiftL` 40))
 {-# INLINE markerWord #-}
@@ -392,20 +403,60 @@ allocSlots s logicalBase n = do
         | i > top + n = pure ()
         | otherwise = unsafeWrite arr i (refWord i) >> go (i + 1)
   go (top + 1)
-  setHeapTop s (top + n + 1)
+  -- Allocation only grows the suffix; sparse identities need pruning
+  -- solely when a rollback or collection lowers the heap top.
+  unsafeWrite (regs s) rH (top + n + 1)
   pure (top + 1)
 {-# INLINE allocSlots #-}
 
--- | The reference id of a variable cell, found through its block marker.
+-- | The reference id of a variable cell: sparse identity after collection,
+-- otherwise the marker of a fresh activation block.
 logicalId :: Store -> Int -> IO (Maybe Int)
 logicalId s addr = do
-  arr <- readIORef (cells s)
-  let go !i
-        | i < 0 = pure Nothing
-        | otherwise = do
-            w <- unsafeRead arr i
-            if tagOf w == tagFun then pure (Just (markerBase w + (addr - i - 1))) else go (i - 1)
-  go (addr - 1)
+  ids <- readIORef (logicalIds s)
+  case IM.lookup addr ids of
+    Just ident -> pure (Just ident)
+    Nothing -> do
+      -- Older compacted cells have no marker. Restrict the scan to the
+      -- freshly allocated suffix, whose blocks still have their markers.
+      boundary <- unsafeRead (regs s) rIDENT
+      arr <- readIORef (cells s)
+      let go !i
+            | i < boundary = pure Nothing
+            | otherwise = do
+                w <- unsafeRead arr i
+                if tagOf w == tagFun
+                  then pure $ if addr <= i + markerVars w
+                    then Just (markerBase w + addr - i - 1)
+                    else Nothing
+                  else go (i - 1)
+      go (addr - 1)
+
+-- Register 12 bounds the prefix whose activation markers have been
+-- replaced by sparse identities; the remaining registers are GC counters.
+rIDENT, rGCCOUNT, rGCLIVE, rGCRECLAIM :: Int
+rIDENT = 12
+rGCCOUNT = 13
+rGCLIVE = 14
+rGCRECLAIM = 15
+
+-- | Install identities while collection's original addresses are still
+-- available. The compacted prefix ends at the supplied heap top.
+replaceLogicalIds :: Store -> Int -> IM.IntMap Int -> IO ()
+replaceLogicalIds s boundary ids = do
+  writeIORef (logicalIds s) ids
+  unsafeWrite (regs s) rIDENT boundary
+
+-- | Collection count, cells retained by the last collection and total
+-- reclaimed cells. These counters are outside the query's logical state.
+collectionStats :: Store -> IO (Int, Int, Int)
+collectionStats s = (,,) <$> readReg s rGCCOUNT <*> readReg s rGCLIVE <*> readReg s rGCRECLAIM
+
+recordCollection :: Store -> Int -> Int -> IO ()
+recordCollection s before after = do
+  readReg s rGCCOUNT >>= writeReg s rGCCOUNT . (+ 1)
+  writeReg s rGCLIVE after
+  readReg s rGCRECLAIM >>= writeReg s rGCRECLAIM . (+ (before - after))
 
 -- | Build a structure from a functor word and argument words, setting the
 -- ground memo when every argument is ground now.

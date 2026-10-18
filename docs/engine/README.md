@@ -28,8 +28,9 @@ Indexing is enabled by default. Automatic tabling applies to eligible pure
 recursive predicates that are not classified as structural recursion;
 `table`, `notable`, `index` and `noindex` declarations override the defaults.
 Tabling, dynamic facts, control constructs and minimization run within the
-core. Constraints and some leaf builtins reuse reference implementations
-through adapters, with watched bindings synchronized to the heap.
+core. Constraint posting and labeling use the shared persistent propagation
+kernel directly, with Core choices and watched bindings synchronized to the
+heap. Some other leaf builtins still use Reference adapters.
 
 Declared sorts, modes and determinism are enforced where needed. Compiler
 proofs remove checks already established by callers or clause bodies;
@@ -52,6 +53,7 @@ those paths and comparisons. They are not the normal CLI/REPL query engine.
 
 * [Diagnosis and core migration](engine-diagnosis-2026-10-17.md)
 * [Contract proofs and performance](contracts-performance-2026-10-17.md)
+* [Four major Core designs](major-design-2026-10-18.md)
 * [Latest performance overview](../performance/README.md)
 * [Reverse construction, matching and collection](../performance/reports/engine-reverse-2026-10-17.md)
 * [Earlier machine/bytecode roadmap](roadmap.md)

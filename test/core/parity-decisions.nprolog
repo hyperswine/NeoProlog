@@ -1,0 +1,54 @@
+<- notable.
+choose : nondet (any) (any).
+choose N negative <- N < 0.
+choose N nonnegative <- N >= 0.
+choose_error : nondet (any) (any).
+choose_error N R <- X is bad, N < 0, R = X.
+choose_error N positive <- N > 0.
+alias : nondet (any) (any) (any).
+alias X X equal <- X > 0.
+alias X Y distinct <- X <= 0.
+deep_guard : nondet (any) (any).
+deep_guard (box (tag N)) negative <- N < 0.
+deep_guard (box (tag N)) nonnegative <- N >= 0.
+shape : nondet (any) (any) (any).
+shape (box (tag a)) left alpha.
+shape (box (tag a)) right beta.
+shape (box (tag b)) right gamma.
+shape (box (tag a b)) right arity.
+shape X right open.
+shape (box (tag X)) S fallback.
+fresh : unsafe nondet (any) (any).
+fresh N X <- N < 0, write X.
+fresh N X <- N >= 0, write X.
+late_error : nondet (any) (any).
+late_error N X <- N < 0, X is bad.
+late_error N ok <- N >= 0.
+> choose -3 R?
+> choose 0 R?
+> choose 5 R?
+> choose N R?
+> choose "bad" R?
+> choose 1.5 R?
+> choose 1152921504606846976 R?
+> choose_error 1 R?
+> alias 1 2 R?
+> alias X 2 R?
+> alias X X R?
+> deep_guard (box (tag (-3))) R?
+> deep_guard (box (tag 0)) R?
+> deep_guard (box (tag N)) R?
+> deep_guard (box (tag "bad")) R?
+> shape (box (tag a)) right R?
+> shape (box (tag K)) right R?
+> shape (box (tag a b)) right R?
+> shape X X R?
+> fresh 1 X?
+> fresh -1 X?
+> (fresh 1 X, fail ; fresh -1 Y)?
+> late_error 1 X?
+> late_error -1 X?
+> N in -2 .. 2, choose N R, label [N]?
+> N in -2 .. 2, deep_guard (box (tag N)) R, label [N]?
+> N in 0 .. 1, shape (box (tag a)) right N?
+> (shape (box (tag a)) right R, fail ; shape (box (tag b)) right S)?

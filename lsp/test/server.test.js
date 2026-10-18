@@ -202,7 +202,7 @@ test('CLP hover includes propagation examples across the complete operator range
   }
 })
 
-function countingChecker(root, diagnostics = []) {
+function countingChecker(root, diagnostics = [], markSnapshots = false) {
   const executable = path.join(root, 'counting-checker'), log = path.join(root, 'checks.jsonl')
   fs.writeFileSync(executable, '#!/usr/bin/env node\n'
     + `const fs = require('fs'), args = process.argv.slice(2); let source = '';\n`
@@ -210,7 +210,9 @@ function countingChecker(root, diagnostics = []) {
     + `process.stdin.on('end', () => {\n`
     + `const buffers = []; for (let i = 4; i < args.length; i += 3) buffers.push({ path: args[i+1], text: fs.readFileSync(args[i+2], 'utf8') });\n`
     + `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ file: args[3], source, buffers }) + '\\n');\n`
-    + `console.log(${JSON.stringify(JSON.stringify(diagnostics))}); });\n`, { mode: 0o755 })
+    + `const diagnostics = ${JSON.stringify(diagnostics)};\n`
+    + `if (${JSON.stringify(markSnapshots)}) for (const diagnostic of diagnostics) { diagnostic.file = args[3]; diagnostic.message += '\\n' + JSON.stringify({ source, buffers }); }\n`
+    + `console.log(JSON.stringify(diagnostics)); });\n`, { mode: 0o755 })
   const calls = file => {
     const rows = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []
     return file ? rows.filter(row => row.file === file) : rows
@@ -249,19 +251,35 @@ test('only transitive importers recheck and receive relevant unsaved snapshots',
   fs.writeFileSync(path.join(root, 'neoprolog.conf'), 'lib#test lib.nprolog\nleaf#test leaf.nprolog\n')
   fs.writeFileSync(lib, '<- import "leaf#test".\nlib.\n')
   fs.writeFileSync(leaf, 'leaf.\n')
-  const { executable, calls } = countingChecker(root)
-  const { notify } = await client(t, executable)
+  const completed = { file, code: 'test-importer-check-completed', severity: 'warning', message: 'checked snapshot',
+    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } }
+  const { executable, calls } = countingChecker(root, [completed], true)
+  const { notify, messages } = await client(t, executable)
+  // The checker logs before the server caches its result. Await the warning
+  // for this exact snapshot so an earlier cached publication cannot unblock us.
+  const published = (marker, checkedFile, checkedUri) => {
+    const checked = calls(checkedFile).at(-1)
+    if (!checked) return false
+    const message = completed.message + '\n' + JSON.stringify({ source: checked.source, buffers: checked.buffers })
+    return messages.slice(marker).some(m => m.method === 'textDocument/publishDiagnostics' && m.params.uri === checkedUri
+      && m.params.diagnostics.some(d => d.code === completed.code && d.message === message))
+  }
   for (const [f, u, text] of [[file, uri, '<- import "lib#test".\nmain.\n'], [other, otherUri, 'other.\n'], [leaf, leafUri, 'leaf.\n']]) {
     fs.writeFileSync(f, text)
     notify('textDocument/didOpen', { textDocument: { uri: u, languageId: 'infera', version: 1, text } })
   }
-  await until(() => calls(file).length === 1 && calls(leaf).length === 1 && calls(other).length === 1)
+  await until(() => calls(file).length === 1 && calls(leaf).length === 1 && calls(other).length === 1
+    && published(0, file, uri) && published(0, leaf, leafUri) && published(0, other, otherUri))
+  const changedAt = messages.length
   notify('textDocument/didChange', { textDocument: { uri: leafUri, version: 2 }, contentChanges: [{ text: 'unsaved.\n' }] })
-  await until(() => calls(file).length === 2 && calls(leaf).length === 2)
+  await until(() => calls(file).length === 2 && calls(leaf).length === 2
+    && published(changedAt, file, uri) && published(changedAt, leaf, leafUri))
   assert.deepEqual(calls(file).at(-1).buffers, [{ path: leaf, text: 'unsaved.\n' }])
   assert.equal(calls(other).length, 1)
+  const closedAt = messages.length
   notify('textDocument/didClose', { textDocument: { uri: leafUri } })
-  await until(() => calls(file).length === 3)
+  await until(() => calls(file).length === 3 && published(closedAt, file, uri))
+  assert.equal(calls(file).length, 3)
   assert.deepEqual(calls(file).at(-1).buffers, [])
   assert.equal(calls(other).length, 1)
 })

@@ -83,6 +83,9 @@ library
         Infera.Core.Store
         Infera.Core.Compile
         Infera.Core.Run
+        Infera.Core.Constraint
+        Infera.Core.Delta
+        Infera.Core.Liveness
         Infera.Module
         Infera.Repl
     other-modules:    Infera.Engine.Contracts
@@ -119,6 +122,7 @@ test-suite infera-test
     hs-source-dirs:   test
     main-is:          Spec.hs
     other-modules:    InferaTest CorrectnessTest MinesweeperTest InferenceTest CoreTest
+                      CoreConstraintTest CoreDecisionTest CoreDeltaTest CoreLivenessTest
                       CLPPerformanceTest ReferenceCLP BreadboardTest TablingTest
                       MachineHeapTest MachineControlTest MachineSubsearchTest
                       MachineCLPTest MachineBreadboardTest
@@ -203,3 +207,12 @@ benchmark core-engine
     build-depends:
         base,
         infera
+
+benchmark core-major
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   bench
+    main-is:          core-major.hs
+    default-language: Haskell2010
+    ghc-options:      -O2 -rtsopts
+    build-depends:    base, containers, directory, filepath, infera

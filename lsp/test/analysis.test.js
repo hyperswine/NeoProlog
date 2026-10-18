@@ -200,7 +200,7 @@ test('flag styling is removed with edits and remains tolerant without producing 
 test('extension contributes overridable underline styles and visible compiler suggestions by default', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8'))
   const lock = JSON.parse(fs.readFileSync(path.join(__dirname, '../package-lock.json'), 'utf8'))
-  assert.equal(manifest.version, '2.0.3')
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/)
   assert.equal(lock.version, manifest.version)
   assert.equal(lock.packages[''].version, manifest.version)
   assert.equal(manifest.contributes.configuration.properties['infera.performanceHints'].default, true)

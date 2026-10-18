@@ -1,0 +1,29 @@
+edge a b. edge a c. edge b d. edge c d. edge d a. edge d e.
+path X Y <- path X Z, edge Z Y.
+path X Y <- edge X Y.
+red a b. red b c. blue a d. blue d e.
+colored X Y <- colored X Z, red Z Y.
+colored X Y <- red X Y.
+colored X Y <- colored X Z, blue Z Y.
+colored X Y <- blue X Y.
+shared Pair Y <- shared Pair Z, next Z Y.
+shared (pair a a) first.
+shared (pair X X) open.
+next first second. next open shared. next second third.
+open X Y <- open X Z, relation Z Y.
+open seed X.
+relation left right. relation right done.
+> path a X?
+> path X Y?
+> path a e?
+> path e X?
+> findall X (path a X) L?
+> once (path a X)?
+> (path e X -> R = found ; R = empty)?
+> not (path e a)?
+> path a X, path a Y?
+> colored a X?
+> colored X Y?
+> shared (pair X X) Result?
+> Pair = pair X Y, X = Y, shared Pair Result?
+> open seed X?

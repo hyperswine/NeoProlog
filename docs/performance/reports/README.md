@@ -5,6 +5,7 @@ the [engine guide](../../engine/README.md) for the default architecture.
 
 | Stage | Report |
 | --- | --- |
+| Current core: constraints, decisions, liveness and delta tables | [Four designs, 2026-10-18](engine-major-2026-10-18.md) |
 | Current core: construction, matching and collection | [Reverse optimization, 2026-10-17](engine-reverse-2026-10-17.md) |
 | Earlier machine: completed opaque controls | [Opaque controls, 2026-10-17](engine-step2-opaque-controls-2026-10-17.md) |
 | Earlier machine: arithmetic/CLP operands | [Builtin operands, 2026-10-17](engine-step2-builtin-operands-2026-10-17.md) |

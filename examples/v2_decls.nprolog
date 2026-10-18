@@ -48,6 +48,7 @@ sign N S <- (N > 0 -> S = pos ; N < 0 -> S = neg ; S = zero).
 > nat X, X > 3, !?
 > sign -2 S?
 
+# LSP SHOULD CATCH THESE.
 # Errors (each query reports and moves on):
 > fact X 5?
 > fact a R?

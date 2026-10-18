@@ -13,6 +13,7 @@ module Infera.Core.Run
   ( Step (..),
     runCore,
     runCoreWith,
+    runCoreWithStats,
   )
 where
 
@@ -26,7 +27,10 @@ import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble, numericTerm)
 import qualified Infera.CLP as CLP
+import qualified Infera.Core.Constraint as NativeConstraint
 import Infera.Core.Compile
+import qualified Infera.Core.Liveness as Liveness
+import qualified Infera.Core.Delta as Delta
 import Infera.Core.Store
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -103,6 +107,10 @@ data Alt
   | -- | remaining reference items of a delegated goal and the substitution
     -- the goal started from
     AltLeaf [SearchItem] !(IM.IntMap Term) Cont
+  | -- | native labeling retries own heap/trail and CLP rollback together
+    AltLabel [S.VarId] !S.VarId [Integer] Cont
+  | -- | retry recomputes the domain under the current incumbent
+    AltOptimize [S.VarId] !S.VarId !Integer !Term !(IORef Minimum) Cont
   | -- | sentinel of a tabled fixpoint iteration
     AltTable !(IORef Fix)
   | -- | remaining table answers to consume: answers, saved call address,
@@ -120,6 +128,9 @@ data Minimum = Minimum
   { mnEntryHeap :: !Int,
     mnEntryTrail :: !Int,
     mnEntryOut :: !Int,
+    -- | The winning branch's next logical ID, independent of the entry
+    -- choice point restored while exploring or returning the minimum.
+    mnBestFresh :: !Int,
     mnBest :: Maybe (Integer, [(Int, Copy)], [OutputEvent], Map.Map Term TableEntry, Map.Map PredKey [(Term, Int)], CLP.Store, IS.IntSet)
   }
 
@@ -133,6 +144,12 @@ data Fix = Fix
     fxDepth :: !Int,
     -- | the running table map of the fixpoint (the reference's @tables'@)
     fxTables :: Map.Map Term TableEntry,
+    -- | Entry tables are restored if a speculative delta round observes an
+    -- issue; the ordinary evaluator then replays the complete fixpoint.
+    fxInitialTables :: Map.Map Term TableEntry,
+    -- | Proven recursive clause ordinals; Nothing uses full iteration.
+    fxDeltaClauses :: Maybe [Int],
+    fxDelta :: [(Term, Int, [OutputEvent])],
     fxAnswers :: [(Term, Int, [OutputEvent])],
     fxSet :: Set.Set Term,
     fxIteration :: !Int,
@@ -196,12 +213,19 @@ runCore = runCoreWith initialCollectLimit
 -- the first construct that would abandon the run, if any.
 runCoreWith :: Int -> P.Program -> S.Query -> IO (Maybe String, IO Step)
 runCoreWith limit program query = do
+  (reason, first, _) <- runCoreWithStats limit program query
+  pure (reason, first)
+
+-- | Collection evidence for acceptance tests. Normal solving does not poll
+-- this action; counters change only when collection actually runs.
+runCoreWithStats :: Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int))
+runCoreWithStats limit program query = do
   syms <- newSymbols
   store <- newStore syms
   writeReg store rGCLIM limit
   compiled <- compileProgram store program query
   case compiled of
-    Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason))
+    Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason), collectionStats store)
     Right core -> do
       choices <- newArray_ (0, 1023)
       guards <- newArray (0, 3 * 1024 - 1) 0
@@ -212,7 +236,7 @@ runCoreWith limit program query = do
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
       writeIORef (mVarCells m) (IM.fromList [(i, i) | i <- [0 .. cpQueryVars core - 1]])
-      pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone))
+      pure (cpUnsupported core, run m (CGoals (cpQuery core) 0 0 0 CDone), collectionStats store)
 
 -- ─── choice stack ────────────────────────────────────────────────────────────
 
@@ -458,6 +482,10 @@ run' m cont = case cont of
         when better $ do
           trailArr <- readIORef (trail s)
           top <- trailTop s
+          -- All older cells are restored together. Number their copied
+          -- fresh variables in one namespace, preserving both aliases and
+          -- distinct variables across separate bound roots.
+          copiedNames <- newIORef IM.empty
           -- Walk the trail downward: an odd entry restores the word below it.
           let scan !i acc
                 | i < mnEntryTrail mn = pure acc
@@ -472,7 +500,7 @@ run' m cont = case cont of
                         if addr >= mnEntryHeap mn || (tagOf w == tagRef && valOf w == addr)
                           then scan (i - 1) acc
                           else do
-                            copy <- copyOut m (mnEntryHeap mn) w
+                            copy <- copyOutWith m copiedNames (mnEntryHeap mn) w
                             scan (i - 1) ((addr, copy) : acc)
           bound <- scan (top - 1) []
           produced <- outputSince m (mnEntryOut mn)
@@ -480,7 +508,8 @@ run' m cont = case cont of
           dynamic <- readIORef (mDynamic m)
           store <- readIORef (mCLP m)
           watched <- readIORef (mWatched m)
-          writeIORef ref mn {mnBest = Just (n, bound, produced, tables, dynamic, store, watched)}
+          winnerFresh <- freshId s
+          writeIORef ref mn {mnBestFresh = winnerFresh, mnBest = Just (n, bound, produced, tables, dynamic, store, watched)}
         backtrack m
   CExitTable fixRef -> do
     fx <- readIORef fixRef
@@ -655,7 +684,7 @@ step' m goal goals base barrier depth next = case goal of
     entryHeap <- heapTop s
     entryTrail <- trailTop s
     entryOut <- outLen s
-    ref <- newIORef (Minimum entryHeap entryTrail entryOut Nothing)
+    ref <- newIORef (Minimum entryHeap entryTrail entryOut 0 Nothing)
     buffer <- newIORef []
     let rest = CGoals goals base barrier depth next
     sentinel <- pushChoice m (AltMinimize ref buffer rest)
@@ -928,6 +957,24 @@ fileContents m pathWord
 -- stays consistent across goals.
 delegate :: Machine -> Term -> Cont -> IO Step
 delegate m goal cont = do
+  store <- readIORef (mCLP m)
+  case goal of
+    Compound name args | Just result <- NativeConstraint.post store name args ->
+      acceptConstraint m result (run m cont)
+    Compound "label" [list] -> nativeLabel m (NativeConstraint.labelVariables store list) cont
+    Compound "labeling" [list] -> nativeLabel m (NativeConstraint.labelVariables store list) cont
+    Compound "labeling" [options, list] -> case deepWalk (CLP.stSubst store) options of
+      Compound "cons" [Compound "min" [cost], Atom "nil"] ->
+        case NativeConstraint.minimumVariables store list of
+          Left err -> raiseError m err
+          Right variables -> nativeMinimum m cost variables cont
+      other -> raiseError m (TypeError "labeling options [min Cost]" other)
+    _ -> delegateReference m goal cont
+
+-- Leaf compatibility remains available for strings, formatting and file IO;
+-- constraint posting and search never construct a reference Search here.
+delegateReference :: Machine -> Term -> Cont -> IO Step
+delegateReference m goal cont = do
   let s = mStore m
   store <- readIORef (mCLP m)
   fresh <- freshId s
@@ -937,6 +984,95 @@ delegate m goal cont = do
     cells' <- readIORef (mVarCells m)
     traceMsg ("delegate " ++ show goal ++ " fresh=" ++ show fresh ++ " cells=" ++ show [(v, a) | v <- S.termVarIds goal, Just a <- [IM.lookup v cells']])
   leafItems m items (CLP.stSubst store) cont
+
+acceptConstraint :: Machine -> Either SolveError (Maybe CLP.Store) -> IO Step -> IO Step
+acceptConstraint m result continue = case result of
+  Left err -> raiseError m err
+  Right Nothing -> backtrack m
+  Right (Just store) -> do
+    previous <- CLP.stSubst <$> readIORef (mCLP m)
+    ok <- installStore m previous store
+    if ok then continue else backtrack m
+
+nativeLabel :: Machine -> [S.VarId] -> Cont -> IO Step
+nativeLabel m variables cont = do
+  store <- readIORef (mCLP m)
+  case NativeConstraint.selectLabel False store variables of
+    Left err -> raiseError m err
+    Right NativeConstraint.LabelDone -> run m cont
+    Right (NativeConstraint.LabelNext pending variable values) ->
+      nativeLabelValues m pending variable values cont
+
+nativeLabelValues :: Machine -> [S.VarId] -> S.VarId -> [Integer] -> Cont -> IO Step
+nativeLabelValues m _ _ [] _ = backtrack m
+nativeLabelValues m variables variable (value : rest) cont = do
+  unless (null rest) $ () <$ pushChoice m (AltLabel variables variable rest cont)
+  store <- readIORef (mCLP m)
+  acceptConstraint m (CLP.storeBind store variable value) (nativeLabel m variables cont)
+
+nativeMinimum :: Machine -> Term -> [S.VarId] -> Cont -> IO Step
+nativeMinimum m cost variables cont = do
+  let s = mStore m
+  entryHeap <- heapTop s
+  entryTrail <- trailTop s
+  entryOut <- outLen s
+  ref <- newIORef (Minimum entryHeap entryTrail entryOut 0 Nothing)
+  issues <- newIORef []
+  sentinel <- pushChoice m (AltMinimize ref issues cont)
+  pushScope m (SBuffer issues)
+  -- The sentinel owns the winner and all errors, exactly as minimize does.
+  -- Native choices below it restore the heap, domains and watches together.
+  sentinel `seq` nativeMinimumNode m cost variables ref cont
+
+minimumBound :: IORef Minimum -> IO (Maybe Integer)
+minimumBound ref = do
+  minimum' <- readIORef ref
+  pure (case mnBest minimum' of
+    Nothing -> Nothing
+    Just (value, _, _, _, _, _, _) -> Just value)
+
+nativeMinimumNode :: Machine -> Term -> [S.VarId] -> IORef Minimum -> Cont -> IO Step
+nativeMinimumNode m cost variables ref cont = do
+  store <- readIORef (mCLP m)
+  incumbent <- minimumBound ref
+  acceptConstraint m (NativeConstraint.boundMinimum cost incumbent store) $ do
+    bounded <- readIORef (mCLP m)
+    case NativeConstraint.selectLabel True bounded variables of
+      Left err -> raiseError m err
+      Right NativeConstraint.LabelDone -> case NativeConstraint.minimumCost bounded cost of
+        Left err -> raiseError m err
+        Right value -> do
+          word <- numberWord (mStore m) (NVInt value)
+          run m (CExitMinimize (PWord word) 0 ref)
+      Right (NativeConstraint.LabelNext pending variable _) ->
+        case CLP.domainOf bounded variable of
+          Just (CLP.Domain (CLP.Fin lower) _ _) ->
+            nativeMinimumValues m pending variable lower cost ref cont
+          _ -> raiseError m (UnboundedDomain (Var variable))
+
+nativeMinimumValues :: Machine -> [S.VarId] -> S.VarId -> Integer -> Term -> IORef Minimum -> Cont -> IO Step
+nativeMinimumValues m variables variable lower cost ref cont = do
+  store <- readIORef (mCLP m)
+  incumbent <- minimumBound ref
+  let restricted = CLP.addDomain (Var variable) (CLP.Fin lower) CLP.PosInf store
+        >>= maybe (Right Nothing) (NativeConstraint.boundMinimum cost incumbent)
+  case restricted of
+    Left err -> raiseError m err
+    Right Nothing -> backtrack m
+    Right (Just bounded) ->
+      let values = case deepWalk (CLP.stSubst bounded) (Var variable) of
+            IntLit value -> [value]
+            _ -> maybe [] id (CLP.domainOf bounded variable >>= CLP.domainValues)
+       in case values of
+         [] -> backtrack m
+         value : _ -> case CLP.storeBind bounded variable value of
+           -- An error stops this variable's exploration, while a failed
+           -- value and an explored child permit the next value. This differs
+           -- from ordinary label's stream of independent alternatives.
+           Left err -> raiseError m err
+           Right result -> do
+             _ <- pushChoice m (AltOptimize variables variable (value + 1) cost ref cont)
+             acceptConstraint m (Right result) (nativeMinimumNode m cost variables ref cont)
 
 leafItems :: Machine -> [SearchItem] -> IM.IntMap Term -> Cont -> IO Step
 leafItems m items previous cont = case items of
@@ -1272,6 +1408,12 @@ backtrackChoice m top =
         AltLeaf items previous cont -> do
           pop
           leafItems m items previous cont
+        AltLabel variables variable values cont -> do
+          pop
+          nativeLabelValues m variables variable values cont
+        AltOptimize variables variable lower cost ref cont -> do
+          pop
+          nativeMinimumValues m variables variable lower cost ref cont
         AltFindAll results buffer target base _ cont -> do
           pop
           issues <- reverse <$> readIORef buffer
@@ -1301,16 +1443,34 @@ backtrackChoice m top =
             then raiseItems m issues (backtrack m)
             else case mnBest mn of
               Nothing -> backtrack m
-              Just (_, bound, produced, tables, dynamic, store, watched) -> do
+              Just (_, bound, produced, tables, dynamic, store, _) -> do
+                currentFresh <- freshId s
+                setFreshId s (max currentFresh (mnBestFresh mn))
+                -- The old entry store must not record the writes that
+                -- reconstruct an already-propagated winning state.
+                writeReg s rCLP 0
                 fresh <- newIORef IM.empty
                 forM_ bound $ \(addr, copy) -> do
                   w <- rebuildCopyWith m fresh copy
                   bind s addr w
+                rebuilt <- readIORef fresh
+                previousCells <- readIORef (mVarCells m)
+                let older = IM.filter (< mnEntryHeap mn) previousCells
+                    copied = minimumCopyCells rebuilt (map snd bound)
+                    restoredCells = IM.union copied older
+                    restoredWatched = IS.fromList
+                      [addr | ident <- IS.toList (CLP.stWatched store),
+                        Just addr <- [IM.lookup ident restoredCells]]
+                -- CpFresh identities survive, their old branch addresses
+                -- do not. Rebuild watches from the shared copy map before
+                -- the continuation can bind an escaped local variable.
+                writeIORef (mVarCells m) restoredCells
                 mapM_ (emitOutput m) produced
                 writeIORef (mTables m) tables
                 writeIORef (mDynamic m) dynamic
                 writeIORef (mCLP m) store
-                writeIORef (mWatched m) watched
+                writeIORef (mWatched m) restoredWatched
+                writeReg s rCLP (if IS.null (CLP.stWatched store) then 0 else 1)
                 -- The winner's store already holds these bindings.
                 writeReg s rBOUND 0
                 run m cont
@@ -1322,9 +1482,31 @@ backtrackChoice m top =
 
 -- ─── findall copies ──────────────────────────────────────────────────────────
 
+-- | Recover the logical-to-physical map of the winner's newly rebuilt
+-- variables. Copy ordinals belong to one candidate-wide namespace; the
+-- logical IDs remain the identities used by its constraint store.
+minimumCopyCells :: IM.IntMap Int -> [Copy] -> IM.IntMap Int
+minimumCopyCells rebuilt = go IM.empty
+  where
+    go !known [] = known
+    go !known (copy : rest) = case copy of
+      CpFresh ordinal logical -> case IM.lookup ordinal rebuilt of
+        Just addr -> go (IM.insert logical addr known) rest
+        Nothing -> go known rest
+      CpStruct _ children -> go known (children ++ rest)
+      CpRef _ -> go known rest
+      CpWord _ -> go known rest
+
 copyOut :: Machine -> Int -> Word' -> IO Copy
 copyOut m entryHeap word = do
   fresh <- newIORef IM.empty
+  copyOutWith m fresh entryHeap word
+
+-- | Copy several roots in a shared variable namespace. A minimum winner
+-- needs this across its saved bindings; findall uses 'copyOut' separately
+-- for each solution, keeping each solution's fresh variables independent.
+copyOutWith :: Machine -> IORef (IM.IntMap Int) -> Int -> Word' -> IO Copy
+copyOutWith m fresh entryHeap word = do
   let go w0 = do
         w <- deref s w0
         case tagOf w of
@@ -1858,9 +2040,11 @@ callTabled m predicate cont0 = do
           Nothing -> do
             entryOut <- outLen s
             issues <- newIORef []
+            let delta = P.lookupPred key (mProgram m) >>= \source -> Delta.recursiveClauses (mProgram m) source callKey
             fixRef <- newIORef Fix
               { fxKey = callKey, fxPred = predicate, fxArgs = saved, fxEntryOut = entryOut, fxDepth = depth,
-                fxTables = tables, fxAnswers = [], fxSet = Set.empty, fxIteration = 0, fxFound = [],
+                fxTables = tables, fxInitialTables = tables, fxDeltaClauses = delta, fxDelta = [],
+                fxAnswers = [], fxSet = Set.empty, fxIteration = 0, fxFound = [],
                 fxCompleted = Map.empty, fxIssues = issues, fxCont = returnCont, fxUnsafe = False }
             startIteration m fixRef
 
@@ -1870,12 +2054,14 @@ callConstrained m store saved arity = do
   args <- forM [0 .. arity - 1] $ \i -> readCell (mStore m) (saved + i) >>= exportFor m
   pure (any (CLP.isConstrained store) (concatMap S.termVarIds args))
 
--- | One fixpoint iteration: all clauses run against the partial table.
+-- | One fixpoint iteration. Proven linear recursion consumes only the last
+-- round's fresh answers; other shapes retain the complete partial table.
 startIteration :: Machine -> IORef Fix -> IO Step
 startIteration m fixRef = do
   fx <- readIORef fixRef
   let s = mStore m
-      partial = TableEntry False False (fxAnswers fx) (fxSet fx)
+      visible = case fxDeltaClauses fx of Just _ -> fxDelta fx; Nothing -> fxAnswers fx
+      partial = TableEntry False False visible (fxSet fx)
   writeIORef (mTables m) (Map.insert (fxKey fx) partial (fxTables fx))
   issues <- newIORef []
   writeIORef fixRef fx {fxFound = [], fxCompleted = Map.empty, fxIssues = issues}
@@ -1884,7 +2070,15 @@ startIteration m fixRef = do
   loadArgs s (fxArgs fx) (pArity (fxPred fx))
   if fxDepth fx > maxResolutionDepth
     then raiseItems m [BranchExhausted] (backtrack m)
-    else callClauses m (fxPred fx) (sentinel + 1) (fxDepth fx) (CExitTable fixRef)
+    else case fxDeltaClauses fx of
+      Just recursive | fxIteration fx > 0 -> case recursive of
+        [] -> backtrack m
+        [ordinal] -> tryClause m (fxPred fx) ordinal (sentinel + 1) (fxDepth fx) (CExitTable fixRef)
+        ordinal : more -> do
+          saved <- saveArgs s (pArity (fxPred fx))
+          choice <- pushChoice m (AltClauses (fxPred fx) more saved (fxDepth fx) (CExitTable fixRef))
+          tryClause m (fxPred fx) ordinal (min (sentinel + 1) choice) (fxDepth fx) (CExitTable fixRef)
+      _ -> callClauses m (fxPred fx) (sentinel + 1) (fxDepth fx) (CExitTable fixRef)
 
 -- | The inner search of an iteration is exhausted; the state is back at the
 -- call entry.
@@ -1902,7 +2096,19 @@ finishIteration m fixRef = do
       tables' = Map.union completed (Map.delete (fxKey fx) (fxTables fx))
       converged = null fresh
       gaveUp = fxIteration fx >= maxTableIterations
-  if fxUnsafe fx
+      deltaIssue = case fxDeltaClauses fx of
+        Just _ -> not (null deps) || not (null others)
+        Nothing -> False
+  if deltaIssue
+    then do
+      -- The buffered round has produced no public items. Resource limits or
+      -- a foreign incomplete table can make skipped old derivations visible,
+      -- so restart from the exact entry tables using the general evaluator.
+      writeIORef fixRef fx
+        {fxTables = fxInitialTables fx, fxDeltaClauses = Nothing, fxDelta = [],
+         fxAnswers = [], fxSet = Set.empty, fxIteration = 0, fxUnsafe = False}
+      startIteration m fixRef
+    else if fxUnsafe fx
     then do
       writeIORef (mTables m) (fxTables fx)
       loadArgs (mStore m) (fxArgs fx) (pArity (fxPred fx))
@@ -1918,7 +2124,7 @@ finishIteration m fixRef = do
       raiseItems m (map ConsumedIncomplete deps ++ others ++ [BranchExhausted | gaveUp])
         (consumeAnswers m answers' (fxArgs fx) (pArity (fxPred fx)) (fxCont fx))
     else do
-      writeIORef fixRef fx {fxTables = tables', fxAnswers = answers', fxSet = set', fxIteration = fxIteration fx + 1}
+      writeIORef fixRef fx {fxTables = tables', fxAnswers = answers', fxSet = set', fxDelta = fresh, fxIteration = fxIteration fx + 1}
       startIteration m fixRef
   where
     dedup _ [] = []
@@ -2067,19 +2273,6 @@ collect m cont nargs = do
   -- The bitmaps are small and newArray clears them in bulk. Reusing them
   -- would require a slower bit-by-bit clear; reuse the word-sized arrays.
   marks <- newArray (0, top) False :: IO (IOUArray Int Bool)
-  trailed <- newArray (0, top) False :: IO (IOUArray Int Bool)
-  -- Cells with a trail entry can become unbound again; their ids matter.
-  do
-    trailArr0 <- readIORef (trail s)
-    trailLen0 <- trailTop s
-    let noteTrail i
-          | i < 0 = pure ()
-          | otherwise = do
-              entry <- unsafeRead trailArr0 i
-              let addr = entry `div` 2
-              when (addr < top) (unsafeWrite trailed addr True)
-              noteTrail (if odd entry then i - 2 else i - 1)
-    noteTrail (trailLen0 - 1)
   -- Slot zero is the stack height, kept unboxed just like the addresses.
   stackRef <- newIORef =<< (newArray (0, 4095) 0 :: IO (IOUArray Int Int))
   let push a = do
@@ -2098,28 +2291,7 @@ collect m cont nargs = do
         unsafeWrite st' 0 (i + 1)
       markCell a = do
         seen <- unsafeRead marks a
-        if seen then pure () else unsafeWrite marks a True >> push a >> markBlockOf a
-      -- A live slot that is unbound, or bound but undoable, keeps its whole
-      -- activation block, marker included, so its logical id survives
-      -- compaction. Functor words below a cell are either its structure's
-      -- functor (block size 0) or a block marker.
-      markBlockOf a = do
-        w0 <- unsafeRead arr a
-        undoable <- unsafeRead trailed a
-        when ((tagOf w0 == tagRef && valOf w0 == a) || undoable) $ scanBlock a
-      scanBlock a = do
-        let scan i
-              | i < 0 = pure ()
-              | otherwise = do
-                  w <- unsafeRead arr i
-                  if tagOf w == tagFun
-                    then do
-                      let n = markerVars w
-                      when (n > 0 && a <= i + n) $ do
-                        unsafeWrite marks i True
-                        forM_ [i + 1 .. i + n] markCell
-                    else scan (i - 1)
-        scan (a - 1)
+        if seen then pure () else unsafeWrite marks a True >> push a
       markStructure a = do
         seen <- unsafeRead marks a
         if seen
@@ -2145,26 +2317,20 @@ collect m cont nargs = do
               then (if valOf w /= a then markCell (valOf w) else pure ())
               else if tagOf w == tagStr then markStructure (valOf w) else pure ()
             drain
-      markBlock base
-        | base == 0 = forM_ [0 .. queryCells - 1] markCell
-        | otherwise = do
-            marker <- unsafeRead arr (base - 1)
-            unsafeWrite marks (base - 1) True
-            forM_ [base .. base + markerVars marker - 1] markCell
       markCont c = case c of
         CDone -> pure ()
-        CGoals _ base _ _ next -> markBlock base >> markCont next
+        CGoals goals base _ _ next -> Liveness.visitGoals markWord base goals >> markCont next
         CReturn _ _ check next -> do
           forM_ (maybe [] (\(_, _, ws) -> ws) check) markWord
           markCont next
-        CExitIf _ _ base _ _ next -> markBlock base >> markCont next
+        CExitIf _ goals base _ _ next -> Liveness.visitGoals markWord base goals >> markCont next
         CExitNot _ _ _ -> pure ()
-        CExitFindAll _ results _ base _ _ _ -> markBlock base >> markResults results
+        CExitFindAll _ results template base _ _ _ -> Liveness.visitPattern markWord base template >> markResults results
         CExitTable fixRef -> do
           fx <- readIORef fixRef
           forM_ [fxArgs fx .. fxArgs fx + pArity (fxPred fx) - 1] markCell
           markCont (fxCont fx)
-        CExitMinimize _ base _ -> markBlock base
+        CExitMinimize cost base _ -> Liveness.visitPattern markWord base cost
       markResults ref = do
         collected <- readIORef ref
         forM_ collected (markCopy . fst)
@@ -2176,12 +2342,12 @@ collect m cont nargs = do
         AltClauses predicate _ saved _ c -> do
           forM_ [saved .. saved + pArity predicate - 1] markCell
           markCont c
-        AltGoals _ base _ _ c -> markBlock base >> markCont c
+        AltGoals goals base _ _ c -> Liveness.visitGoals markWord base goals >> markCont c
         AltNot _ _ c -> markCont c
         AltIf _ elseGoals c -> do
-          forM_ elseGoals (\(_, base, _, _) -> markBlock base)
+          forM_ elseGoals (\(goals, base, _, _) -> Liveness.visitGoals markWord base goals)
           markCont c
-        AltFindAll results _ _ base _ c -> markBlock base >> markResults results >> markCont c
+        AltFindAll results _ target base _ c -> Liveness.visitPattern markWord base target >> markResults results >> markCont c
         AltLeaf _ _ c -> markCont c
         AltTable fixRef -> do
           fx <- readIORef fixRef
@@ -2191,15 +2357,34 @@ collect m cont nargs = do
         AltRetract _ _ saved c -> markCell saved >> markCont c
         AltMinimize ref _ c -> do
           mn <- readIORef ref
-          forM_ (mnBest mn) $ \(_, bound, _, _, _, _, _) -> forM_ bound $ \(addr, copy) -> markCell addr >> markCopy copy
+          forM_ (mnBest mn) $ \(_, bound, _, _, _, _, watched) -> do
+            forM_ bound $ \(addr, copy) -> markCell addr >> markCopy copy
+            markWatched watched
           markCont c
+        AltLabel _ _ _ c -> markCont c
+        AltOptimize _ _ _ _ _ c -> markCont c
+      -- Constraint stores retain logical variables independently of the
+      -- suspended syntax. Their watched cells, and pending reconciliation
+      -- cells, must survive even when a local has no remaining goal use.
+      markWatched watched = forM_ (IS.toList watched) $ \addr ->
+        when (addr >= 0 && addr < top) (markCell addr)
   -- The query block is a root even when no continuation names it any
   -- more: the answer is exported from it.
   forM_ [0 .. queryCells - 1] markCell
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= markWord
   markCont cont
+  readIORef (mWatched m) >>= markWatched
+  pendingCount0 <- readReg s rBOUND
+  when (pendingCount0 > 0) $ do
+    pending <- readIORef (bound s)
+    forM_ [0 .. pendingCount0 - 1] $ \i -> do
+      addr <- unsafeRead pending i
+      when (addr >= 0 && addr < top) (markCell addr)
   choiceTop <- readIORef (mChoiceTop m)
-  forM_ [0 .. choiceTop - 1] $ \i -> readChoice m i >>= markAlt . chAlt
+  forM_ [0 .. choiceTop - 1] $ \i -> do
+    choice <- readChoice m i
+    markAlt (chAlt choice)
+    markWatched (chWatched choice)
   drain
   -- Forwarding: fwd a = live cells below a.
   let fwd = gcForward workspace
@@ -2266,28 +2451,26 @@ collect m cont nargs = do
   keptTotal <- compactTrail 0 0
   unsafeWrite keptBelow trailLen keptTotal
   setTrailTop s keptTotal
-  -- Relocate control records before sliding: they read markers via old
-  -- addresses only through 'forward', which does not touch cells.
-  let relocBlock base
-        | base == 0 = pure 0
-        | otherwise = (+ 1) <$> forward (base - 1)
-      relocCont c = case c of
+  -- Suspended syntax now captures only the cells it actually uses. Slot
+  -- references become PWord values before the activation markers vanish;
+  -- the shared predicate/clause plans remain unchanged.
+  let relocCont c = case c of
         CDone -> pure CDone
         CGoals goals base barrier depth next ->
-          CGoals goals <$> relocBlock base <*> pure barrier <*> pure depth <*> relocCont next
+          (\gs -> CGoals gs 0 barrier depth) <$> Liveness.relocateGoals reloc base goals <*> relocCont next
         CReturn commit guard check next -> do
           check' <- case check of
             Nothing -> pure Nothing
             Just (key, sig, ws) -> Just . (,,) key sig <$> mapM reloc ws
           CReturn commit guard check' <$> relocCont next
         CExitIf sentinel thenGoals base barrier depth next ->
-          CExitIf sentinel thenGoals <$> relocBlock base <*> pure barrier <*> pure depth <*> relocCont next
+          (\gs -> CExitIf sentinel gs 0 barrier depth) <$> Liveness.relocateGoals reloc base thenGoals <*> relocCont next
         CExitNot sentinel flag depth -> pure (CExitNot sentinel flag depth)
         -- Shared buffers are relocated once, through the sentinel's alternative.
         CExitFindAll sentinel results template base entryHeap entryOut depth ->
-          CExitFindAll sentinel results template <$> relocBlock base <*> forward entryHeap <*> pure entryOut <*> pure depth
+          (\p h -> CExitFindAll sentinel results p 0 h entryOut depth) <$> Liveness.relocatePattern reloc base template <*> forward entryHeap
         CExitTable fixRef -> pure (CExitTable fixRef)
-        CExitMinimize cost base ref -> CExitMinimize cost <$> relocBlock base <*> pure ref
+        CExitMinimize cost base ref -> (\p -> CExitMinimize p 0 ref) <$> Liveness.relocatePattern reloc base cost
       relocResults ref = do
         collected <- readIORef ref
         relocated <- forM collected $ \(copy, produced) -> (\c -> (c, produced)) <$> relocCopy copy
@@ -2300,18 +2483,18 @@ collect m cont nargs = do
         AltClauses predicate more saved depth c ->
           AltClauses predicate more <$> forward saved <*> pure depth <*> relocCont c
         AltGoals goals base barrier depth c ->
-          AltGoals goals <$> relocBlock base <*> pure barrier <*> pure depth <*> relocCont c
+          (\gs -> AltGoals gs 0 barrier depth) <$> Liveness.relocateGoals reloc base goals <*> relocCont c
         AltNot flag buffer c -> AltNot flag buffer <$> relocCont c
         AltIf counter elseGoals c -> do
           elseGoals' <- case elseGoals of
             Nothing -> pure Nothing
             Just (goals, base, barrier, depth) -> do
-              base' <- relocBlock base
-              pure (Just (goals, base', barrier, depth))
+              goals' <- Liveness.relocateGoals reloc base goals
+              pure (Just (goals', 0, barrier, depth))
           AltIf counter elseGoals' <$> relocCont c
         AltFindAll results buffer target base depth c -> do
           relocResults results
-          AltFindAll results buffer target <$> relocBlock base <*> pure depth <*> relocCont c
+          (\p -> AltFindAll results buffer p 0 depth) <$> Liveness.relocatePattern reloc base target <*> relocCont c
         AltLeaf items previous c -> AltLeaf items previous <$> relocCont c
         AltTable fixRef -> do
           fx <- readIORef fixRef
@@ -2337,6 +2520,8 @@ collect m cont nargs = do
           entryTrail' <- unsafeRead keptBelow (mnEntryTrail mn)
           writeIORef ref mn {mnEntryHeap = entryHeap', mnEntryTrail = entryTrail', mnBest = best'}
           AltMinimize ref buffer <$> relocCont c
+        AltLabel variables selected values c -> AltLabel variables selected values <$> relocCont c
+        AltOptimize variables selected value goal minimum c -> AltOptimize variables selected value goal minimum <$> relocCont c
   cont' <- relocCont cont
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
   varCells <- readIORef (mVarCells m)
@@ -2364,8 +2549,33 @@ collect m cont nargs = do
       keep <- liveCell addr
       if keep then (: []) <$> forward addr else pure []
     writeChoice m i choice {chH = h', chTR = tr', chAlt = alt', chWatched = IS.fromList (concat watchedList)}
+  -- Preserve identities independently of frame layout. This pass reads
+  -- every old marker once, rather than scanning back from each surviving
+  -- slot. It also carries forward identities detached by earlier GCs.
+  knownIds <- readIORef (logicalIds s)
+  let retainIds !addr !end !offset acc
+        | addr >= top = pure acc
+        | otherwise = do
+            word <- unsafeRead arr addr
+            if tagOf word == tagFun && markerVars word > 0
+              then retainIds (addr + 1) (addr + markerVars word) (markerBase word - addr - 1) acc
+              else do
+                keep <- liveCell addr
+                let ident = case IM.lookup addr knownIds of
+                      Just v -> Just v
+                      Nothing | addr <= end -> Just (offset + addr)
+                      _ -> Nothing
+                acc' <- case (keep, ident) of
+                  (True, Just v) -> do
+                    addr' <- forward addr
+                    pure ((addr', v) : acc)
+                  _ -> pure acc
+                retainIds (addr + 1) end offset acc'
+  retainedIds <- retainIds 0 (-1) 0 []
+  replaceLogicalIds s newTop (IM.fromDistinctAscList (reverse retainedIds))
   slide 0
   setHeapTop s newTop
+  recordCollection s top newTop
   refreshHb m
   when traceOn (checkInvariants m cont')
   floor' <- readReg s rGCLIM

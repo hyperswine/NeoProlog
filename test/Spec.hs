@@ -39,6 +39,10 @@ import MachineCompiledControlTest (machineCompiledControlGroup)
 import MachineCacheTest (machineCacheGroup)
 import MachineOperandTest (machineOperandGroup)
 import CoreTest (coreGroup)
+import CoreConstraintTest (coreConstraintGroup)
+import CoreDecisionTest (coreDecisionGroup)
+import CoreDeltaTest (coreDeltaGroup)
+import CoreLivenessTest (coreLivenessGroup)
 import MachineTypedBuiltinTest (machineTypedBuiltinGroup)
 import MachineOpaqueScopeTest (machineOpaqueScopeGroup)
 import System.Environment (getArgs)
@@ -70,6 +74,10 @@ groups =
     ("machine-cache", machineCacheGroup),
     ("machine-operands", machineOperandGroup),
     ("core-engine", coreGroup),
+    ("core-native-clp", coreConstraintGroup),
+    ("core-decisions", coreDecisionGroup),
+    ("core-delta", coreDeltaGroup),
+    ("core-liveness", coreLivenessGroup),
     ("machine-typed-builtin", machineTypedBuiltinGroup),
     ("machine-opaque-scope", machineOpaqueScopeGroup)
   ]
