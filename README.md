@@ -42,9 +42,15 @@ infera --trace <file> ["query?"] # trace an explicit query, or the file's inline
 
 `check` resolves imports and checks undefined predicates, call arities,
 declarations without matching clauses, and literal arguments that conflict
-with every declared signature. Singleton variables, conflicting flags, and
-unreachable clause heads produce warnings. Errors exit 1; warnings alone exit
-0. Informational performance suggestions also leave the exit status unchanged:
+with every declared signature. Singleton variables (`singleton-variable`),
+conflicting flags (`conflicting-flags`), unreachable clause heads
+(`head-sort-mismatch`) and clauses that shadow a builtin (`shadowed-builtin`)
+produce warnings. Builtins are matched before user clauses, so clauses for a
+builtin's name and arity such as a user-defined `is/2` or `findall/3` never
+run; the warning names the builtin and asks for a rename. Variables used once
+in an inline query are answer variables and are not reported as singletons.
+Errors exit 1; warnings alone exit 0. Informational performance suggestions
+also leave the exit status unchanged:
 
 | code | opportunity |
 | --- | --- |

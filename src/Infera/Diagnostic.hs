@@ -52,10 +52,12 @@ diagnose items = concatMap inspect items
     emit item severity code message = Diagnostic (locatedSpan item) severity code message
     inspect item = case locatedItem item of
       TLClause cl ->
-        calls item (clauseBody cl) ++ singletons item (clauseHead cl : clauseBody cl)
+        shadowedBuiltin item cl ++ calls item (clauseBody cl)
+          ++ singletons item (clauseHead cl : clauseBody cl)
           ++ headSort item cl ++ effects item cl ++ performance item cl
-      TLQuery q -> calls item (queryGoals q) ++ singletons item (queryGoals q)
-        ++ labelingHints item [] (queryGoals q)
+      -- Query variables are answer variables: a variable used once names an
+      -- answer to report, so it is never a singleton mistake.
+      TLQuery q -> calls item (queryGoals q) ++ labelingHints item [] (queryGoals q)
       TLDecl d ->
         let key = (declName d, length (declArgs d))
             flagsOnly = null (declArgs d) && declDet d == Nothing
@@ -65,6 +67,18 @@ diagnose items = concatMap inspect items
               ++ [emit item Warning "conflicting-flags" "declaration contains both enabling and disabling flags"
                  | (FlagTable `elem` flags && FlagNoTable `elem` flags)
                     || (FlagIndex `elem` flags && FlagNoIndex `elem` flags)]
+      _ -> []
+    -- Builtins are matched before user clauses, so clauses for a builtin's
+    -- name and arity never run. Reported once, on the first such clause head.
+    shadowedBuiltin item cl = case clauseKey cl of
+      Just key@(name, arity)
+        | isBuiltin key, Map.lookup key firstClauseSpans == Just (locatedSpan item) ->
+            [Diagnostic (fromMaybe (locatedSpan item) (locatedHeadSpan item)) Warning "shadowed-builtin"
+              ("clauses for " ++ showPredKey key ++ " never run: " ++ showPredKey key
+                ++ " is a builtin and calls always go to the builtin; "
+                ++ (if locatedIsDCG item
+                      then "a DCG rule adds two arguments, so rename the nonterminal (for example my_" ++ name ++ ")"
+                      else "rename the predicate (for example " ++ showPredKey ("my_" ++ name, arity) ++ ")"))]
       _ -> []
     effects item cl = case clauseKey cl of
       Just key -> [emit item Error "unsafe-call" (describeViolation prog key g) | g <- clauseViolations prog cl]

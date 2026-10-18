@@ -36,6 +36,20 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     check("p : det (int: <=).\n", "declaration-without-clauses")
     check('p : det (int: <=).\np 1.\n> p "bad"?\n', "call-sort-mismatch")
     check("p X.\n", "singleton-variable", success=True)
+    # Query variables are answer variables, never singleton mistakes.
+    assert check("p 1.\n> p X?\n> p Y, true?\n", success=True) == []
+    rows = check("p X <- true.\n> p Z?\n", "singleton-variable", success=True)
+    assert [d["range"]["start"]["line"] for d in rows] == [0], rows  # the clause, not the query
+    # Clauses for a builtin's name and arity never run; one warning per predicate, on the head.
+    rows = check("same S T <- S == T.\nis S T <- S == T.\nis S T <- S = T.\n", "shadowed-builtin", success=True)
+    shadowed = [d for d in rows if d["code"] == "shadowed-builtin"]
+    assert len(shadowed) == 1 and shadowed[0]["severity"] == "warning", rows
+    assert "is/2" in shadowed[0]["message"] and "rename" in shadowed[0]["message"], rows
+    assert shadowed[0]["range"] == {"start": {"line": 1, "character": 0},
+                                    "end": {"line": 1, "character": 2}}, rows
+    check("findall A B C <- A = B, B = C.\n", "shadowed-builtin", success=True)
+    check("nl -> \"x\".\n", "shadowed-builtin", success=True)
+    assert check("my_is S T <- S == T.\n> my_is 1 1?\n", success=True) == []
     check("p : det (int: <=).\np 2.\n> p (1 + 1)?\n", success=True)
     check("p X <- call X.\n", success=True)
     rows = check("walk X <- walk X, true.\n", "perf-non-tail-recursion", success=True)

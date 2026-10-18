@@ -37,7 +37,7 @@
 <table>
 <tr><th>Command</th><th>Meaning</th></tr>
 <tr><td id="cli-file" data-dash="Command:infera FILE"><code>infera FILE</code></td><td>load a file, run its inline <code>&gt;</code> queries, then start the REPL</td></tr>
-<tr><td id="cli-check" data-dash="Command:infera check"><code>infera check FILE…</code></td><td>parse, resolve imports, and check undefined calls, arities, declarations and literal sort conflicts; warnings for singletons and conflicting flags; exit status 1 on errors, 0 for warnings alone</td></tr>
+<tr><td id="cli-check" data-dash="Command:infera check"><code>infera check FILE…</code></td><td>parse, resolve imports, and check undefined calls, arities, declarations and literal sort conflicts; warnings for singletons (<code>singleton-variable</code>, clauses only: query variables are answers), conflicting flags (<code>conflicting-flags</code>), unreachable heads (<code>head-sort-mismatch</code>) and clauses for a builtin's name and arity, which never run (<code>shadowed-builtin</code>); exit status 1 on errors, 0 for warnings alone</td></tr>
 <tr><td><code>infera check --json FILE…</code></td><td>emit an array of diagnostics with file, severity, code, message and zero-based UTF-16 ranges; semantic ranges cover the containing source item</td></tr>
 <tr><td><code>infera check --json --stdin FILE</code></td><td>check stdin as unsaved source at the original file path; optional <code>--buffer SOURCE SNAPSHOT</code> arguments override imported source from temporary snapshots without writing the original files</td></tr>
 <tr><td id="cli-reg" data-dash="Command:infera reg"><code>infera reg FILE…</code></td><td>register files as modules in <code>./neoprolog.conf</code></td></tr>

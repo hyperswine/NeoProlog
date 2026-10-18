@@ -7,7 +7,7 @@ module CorrectnessTest (correctnessGroup) where
 
 import Control.Exception (evaluate)
 import Data.Char (ord)
-import Data.List (intercalate, nub, sort)
+import Data.List (intercalate, isInfixOf, nub, sort)
 import qualified Data.Set as Set
 import Hedgehog hiding (Var)
 import qualified Hedgehog.Gen as Gen
@@ -469,6 +469,35 @@ prop_diagnostic_renaming = generated $ do
   ds <- diagnose <$> located (source name)
   map diagnosticCode ds === ["undefined-predicate"] ++ ["singleton-variable" | singleton && not hidden]
 
+-- Clauses whose name and arity belong to a builtin never run: one warning per
+-- predicate, placed on the first clause head. A renamed predicate is clean.
+prop_diagnostic_shadowed_builtin :: Property
+prop_diagnostic_shadowed_builtin = generated $ do
+  (name, arity) <- forAll (Gen.element
+    [("is", 2), ("findall", 3), ("unify", 2), ("write", 1), ("nl", 0), ("label", 1),
+     ("str_concat", 3), ("seq", 3), ("assert", 1), ("forall", 2)])
+  shadow <- forAll Gen.bool
+  extra <- forAll (Gen.int (Range.constant 0 2))
+  let predicate = if shadow then name else "my_" ++ name
+      clause = predicate ++ concat (replicate arity " _") ++ "."
+  ds <- diagnose <$> located (unlines (replicate (1 + extra) clause))
+  [diagnosticCode d | d <- ds, diagnosticSeverity d == Warning] === ["shadowed-builtin" | shadow]
+  case [d | d <- ds, diagnosticCode d == "shadowed-builtin"] of
+    [d] -> do
+      (spanLine (diagnosticSpan d), spanColumn (diagnosticSpan d)) === (1, 1)
+      assert (showPredKey (name, arity) `isInfixOf` diagnosticMessage d)
+    _ -> pure ()
+
+-- A variable used once in a query names an answer, so queries never report
+-- singletons; the same variable in a clause head still does.
+prop_diagnostic_query_answer_variables :: Property
+prop_diagnostic_query_answer_variables = generated $ do
+  inQuery <- forAll Gen.bool
+  name <- forAll (("V" ++) <$> Gen.string (Range.linear 0 6) (chars "abc012"))
+  let source = if inQuery then "p 1.\n> p " ++ name ++ "?\n" else "p " ++ name ++ ".\n"
+  ds <- diagnose <$> located source
+  map diagnosticCode ds === ["singleton-variable" | not inQuery]
+
 prop_diagnostic_sort_model :: Property
 prop_diagnostic_sort_model = generated $ do
   declared <- forAll (Gen.element [SAny, SInt, SNum, SFloat, SStr, SChar, SAtom, SList SInt])
@@ -503,5 +532,7 @@ correctnessGroup = Group "Generated correctness models"
     ("diagnostic UTF-16 locations", prop_diagnostic_locations),
     ("diagnostic arities through meta goals", prop_diagnostic_arity_model),
     ("diagnostic variable naming", prop_diagnostic_renaming),
+    ("diagnostic shadowed builtins", prop_diagnostic_shadowed_builtin),
+    ("diagnostic query answer variables", prop_diagnostic_query_answer_variables),
     ("diagnostic sorts vs literal model", prop_diagnostic_sort_model)
   ]
