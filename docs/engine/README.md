@@ -63,6 +63,7 @@ those paths and comparisons. They are not the normal CLI/REPL query engine.
 * [Contract proofs and performance](contracts-performance-2026-10-17.md)
 * [Mutable CLP propagation](mutable-clp-2026-10-18.md)
 * [Domain-consistent offset equalities](offset-equality-2026-10-18.md)
+* [Compiled arithmetic plans](arith-plans-2026-10-19.md)
 * [Allocation-free clause selection](clause-selection-2026-10-19.md)
 * [Answers up to renaming, plain calls and the choice stack](control-stacks-2026-10-19.md)
 * [Reusable operand slots and tail frames](reusable-slots-2026-10-18.md)

@@ -841,7 +841,7 @@ goalName :: Goal -> String
 goalName g = case g of
   GCall _ _ _ -> "call"; GTabled _ _ -> "tabled"; GCallFacts k _ -> "facts " ++ show k; GAssert _ -> "assert"
   GRetract _ -> "retract"; GRetractAll _ -> "retractall"; GMinimize _ _ -> "minimize"; GCallDyn _ _ _ -> "calldyn"
-  GAnd _ -> "and"; GUnify _ _ -> "unify"; GEquiv _ _ -> "equiv"; GNeq _ _ -> "neq"; GIs _ _ -> "is"; GCmp _ _ _ -> "cmp"
+  GAnd _ -> "and"; GUnify _ _ -> "unify"; GEquiv _ _ -> "equiv"; GNeq _ _ -> "neq"; GIs _ _ _ -> "is"; GCmp _ _ _ _ _ -> "cmp"
   GTrue -> "true"; GFail -> "fail"; GCut -> "cut"; GOr _ _ -> "or"; GIf _ _ _ -> "if"; GNot _ -> "not"; GOnce _ -> "once"
   GFindAll _ _ _ -> "findall"; GCheck _ _ -> "check"; GWrite _ _ -> "write"; GNl -> "nl"; GError _ -> "error"
   GLeaf n _ -> "leaf " ++ n; GPhrase _ _ -> "phrase"; GPhraseFile _ _ -> "phrasefile"; GEmit _ -> "emit"; GEmitText _ -> "emittext"
@@ -1005,15 +1005,25 @@ step' m goal goals base barrier depth next = case goal of
         ta <- exportFor m wa
         tb <- exportFor m wb
         delegate m (Compound "neq" [ta, tb]) (CGoals goals base barrier depth next)
-  GIs target expr -> do
-    fast <- evalFast m base expr
-    if fast
-      then do
-        quick <- readReg (mStore m) rVAL
+  -- The store is taken once: a selector thunk per use was allocated here.
+  GIs target expr plan -> case plan of
+    PlanNone -> do
+      fast <- evalFast m base expr
+      if fast
+        then do
+          quick <- readReg st rVAL
+          bindQuick quick
+        else general
+    _ -> do
+      quick <- runPlan st base plan
+      if quick /= planMiss then bindQuick quick else general
+    where
+      !st = mStore m
+      bindQuick quick = do
         wt <- numericTarget m base target
-        ok <- unify (mStore m) wt (intWord quick)
+        ok <- unify st wt (intWord quick)
         if ok then continue else backtrack m
-      else do
+      general = do
         value <- evalExpr m base expr
         case value of
           Left err -> raiseError m err
@@ -1022,17 +1032,30 @@ step' m goal goals base barrier depth next = case goal of
             raiseError m (InstantiationError shown)
           Right (Just number) -> do
             wt <- numericTarget m base target
-            wv <- numberWord (mStore m) number
-            ok <- unify (mStore m) wt wv
+            wv <- numberWord st number
+            ok <- unify st wt wv
             if ok then continue else backtrack m
-  GCmp op a b -> do
-    fa <- evalFast m base a
-    qa <- readReg (mStore m) rVAL
-    fb <- if fa then evalFast m base b else pure False
-    qb <- readReg (mStore m) rVAL
-    if fb
-      then if cmpAccepts op (compare qa qb) then continue else backtrack m
-      else do
+  GCmp op a b pa pb -> case () of
+    _
+      | planned pa && planned pb -> do
+          qa <- runPlan st base pa
+          qb <- if qa /= planMiss then runPlan st base pb else pure planMiss
+          if qb /= planMiss
+            then if cmpAccepts op (compare qa qb) then continue else backtrack m
+            else general
+      | otherwise -> do
+          fa <- evalFast m base a
+          qa <- readReg st rVAL
+          fb <- if fa then evalFast m base b else pure False
+          qb <- readReg st rVAL
+          if fb
+            then if cmpAccepts op (compare qa qb) then continue else backtrack m
+            else general
+    where
+      !st = mStore m
+      planned PlanNone = False
+      planned _ = True
+      general = do
         outcome <- compareGoal m base a b
         case outcome of
           Left err -> raiseError m err
@@ -1982,6 +2005,55 @@ evalFast m base expr = case expr of
       w <- deref s w0
       if tagOf w == tagInt then yield (valOf w) else pure False
     fits r = if r >= -(2 ^ (60 :: Int)) && r < 2 ^ (60 :: Int) then yield r else pure False
+
+-- | Run a compiled plan ('exprPlan'), returning its immediate integer value,
+-- or 'planMiss' when an operand is not an immediate integer or the result
+-- leaves the bounds of 'evalFast'. A plan covers exactly the shapes whose
+-- 'evalFast' outcome it reproduces, so a miss goes straight to the general
+-- evaluator, which owns errors, bignums, floats and instantiation.
+runPlan :: Store -> Int -> Plan -> IO Int
+runPlan s base plan = case plan of
+  PlanSlot i -> slotInt i
+  PlanSI op i k -> do
+    x <- slotInt i
+    pure $! if x == planMiss then planMiss else planApply op x k
+  PlanIS op k i -> do
+    y <- slotInt i
+    pure $! if y == planMiss then planMiss else planApply op k y
+  PlanSS op i j -> do
+    x <- slotInt i
+    if x == planMiss
+      then pure planMiss
+      else do
+        y <- slotInt j
+        pure $! if y == planMiss then planMiss else planApply op x y
+  PlanImm n -> pure n
+  PlanNone -> pure planMiss
+  where
+    slotInt i = do
+      w <- deref s (refWord (base + i))
+      pure $! if tagOf w == tagInt then valOf w else planMiss
+{-# INLINE runPlan #-}
+
+-- | No immediate integer is 'minBound', so it marks a plan that missed.
+planMiss :: Int
+planMiss = minBound
+
+-- | 'evalFast''s binary operators and bounds over immediate integers.
+planApply :: ArithOp -> Int -> Int -> Int
+planApply op x y = case op of
+  OpPlus -> fits (x + y)
+  OpMinus -> fits (x - y)
+  OpMul
+    | abs x < 2 ^ (30 :: Int) && abs y < 2 ^ (30 :: Int) -> x * y
+    | otherwise -> planMiss
+  OpDiv -> if y == 0 then planMiss else fits (x `div` y)
+  OpMod -> if y == 0 then planMiss else x `mod` y
+  OpMin -> min x y
+  OpMax -> max x y
+  _ -> planMiss
+  where
+    fits r = if r >= -(2 ^ (60 :: Int)) && r < 2 ^ (60 :: Int) then r else planMiss
 
 evalExpr :: Machine -> Int -> Expr -> IO (Either SolveError (Maybe NumericValue))
 evalExpr m base expr = case expr of

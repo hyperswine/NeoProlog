@@ -16,7 +16,7 @@ import qualified Infera.Machine.Control as Machine
 
 parityFiles :: [FilePath]
 parityFiles = ["test/core/parity-basic.nprolog", "test/core/parity-edge.nprolog", "test/core/parity-tabling.nprolog", "test/core/parity-dynamic.nprolog", "test/core/parity-minimize.nprolog", "test/core/parity-clp.nprolog", "test/core/parity-contracts.nprolog", "test/core/parity-structures.nprolog",
-  "test/core/parity-decisions.nprolog", "test/core/parity-delta.nprolog", "test/core/parity-liveness.nprolog", "test/core/parity-native-clp.nprolog", "test/core/parity-mutable-clp.nprolog", "test/core/parity-slots.nprolog"]
+  "test/core/parity-decisions.nprolog", "test/core/parity-delta.nprolog", "test/core/parity-liveness.nprolog", "test/core/parity-native-clp.nprolog", "test/core/parity-mutable-clp.nprolog", "test/core/parity-slots.nprolog", "test/core/parity-arith.nprolog"]
 
 data Observed = Observed [String] [String] Bool deriving (Eq, Show)
 

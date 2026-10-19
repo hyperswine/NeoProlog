@@ -1,0 +1,92 @@
+# Compiled arithmetic plans: slot op immediate, immediate op slot, slot op
+# slot, and comparisons of slots against immediates or slots. Immediate
+# integers span -1152921504606846976 .. 1152921504606846975 (61 bits);
+# products are planned only while both factors are below 2^30 in magnitude.
+inc X Y <- Y is X + 1.
+dec X Y <- Y is X - 1.
+rsub X Y <- Y is 1 - X.
+add X Y Z <- Z is X + Y.
+sub X Y Z <- Z is X - Y.
+mulk X Y <- Y is X * 1073741824.
+mul X Y Z <- Z is X * Y.
+dv X Y Z <- Z is X / Y.
+md X Y Z <- Z is X % Y.
+kdv X Y <- Y is 100 / X.
+kmd X Y <- Y is 100 % X.
+lo X Y Z <- Z is min X Y.
+hi X Y Z <- Z is max X Y.
+copy X Y <- Y is X.
+pos X <- X > 0.
+nonneg X <- X >= 0.
+below X <- 10 > X.
+gt X Y <- X > Y.
+le X Y <- X <= Y.
+checked X <- 3 is X + 1.
+fib 0 0.
+fib 1 1.
+fib N F <- N > 1, N1 is N - 1, N2 is N - 2, fib N1 F1, fib N2 F2, F is F1 + F2.
+> inc 1152921504606846974 Y?
+> inc 1152921504606846975 Y?
+> X is 0 - 1152921504606846975 - 1, dec X Y?
+> X is 0 - 1152921504606846975, dec X Y?
+> X is 0 - 1152921504606846975, rsub X Y?
+> X is 0 - 1152921504606846975 - 1, rsub X Y?
+> add 576460752303423488 576460752303423487 Z?
+> add 576460752303423488 576460752303423488 Z?
+> X is 0 - 1152921504606846975 - 1, sub X 1 Z?
+> X is 1152921504606846975 + 1, inc X Y?
+> X is 1152921504606846975 + 1, add X X Z, gt X 0, gt Z X?
+> mulk 1073741823 Y?
+> mulk 1073741824 Y?
+> mulk (-1073741823) Y?
+> mul 1073741824 1073741824 Z?
+> mul 4000000000 4000000000 Z?
+> mul (-3) 7 Z?
+> dv 7 2 Z, dv (-7) 2 W?
+> X is 0 - 1152921504606846975 - 1, dv X (-1) Z?
+> X is 0 - 1152921504606846975 - 1, dv X 1 Z?
+> dv 1 0 Z?
+> dv 0 0 Z?
+> md 7 0 Z?
+> md (-7) 2 Z, md 7 (-2) W?
+> kdv 0 Y?
+> kmd 0 Y?
+> kdv 7 Y, kmd 7 W?
+> dv 1.5 0 Z?
+> dv 1 0.0 Z?
+> md 5.0 2 Z?
+> md 5 2.0 Z?
+> md 5 0.0 Z?
+> inc 1.5 Y?
+> add 1 2.5 Z, sub 2.5 1 W?
+> mulk 0.5 Y?
+> dv 7.0 2 Z, kdv 4.0 W?
+> lo 3 4.5 Z, hi 3 4.5 W, lo 3 4 U, hi (-3) (-4) V?
+> copy 7 Y, copy 2.5 W?
+> X is 1152921504606846975 + 1, copy X Y?
+> pos 1, pos 0.5, nonneg 0, below 9?
+> pos 0?
+> pos (-0.5)?
+> pos a?
+> pos X?
+> gt 2 1.5, le 1.5 2, le 2 2?
+> gt a b, le a a?
+> gt "b" "a"?
+> gt a 1?
+> X is 1152921504606846975 + 1, gt X 1152921504606846975, le 1152921504606846975 X?
+> X is 0 - 1152921504606846975 - 2, gt 0 X?
+> gt X 1?
+> gt 1 X?
+> inc X Y?
+> inc a Y?
+> add 1 a Z?
+> add a X Z?
+> dv X 0 Z?
+> mulk X Y?
+> checked 2?
+> checked 3?
+> checked 2.0?
+> inc 1 2?
+> inc 1 3?
+> inc 1 2.0?
+> fib 20 F?

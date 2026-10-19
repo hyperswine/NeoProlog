@@ -10,6 +10,8 @@
 module Infera.Core.Compile
   ( Pattern (..),
     Expr (..),
+    Plan (..),
+    exprPlan,
     ArithOp (..),
     CmpOp (..),
     Check (..),
@@ -76,6 +78,40 @@ data Expr
     EPat Pattern
   | EOp !ArithOp [Expr]
 
+-- | A compiled plan for a common arithmetic shape: a slot or immediate, or
+-- one binary operator over two of them with at least one slot. It runs
+-- directly on immediate integer words, under the same bounds as the
+-- general fast path, and misses on any other operand or result; the
+-- general evaluator then decides the outcome. 'PlanNone' marks every other
+-- shape. Plans are derived from their 'Expr' by 'exprPlan', so anything
+-- that rewrites an expression rebuilds its plan the same way.
+data Plan
+  = PlanNone
+  | PlanImm !Int
+  | PlanSlot !Int
+  | -- | slot op immediate
+    PlanSI !ArithOp !Int !Int
+  | -- | immediate op slot
+    PlanIS !ArithOp !Int !Int
+  | -- | slot op slot
+    PlanSS !ArithOp !Int !Int
+
+exprPlan :: Expr -> Plan
+exprPlan expr = case expr of
+  EImm n -> PlanImm n
+  EPat p | Just v <- slotOf p -> PlanSlot v
+  EOp op [a, b] | planOp op -> case (a, b) of
+    (EPat pa, EImm k) | Just v <- slotOf pa -> PlanSI op v k
+    (EImm k, EPat pb) | Just v <- slotOf pb -> PlanIS op k v
+    (EPat pa, EPat pb) | Just v <- slotOf pa, Just w <- slotOf pb -> PlanSS op v w
+    _ -> PlanNone
+  _ -> PlanNone
+  where
+    slotOf (PSlot v) = Just v
+    slotOf (PFirst v) = Just v
+    slotOf _ = Nothing
+    planOp op = op `elem` [OpPlus, OpMinus, OpMul, OpDiv, OpMod, OpMin, OpMax]
+
 data CmpOp = CmpGt | CmpLt | CmpGte | CmpLte deriving (Eq, Show)
 
 data Check = CkVar | CkNonvar | CkGround | CkInt | CkFloat | CkNum | CkStr | CkAtom | CkChar | CkList
@@ -108,8 +144,9 @@ data Goal
   | GEquiv Pattern Pattern
   | -- | disequality; a constraint when non-ground, which the core abandons
     GNeq Pattern Pattern
-  | GIs Pattern Expr
-  | GCmp !CmpOp Expr Expr
+  | -- | the expression's 'exprPlan' is kept beside it
+    GIs Pattern Expr !Plan
+  | GCmp !CmpOp Expr Expr !Plan !Plan
   | GTrue
   | GFail
   | GCut
@@ -365,7 +402,7 @@ nestedPaths depth pattern
 
 leadingIntGuard :: Clause -> Maybe IntGuard
 leadingIntGuard clause = case clBody clause of
-  GCmp op a b : _ -> IntGuard op <$> value a <*> value b
+  GCmp op a b _ _ : _ -> IntGuard op <$> value a <*> value b
   _ -> Nothing
   where
     slots = IM.fromListWith (\_ first -> first)
@@ -885,11 +922,11 @@ compileGoal ctx term = case term of
     expr <- compileExpr ctx b
     facts <- readIORef (ctxFacts ctx)
     assumePattern ctx pa (exprSort facts expr)
-    pure (GIs pa expr)
-  Compound "gt" [a, b] -> GCmp CmpGt <$> compileExpr ctx a <*> compileExpr ctx b
-  Compound "lt" [a, b] -> GCmp CmpLt <$> compileExpr ctx a <*> compileExpr ctx b
-  Compound "gte" [a, b] -> GCmp CmpGte <$> compileExpr ctx a <*> compileExpr ctx b
-  Compound "lte" [a, b] -> GCmp CmpLte <$> compileExpr ctx a <*> compileExpr ctx b
+    pure (GIs pa expr (exprPlan expr))
+  Compound "gt" [a, b] -> comparison CmpGt a b
+  Compound "lt" [a, b] -> comparison CmpLt a b
+  Compound "gte" [a, b] -> comparison CmpGte a b
+  Compound "lte" [a, b] -> comparison CmpLte a b
   Compound "var" [x] -> GCheck CkVar <$> arg x
   Compound "nonvar" [x] -> GCheck CkNonvar <$> arg x
   Compound "ground" [x] -> checked CkGround S.SAny x
@@ -923,6 +960,10 @@ compileGoal ctx term = case term of
       px <- arg x
       assumePattern ctx px sort
       pure (GCheck check px)
+    comparison op a b = do
+      ea <- compileExpr ctx a
+      eb <- compileExpr ctx b
+      pure (GCmp op ea eb (exprPlan ea) (exprPlan eb))
     unsupported what = do
       if ctxDynamic ctx then pure () else modifyIORef' (ctxProblems ctx) (what :)
       pure (GUnsupported term)

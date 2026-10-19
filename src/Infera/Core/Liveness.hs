@@ -47,8 +47,8 @@ visitGoals visit base = mapM_ goal
       GUnify a b -> pattern a >> pattern b
       GEquiv a b -> pattern a >> pattern b
       GNeq a b -> pattern a >> pattern b
-      GIs p e -> pattern p >> expr e
-      GCmp _ a b -> expr a >> expr b
+      GIs p e _ -> pattern p >> expr e
+      GCmp _ a b _ _ -> expr a >> expr b
       GTrue -> pure ()
       GFail -> pure ()
       GCut -> pure ()
@@ -106,8 +106,14 @@ relocateGoals relocate base = mapM goal
       GUnify a b -> GUnify <$> pattern a <*> pattern b
       GEquiv a b -> GEquiv <$> pattern a <*> pattern b
       GNeq a b -> GNeq <$> pattern a <*> pattern b
-      GIs p e -> GIs <$> pattern p <*> expr e
-      GCmp op a b -> GCmp op <$> expr a <*> expr b
+      GIs p e _ -> do
+        p' <- pattern p
+        e' <- expr e
+        pure (GIs p' e' (exprPlan e'))
+      GCmp op a b _ _ -> do
+        a' <- expr a
+        b' <- expr b
+        pure (GCmp op a' b' (exprPlan a') (exprPlan b'))
       GTrue -> pure GTrue
       GFail -> pure GFail
       GCut -> pure GCut

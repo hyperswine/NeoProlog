@@ -5,6 +5,16 @@ See the [current engine guide](../engine/README.md),
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
+## Compiled arithmetic plans - 2026-10-19
+
+The [arithmetic plans report](../engine/arith-plans-2026-10-19.md) records
+compiled plans for flat arithmetic (slot or immediate, and one operator
+over slots and immediates) in `is` and comparisons. Plans run directly on
+immediate integer words and fall back to the general evaluator on any
+miss. On a loaded machine, batch-20 CPU fell 10-12% on Fibonacci, 5-9% on
+loop and about 6% on queens versus `e47bc65`, with reverse (no
+arithmetic) flat as the control. GHC allocation is unchanged.
+
 ## Allocation-free clause selection - 2026-10-19
 
 The [clause selection report](../engine/clause-selection-2026-10-19.md)
