@@ -13,3 +13,4 @@ output/
 docs/dash/dist/
 .claude/
 __pycache__/
+NOTES.txt
