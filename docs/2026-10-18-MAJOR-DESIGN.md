@@ -3,7 +3,7 @@
 Date: 2026-10-18
 
 This document records the first four-design slice. The subsequent
-[mutable CLP follow-up](mutable-clp-2026-10-18.md) replaces the persistent
+[mutable CLP follow-up](2026-10-18-MUTABLE-CLP.md) replaces the persistent
 constraint state and synchronization path described below.
 
 This change implements a bounded first slice of four structural improvements:
@@ -15,7 +15,7 @@ and preserve its reference-compatible search boundary.
 This document describes the implementation and its validation contract. It does
 not establish that the checks have passed or that any workload is faster. The
 associated measurements, validation results, source identities and remaining
-limitations belong in the [performance report](../performance/reports/engine-major-2026-10-18.md).
+limitations belong in the [performance report](2026-10-18-ENGINE-MAJOR.md).
 
 | Design | Implemented slice | Deliberate boundary |
 | --- | --- | --- |
@@ -26,8 +26,8 @@ limitations belong in the [performance report](../performance/reports/engine-maj
 
 ## Native constraint posting and search
 
-[`Core.Constraint`](../../src/Infera/Core/Constraint.hs) provides the operations
-that [`Core.Run`](../../src/Infera/Core/Run.hs) needs without constructing a
+[`Core.Constraint`](../src/Infera/Core/Constraint.hs) provides the operations
+that [`Core.Run`](../src/Infera/Core/Run.hs) needs without constructing a
 reference `Search` or a `SolverState` for each constraint-search node. Exact
 builtin arities for integer relations, domains, disequality, all-different and
 reification enter this path. Other leaf builtins keep the existing compatibility
@@ -69,7 +69,7 @@ remain separate design work.
 
 ## Compiled clause and guard decisions
 
-[`Core.Compile`](../../src/Infera/Core/Compile.hs) builds decisions once per
+[`Core.Compile`](../src/Infera/Core/Compile.hs) builds decisions once per
 compiled predicate. Principal indexes now intersect all useful bound argument
 keys while retaining ascending source-clause order. Open heads remain candidates.
 
@@ -98,14 +98,14 @@ successful execution may discard alternatives.
 
 ## Precise activation liveness
 
-[`Core.Liveness`](../../src/Infera/Core/Liveness.hs) enumerates the heap operands
+[`Core.Liveness`](../src/Infera/Core/Liveness.hs) enumerates the heap operands
 of suspended goals, arithmetic expressions and scope continuations. Collection
 can retain those operands without retaining every variable in the original
 activation block. Surviving slot operands are rewritten into relocated cell
 references, so subsequent bindings and trail unwinds remain visible through the
 same logical variable. Shared immutable predicate plans are not rewritten.
 
-[`Core.Store`](../../src/Infera/Core/Store.hs) keeps sparse logical identities
+[`Core.Store`](../src/Infera/Core/Store.hs) keeps sparse logical identities
 for cells detached from their activation markers by collection. Fresh
 activations continue to use compact block markers. This separates a variable's
 reference-visible identity from its physical address and from whether its
@@ -127,7 +127,7 @@ of answer parity or a timing observation.
 
 ## Incremental table rounds
 
-[`Core.Delta`](../../src/Infera/Core/Delta.hs) ports the narrow semantic proof
+[`Core.Delta`](../src/Infera/Core/Delta.hs) ports the narrow semantic proof
 already used by Reference. A qualifying recursive clause starts with exactly
 one self-call of the current variant. Its suffix and all base-clause bodies
 must be acyclic positive goals with no declared contracts, effects, dynamic
@@ -162,24 +162,24 @@ The new tests are intended to detect semantic regressions and prove that the
 selected implementation path was exercised. Their existence is not a passing
 result; executed results are recorded in the performance report.
 
-- [`CoreConstraintTest`](../../test/CoreConstraintTest.hs) compares direct Core
+- [`CoreConstraintTest`](../test/CoreConstraintTest.hs) compares direct Core
   streams with Reference, including ordered answers, residual constraints,
   output, fresh IDs, errors and exhaustion. Generated finite grids have an
   independent Cartesian answer oracle; generated optimization cases have an
   independent cost oracle. Selected tests compare every persistent store field.
   Controls, alias lists, failed branches, nonlinear errors and winner rollback
   exercise the boundary behavior.
-- [`CoreDecisionTest`](../../test/CoreDecisionTest.hs) compares indexed and
+- [`CoreDecisionTest`](../test/CoreDecisionTest.hs) compares indexed and
   unindexed execution and checks candidate ordinals directly. Generated guards
   and nested patterns cover both eliminated and retained clauses, including
   open patterns, scalar values and the active-CLP gate. Direct Core draining
   rejects a runtime abandonment.
-- [`CoreLivenessTest`](../../test/CoreLivenessTest.hs) uses tiny collection
+- [`CoreLivenessTest`](../test/CoreLivenessTest.hs) uses tiny collection
   thresholds, generated partially live activations, retained and interleaved
   answer streams, and sparse-ID rollback checks. A dead-graph case asserts
   collection and reclamation through counters, so parity alone cannot mask
   continued whole-activation retention.
-- [`CoreDeltaTest`](../../test/CoreDeltaTest.hs) compares delta and explicitly
+- [`CoreDeltaTest`](../test/CoreDeltaTest.hs) compares delta and explicitly
   disabled delta execution against the full Reference fixpoint. A leading
   inert `true` disables the proof while preserving logical clause behavior.
   Generated graph closures and multiple recursive rules have a separate

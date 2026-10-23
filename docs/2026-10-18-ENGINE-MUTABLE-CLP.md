@@ -8,7 +8,7 @@ and allocates 2-14% less, but takes **7-13% more CPU**. This is a useful linear
 constraint improvement with an explicit regression on mixed/global constraint
 workloads, rather than a general CLP throughput win.
 
-The [design document](../../engine/mutable-clp-2026-10-18.md) describes sparse
+The [design document](2026-10-18-MUTABLE-CLP.md) describes sparse
 mutable variable/constraint cells, native linear propagation and scheduling,
 undo marks in Core choices, incremental immutable snapshots and heap binding
 deltas. Absolute values, reification, all-different and general disequality
@@ -35,7 +35,7 @@ NUL, file bytes and NUL. Hashes were checked again after the matrix. Raw rows
 also retain workload fingerprints, host, command, batch, round, order and UTC
 time. Builds, tests, diagnostic probes and timings ran sequentially.
 
-[Final raw data](../data/jsonl/engine-mutable-clp-2026-10-18.jsonl) contains
+[Final raw data](data/jsonl/engine-mutable-clp-2026-10-18.jsonl) contains
 180 successful rows: one validation pair per case, then five measured pairs.
 Baseline/candidate order alternates by round. Batches target 0.25 s of baseline
 query CPU, capped at 2,000 queries. Each process fully drains and checks a
@@ -49,7 +49,7 @@ models check physical holes, shorts, score and exhaustive optimum in the
 bounded placement window. The optimum model takes circuit net pairs/rows and
 selected wired nets from the Reference answer, so its independent optimum is
 conditional on those fields. Full ordered parity separately checks all terms.
-The [preceding report](engine-major-2026-10-18.md#loaded-program-method)
+The [preceding report](2026-10-18-ENGINE-MAJOR.md#loaded-program-method)
 provides further detail about this unchanged runner.
 
 ```sh
@@ -89,7 +89,7 @@ three disconnected parts over a wider 1..16 column range. Ordinary pure
 workloads are mostly within 0-1.5% of baseline; no broad pure-language gain is
 established. The table cases improve locally with no CLP work in their bodies.
 
-The [initial validation pairs](../data/jsonl/engine-mutable-clp-initial-2026-10-18.jsonl)
+The [initial validation pairs](data/jsonl/engine-mutable-clp-initial-2026-10-18.jsonl)
 precede the final source. They exposed mixed breadboard costs. The complex
 bridge subsequently stopped comparing the entire watched set after each
 reduction and now imports watches using dirty variable IDs. The final table
@@ -109,7 +109,7 @@ live-heap measurements or process RSS.
 
 ## Native path and memory evidence
 
-[Untimed native counters](../data/jsonl/engine-mutable-clp-counters-2026-10-18.jsonl)
+[Untimed native counters](data/jsonl/engine-mutable-clp-counters-2026-10-18.jsonl)
 use initial Core collection limit one and reject fallback, errors and
 exhaustion. Each query produces one answer. Counters are disabled in normal
 execution and in all timings above. Raw rows include the probe source and
@@ -130,7 +130,7 @@ It asserts zero remaining undo history and zero live constraint cells after
 every commit, at most two variable cells, and exact final persistent-store
 parity. This catches retained dropped-CID cells and deferred snapshot deltas.
 
-A separate [whole-process memory probe](../data/jsonl/engine-mutable-clp-memory-2026-10-18.jsonl)
+A separate [whole-process memory probe](data/jsonl/engine-mutable-clp-memory-2026-10-18.jsonl)
 repeats `X #<= N` in a deterministic decreasing loop. The small query first
 passes Reference/machine/Core parity with forced collection. All larger runs
 return exactly one answer with `X in inf..1`, without errors or exhaustion.

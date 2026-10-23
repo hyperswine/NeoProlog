@@ -28,7 +28,7 @@ timed invocation. Lower is faster.
 | Recursive Fibonacci, 25 | 45.104 | 10.680 | 29.156 | 4.22x | 1.55x |
 | First valid 8-queens placement | 9.517 | 2.430 | 5.438 | 3.92x | 1.75x |
 
-[Raw loaded samples](../data/jsonl/engine-external-loaded-2026-10-18.jsonl)
+[Raw loaded samples](data/jsonl/engine-external-loaded-2026-10-18.jsonl)
 contain 72 successful rows: 12 validation and 60 measured samples. Batch sizes
 are respectively 256, 256, 32 and 128 queries, identical across engines. All
 batch CPU observations exceed 50 ms; no below-resolution timing or failed
@@ -88,7 +88,7 @@ result and completion marker, without errors or exhaustion.
 | Recursive Fibonacci, 25 | 58.837 | 51.094 | 78.958 |
 | First valid 8-queens placement | 31.956 | 19.209 | 55.113 |
 
-[Raw CLI samples](../data/jsonl/engine-external-cli-2026-10-18.jsonl) contain
+[Raw CLI samples](data/jsonl/engine-external-cli-2026-10-18.jsonl) contain
 72 successful processes, including warmups, using `bench/run.py`'s unchanged
 execution and validation functions. The reverse input is **3,000 repetitions
 here and 100 in the loaded table**. Their absolute times are not directly
@@ -105,7 +105,7 @@ revision `c1a2ee3eee8a88734c2ec8e6f28a5dae1225a349`. Its sorted
 Rows retain binary hashes, source/runner hashes, commands, batch sizes,
 round/order, host and UTC time. All source and binary hashes were checked again
 after each matrix. The
-[provenance record](../data/jsonl/engine-external-provenance-2026-10-18.jsonl)
+[provenance record](data/jsonl/engine-external-provenance-2026-10-18.jsonl)
 contains both orchestration scripts, the standalone Prolog driver and parser,
 clock references, and hashes of the raw matrices. The driver/helper files were
 temporary comparison artifacts; no runtime or maintained benchmark source was
@@ -129,7 +129,7 @@ the loaded orchestration invokes the unchanged Core runner and external driver.
 
 There is no maintained equivalent external breadboard, Minesweeper or tabling
 fixture in this comparison. The measured 34% Minesweeper CPU reduction in the
-[mutable CLP report](engine-mutable-clp-2026-10-18.md) compares Infera versions,
+[mutable CLP report](2026-10-18-ENGINE-MUTABLE-CLP.md) compares Infera versions,
 not Infera with these other solvers. CLP competitiveness remains unmeasured.
 
 Reverse is the clearest remaining gap in this ordinary workload set. Existing
@@ -141,8 +141,8 @@ reuse as candidates; these results do not yet measure their potential gain.
 Current source points to repeated call/goal dispatch, head matching and
 activation bookkeeping as the leading ordinary-execution candidates. Every
 clause still allocates and initializes all logical variable slots before
-matching ([Run.hs](../../../src/Infera/Core/Run.hs), `tryClause`;
-[Store.hs](../../../src/Infera/Core/Store.hs), `allocSlots`). Tail calls can
+matching ([Run.hs](../src/Infera/Core/Run.hs), `tryClause`;
+[Store.hs](../src/Infera/Core/Store.hs), `allocSlots`). Tail calls can
 reuse continuations, but still create another activation. Liveness currently
 removes dead roots at collection time; it does not implement allocation-time
 slot reuse.
@@ -171,7 +171,7 @@ separate some tempting explanations:
 | Fibonacci | 0.086 | 141.34 | 0.82% |
 | Queens | 0.085 | 36.33 | 1.66% |
 
-[Raw setup probes](../data/jsonl/engine-external-setup-2026-10-18.jsonl) contain
+[Raw setup probes](data/jsonl/engine-external-setup-2026-10-18.jsonl) contain
 three samples of 512 fresh preparations per case, including the probe source
 and binary identity. Loading and query execution are excluded. Each sample
 creates a fresh native machine through the returned first IO action, retains

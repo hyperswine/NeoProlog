@@ -10,7 +10,7 @@ activation cells. Breadboard and Minesweeper remain near their earlier times;
 these changes do not establish a general throughput improvement. Several
 ordinary workloads still take 2-6% more CPU.
 
-The [design document](../../engine/major-design-2026-10-18.md) describes native
+The [design document](2026-10-18-MAJOR-DESIGN.md) describes native
 constraint posting/search, bounded compiled decisions, precise activation
 liveness and delta tabling. All four run in the existing public Core.
 Constraint propagation still uses the persistent kernel. Mutable trailed
@@ -49,7 +49,7 @@ cabal list-bin bench:core-major --enable-optimization=2
 
 ## Loaded-program method
 
-[Final raw data](../data/jsonl/engine-major-2026-10-18.jsonl) contains one checked
+[Final raw data](data/jsonl/engine-major-2026-10-18.jsonl) contains one checked
 fresh-process validation sample per case/version, then five measured pairs.
 Order alternates baseline/candidate each round. Batches target about 0.25 s of
 baseline query CPU using the validation sample, capped at 2,000 queries.
@@ -124,7 +124,7 @@ retains fewer than 64 cells at its last collection. Both cases finish with
 three live Core cells in the counter probe. A separate longer-spin pressure
 probe records collection for larger input as well:
 
-[Raw pressure counters](../data/jsonl/engine-major-liveness-2026-10-18.jsonl), using an initial collection threshold of one cell (adapted by the collector), with 90,000 spin calls:
+[Raw pressure counters](data/jsonl/engine-major-liveness-2026-10-18.jsonl), using an initial collection threshold of one cell (adapted by the collector), with 90,000 spin calls:
 
 | List cells | Collections | Last live Core cells | Reclaimed cells |
 | ---: | ---: | ---: | ---: |
@@ -141,17 +141,17 @@ uses 20,000 elements and 90,000 spin calls; CPU is approximately unchanged.
 
 ### Diagnosis and rejected intermediate costs
 
-The [initial matrix](../data/jsonl/engine-major-initial-2026-10-18.jsonl) showed a
+The [initial matrix](data/jsonl/engine-major-initial-2026-10-18.jsonl) showed a
 25% loop regression. Selection was refining a pure singleton even though head
 and body execution already decided it. A
-[second matrix](../data/jsonl/engine-major-singleton-2026-10-18.jsonl) stopped that
+[second matrix](data/jsonl/engine-major-singleton-2026-10-18.jsonl) stopped that
 work, but exposed about 40 unnecessary bytes per loop call: a temporary Maybe
 and a rebuilt singleton list. Returning the cached immediate-key list directly
 removed that allocation. Variable-only deep paths and single-clause deep
 metadata are also omitted. Intermediate rows have their own source/binary
 hashes and are excluded from the final table.
 
-The separate [baseline cost-centre profiles](../data/jsonl/engine-major-profile-2026-10-18.jsonl)
+The separate [baseline cost-centre profiles](data/jsonl/engine-major-profile-2026-10-18.jsonl)
 are coarse whole-process diagnostics, including loading/oracle/preflight, and
 are excluded from performance ratios. In the minefield profile, bounds
 propagation, normalization, registration and store synchronization remain
@@ -163,7 +163,7 @@ redesign next; it does not attribute the entire timed solve to one function.
 Five checked fresh-process CLI samples per engine/case, after one checked
 warmup, include startup, parsing/loading, solving and output. Infera uses RTS
 `-N1`. Installed comparisons are SWI-Prolog version 10.0.2 for fat-darwin,
-and cargo:0.10.0. [Raw CLI samples](../data/jsonl/engine-major-cli-2026-10-18.jsonl)
+and cargo:0.10.0. [Raw CLI samples](data/jsonl/engine-major-cli-2026-10-18.jsonl)
 retain engine versions and binary hashes. This separate sequence uses fixed
 engine order within each case, so it is a local comparison with startup costs,
 not the alternating loaded-program matrix above.

@@ -30,8 +30,8 @@ suites:
   startup, parsing/loading, solving and output. Infera uses RTS `-N1`;
   comparison engines are SWI-Prolog 10.0.2 and Scryer 0.10.0.
 
-The [loaded samples](../data/jsonl/engine-reverse-loaded-2026-10-17.jsonl) and
-[CLI samples](../data/jsonl/engine-reverse-cli-2026-10-17.jsonl) retain binary and source
+The [loaded samples](data/jsonl/engine-reverse-loaded-2026-10-17.jsonl) and
+[CLI samples](data/jsonl/engine-reverse-cli-2026-10-17.jsonl) retain binary and source
 hashes, environment, sample order and individual timings. These are local
 measurements, not portable performance thresholds or inference-rate claims.
 

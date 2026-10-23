@@ -29,8 +29,8 @@ comment recorded as a workaround.
 
 ## Change
 
-[`CLP.reduce`](../../src/Infera/CLP.hs) and the mutable kernel's native
-reducer in [`CLP.Mutable`](../../src/Infera/CLP/Mutable.hs) recognise a
+[`CLP.reduce`](../src/Infera/CLP.hs) and the mutable kernel's native
+reducer in [`CLP.Mutable`](../src/Infera/CLP/Mutable.hs) recognise a
 reduced linear equality whose coefficient map holds exactly two variables
 with coefficients in {-1, 1} (`unitPair`). After substitution of bound and
 aliased variables, `cx*x + cy*y + k = 0` is the bijection `x = a + s*y` with

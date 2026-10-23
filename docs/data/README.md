@@ -6,7 +6,7 @@
 | [tsv/](tsv/) | Tab-separated tables: engine comparisons, application checks and repeated experiments |
 
 Names retain the implementation stage, workload and date. The
-[reports](../reports/README.md) explain which samples are comparable and
+[dated reports](../README.md) explain which samples are comparable and
 which failed or superseded attempts must be excluded from conclusions.
 
 These files were moved without changing their contents. Recorded commands,

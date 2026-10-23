@@ -3,10 +3,10 @@
 This is historical validation detail for `Infera.Machine`, extracted from
 an earlier version of the repository README. Statements below about the
 public default or current gates describe those implementation stages.
-Normal queries now use the core described in the [current engine guide](README.md).
-Use the [performance overview](../performance/README.md) for the latest results.
+Normal queries now use the core described in the [current engine guide](2026-10-17-ENGINE.md).
+Use the [performance overview](2026-10-15-PERFORMANCE.md) for the latest results.
 
-The [machine heap](../../src/Infera/Machine/Heap.hs) uses paged cells and a trail with
+The [machine heap](../src/Infera/Machine/Heap.hs) uses paged cells and a trail with
 immutable copy-on-write snapshots. Five generated
 properties run 300 cases each against the existing unifier, checking term
 round trips, ordered binding attempts, nested rollback, independent resumed
@@ -53,7 +53,7 @@ counts, ground costs and the independent optimum.
 
 The historical CLP integration gate passed 162 properties, including 13 native
 CLP and four native breadboard properties. Initial validated
-[breadboard samples](../performance/data/tsv/engine-native-clp-2026-10-16.tsv) put the experimental
+[breadboard samples](data/tsv/engine-native-clp-2026-10-16.tsv) put the experimental
 machine about 2–7 times slower than the reference on these small cases.
 This is binding/search integration evidence; a speed improvement remains a
 later gate. The measurements exclude loading and CLI startup.
@@ -80,20 +80,20 @@ the source proof. `startGoals` retains
 its explicit fuel limit; eligible calls through `start` reuse their depth
 budget. `startMeasured` adds opt-in execution counters.
 
-Fresh-process [tail measurements](../performance/data/jsonl/engine-tail-2026-10-16.jsonl) complete
+Fresh-process [tail measurements](data/jsonl/engine-tail-2026-10-16.jsonl) complete
 one million iterations in 11.84 seconds without instrumentation. Peak RSS
 stays about 81.5 MiB at 10k, 100k and 1m iterations; measured live counts stay
 at 4 tasks, 2 cut owners, 1,038 cells and 138 bindings. RSS includes program
 loading and fingerprinting. These historical samples establish the initial
 scalar-loop memory gate. Broader fresh-process samples for free results and
 fixed structured arguments are recorded separately in
-[structured tail measurements](../performance/data/jsonl/engine-tail-structured-2026-10-16.jsonl).
+[structured tail measurements](data/jsonl/engine-tail-structured-2026-10-16.jsonl).
 Both new cases complete one million calls; peak RSS stays around 85 MiB at
 10k, 100k and 1m calls, with maximum machine cell counts of 1,029 and 1,033.
 Growing result terms remain live, and repeated structural traversal can add
 substantial work. Those samples predate collection with live alternatives and
 opaque scopes. The historical
-[breadboard recheck](../performance/data/tsv/engine-structured-tail-breadboard-2026-10-16.tsv)
+[breadboard recheck](data/tsv/engine-structured-tail-breadboard-2026-10-16.tsv)
 also predates the public facade switch and places the machine behind the
 reference on these small cases. Later Step 1 samples are tracked in the
 roadmap; current compiler evidence is in the control report. These
@@ -101,7 +101,7 @@ historical results establish no general performance improvement.
 
 The historical Step 1 gate passed 278 Haskell properties (20,698 property test
 cases), 37 editor/LSP tests, 20 harness tests and CLI/trace acceptance. The
-[step 1 acceptance report](../performance/reports/engine-step1-acceptance-2026-10-16.md) records
+[step 1 acceptance report](2026-10-16-ENGINE-STEP1-ACCEPTANCE.md) records
 that snapshot's local exit gates and remaining step 2 throughput work. Its
 generated comparisons cover native builtins, table producers, mutual/helper
 tail calls, collection with live
@@ -155,17 +155,17 @@ producer heads still use their existing template path; native producer bodies
 select the requested backend. Compiler and
 backend tests compare raw scalar bits, ordered observations, source frames and
 repeated/interleaved resumes. The
-[foundation report](../performance/reports/engine-step2-foundation-2026-10-16.md) records the
+[foundation report](2026-10-16-ENGINE-STEP2-FOUNDATION.md) records the
 historical initial compiler gate: 315 Haskell properties (22,180 property test
 cases), 37 editor/LSP tests, 20 harness tests and CLI acceptance passed. Its
 initial comparison established working compiled dispatch and parity without
 establishing a throughput gain. Subsequent implementation and validation are
 recorded separately in the
-[head/register report](../performance/reports/engine-step2-head-register-2026-10-16.md),
-[lifetime report](../performance/reports/engine-step2-lifetimes-2026-10-16.md) and
-[control report](../performance/reports/engine-step2-control-2026-10-16.md) and
-[cache/dispatch report](../performance/reports/engine-step2-cache-2026-10-16.md) and
-[operand report](../performance/reports/engine-step2-operands-2026-10-16.md).
+[head/register report](2026-10-16-ENGINE-STEP2-HEAD-REGISTER.md),
+[lifetime report](2026-10-16-ENGINE-STEP2-LIFETIMES.md) and
+[control report](2026-10-16-ENGINE-STEP2-CONTROL.md) and
+[cache/dispatch report](2026-10-16-ENGINE-STEP2-CACHE.md) and
+[operand report](2026-10-16-ENGINE-STEP2-OPERANDS.md).
 The current gate passed 370 Haskell properties (25,723 cases), 47 LSP tests,
 20 harness tests and CLI acceptance. Ordinary compiled execution skips
 instruction statistics; measured variants distinguish accepted-head work from
@@ -173,7 +173,7 @@ reached body construction. The allocation changes establish smaller temporary
 arrays and skipped future graphs; throughput results remain mixed. All 30
 compiled residency samples and the six-sample interpreted recheck pass.
 
-The historical Step 1 [fresh-process residency gate](../performance/data/jsonl/engine-step1-tail-2026-10-16.jsonl)
+The historical Step 1 [fresh-process residency gate](data/jsonl/engine-step1-tail-2026-10-16.jsonl)
 passed 28 checked samples, including repeated million-call mutual recursion,
 live choices/findall, helpers, structured inputs and live CLP/table/dynamic
 state. Peak RSS stayed around 127–128 MiB, including startup and source

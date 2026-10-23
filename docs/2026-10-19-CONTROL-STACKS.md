@@ -13,7 +13,7 @@ the four ordinary workloads.
 
 The identity of an internal variable is an implementation detail. Parity
 checks now compare answers, output and errors after a consistent renaming of
-the variables inside each answer ([`Infera.Engine.Alpha`](../../src/Infera/Engine/Alpha.hs)).
+the variables inside each answer ([`Infera.Engine.Alpha`](../src/Infera/Engine/Alpha.hs)).
 Query variables keep their ids, since the query names them. Every Core
 observer in the tests and benches uses it; no observer compares `ssFresh`.
 
@@ -28,7 +28,7 @@ implementation-defined value.
 The Core no longer reproduces the reference's fresh ids. Clause entry does
 not reserve ids and frame markers carry only the block size. A variable cell
 gets a name when it first leaves the heap: an export, a constraint, a copied
-answer ([`nameCell`](../../src/Infera/Core/Store.hs)). Names live in the
+answer ([`nameCell`](../src/Infera/Core/Store.hs)). Names live in the
 sparse address map, move with their cells during collection, are pruned when
 the heap top falls below them, and are never reused within a query (the
 counter does not move back on backtracking). Variable-variable unification
@@ -63,7 +63,7 @@ Two legacy-machine test expectations that encoded the capture were corrected
 ## Plain calls
 
 A predicate without declared contracts has no signature to select, no guard
-to push and no output to check. [`callPlain`](../../src/Infera/Core/Run.hs)
+to push and no output to check. [`callPlain`](../src/Infera/Core/Run.hs)
 does only the collection check, the depth check and the inferred switch
 commit; declared predicates keep the full path (`callDeclared`).
 

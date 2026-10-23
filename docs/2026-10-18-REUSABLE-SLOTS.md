@@ -66,6 +66,6 @@ retains callers. Fewer allocations can also mean fewer collection opportunities.
 The existing dead-graph test now adds explicit temporary-term pressure rather
 than assuming a ground spin must allocate frames.
 
-See the [profile and benchmark report](../performance/reports/engine-slots-2026-10-18.md)
+See the [profile and benchmark report](2026-10-18-ENGINE-SLOTS.md)
 for measured CPU and allocation results. Logical Core cell storage, GHC
 allocation and whole-process residency are separate measurements.

@@ -1,13 +1,13 @@
 # Performance measurements
 
-See the [current engine guide](../engine/README.md),
-[dated report index](reports/README.md), and
+See the [current engine guide](2026-10-17-ENGINE.md),
+[dated report index](README.md), and
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
 ## Compiled arithmetic plans - 2026-10-19
 
-The [arithmetic plans report](../engine/arith-plans-2026-10-19.md) records
+The [arithmetic plans report](2026-10-19-ARITH-PLANS.md) records
 compiled plans for flat arithmetic (slot or immediate, and one operator
 over slots and immediates) in `is` and comparisons. Plans run directly on
 immediate integer words and fall back to the general evaluator on any
@@ -17,7 +17,7 @@ arithmetic) flat as the control. GHC allocation is unchanged.
 
 ## Allocation-free clause selection - 2026-10-19
 
-The [clause selection report](../engine/clause-selection-2026-10-19.md)
+The [clause selection report](2026-10-19-CLAUSE-SELECTION.md)
 records Core clause selection from precomputed, shared results, with an
 unboxed retry cursor for clause choices. Ticky shows zero selection
 allocation on reverse, loop, Fibonacci and queens. GHC allocation falls
@@ -26,7 +26,7 @@ to +3% on the four major cases and 40% lower on the nested-decision case.
 
 ## Plain calls and the choice stack - 2026-10-19
 
-The [control stacks report](../engine/control-stacks-2026-10-19.md) records
+The [control stacks report](2026-10-19-CONTROL-STACKS.md) records
 checked loaded-query CPU 9-16% below `1a97539` on reverse, loop, Fibonacci
 and queens, with 27-40% less GHC allocation. Engines are now compared up to
 renaming of variables, which removed the Core's fresh-id bookkeeping and
@@ -37,7 +37,7 @@ most Core time in head matching, term construction, arithmetic and dispatch.
 
 ## Reusable Core slots and tail frames - 2026-10-18
 
-The [profile and reuse report](reports/engine-slots-2026-10-18.md) records one
+The [profile and reuse report](2026-10-18-ENGINE-SLOTS.md) records one
 fresh activation and 90,000 reused tail frames in the checked loop. CPU improves
 4.3% there, but reverse takes 12.1% more CPU and GHC allocation rises on both.
 The measured slot-reuse snapshot takes 1.21x Scryer on loop and 3.19x on reverse; SWI remains
@@ -50,7 +50,7 @@ throughput win.
 
 ## Before slot reuse: Core versus SWI and Scryer - 2026-10-18
 
-The [fresh external comparison](reports/engine-external-2026-10-18.md) records
+The [fresh external comparison](2026-10-18-ENGINE-EXTERNAL.md) records
 GC-inclusive loaded-query CPU at 1.26-2.77x Scryer and 3.92-10.09x SWI on
 reverse, loop, Fibonacci and queens. Three of four meet the roughly-2x target
 relative to Scryer; reverse remains outside it. End-to-end CLI times are closer
@@ -61,7 +61,7 @@ performance remain unmeasured.
 
 ## Mutable CLP propagation - 2026-10-18
 
-The [mutable propagation report](reports/engine-mutable-clp-2026-10-18.md)
+The [mutable propagation report](2026-10-18-ENGINE-MUTABLE-CLP.md)
 records native mutable domains, linear reduction and scheduling with undo
 marks and immutable answer snapshots. Checked 16x16 Minesweeper generation
 falls from 33.7 ms to 22.3 ms with 39% less allocation. Breadboard allocates
@@ -72,7 +72,7 @@ remaining rollback-history limits.
 
 ## Four Core designs - 2026-10-18
 
-The [first implementation report](reports/engine-major-2026-10-18.md) records
+The [first implementation report](2026-10-18-ENGINE-MAJOR.md) records
 native constraint search, deeper clause decisions, precise activation liveness
 and delta tabling. Checked loaded-program samples show 7.16x faster nested
 dispatch and 23.48x faster 240-node closure; guard dispatch improves about 15%.
@@ -82,7 +82,7 @@ keeps those regressions, validation boundaries and remaining CLP work explicit.
 
 ## Reverse construction, matching and collection - 2026-10-17
 
-The [reverse follow-up](reports/engine-reverse-2026-10-17.md) records a 20% reduction
+The [reverse follow-up](2026-10-17-ENGINE-REVERSE.md) records a 20% reduction
 in loaded-program CPU time, 38% less GHC allocation and 17% less maximum
 residency against `e3082b3`. Checked CLI reverse falls from 0.507 s to
 0.414 s, versus SWI 0.068 s and Scryer 0.174 s. The full 391-property
@@ -92,7 +92,7 @@ are linked from the report.
 
 ## Diagnosis and the new core - 2026-10-17
 
-The [engine diagnosis](../engine/engine-diagnosis-2026-10-17.md) profiles the current
+The [engine diagnosis](2026-10-17-ENGINE-DIAGNOSIS.md) profiles the current
 machine (15-45 KB of allocation per inference, a flat profile, 50-200x the
 CPU of Scryer), attributes the cost to the representation, and records the
 first slice of the replacement core in `src/Infera/Core/`: unboxed tagged
@@ -118,7 +118,7 @@ list case, but slower on helper dispatch and structured heads. No general
 throughput win is established. The interpreted native driver remains the public
 default. All 28 compiled residency samples pass, including million-iteration
 loops with live alternatives, opaque scopes and CLP state.
-The [head/register report](reports/engine-step2-head-register-2026-10-16.md) records
+The [head/register report](2026-10-16-ENGINE-STEP2-HEAD-REGISTER.md) records
 current source-matched samples, validation and remaining work.
 
 ## Native follow-up and first bytecode slice - 2026-10-16
@@ -128,7 +128,7 @@ The large-minefield regression is fixed. Constrained table calls now evaluate
 their plain fallback on the active driver. Monotone native-store synchronization
 avoids revalidating unchanged historical substitutions, and graph normalization
 preserves shared grid/list suffixes. The
-[foundation report](reports/engine-step2-foundation-2026-10-16.md) records the contracts,
+[foundation report](2026-10-16-ENGINE-STEP2-FOUNDATION.md) records the contracts,
 correctness tests, bounded-residency recheck and first opt-in bytecode slice.
 
 Fresh CLI measurements use the same local GHC 9.8.2 `-O2` library/executable

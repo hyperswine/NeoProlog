@@ -139,7 +139,7 @@ before the parked-retry fix. The 30-second budget would still reject it. The
 60-second final budget records current behavior explicitly; it does not
 establish an acceptable production latency or a throughput win.
 
-The [residency data](../data/jsonl/engine-step1-tail-2026-10-16.jsonl) include 10k, 100k and
+The [residency data](data/jsonl/engine-step1-tail-2026-10-16.jsonl) include 10k, 100k and
 three ordinary million-call runs each for mutual recursion, a surviving caller
 choice and `findall`, followed by instrumented million-call runs. Helpers,
 structured arguments, CLP state, completed tables and dynamic state each have
@@ -156,24 +156,24 @@ can retain proportional memory; the bounded total-residency claim concerns the
 fixed-live-state cases in this matrix. Parked internal-retry tests separately
 prove bounded active frames while preserving legitimately growing alternatives.
 
-The [breadboard data](../data/tsv/engine-step1-breadboard-2026-10-16.tsv) measure already
+The [breadboard data](data/tsv/engine-step1-breadboard-2026-10-16.tsv) measure already
 loaded checked programs, projection and validation, with one checked warmup and
 three checked runs per engine/case. Exact answer order matches the reference;
 each result also matches an independently enumerated physical optimum. These
 small cases remain slower on the native engine. There is no general speedup
 claim or portable elapsed-time threshold.
 
-The [CLI data](../data/jsonl/engine-step1-cli-2026-10-16.jsonl) include startup, loading,
+The [CLI data](data/jsonl/engine-step1-cli-2026-10-16.jsonl) include startup, loading,
 solving and output. Every warmup and timed process must validate the expected
 result and completion marker. The final budget is explicitly 60 seconds per
-process. Earlier [30-second results](../data/jsonl/engine-step1-cli-before-tail-retries-2026-10-16.jsonl)
-and the [120-second reverse timeout](../data/jsonl/engine-step1-nrev-before-tail-retries-2026-10-16.jsonl)
+process. Earlier [30-second results](data/jsonl/engine-step1-cli-before-tail-retries-2026-10-16.jsonl)
+and the [120-second reverse timeout](data/jsonl/engine-step1-nrev-before-tail-retries-2026-10-16.jsonl)
 are preserved with their previous runtime fingerprint. They preceded the
 parked-retry fix and contain no invented timing samples for failed runs.
 
 ## Step 2 starting contract
 
-An additional [application recheck](../README.md#current-native-engine-recheck---2026-10-16)
+An additional [application recheck](2026-10-15-PERFORMANCE.md#current-native-engine-recheck---2026-10-16)
 after the architectural closeout found 16x16 ordinary minefield generation
 exceeding 30 seconds, versus 2.163s before the earlier optimizations and 0.116s
 on the optimized reference stage. Current graph closure and wide breadboard
@@ -181,7 +181,7 @@ medians are 0.099s and 0.053s. These observations use different historical build
 profiles and are not controlled cross-version ratios. The minefield timeout is
 a material regression missed by the Step 1 correctness/residency matrix.
 Profile and resolve it before starting the compiler/VM work, and retain it in
-future performance checks. [Raw samples](../data/jsonl/performance-step1-2026-10-16.jsonl)
+future performance checks. [Raw samples](data/jsonl/performance-step1-2026-10-16.jsonl)
 include the failed sample and current source hash.
 
 Start with compiled facts and first-order rules over the existing machine:

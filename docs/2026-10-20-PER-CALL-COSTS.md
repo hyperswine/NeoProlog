@@ -17,7 +17,7 @@ what has been tried and measured, and what remains. Branch
 | First 8-queens | 8.31 | ~3.4x | ~1.5x |
 
 SWI and Scryer were not re-measured; their times come from the
-[external comparison](../performance/reports/engine-external-2026-10-18.md)
+[external comparison](2026-10-18-ENGINE-EXTERNAL.md)
 on the same machine and workloads. Day-to-day drift was about 8%, so the
 ratios are approximate. Reverse is about 170 ns per inference before these
 changes and ~145 ns after; SWI is about 17 ns.
@@ -92,15 +92,15 @@ Against `main` (`1a97539`), median of seven runs:
 | Fibonacci | 48.49 | 37.76 | -22% | -60% |
 | Queens | 9.36 | 8.31 | -11% | -45% |
 
-* `1f075ac` ([report](control-stacks-2026-10-19.md)): answers up to
+* `1f075ac` ([report](2026-10-19-CONTROL-STACKS.md)): answers up to
   renaming (removing fresh-id bookkeeping and the marker scan in every
   variable-variable unification), a plain call path for predicates without
   contracts (cause 2), and an unboxed choice stack with unboxed counters
   (cause 3). Most of the CPU gain on reverse and queens.
-* `e47bc65` ([report](clause-selection-2026-10-19.md)): precomputed,
+* `e47bc65` ([report](2026-10-19-CLAUSE-SELECTION.md)): precomputed,
   allocation-free clause selection (cause 4). Allocation fell 24-43%; CPU
   was flat to +3%.
-* `59a7119` ([report](arith-plans-2026-10-19.md)): compiled plans for flat
+* `59a7119` ([report](2026-10-19-ARITH-PLANS.md)): compiled plans for flat
   `is` and comparison shapes (cause 5). Fibonacci -10-12%, loop -5-9%.
 
 ## What did not work

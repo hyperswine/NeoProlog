@@ -75,11 +75,11 @@ LSP tests, CLI diagnostics/live-buffer/tracing/example checks and 20
 benchmark-harness tests passed.
 
 The completed cache matrix contains 216 checked process records. All nine
-broader warm [first-order/control fixtures](../data/tsv/engine-step2-cache-bytecode-2026-10-16.tsv)
-and four [breadboard cases](../data/tsv/engine-step2-cache-breadboard-2026-10-16.tsv) also
+broader warm [first-order/control fixtures](data/tsv/engine-step2-cache-bytecode-2026-10-16.tsv)
+and four [breadboard cases](data/tsv/engine-step2-cache-breadboard-2026-10-16.tsv) also
 passed with positive compiled probes. Breadboard placements match Reference
 and pass the independent physical/optimum validators. All 30 fresh-process
-samples in the full [compiled residency gate](../data/jsonl/engine-step2-cache-tail-2026-10-16.jsonl)
+samples in the full [compiled residency gate](data/jsonl/engine-step2-cache-tail-2026-10-16.jsonl)
 passed. Peak RSS spans 145.44-149.30 MiB; measured active heaps stay at or below
 1,027 cells, with at most four tasks, two choices, two scopes, three cut owners
 and three temporary registers. This is bounded live state, not a process-memory
@@ -88,7 +88,7 @@ The new compiled-control million-call sample retains its selected arm and
 opaque parent with 1,025 active cells and one temporary register. It records
 999,999 query-local memo hits, three source-witness hits and zero misses.
 Every normal sample keeps all 26 counters at zero. All six samples in the
-[interpreted residency recheck](../data/jsonl/engine-step2-cache-native-tail-2026-10-16.jsonl)
+[interpreted residency recheck](data/jsonl/engine-step2-cache-native-tail-2026-10-16.jsonl)
 also pass, with 147.20-148.27 MiB peak RSS and at most 1,030 active heap cells.
 The runtime source hash remains unchanged throughout all measurements.
 
@@ -101,7 +101,7 @@ far and remain uncommitted.
 
 ## Matched baseline and measurement scope
 
-The [raw matrix](../data/jsonl/engine-step2-cache-2026-10-16.jsonl) compares the published
+The [raw matrix](data/jsonl/engine-step2-cache-2026-10-16.jsonl) compares the published
 control core with this implementation on local macOS arm64, GHC 9.8.2,
 library and runners built with `-O2`. The baseline's 26 `src` files were
 checked against the Git blob IDs from `87d3972`: every file matched, with no
@@ -200,7 +200,7 @@ across queries on an unchanged immutable program. Reached invocation/data
 materialization, raw export/normalization, local-operand dispatch, indexing
 instructions and the full argument/permanent-register environment remain
 performance targets. Representative regressions and mixed warm results keep
-the [default migration gates](../../engine/roadmap.md#making-bytecode-the-public-default)
+the [default migration gates](2026-10-16-ENGINE-ROADMAP.md#making-bytecode-the-public-default)
 open. Bytecode remains opt-in until complete parity, cross-platform CI,
 real CLP acceptance, retained-checkpoint/residency checks and checked cold/warm
 performance support switching the facade. Explicit interpreted selection and

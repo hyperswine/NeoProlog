@@ -10,13 +10,13 @@ Reference engine's constraint algorithms, search order and observable errors.
 
 This document describes the implementation and its acceptance contract.
 Measurements, executed checks and source identities belong in the associated
-[performance report](../performance/reports/engine-mutable-clp-2026-10-18.md).
-The preceding [four-design stage](major-design-2026-10-18.md) describes the
+[performance report](2026-10-18-ENGINE-MUTABLE-CLP.md).
+The preceding [four-design stage](2026-10-18-MAJOR-DESIGN.md) describes the
 native search driver that this kernel extends.
 
 ## Mutable state and rollback
 
-[`CLP.Mutable`](../../src/Infera/CLP/Mutable.hs) uses sparse `IntMap` indexes
+[`CLP.Mutable`](../src/Infera/CLP/Mutable.hs) uses sparse `IntMap` indexes
 whose entries point to mutable cells. A variable cell holds its optional
 substitution binding, optional interval-with-holes domain and dependent
 constraint IDs. Constraint cells hold individual residual constraints. Pending
@@ -68,7 +68,7 @@ than introducing a different solver or a new labeling heuristic.
 
 Absolute-value relations, reification, global all-different and general term
 disequality retain the single-step algorithms in
-[`CLP`](../../src/Infera/CLP.hs). The mutable scheduler creates an immutable
+[`CLP`](../src/Infera/CLP.hs). The mutable scheduler creates an immutable
 view, calls the pure reducer for one constraint and imports its effects before
 continuing its own work queue.
 
@@ -115,7 +115,7 @@ history or invalidate choices outside that operation.
 
 ## Core integration
 
-[`Core.Run`](../../src/Infera/Core/Run.hs) creates the kernel lazily. Pure
+[`Core.Run`](../src/Infera/Core/Run.hs) creates the kernel lazily. Pure
 queries can keep an absent backend; a choice created before initialization
 records that absence. If a later branch initializes constraints, returning to
 the earlier choice restores the kernel's remembered initial mark.
@@ -127,7 +127,7 @@ Cuts discard alternatives while retaining the current constraint state.
 Table iteration and opaque control sentinels use the same rollback boundary.
 
 Posting, ordinary labeling and minimum labeling use the mutable adapter in
-[`Core.Constraint`](../../src/Infera/Core/Constraint.hs). List validation,
+[`Core.Constraint`](../src/Infera/Core/Constraint.hs). List validation,
 stable smallest-domain-first selection, ascending enumeration and the
 different ordinary/minimum alias policies follow the preceding native search
 implementation. These operations read mutable walks and domains without

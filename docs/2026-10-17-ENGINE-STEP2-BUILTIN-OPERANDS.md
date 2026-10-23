@@ -87,7 +87,7 @@ shared temporaries, reject stale/missing roots and verify atomic failure.
 Frozen and interleaved checkpoints retain independent results, and traced
 bytecode must retain exact interpreted traces.
 
-The [broader bytecode acceptance runner](../data/tsv/engine-step2-builtin-operands-bytecode-2026-10-17.tsv)
+The [broader bytecode acceptance runner](data/tsv/engine-step2-builtin-operands-bytecode-2026-10-17.tsv)
 passed all **27 engine/case rows and nine positive compiled probes** across
 nine fixtures. Eight probes also have positive typed-builtin counts and equal
 wrapper counts. The early-fail-body fixture intentionally records zero typed
@@ -96,8 +96,8 @@ This runner retains its existing pre-timing compiled probes, so its results
 are a separate warm acceptance gate and are not pooled into the matched
 cache/breadboard measurements below.
 
-All **36 fresh-process residency checks** passed: the [full bytecode matrix](../data/jsonl/engine-step2-builtin-operands-tail-2026-10-17.jsonl)
-contains 30 processes and the [interpreted quick comparison](../data/jsonl/engine-step2-builtin-operands-native-tail-2026-10-17.jsonl)
+All **36 fresh-process residency checks** passed: the [full bytecode matrix](data/jsonl/engine-step2-builtin-operands-tail-2026-10-17.jsonl)
+contains 30 processes and the [interpreted quick comparison](data/jsonl/engine-step2-builtin-operands-native-tail-2026-10-17.jsonl)
 contains six. Each fully drained and met the existing RSS/RTS maximum-live
 bound of 1.5 times prefix maxima. The bytecode matrix covers mutual recursion,
 retained choices, findall, helper calls, structured arguments, CLP, tables,
@@ -164,10 +164,10 @@ checks workload and answer fingerprints across both stages and engines.
 Instruction counters are disabled during timed execution. A positive measured
 probe establishes path coverage separately from the timing sample.
 
-The [cache evidence](../data/jsonl/engine-step2-builtin-operands-cache-2026-10-17.jsonl) stores
+The [cache evidence](data/jsonl/engine-step2-builtin-operands-cache-2026-10-17.jsonl) stores
 per-query and total batch CPU/wall times, commands, stage order, runtime and
 runner/fixture hashes, semantic checks and post-timing metrics. The
-[breadboard evidence](../data/jsonl/engine-step2-builtin-operands-breadboard-2026-10-17.jsonl)
+[breadboard evidence](data/jsonl/engine-step2-builtin-operands-breadboard-2026-10-17.jsonl)
 also retains each complete TSV output and its parsed internal samples.
 Comparisons use medians of corresponding candidate/baseline paired
 ratios for CPU and wall time, with contemporary Reference/Interpreted samples

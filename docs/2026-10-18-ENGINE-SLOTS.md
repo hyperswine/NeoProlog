@@ -14,7 +14,7 @@ mutable CLP propagation. A fresh archived checkout was built with GHC 9.8.2,
 `-O2 --enable-profiling --profiling-detail=late`. Each profile used 64 checked
 queries through the unchanged `bench/core-major.hs` runner.
 
-The [profile data](../data/jsonl/engine-slots-profile-2026-10-18.jsonl) retains
+The [profile data](data/jsonl/engine-slots-profile-2026-10-18.jsonl) retains
 the header, complete `coreSolve` subtree, entries, allocation percentages,
 binary identity and checked runner result. Whole-process profiles also contain
 the separate Reference oracle and native preflight. The following self-time
@@ -38,7 +38,7 @@ dispatch, matching and arithmetic work.
 
 ## Implementation and safety
 
-The [design note](../../engine/reusable-slots-2026-10-18.md) specifies ownership
+The [design note](2026-10-18-REUSABLE-SLOTS.md) specifies ownership
 and refusal conditions. The compiler records which slots need initialization;
 first head occurrences write directly. An escaping unbound operand acquires a
 stable variable cell with the same logical ID. Numeric results stay local.
@@ -52,7 +52,7 @@ offer. Backtracking, constraint watches and copied answers keep stable cells.
 This implements reuse between tail activations; it does not color lifetimes
 within a clause or move the driver to a separate native register stack.
 
-An [untimed native counter probe](../data/jsonl/engine-slots-counters-2026-10-18.jsonl)
+An [untimed native counter probe](data/jsonl/engine-slots-counters-2026-10-18.jsonl)
 records actual executions of the original queries, without the timing runner's
 unused nonce roots:
 
@@ -141,7 +141,7 @@ collection: a reusable ground spin no longer necessarily allocates. Its live
 graph and reclamation assertions remain in force. All **477** inline example
 and fixture queries agree with Reference and the earlier machine under forced
 collection, with no fallback or skips. CLI acceptance, **61** editor tests and
-**56** harness tests pass. [Validation logs](../data/jsonl/engine-slots-validation-2026-10-18.jsonl)
+**56** harness tests pass. [Validation logs](data/jsonl/engine-slots-validation-2026-10-18.jsonl)
 record commands, binary identities and complete output. The source package
 includes the new tests, helpers and evidence. `cabal check` succeeds with its
 existing optimization and dependency-upper-bound warnings.
@@ -177,9 +177,9 @@ normal `core-major` binary hashes are
 `795089937a30a866b9cd5d0e11fee14c671993e618a1e73a52b198c0033beac6`
 and `17a7a7bf1ec378f799de5c09f0a1e3eb97690b3b1f2db373d4b105cfec4a910d`.
 
-[All samples](../data/jsonl/engine-slots-2026-10-18.jsonl) retain the validation
+[All samples](data/jsonl/engine-slots-2026-10-18.jsonl) retain the validation
 round and all five measurement rounds, complete checked output, commands,
-allocation and CPU observations. [Provenance](../data/jsonl/engine-slots-provenance-2026-10-18.jsonl)
+allocation and CPU observations. [Provenance](data/jsonl/engine-slots-provenance-2026-10-18.jsonl)
 includes source/binary hashes, versions and the complete serial orchestrator.
 Both source trees and all binaries were checked unchanged after timing. No
 intermediate diagnostic-build timings enter these comparisons.
@@ -198,7 +198,7 @@ searches are outside this integration claim.
 The initial shared build cache registered an older library directory despite
 compiling newer optimized objects. An isolated package database resolved the
 diagnostic/CLP test mismatch without runtime source changes.
-[Integration commands, binary hashes and complete passing logs](../data/jsonl/engine-slots-integration-2026-10-18.jsonl)
+[Integration commands, binary hashes and complete passing logs](data/jsonl/engine-slots-integration-2026-10-18.jsonl)
 record the combined runtime SHA-256:
 `23884b92212479a52824c75db5d56dfb7adf72fab071bae7859878ed85248532`.
 The benchmark tables above remain measurements of the earlier slot-reuse

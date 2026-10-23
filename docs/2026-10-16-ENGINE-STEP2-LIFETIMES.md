@@ -110,7 +110,7 @@ Structured-list and early-failure samples improve over the interpreted backend,
 while helper dispatch and structured heads are slower. No general throughput
 gain is established. The additional per-goal dispatch/lookup and cold compiler
 costs remain targets for profiling and persistent code caching.
-[Raw first-order samples](../data/tsv/engine-step2-lifetimes-2026-10-16.tsv).
+[Raw first-order samples](data/tsv/engine-step2-lifetimes-2026-10-16.tsv).
 
 ## Real CLP acceptance
 
@@ -128,7 +128,7 @@ interpreter-only fallback cannot pass. CI is configured to run these checks.
 
 The compiled path remains slower on these small circuits. The acceptance
 establishes correctness and exercised incremental allocation, rather than a
-breadboard speedup. [Raw breadboard samples](../data/tsv/engine-step2-lifetimes-breadboard-2026-10-16.tsv).
+breadboard speedup. [Raw breadboard samples](data/tsv/engine-step2-lifetimes-breadboard-2026-10-16.tsv).
 
 The 16x16 minefield with 50 bombs and at most two bombs in every overlapping
 2x2 window also fully drains under both native backends. Exact Reference
@@ -147,7 +147,7 @@ goals and 19,863 body allocation instructions. Its maximum temporary array has
 11 registers, compared with 25 in the previous snapshot of the same workload;
 the active heap peaks at 4,052 cells versus 4,464 previously. Both native
 backends remain slower than Reference, and the small timing differences are
-mixed. [Raw minefield samples and probe](../data/jsonl/engine-step2-lifetimes-minefield-2026-10-16.jsonl).
+mixed. [Raw minefield samples and probe](data/jsonl/engine-step2-lifetimes-minefield-2026-10-16.jsonl).
 
 ## Compiled residency
 
@@ -161,7 +161,7 @@ Peak RSS ranges from 131.06 to 132.17 MiB, including process startup and source
 fingerprinting. Measured active heaps peak at 1,027 cells, with at most four
 tasks, two choices and three temporary registers. Larger caller-owned answers
 or retained checkpoints still deliberately retain their memory.
-[Raw compiled residency samples](../data/jsonl/engine-step2-lifetimes-tail-2026-10-16.jsonl).
+[Raw compiled residency samples](data/jsonl/engine-step2-lifetimes-tail-2026-10-16.jsonl).
 
 This is bounded residency, not a lower process-RSS claim: the previous snapshot
 reported roughly 126-128 MiB. The current compiler retains additional immutable
@@ -170,7 +170,7 @@ body plans, and process peaks also include runner/source metadata work.
 The six-sample interpreted mutual/helper recheck also passes against the same
 runtime source. Peak RSS ranges from 131.05 to 132.08 MiB, with at most 1,030
 measured active heap cells and four tasks.
-[Raw default-backend recheck](../data/jsonl/engine-step2-lifetimes-native-tail-2026-10-16.jsonl).
+[Raw default-backend recheck](data/jsonl/engine-step2-lifetimes-native-tail-2026-10-16.jsonl).
 
 ## Remaining Step 2 work
 

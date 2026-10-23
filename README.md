@@ -419,10 +419,10 @@ library APIs still use the earlier machine. Unsupported core constructs
 restart on that machine and skip already-delivered search items.
 
 Start with the [documentation index](docs/README.md) or the
-[current engine guide](docs/engine/README.md). The
-[performance overview](docs/performance/README.md) links to checked results,
+[current engine guide](docs/2026-10-17-ENGINE.md). The
+[performance overview](docs/2026-10-15-PERFORMANCE.md) links to checked results,
 dated reports and raw measurements. The
-[engine roadmap](docs/engine/roadmap.md) records the earlier machine/bytecode
+[engine roadmap](docs/2026-10-16-ENGINE-ROADMAP.md) records the earlier machine/bytecode
 plan; its historical backend decisions do not describe the current default.
 
 ## Layout
@@ -487,9 +487,8 @@ bench/machine-minefield.hs validated larger minefield setup/generation regressio
 bench/machine-bytecode.hs serial checked reference/interpreted/bytecode comparison
 bench/machine-cache.hs fresh-process cold/warm predicate-cache comparison
 docs/README.md          documentation index
-docs/engine/            current engine guide, contracts and implementation history
-docs/performance/       performance overview and dated reports
-docs/performance/data/  raw JSONL and TSV benchmark records
+docs/                   dated design notes and reports, indexed in docs/README.md
+docs/data/              raw JSONL and TSV benchmark records
 docs/website/           published language/tooling reference
 docs/dash/              Dash docset builder and feed
 lsp/                    VS Code extension and language server
@@ -522,12 +521,12 @@ Core acceptance compares ordered answers, output, errors and exhaustion
 against both the reference resolver and the earlier machine, and replays
 fixtures with frequent collection. Dedicated regressions cover declared tail
 recursion and collection workspace growth. The
-[reverse report](docs/performance/reports/engine-reverse-2026-10-17.md) records
+[reverse report](docs/2026-10-17-ENGINE-REVERSE.md) records
 the completed 391-property suite, all 296 example/parity queries, 61 LSP tests
 and 34 benchmark-harness tests.
 
 The older machine remains covered for tracing, fallback and goal-level APIs.
-Its detailed [machine/bytecode validation history](docs/engine/legacy-machine-validation.md)
+Its detailed [machine/bytecode validation history](docs/2026-10-17-LEGACY-MACHINE-VALIDATION.md)
 is kept separately from the current execution guide.
 
 ```sh
@@ -564,7 +563,7 @@ Performance tests compare the constraint store with a frozen full-scan reference
 and eligible delta tabling with ordered observations from the general evaluator.
 Breadboard scoring and optima have independent arithmetic and exhaustive models.
 Run `python3 test/bench.py "$(cabal list-bin exe:infera)"` for validated local
-timings; see [benchmark results and scope](docs/performance/README.md). Timing thresholds
+timings; see [benchmark results and scope](docs/2026-10-15-PERFORMANCE.md). Timing thresholds
 are not correctness gates.
 
 The optional machine/reference breadboard benchmark loads and checks the

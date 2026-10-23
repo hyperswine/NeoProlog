@@ -1,8 +1,8 @@
 # Compiled arithmetic plans - 2026-10-19
 
 Branch `core-unboxed-control`, base `e47bc65`. Follows the
-[clause selection report](clause-selection-2026-10-19.md). The
-[control stacks report](control-stacks-2026-10-19.md) profile put
+[clause selection report](2026-10-19-CLAUSE-SELECTION.md). The
+[control stacks report](2026-10-19-CONTROL-STACKS.md) profile put
 `evalFast` at about 14% of Core time on Fibonacci. `evalFast` walks an
 `Expr` tree recursively and passes every intermediate value through the
 `rVAL` store register. Most arithmetic in practice has one of a few flat
@@ -10,7 +10,7 @@ shapes: `N > 0`, `N1 is N - 1`, `F is F1 + F2`.
 
 ## What changed
 
-**Plans.** [Compile.hs](../../src/Infera/Core/Compile.hs) adds a `Plan`
+**Plans.** [Compile.hs](../src/Infera/Core/Compile.hs) adds a `Plan`
 type, derived from an `Expr` by `exprPlan`:
 
 | Plan | Shape | Example |
@@ -27,7 +27,7 @@ The binary plans cover the operators that `evalFast` handles: `+`, `-`,
 and `GCmp` carries the plan of each side. Nothing else about the goals
 changed.
 
-**Running a plan.** [Run.hs](../../src/Infera/Core/Run.hs) `runPlan`
+**Running a plan.** [Run.hs](../src/Infera/Core/Run.hs) `runPlan`
 dereferences the slot words and reads them as immediate integers. It
 returns the result as an `Int`, or `planMiss` (`minBound`; no immediate
 integer has that value). `planApply` reproduces the bounds of `evalFast`
@@ -56,7 +56,7 @@ the same as the old fast path.
 
 **Relocated plans.** Collection can detach suspended goal plans from their
 activation, and turns slots into words when it does
-([Liveness.hs](../../src/Infera/Core/Liveness.hs)). It rebuilds each plan
+([Liveness.hs](../src/Infera/Core/Liveness.hs)). It rebuilds each plan
 from the relocated expression with `exprPlan`. Relocated slots are no
 longer slots, so those goals get `PlanNone` and take the old route.
 
@@ -125,7 +125,7 @@ no tree walk and no `rVAL` round trips.
 
 * Full Haskell suite: 497 checks. The new parity file adds one check
   through `CoreTest`'s parity list.
-* [test/core/parity-arith.nprolog](../../test/core/parity-arith.nprolog),
+* [test/core/parity-arith.nprolog](../test/core/parity-arith.nprolog),
   65 queries: every planned shape at the immediate boundary in both
   directions (`2^60 - 1 + 1`, `-2^60 - 1`, `1 - (-2^60)`, doubling `2^59`,
   products at `2^30`); bignum operands to planned goals;

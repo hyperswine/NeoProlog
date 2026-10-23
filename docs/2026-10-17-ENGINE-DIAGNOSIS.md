@@ -30,7 +30,7 @@ A stale `dist-newstyle` executable from 2026-10-16 11:48 (before the Step 1
 public switch) ran the same three workloads 3-7x faster than the current
 source. The current machine is a throughput regression against that build,
 which agrees with the pre-migration CLI baseline recorded in
-[performance.md](../performance/README.md).
+[performance.md](2026-10-15-PERFORMANCE.md).
 
 ## Profile
 
@@ -51,7 +51,7 @@ single function dominates. The entries group by cause:
 ## Where the work comes from
 
 Every user predicate call in
-[Control.hs](../../src/Infera/Machine/Control.hs) `callPredicate` does the
+[Control.hs](../src/Infera/Machine/Control.hs) `callPredicate` does the
 following before any clause is tried:
 
 1. Exports the goal from the heap to a `Term` (`Bridge.exportRawTerms`), then
@@ -69,7 +69,7 @@ following before any clause is tried:
    `Bridge.bindingChanges`), even when the program posts no constraints. The
    heap is not the source of truth; it is one of two.
 4. Runs builtins on `Term`s: `is` and comparisons in
-   [Builtins.hs](../../src/Infera/Machine/Builtins.hs) receive exported terms,
+   [Builtins.hs](../src/Infera/Machine/Builtins.hs) receive exported terms,
    walk the substitution, evaluate, and return a `Unify` that is imported back
    into the heap.
 5. Freezes the heap at every choice point and opaque scope. A freeze copies
@@ -347,7 +347,7 @@ unification (8%); the remaining allocation is boxed results of small
 
 ### Reverse follow-up and current next steps
 
-The [reverse follow-up](../performance/reports/engine-reverse-2026-10-17.md) optimizes structure
+The [reverse follow-up](2026-10-17-ENGINE-REVERSE.md) optimizes structure
 construction, head matching and collection against `e3082b3`: loaded CPU
 falls from 0.457 s to 0.365 s and GHC allocation falls 38%. The complete
 391-property suite and all 296 forced-collection inline queries pass.

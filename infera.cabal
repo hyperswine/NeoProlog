@@ -18,12 +18,9 @@ category:           Language
 build-type:         Simple
 extra-doc-files:    README.md
                     docs/*.md
-                    docs/engine/*.md
-                    docs/performance/*.md
-                    docs/performance/reports/*.md
-                    docs/performance/data/*.md
-                    docs/performance/data/jsonl/*.jsonl
-                    docs/performance/data/tsv/*.tsv
+                    docs/data/*.md
+                    docs/data/jsonl/*.jsonl
+                    docs/data/tsv/*.tsv
                     docs/website/*.html
                     docs/website/*.css
                     docs/dash/README.md

@@ -79,7 +79,7 @@ builder rollback and public atomicity.
 The complete final-source Haskell suite passed **361 properties / 25,018
 cases** across 35 groups. All **37 LSP tests**, CLI diagnostics/live-buffer/
 trace/REPL/runtime-error/shipped-example checks and **20 Python harness tests**
-also passed. The [broader bytecode benchmark](../data/tsv/engine-step2-operands-bytecode-2026-10-16.tsv)
+also passed. The [broader bytecode benchmark](data/tsv/engine-step2-operands-bytecode-2026-10-16.tsv)
 passed all **27 engine/case rows and nine positive compiled probes** across its
 nine fixtures. Cross-platform CI has not run for this candidate. CI now
 includes warm control batches of 20 and breadboard batches of 10; configuration
@@ -87,8 +87,8 @@ is not evidence of a remote pass. Earlier-stage results are not substituted
 for final-source gates.
 
 Fresh-process residency passed all **30 bytecode** samples in the
-[full matrix](../data/jsonl/engine-step2-operands-tail-2026-10-16.jsonl) and **six interpreted**
-samples in the [quick comparison](../data/jsonl/engine-step2-operands-native-tail-2026-10-16.jsonl).
+[full matrix](data/jsonl/engine-step2-operands-tail-2026-10-16.jsonl) and **six interpreted**
+samples in the [quick comparison](data/jsonl/engine-step2-operands-native-tail-2026-10-16.jsonl).
 The compiled matrix covers mutual recursion, retained choices, findall, helper
 calls, structured arguments, CLP, tables, dynamic state and parked compiled
 controls, including normal and measured million-call runs. Every search fully
@@ -151,7 +151,7 @@ plan had already been evaluated before that hit.
 
 ## Final acceptance measurements
 
-The [final matrix](../data/jsonl/engine-step2-operands-2026-10-16.jsonl) completed all
+The [final matrix](data/jsonl/engine-step2-operands-2026-10-16.jsonl) completed all
 **240 records / 180 measured samples**, and all four breadth processes passed.
 Every matrix record passed status/full-drain/Reference/independent-model
 checks. Workload and answer fingerprints match per case; all recorded runtime
@@ -212,10 +212,10 @@ caused it. They cannot support making bytecode the default.
 
 All placement geometry, net compatibility, independently enumerated optimum
 and exact Reference-order checks passed. Raw rounds are baseline
-[first](../data/tsv/engine-step2-operands-cache-baseline-breadboard-r1-2026-10-16.tsv) and
-[second](../data/tsv/engine-step2-operands-cache-baseline-breadboard-r2-2026-10-16.tsv),
-candidate [first](../data/tsv/engine-step2-operands-operands-breadboard-r1-2026-10-16.tsv)
-and [second](../data/tsv/engine-step2-operands-operands-breadboard-r2-2026-10-16.tsv).
+[first](data/tsv/engine-step2-operands-cache-baseline-breadboard-r1-2026-10-16.tsv) and
+[second](data/tsv/engine-step2-operands-cache-baseline-breadboard-r2-2026-10-16.tsv),
+candidate [first](data/tsv/engine-step2-operands-operands-breadboard-r1-2026-10-16.tsv)
+and [second](data/tsv/engine-step2-operands-operands-breadboard-r2-2026-10-16.tsv).
 Pooled medians of six batch-100 averages, in seconds per query:
 
 | Case | Baseline bytecode wall | Interpreted wall | Bytecode wall | Baseline bytecode CPU | Interpreted CPU | Bytecode CPU |
@@ -246,16 +246,16 @@ reversed-order rounds with three batch-100 samples per engine/case.
 
 | Intermediate runtime | Matrix | Breadboard rounds: baseline / candidate |
 | --- | --- | --- |
-| Before protected sets (`6f927f`) | [matrix](../data/jsonl/engine-step2-operands-before-root-sets-2026-10-16.jsonl) | [r1 baseline](../data/tsv/engine-step2-operands-before-root-sets-cache-baseline-breadboard-r1-2026-10-16.tsv), [r1 candidate](../data/tsv/engine-step2-operands-before-root-sets-operands-breadboard-r1-2026-10-16.tsv), [r2 baseline](../data/tsv/engine-step2-operands-before-root-sets-cache-baseline-breadboard-r2-2026-10-16.tsv), [r2 candidate](../data/tsv/engine-step2-operands-before-root-sets-operands-breadboard-r2-2026-10-16.tsv) |
-| Eager protected sets (`ff29c3`) | [matrix](../data/jsonl/engine-step2-operands-eager-root-sets-2026-10-16.jsonl) | [r1 baseline](../data/tsv/engine-step2-operands-eager-root-sets-cache-baseline-breadboard-r1-2026-10-16.tsv), [r1 candidate](../data/tsv/engine-step2-operands-eager-root-sets-operands-breadboard-r1-2026-10-16.tsv), [r2 baseline](../data/tsv/engine-step2-operands-eager-root-sets-cache-baseline-breadboard-r2-2026-10-16.tsv), [r2 candidate](../data/tsv/engine-step2-operands-eager-root-sets-operands-breadboard-r2-2026-10-16.tsv) |
-| Before small-local reads (`b41164`) | [matrix](../data/jsonl/engine-step2-operands-before-small-locals-2026-10-16.jsonl) | [r1 baseline](../data/tsv/engine-step2-operands-before-small-locals-cache-baseline-breadboard-r1-2026-10-16.tsv), [r1 candidate](../data/tsv/engine-step2-operands-before-small-locals-operands-breadboard-r1-2026-10-16.tsv), [r2 baseline](../data/tsv/engine-step2-operands-before-small-locals-cache-baseline-breadboard-r2-2026-10-16.tsv), [r2 candidate](../data/tsv/engine-step2-operands-before-small-locals-operands-breadboard-r2-2026-10-16.tsv) |
+| Before protected sets (`6f927f`) | [matrix](data/jsonl/engine-step2-operands-before-root-sets-2026-10-16.jsonl) | [r1 baseline](data/tsv/engine-step2-operands-before-root-sets-cache-baseline-breadboard-r1-2026-10-16.tsv), [r1 candidate](data/tsv/engine-step2-operands-before-root-sets-operands-breadboard-r1-2026-10-16.tsv), [r2 baseline](data/tsv/engine-step2-operands-before-root-sets-cache-baseline-breadboard-r2-2026-10-16.tsv), [r2 candidate](data/tsv/engine-step2-operands-before-root-sets-operands-breadboard-r2-2026-10-16.tsv) |
+| Eager protected sets (`ff29c3`) | [matrix](data/jsonl/engine-step2-operands-eager-root-sets-2026-10-16.jsonl) | [r1 baseline](data/tsv/engine-step2-operands-eager-root-sets-cache-baseline-breadboard-r1-2026-10-16.tsv), [r1 candidate](data/tsv/engine-step2-operands-eager-root-sets-operands-breadboard-r1-2026-10-16.tsv), [r2 baseline](data/tsv/engine-step2-operands-eager-root-sets-cache-baseline-breadboard-r2-2026-10-16.tsv), [r2 candidate](data/tsv/engine-step2-operands-eager-root-sets-operands-breadboard-r2-2026-10-16.tsv) |
+| Before small-local reads (`b41164`) | [matrix](data/jsonl/engine-step2-operands-before-small-locals-2026-10-16.jsonl) | [r1 baseline](data/tsv/engine-step2-operands-before-small-locals-cache-baseline-breadboard-r1-2026-10-16.tsv), [r1 candidate](data/tsv/engine-step2-operands-before-small-locals-operands-breadboard-r1-2026-10-16.tsv), [r2 baseline](data/tsv/engine-step2-operands-before-small-locals-cache-baseline-breadboard-r2-2026-10-16.tsv), [r2 candidate](data/tsv/engine-step2-operands-before-small-locals-operands-breadboard-r2-2026-10-16.tsv) |
 
-Initial dense/fused [control samples](../data/jsonl/engine-step2-operands-initial-2026-10-16.jsonl),
+Initial dense/fused [control samples](data/jsonl/engine-step2-operands-initial-2026-10-16.jsonl),
 before trusted node allocation, showed only a 1.29% median reduction for
 batch-100 controls: 0.01187361 to 0.01172045 s/query. Ranges overlapped:
 0.01144132-0.01248821 versus 0.01137522-0.01263431 s. Initial batch-20
-breadboard [baseline](../data/tsv/engine-step2-operands-initial-cache-baseline-breadboard-2026-10-16.tsv)
-and [candidate](../data/tsv/engine-step2-operands-initial-dense-fused-breadboard-2026-10-16.tsv)
+breadboard [baseline](data/tsv/engine-step2-operands-initial-cache-baseline-breadboard-2026-10-16.tsv)
+and [candidate](data/tsv/engine-step2-operands-initial-dense-fused-breadboard-2026-10-16.tsv)
 were mixed, including wide 8.34% slower than interpreted. These motivated
 removing nested node checkpoints, rather than establishing a control win.
 
@@ -290,7 +290,7 @@ Bytecode remains opt-in. Migration still requires complete generated/API/
 stdlib and trace parity, rollback and retained/interleaved snapshot checks,
 final-source residency, cross-platform CI, and matched cold/warm representative
 performance. Helpers, heads, controls, minefield and all four breadboard cases
-remain inputs. The [roadmap gates](../../engine/roadmap.md#making-bytecode-the-public-default)
+remain inputs. The [roadmap gates](2026-10-16-ENGINE-ROADMAP.md#making-bytecode-the-public-default)
 retain explicit interpreted selection and Reference. Intermediate gains do
 not resolve outstanding representative regressions.
 

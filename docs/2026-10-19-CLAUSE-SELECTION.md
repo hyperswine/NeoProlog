@@ -1,7 +1,7 @@
 # Allocation-free Core clause selection - 2026-10-19
 
 Branch `core-unboxed-control`, base `1f075ac`. Follows the
-[control stacks report](control-stacks-2026-10-19.md), whose profile put
+[control stacks report](2026-10-19-CONTROL-STACKS.md), whose profile put
 `candidateClauses` at about 9% of Core time on Fibonacci. A ticky build
 showed 40-96 bytes of GHC heap per call in selection: `[Int]` results from
 IntMap lookups, list intersections, `filterM` over the leading integer
