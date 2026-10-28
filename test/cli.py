@@ -1,5 +1,6 @@
 """Exercise the real compiler CLI contract, including imported locations."""
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,10 @@ binary = str(Path(sys.argv[1]).resolve())
 
 with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     root = Path(tmp).resolve()
+    version = subprocess.run([binary, "--version"], cwd=root, capture_output=True,
+                             text=True, timeout=20, check=True)
+    assert re.fullmatch(r"infera \d+\.\d+\.\d+\n", version.stdout), version
+    assert not version.stderr and not (root / ".infera_history").exists(), version
 
     def check(source, expected_code=None, success=False):
         target = root / "main.nprolog"
