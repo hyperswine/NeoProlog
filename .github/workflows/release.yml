@@ -1,26 +1,113 @@
 name: Release
 
-# On a version tag: build the Dash docset from docs/website and attach it to
-# the GitHub release, so the Dash feed (docs/dash/Infera.xml) resolves.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag or candidate branch to build (push a v tag to publish)
+        required: true
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  binary:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2
+        id: hs
+        with:
+          ghc-version: "9.8.2"
+          cabal-version: "3.16.1.0"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ steps.hs.outputs.cabal-store }}
+            dist-newstyle
+          key: release-${{ runner.os }}-ghc982-${{ hashFiles('infera.cabal', 'cabal.project*') }}
+          restore-keys: release-${{ runner.os }}-ghc982-
+      - run: cabal update
+      - run: cabal build all --enable-tests --enable-optimization=2
+      - run: cabal test all --enable-optimization=2 --test-show-details=direct
+      - name: Check CLI and release version
+        shell: bash
+        run: |
+          infera_binary="$(cabal list-bin exe:infera --enable-optimization=2)"
+          python3 test/cli.py "$infera_binary"
+          package_version="$(awk '/^version:/ { print $2 }' infera.cabal)"
+          test "$("$infera_binary" --version)" = "infera $package_version"
+          if [[ "$RELEASE_TAG" == v* ]]; then
+            test "$package_version" = "${RELEASE_TAG#v}"
+          fi
+          echo "INFERA_BIN=$infera_binary" >> "$GITHUB_ENV"
+      - name: Sign macOS executable
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - "$INFERA_BIN"
+      - name: Package binary and module examples
+        run: python3 scripts/package-release.py --binary "$INFERA_BIN"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: infera-${{ runner.os }}
+          path: dist-release/*
+          if-no-files-found: error
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: runner.os == 'Linux'
+        with:
+          node-version: "22.13.0"
+      - name: Check and package matching VS Code extension
+        if: runner.os == 'Linux'
+        run: |
+          npm ci --prefix lsp
+          npm test --prefix lsp
+          npm run package --prefix lsp
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: runner.os == 'Linux'
+        with:
+          name: infera-vscode
+          path: lsp/*.vsix
+
   docset:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: "22"
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22.13.0"
       - run: sudo apt-get update && sudo apt-get install -y sqlite3
       - run: node docs/dash/build.js
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: docs/dash/dist/Infera.tgz
+          name: infera-docset
+          path: docs/dash/dist/Infera.tgz
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [binary, docset]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: artifacts/**/*
           generate_release_notes: true

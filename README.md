@@ -9,14 +9,22 @@ The previous engine lives on the `v1` branch (tag `v1.0.0`).
 
 ## Install
 
-With [Homebrew](https://brew.sh) (builds from source with Homebrew's GHC):
+On Apple Silicon with macOS 15 or newer, install the prebuilt release from
+the shared [Homebrew tap](https://github.com/hyperswine/homebrew-tap):
 
 ```
-brew tap hyperswine/neoprolog https://github.com/hyperswine/NeoProlog
-brew install infera
+brew install hyperswine/tap/infera
+infera --version
 ```
 
-From a checkout, with GHC and cabal-install (for example via
+This downloads a checksum-verified binary; GHC, Cabal and a source checkout are
+not required. Examples and their module map are installed together under
+`$(brew --prefix)/share/infera`: run them from that directory, or copy it into
+a writable project. Your own module registrations and REPL history stay in
+your project directory. Release archives and the editor VSIX are also available
+from [GitHub releases](https://github.com/hyperswine/NeoProlog/releases).
+
+To develop Infera itself from a checkout, use GHC and cabal-install (for example via
 [ghcup](https://www.haskell.org/ghcup/)):
 
 ```

@@ -32,6 +32,8 @@ import Infera.Repl
 import Infera.Syntax
 import Infera.Unify
 import qualified Control.Exception as CE
+import Data.Version (showVersion)
+import Paths_infera (version)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
@@ -40,6 +42,7 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
+    ["--version"] -> putStrLn ("infera " ++ showVersion version)
     ("reg" : paths) -> mapM_ registerModule paths
     ["--trace", file] -> runTraceFile file Nothing
     ["--trace", file, query] -> runTraceFile file (Just query)

@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               infera
-version:            2.0.0
+version:            2.1.0
 synopsis:           Prolog-inspired logic language with sorts, modes, tabling and CLP(Z)
 description:
     Infera is a Prolog-inspired logic programming language.  Predicates can
@@ -25,6 +25,7 @@ extra-doc-files:    README.md
                     docs/website/*.css
                     docs/dash/README.md
 extra-source-files: infera.conf examples/*.nprolog test/cli.py test/bench.py
+                    scripts/package-release.py
                     test/core/*.nprolog
                     docs/dash/build.js docs/dash/Infera.xml
                     test/bench_harness_test.py test/runtime_bench_harness_test.py
@@ -90,6 +91,8 @@ library
         Infera.Module
         Infera.Repl
     other-modules:    Infera.Engine.Contracts
+                      Paths_infera
+    autogen-modules:  Paths_infera
     build-depends:
         base                        >= 4.14 && < 5,
         array                       >= 0.5 && < 0.6,
