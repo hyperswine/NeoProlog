@@ -289,11 +289,15 @@ test('missing disk imports and configuration changes invalidate cached checks', 
   const lib = path.join(root, 'lib.nprolog'), libUri = pathToFileURL(lib).href
   const conf = path.join(root, 'neoprolog.conf'), confUri = pathToFileURL(conf).href
   fs.writeFileSync(conf, 'lib#test lib.nprolog\n')
+  // Start with the import present: a check whose inputs match an earlier
+  // snapshot may legitimately reuse that cached result, so the missing-file
+  // snapshot below must be new to the server rather than a return to the first.
+  fs.writeFileSync(lib, 'lib0.\n')
   const { executable, calls } = countingChecker(root), { notify } = await client(t, executable)
   notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text: '<- import "lib#test".\nmain.\n' } })
   await until(() => calls(file).length === 1)
   fs.writeFileSync(lib, 'lib.\n')
-  notify('workspace/didChangeWatchedFiles', { changes: [{ uri: libUri, type: 1 }] })
+  notify('workspace/didChangeWatchedFiles', { changes: [{ uri: libUri, type: 2 }] })
   await until(() => calls(file).length === 2)
   fs.unlinkSync(lib)
   notify('workspace/didChangeWatchedFiles', { changes: [{ uri: libUri, type: 3 }] })
