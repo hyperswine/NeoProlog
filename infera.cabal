@@ -11,6 +11,7 @@ description:
 homepage:           https://github.com/hyperswine/NeoProlog
 bug-reports:        https://github.com/hyperswine/NeoProlog/issues
 license:            GPL-3.0-only
+license-file:       LICENSE
 author:             Jasen Qin
 maintainer:         jasen.qin33@gmail.com
 copyright:          2025 Jasen Qin

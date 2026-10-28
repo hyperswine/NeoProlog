@@ -14,3 +14,6 @@ docs/dash/dist/
 .claude/
 __pycache__/
 NOTES.txt
+
+# Generated binary release archives.
+dist-release/
