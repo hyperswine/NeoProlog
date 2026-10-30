@@ -203,6 +203,40 @@ four are faster. `core-fib` is the exception in both columns that matter:
 it has no kernel, so it carries the interpreter's per-call allocation
 with none of the compensation.
 
+## What did not work
+
+**Arithmetic goals as stream instructions.** The plan's fragment-growth list
+puts structures as arguments first, but the encoder already builds a
+structure argument with @PUSH_*@ over @PUT_STRUCT@; what actually kept
+clauses off the stream was the single-goal builtin rule, so `GIs` and `GCmp`
+were the next thing to encode. Both were implemented and measured over nine
+cases with the JIT enabled, seven interleaved samples per column, against the
+previous commit:
+
+| Case | CPU | Allocation |
+| --- | ---: | ---: |
+| guards | -3.1% | -4.4% |
+| core-fib | -0.6% | -4.7% |
+| core-nrev, core-queens, core-loop | +0.6% to +0.2% | -1.6% to 0% |
+| liveness | **+5.7%** | -4.1% |
+| minefield-16, breadboard-*, table-cycle | flat | flat |
+
+Coverage grew as intended — `fib`, `build`, `spin`, `range` and `loop`
+clauses streamed for the first time — but the CPU effect is a wash with one
+clear regression, and `liveness` pays 4% for the stream it did not pay
+before. Hoisting the two instruction bodies out of `streamCode`'s dispatch
+recovered most of an earlier 3% loss on `core-queens`, which is the same
+codegen sensitivity [WAM-STREAM](2026-10-30-WAM-STREAM.md) ran into; decoding
+the inline plan without rebuilding a boxed `Plan` per execution fixed the
+allocation but not the CPU.
+
+The change was not kept. A stream that is slower than the tree for a
+three-goal recursive clause costs more than the fragment it adds, and the
+`liveness` regression is not explained: the clause it is attributed to is
+neutral in isolation. Anyone picking this up should start from why a streamed
+tail-recursive clause with a structure head is slower than the same clause
+interpreted, before growing the fragment further.
+
 ## Remaining work
 
 1. **The per-call allocation above**, found but not localized.
