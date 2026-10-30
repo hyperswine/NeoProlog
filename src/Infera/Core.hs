@@ -15,6 +15,7 @@ module Infera.Core
   )
 where
 
+import Infera.Core.Compile (CoreProgram (..), Unsupported (..), compileProgram, programScope)
 import Infera.Core.Run (Step (..), runCore, runCoreWith)
 import Infera.Engine.Reference (Search)
 import qualified Infera.Machine.Control as Machine
@@ -60,9 +61,16 @@ solveQueryOrFallback program query =
   maybe (Machine.solveQuery program query) id (solveQuery program query)
 
 -- | Nothing when every construct of this program and query runs on the
--- core, otherwise the first one that would make a run fall back.
+-- core, otherwise the first one that would make a run fall back. The program
+-- half comes from its loaded image, so this compiles only the query's goals
+-- and starts no machine.
 coreSupports :: Program -> Query -> Maybe String
-coreSupports program query = unsafePerformIO (fst <$> runCore program query)
+coreSupports program query = unsafePerformIO $ do
+  scope <- programScope program
+  compiled <- compileProgram scope query
+  pure $ case compiled of
+    Left (Unsupported reason) -> Just reason
+    Right core -> cpUnsupported core
 {-# NOINLINE coreSupports #-}
 
 -- | Run a query to completion on the core alone: the item count, or the

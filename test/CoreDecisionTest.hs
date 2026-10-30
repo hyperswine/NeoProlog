@@ -53,10 +53,10 @@ assertParity indexed unindexed query = do
 
 selected :: Program -> PredKey -> [Term] -> Bool -> PropertyT IO [Int]
 selected program key args constrained = evalIO $ do
-  symbols <- Store.newSymbols
-  store <- Store.newStore symbols
+  scope <- Compile.programScope program
+  store <- Store.newStore (Compile.scopeSymbols scope)
   let query = Query [] [] 0
-  compiled <- Compile.compileProgram store program query
+  compiled <- Compile.compileProgram scope query
   case compiled of
     Left reason -> fail (show reason)
     Right code -> do

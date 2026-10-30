@@ -34,6 +34,8 @@ import qualified Infera.CLP as CLP
 import qualified Infera.CLP.Mutable as Mutable
 import qualified Infera.Core.Constraint as NativeConstraint
 import Infera.Core.Compile
+import Infera.Core.Jit (invokeJitKernel, jitEnabled)
+import Infera.Core.Ops
 import qualified Infera.Core.Liveness as Liveness
 import qualified Infera.Core.Delta as Delta
 import Infera.Core.Store
@@ -85,6 +87,9 @@ data Cont
     CExitTable !(IORef Fix)
   | -- | a candidate of a minimize scope: cost pattern, base, state ref
     CExitMinimize Pattern !Int !(IORef Minimum)
+  | -- | a suspended clause instruction stream: code, pc, activation base,
+    -- cut barrier, depth
+    CStream !ClauseStream !Int !Int !Int !Int Cont
 
 -- | One choice point, as a value. The stack itself is stored in 'Choices';
 -- this record is built only on cold paths (collection, invariant checks).
@@ -274,10 +279,10 @@ runCoreWithSlotStats limit program query = do
 
 startCore :: Bool -> Bool -> Int -> P.Program -> S.Query -> IO (Maybe String, IO Step, IO (Int, Int, Int), IO (Int, Int, Int), IO (Int, Int, Int))
 startCore measured measureSlots limit program query = do
-  syms <- newSymbols
-  store <- newStore syms
+  scope <- programScope program
+  store <- newStore (scopeSymbols scope)
   writeReg store rGCLIM limit
-  compiled <- compileProgram store program query
+  compiled <- compileProgram scope query
   case compiled of
     Left (Unsupported reason) -> pure (Just reason, pure (Abandon reason), collectionStats store, pure (0, 0, 0), pure (0, 0, 0))
     Right core -> do
@@ -611,6 +616,7 @@ run' m cont = case cont of
     state <- exportState m
     pure (Yield (Found state) (backtrack m))
   CGoals goals base barrier depth next -> runGoals m goals base barrier depth next
+  CStream stream pc base barrier depth next -> runStream m stream pc base barrier depth next
   CReturn commitHeight guardBase check next -> do
     problem <- case check of
       Nothing -> pure Nothing
@@ -649,7 +655,7 @@ run' m cont = case cont of
               Nothing -> True
               Just (current, _, _, _, _, _, _) -> n < current
         when better $ do
-          trailArr <- readIORef (trail s)
+          trailArr <- trailPtr s
           top <- trailTop s
           -- All older cells are restored together. Number their copied
           -- fresh variables in one namespace, preserving both aliases and
@@ -659,7 +665,7 @@ run' m cont = case cont of
           let scan !i acc
                 | i < mnEntryTrail mn = pure acc
                 | otherwise = do
-                    entry <- unsafeRead trailArr i
+                    entry <- peekAt trailArr i
                     if odd entry
                       then scan (i - 2) acc
                       else do
@@ -708,6 +714,7 @@ contDepth cont = case cont of
   CExitFindAll _ _ _ _ _ _ depth -> depth
   CExitTable _ -> 0
   CExitMinimize _ _ _ -> 0
+  CStream _ _ _ _ depth _ -> depth
 
 -- Skip exhausted goal lists so that a tail call sees its caller's return.
 dropEmpty :: Cont -> Cont
@@ -969,7 +976,7 @@ step' m goal goals base barrier depth next = case goal of
     goal <- phraseTerm m aliases ntWord (refWord chars)
     table <- readIORef aliases
     let csId = head [v | (v, w) <- IM.toList table, w == refWord chars]
-    phraseGoal <- compileGoalTerm s (mProgram m) (cpPreds (mCore m)) goal
+    phraseGoal <- compileGoalTerm (symbols s) (mProgram m) (cpPreds (mCore m)) goal
     runDynamic m aliases [] [GIf [phraseGoal] [GEmitText (PSlot csId)] Nothing] depth (CGoals goals base barrier depth next)
   GEmitText pattern -> do
     word <- buildArg m base False pattern
@@ -1019,10 +1026,12 @@ step' m goal goals base barrier depth next = case goal of
       if quick /= planMiss then bindQuick quick else general
     where
       !st = mStore m
-      bindQuick quick = do
-        wt <- numericTarget m base target
-        ok <- unify st wt (intWord quick)
-        if ok then continue else backtrack m
+      bindQuick quick = case target of
+        PFirst i | base > 0 -> writeCell st (base + i) (intWord quick) >> continue
+        _ -> do
+          wt <- numericTarget m base target
+          ok <- unify st wt (intWord quick)
+          if ok then continue else backtrack m
       general = do
         value <- evalExpr m base expr
         case value of
@@ -1122,7 +1131,7 @@ stabilize s base pattern = case pattern of
 -- them in the same block. Cuts stay local.
 runDynamic :: Machine -> IORef (IM.IntMap Word') -> [Term] -> [Goal] -> Int -> Cont -> IO Step
 runDynamic m aliases terms extra depth cont = do
-  compiled <- mapM (compileGoalTerm (mStore m) (mProgram m) (cpPreds (mCore m))) terms
+  compiled <- mapM (compileGoalTerm (symbols (mStore m)) (mProgram m) (cpPreds (mCore m))) terms
   table <- readIORef aliases
   let s = mStore m
   block <- allocSlots s (max 1 (IM.size table))
@@ -1372,22 +1381,38 @@ callPlain m frame predicate cont0 = do
       let depth = contDepth cont + 1
       if depth > maxResolutionDepth
         then raiseItems m [BranchExhausted] (backtrack m)
-        else do
-          entry <- choiceTop m
+        else case (pJit predicate, mSlotStats m) of
+          (Just kernel, Nothing) | jitEnabled -> do
+            code <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
+            case code of
+              1 -> run m cont
+              0 -> backtrack m
+              3 -> raiseItems m [BranchExhausted] (backtrack m)
+              _ -> enterPlainInterpreted frame' cont depth
+          _ -> enterPlainInterpreted frame' cont depth
+    enterPlainInterpreted frame' cont depth = do
+      let !s = mStore m
+      entry <- choiceTop m
+      rawCands <- candidateClauses s predicate
+      cands <- pruneCandidates s predicate rawCands
+      case cands of
+        NoCandidate -> backtrack m
+        OneCandidate ordinal
+          | null (clBody (pClauses predicate ! ordinal)) ->
+              tryClauseWithFrame m frame' predicate ordinal entry depth cont
+        _ -> do
           commits <- case pSwitch predicate of
             Nothing -> pure False
-            Just positions -> switchGround (mStore m) positions
+            Just positions -> switchGround s positions
           returnCont <-
             if not commits
               then pure cont
               else case cont of
-                -- A committing frame already removes every choice and guard
-                -- above its own, older entry.
                 CReturn h _ Nothing _ | h >= 0 -> pure cont
                 _ -> do
                   guardBase <- guardTop m
                   pure (CReturn entry guardBase Nothing cont)
-          callClausesWithFrame m frame' predicate entry depth returnCont
+          dispatchCandidates m frame' predicate entry depth returnCont cands
 
 -- | A call to a predicate with declared contracts.
 callDeclared :: Machine -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
@@ -1452,6 +1477,7 @@ tailFrame s base cont
       | other == base = False
       | other < base = True
       | otherwise = dead next
+    dead (CStream _ _ other _ _ next) = if other == base then False else other < base || dead next
     dead (CReturn _ _ _ next) = dead next
     dead (CExitIf _ _ other _ _ next) = other /= base && dead next
     dead (CExitNot _ _ _) = True
@@ -1459,14 +1485,361 @@ tailFrame s base cont
     dead (CExitTable _) = False
     dead (CExitMinimize _ other _) = other /= base
 
+-- ─── the clause stream ───────────────────────────────────────────────────────
+
+-- | Whether clauses that have a stream run on it. The flag exists so that a
+-- divergence can be bisected between the two interpreters, and so that the
+-- tree path stays exercisable after the fragment grows.
+streamEnabled :: Bool
+streamEnabled = unsafePerformIO (maybe True (/= "0") <$> lookupEnv "INFERA_CORE_STREAM")
+{-# NOINLINE streamEnabled #-}
+
+-- | A head match that failed. A sentinel rather than 'Maybe': the head
+-- matcher runs once per clause activation and every box counts.
+streamFailed :: Int
+streamFailed = -1
+
+-- | Run a clause's instruction stream. A stream is the clause's head match,
+-- which is the leading run of @GET_*@ instructions, followed by its body; the
+-- activation is already allocated and initialized by the caller, so the stream
+-- only has to leave the same store, trail and control state that 'matchHead'
+-- and 'step'' would.
+--
+-- Every function here is top-level and takes the frame it works on as
+-- arguments. A local recursive loop that captured the frame would allocate a
+-- closure group per clause activation, which costs more than the dispatch it
+-- saves.
+runStream :: Machine -> ClauseStream -> Int -> Int -> Int -> Int -> Cont -> IO Step
+runStream m stream !pc !base !barrier !depth !next = streamCode m stream pc 0 base barrier depth next
+
+-- | One instruction. @sp@ is the operand stack: the argument registers at and
+-- above the callee's arity, which a call does not otherwise use, as in WAM.
+streamCode :: Machine -> ClauseStream -> Int -> Int -> Int -> Int -> Int -> Cont -> IO Step
+streamCode m !stream !pc !sp !base !barrier !depth !next = case () of
+  _ | op == opProceed -> run m next
+    | op == opCheckBound -> do
+        pending <- readReg s rBOUND
+        if pending > 0
+          then reconciled m (streamCode m stream (pc + 1) sp base barrier depth next)
+          else streamCode m stream (pc + 1) sp base barrier depth next
+    | op == opCut -> cutTo m barrier >> streamCode m stream (pc + 1) sp base barrier depth next
+    | op == opFail -> backtrack m
+    | op == opCall -> do
+        let !entry = unsafeAt code (pc + 1)
+            !arity = unsafeAt code (pc + 2)
+        predicate <- streamCallTarget stream entry
+        pending <- arithData s
+        when (pending > 0) (normalizeArgs m arity)
+        callPredicate m 0 predicate (streamCallTrust stream entry)
+          (CStream stream (pc + 3) base barrier depth next)
+    | op == opExecute -> do
+        let !entry = unsafeAt code (pc + 1)
+            !arity = unsafeAt code (pc + 2)
+        predicate <- streamCallTarget stream entry
+        pending <- arithData s
+        when (pending > 0) (normalizeArgs m arity)
+        callPredicate m base predicate (streamCallTrust stream entry) next
+    | op == opEscape ->
+        runGoals m (streamEscapeGoals stream (unsafeAt code (pc + 1))) base barrier depth next
+    | op == opArgPrep -> streamCode m stream (pc + 2) (unsafeAt code (pc + 1)) base barrier depth next
+    | op == opPutFirst -> do
+        let !i = unsafeAt code (pc + 1)
+            !off = unsafeAt code (pc + 2)
+            !addr = base + off
+        -- A first occurrence is still unbound and unreferenced: the value is
+        -- installed without a binding transaction. A constructor for an
+        -- unbound argument introduces its variable here, as buildArg does.
+        writeCell s addr (refWord addr)
+        word <- slotWord s base off
+        writeArg s i word
+        streamCode m stream (pc + 3) sp base barrier depth next
+    | op == opPutVar -> do
+        let !i = unsafeAt code (pc + 1)
+            !off = unsafeAt code (pc + 2)
+            !addr = base + off
+        word <- readCell s addr
+        value <- if word == refWord addr then operandAt s base off else pure word
+        writeArg s i value
+        streamCode m stream (pc + 3) sp base barrier depth next
+    | op == opPutConst -> do
+        writeArg s (unsafeAt code (pc + 1)) (unsafeAt code (pc + 2))
+        streamCode m stream (pc + 3) sp base barrier depth next
+    | op == opPutStruct -> do
+        let !i = unsafeAt code (pc + 1)
+            !f = unsafeAt code (pc + 2)
+            !n = unsafeAt code (pc + 3)
+        word <- streamStructure s f sp n
+        writeArg s i word
+        streamCode m stream (pc + 4) (sp - n) base barrier depth next
+    | op == opPushFirst -> do
+        let !off = unsafeAt code (pc + 1)
+            !addr = base + off
+        writeCell s addr (refWord addr)
+        word <- slotWord s base off
+        writeArg s sp word
+        streamCode m stream (pc + 2) (sp + 1) base barrier depth next
+    | op == opPushVar -> do
+        let !off = unsafeAt code (pc + 1)
+            !addr = base + off
+        word <- readCell s addr
+        value <- if word == refWord addr then operandAt s base off else pure word
+        writeArg s sp value
+        streamCode m stream (pc + 2) (sp + 1) base barrier depth next
+    | op == opPushConst -> do
+        writeArg s sp (unsafeAt code (pc + 1))
+        streamCode m stream (pc + 2) (sp + 1) base barrier depth next
+    | op == opPushStruct -> do
+        let !f = unsafeAt code (pc + 1)
+            !n = unsafeAt code (pc + 2)
+        word <- streamStructure s f sp n
+        writeArg s (sp - n) word
+        streamCode m stream (pc + 3) (sp - n + 1) base barrier depth next
+    | op == opDoUnify -> do
+        a <- readArg s 0
+        b <- readArg s 1
+        ok <- unify s a b
+        if ok
+          then streamCode m stream (pc + 1) sp base barrier depth next
+          else backtrack m
+    | op >= opGetFirst && op <= opGetListFirst -> do
+        after <- streamHead m stream base pc
+        if after == streamFailed
+          then backtrack m
+          else streamCode m stream after sp base barrier depth next
+    | otherwise -> pure (Abandon ("core: unknown stream opcode " ++ show op))
+  where
+    !s = mStore m
+    !code = csCode stream
+    !op = unsafeAt code pc
+
+-- | The pair of children a two-argument constructor pops, or the general
+-- list for any other arity.
+streamStructure :: Store -> Word' -> Int -> Int -> IO Word'
+streamStructure s functor sp n = case n of
+  2 -> do
+    a <- readArg s (sp - 2)
+    b <- readArg s (sp - 1)
+    structure2 s functor a b
+  _ -> structureWord s functor =<< mapM (readArg s) [sp - n .. sp - 1]
+{-# INLINE streamStructure #-}
+
+-- | Match every consecutive head-argument instruction, returning the offset of
+-- the first instruction after them or 'streamFailed'.
+streamHead :: Machine -> ClauseStream -> Int -> Int -> IO Int
+streamHead m !stream !base !pc = case () of
+  _ | op == opGetFirst -> do
+        writeFirst s (base + unsafeAt code (pc + 2)) =<< readArg s (unsafeAt code (pc + 1))
+        streamHead m stream base (pc + 3)
+    | op == opGetVar -> do
+        arg <- readArg s (unsafeAt code (pc + 1))
+        word <- slotWord s base (unsafeAt code (pc + 2))
+        streamIfUnify m stream base (pc + 3) arg word
+    | op == opGetConst -> do
+        arg <- readArg s (unsafeAt code (pc + 1))
+        streamIfUnify m stream base (pc + 3) arg (unsafeAt code (pc + 2))
+    | op == opGetListFirst -> do
+        let !entry = unsafeAt code (pc + 2)
+            !functor = unsafeAt code (pc + 3)
+            !h = unsafeAt code (pc + 4)
+            !t = unsafeAt code (pc + 5)
+        arg <- readArg s (unsafeAt code (pc + 1))
+        d <- deref s arg
+        case tagOf d of
+          tag | tag == tagStr -> do
+            f <- readCell s (valOf d)
+            if funKey f /= functor
+              then pure streamFailed
+              else do
+                headWord <- readCell s (valOf d + 1)
+                tailWord <- readCell s (valOf d + 2)
+                writeFirst s (base + h) headWord
+                writeFirst s (base + t) tailWord
+                streamHead m stream base (pc + 6)
+            | tag == tagRef -> do
+                ok <- unifyPattern m base (streamSidePattern stream entry) arg
+                if ok then streamHead m stream base (pc + 6) else pure streamFailed
+            | otherwise -> pure streamFailed
+    | op == opGetStruct -> do
+        let !entry = unsafeAt code (pc + 2)
+            !functor = unsafeAt code (pc + 3)
+            !n = unsafeAt code (pc + 4)
+            !after = unsafeAt code (pc + 5)
+        arg <- readArg s (unsafeAt code (pc + 1))
+        d <- deref s arg
+        case tagOf d of
+          tag | tag == tagStr -> do
+            f <- readCell s (valOf d)
+            if funKey f /= functor
+              then pure streamFailed
+              else do
+                rest <- streamOperands m stream base [valOf d + 1 .. valOf d + n] (pc + 6)
+                if rest == streamFailed then pure streamFailed else streamHead m stream base rest
+            | tag == tagRef -> do
+                -- Building the pattern, occurs-checking it and binding is the
+                -- tree's write mode; it needs the pattern, so take that path
+                -- whole and skip the operand instructions it replaced.
+                ok <- unifyPattern m base (streamSidePattern stream entry) arg
+                if ok then streamHead m stream base after else pure streamFailed
+            | otherwise -> pure streamFailed
+    | otherwise -> pure pc
+  where
+    !s = mStore m
+    !code = csCode stream
+    !op = unsafeAt code pc
+
+streamIfUnify :: Machine -> ClauseStream -> Int -> Int -> Word' -> Word' -> IO Int
+streamIfUnify m stream base after arg word = do
+  ok <- unify (mStore m) word arg
+  if ok then streamHead m stream base after else pure streamFailed
+{-# INLINE streamIfUnify #-}
+
+streamOperands :: Machine -> ClauseStream -> Int -> [Int] -> Int -> IO Int
+streamOperands _ _ _ [] pc = pure pc
+streamOperands m stream base (cell : rest) pc = do
+  next <- streamOperand m stream base cell pc
+  if next == streamFailed then pure streamFailed else streamOperands m stream base rest next
+
+-- | One unify operand: the word to match is the contents of @cell@.
+streamOperand :: Machine -> ClauseStream -> Int -> Int -> Int -> IO Int
+streamOperand m !stream !base !cell !pc = case () of
+  _ | op == opUF -> do
+        writeFirst s (base + unsafeAt code (pc + 1)) =<< readCell s cell
+        pure (pc + 2)
+    | op == opUV -> do
+        word <- readCell s cell
+        value <- slotWord s base (unsafeAt code (pc + 1))
+        ok <- unify s value word
+        pure (if ok then pc + 2 else streamFailed)
+    | op == opUC -> do
+        word <- readCell s cell
+        ok <- unify s (unsafeAt code (pc + 1)) word
+        pure (if ok then pc + 2 else streamFailed)
+    | op == opUSF -> do
+        let !entry = unsafeAt code (pc + 1)
+            !functor = unsafeAt code (pc + 2)
+            !h = unsafeAt code (pc + 3)
+            !t = unsafeAt code (pc + 4)
+            !after = unsafeAt code (pc + 5)
+        word <- readCell s cell
+        d <- deref s word
+        case tagOf d of
+          tag | tag == tagStr -> do
+            f <- readCell s (valOf d)
+            if funKey f /= functor
+              then pure streamFailed
+              else do
+                headWord <- readCell s (valOf d + 1)
+                tailWord <- readCell s (valOf d + 2)
+                writeFirst s (base + h) headWord
+                writeFirst s (base + t) tailWord
+                pure (pc + 6)
+            | tag == tagRef -> do
+                ok <- unifyPattern m base (streamSidePattern stream entry) word
+                pure (if ok then after else streamFailed)
+            | otherwise -> pure streamFailed
+    | op == opUS -> do
+        let !entry = unsafeAt code (pc + 1)
+            !functor = unsafeAt code (pc + 2)
+            !n = unsafeAt code (pc + 3)
+            !after = unsafeAt code (pc + 4)
+        word <- readCell s cell
+        d <- deref s word
+        case tagOf d of
+          tag | tag == tagStr -> do
+            f <- readCell s (valOf d)
+            if funKey f /= functor
+              then pure streamFailed
+              else streamOperands m stream base [valOf d + 1 .. valOf d + n] (pc + 5)
+            | tag == tagRef -> do
+                ok <- unifyPattern m base (streamSidePattern stream entry) word
+                pure (if ok then after else streamFailed)
+            | otherwise -> pure streamFailed
+    | otherwise -> pure streamFailed
+  where
+    !s = mStore m
+    !code = csCode stream
+    !op = unsafeAt code pc
+
+streamCallTarget :: ClauseStream -> Int -> IO Pred
+streamCallTarget stream entry = case unsafeAt (csRefs stream) entry of
+  SRefCall ref _ -> readIORef ref
+  _ -> error "core: stream call entry is not a call"
+
+streamCallTrust :: ClauseStream -> Int -> Maybe Trust
+streamCallTrust stream entry = case unsafeAt (csRefs stream) entry of
+  SRefCall _ trust -> trust
+  _ -> error "core: stream call entry is not a call"
+
+streamEscapeGoals :: ClauseStream -> Int -> [Goal]
+streamEscapeGoals stream entry = case unsafeAt (csRefs stream) entry of
+  SRefEscape goals -> goals
+  _ -> error "core: stream escape entry is not an escape"
+
+streamSidePattern :: ClauseStream -> Int -> Pattern
+streamSidePattern stream entry = case unsafeAt (csRefs stream) entry of
+  SRefPattern pattern -> pattern
+  _ -> error "core: stream pattern entry is not a pattern"
+
 -- | Select and try the clauses of a predicate against the registers.
 callClauses :: Machine -> Pred -> Int -> Int -> Cont -> IO Step
 callClauses m = callClausesWithFrame m 0
 
+clauseAcceptsInt0 :: Clause -> Int -> Bool
+clauseAcceptsInt0 cl !n = case (clHead cl, clBody cl) of
+  (PFirst s : _, GCmp op _ _ (PlanSlot s') (PlanImm rhs) : _) | s == s' ->
+    cmpAccepts op (compare n rhs)
+  (PFirst s : _, GCmp op _ _ (PlanImm lhs) (PlanSlot s') : _) | s == s' ->
+    cmpAccepts op (compare lhs n)
+  _ -> True
+{-# INLINE clauseAcceptsInt0 #-}
+
+pruneCandidates s predicate cands = case cands of
+  Candidates ordinals | pArity predicate > 0 -> do
+    w0 <- readArg s 0 >>= deref s
+    if tagOf w0 /= tagInt
+      then pure cands
+      else do
+        let !v0 = valOf w0
+            !clauses = pClauses predicate
+            !len = numElements ordinals
+            -- Decided without allocating: most calls to an integer-first
+            -- predicate reject no clause at all, and building the kept list
+            -- there costs a few words per call.
+            allAccept !i =
+              i >= len
+                || (clauseAcceptsInt0 (clauses ! unsafeAt ordinals i) v0 && allAccept (i + 1))
+        if allAccept 0
+          then pure cands
+          else do
+            let kept = [ord | i <- [0 .. len - 1], let ord = ordinals `unsafeAt` i, clauseAcceptsInt0 (clauses ! ord) v0]
+            pure $! case kept of
+              [] -> NoCandidate
+              [ord] -> OneCandidate ord
+              _ -> Candidates (IA.listArray (0, length kept - 1) kept)
+  _ -> pure cands
+{-# INLINE pruneCandidates #-}
+
 callClausesWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
-callClausesWithFrame m frame predicate barrier depth returnCont = do
+callClausesWithFrame m frame predicate barrier depth returnCont =
+  case (pJit predicate, mSlotStats m) of
+    (Just kernel, Nothing) | jitEnabled -> do
+      code <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
+      case code of
+        1 -> run m returnCont
+        0 -> backtrack m
+        3 -> raiseItems m [BranchExhausted] (backtrack m)
+        _ -> callClausesInterpreted m frame predicate barrier depth returnCont
+    _ -> callClausesInterpreted m frame predicate barrier depth returnCont
+
+callClausesInterpreted :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
+callClausesInterpreted m frame predicate barrier depth returnCont = do
   let !s = mStore m
-  candidates <- candidateClauses s predicate
+  rawCands <- candidateClauses s predicate
+  cands <- pruneCandidates s predicate rawCands
+  dispatchCandidates m frame predicate barrier depth returnCont cands
+
+dispatchCandidates m frame predicate barrier depth returnCont candidates = do
+  let !s = mStore m
   case candidates of
     NoCandidate -> backtrack m
     OneCandidate ordinal -> tryClauseWithFrame m frame predicate ordinal barrier depth returnCont
@@ -1506,13 +1879,16 @@ recordSlots m reused count = case mSlotStats m of
 
 enterClause :: Machine -> Clause -> Int -> Int -> Int -> Cont -> IO Step
 enterClause m clause base barrier depth cont = do
-  ok <- matchHead m base (clHead clause) 0
   let !cont' = case cont of
         CReturn h g (Just _) next | clTrustReturn clause -> CReturn h g Nothing next
         _ -> cont
-  if ok
-    then runGoals m (clBody clause) base barrier depth cont'
-    else backtrack m
+  case clStream clause of
+    Just stream | streamEnabled -> runStream m stream 0 base barrier depth cont'
+    _ -> do
+      ok <- matchHead m base (clHead clause) 0
+      if ok
+        then runGoals m (clBody clause) base barrier depth cont'
+        else backtrack m
 {-# INLINE enterClause #-}
 
 matchHead :: Machine -> Int -> [Pattern] -> Int -> IO Bool
@@ -2622,20 +2998,20 @@ checkInvariants :: Machine -> Cont -> IO ()
 checkInvariants m cont = do
   let s = mStore m
   top <- heapTop s
-  arr <- readIORef (cells s)
+  arr <- cellsPtr s
   forM_ [0 .. top - 1] $ \a -> do
-    w <- unsafeRead arr a
+    w <- peekAt arr a
     when ((tagOf w == tagRef || tagOf w == tagStr) && (valOf w < 0 || valOf w >= top)) $
       traceMsg ("INVARIANT: cell " ++ show a ++ " points outside the heap: " ++ show w)
-  tr <- readIORef (trail s)
+  tr <- trailPtr s
   trTop <- trailTop s
   let walk i
         | i < 0 = pure ()
         | otherwise = do
-            e <- unsafeRead tr i
+            e <- peekAt tr i
             let addr = e `div` 2
             when (addr >= top) (traceMsg ("INVARIANT: trail entry " ++ show i ++ " -> dead cell " ++ show addr))
-            w <- if addr < top then unsafeRead arr addr else pure 0
+            w <- if addr < top then peekAt arr addr else pure 0
             when (addr < top && even e && w == refWord addr) (traceMsg ("INVARIANT: trail entry " ++ show i ++ " for unbound cell " ++ show addr))
             walk (if odd e then i - 2 else i - 1)
   walk (trTop - 1)
@@ -2651,9 +3027,10 @@ checkInvariants m cont = do
         CExitIf _ _ base _ _ next -> checkBase base >> checkCont next
         CExitFindAll _ _ _ base _ _ _ -> checkBase base
         CExitMinimize _ base _ -> checkBase base
+        CStream _ _ base _ _ next -> checkBase base >> checkCont next
         _ -> pure ()
       checkBase base = when (base > 0) $ do
-        marker <- unsafeRead arr (base - 1)
+        marker <- peekAt arr (base - 1)
         unless (tagOf marker == tagFun) (traceMsg ("INVARIANT: block base " ++ show base ++ " has no marker: " ++ show marker))
       checkAlt alt = case alt of
         AltClauses _ _ _ _ c -> checkCont c
@@ -2706,7 +3083,7 @@ collect m cont nargs = do
       queryCells = max 1 (cpQueryVars (mCore m))
   top <- heapTop s
   traceMsg ("GC at H=" ++ show top)
-  arr <- readIORef (cells s)
+  arr <- cellsPtr s
   trailLen <- trailTop s
   workspace <- collectionWorkspace m top trailLen
   -- The bitmaps are small and newArray clears them in bulk. Reusing them
@@ -2736,7 +3113,7 @@ collect m cont nargs = do
         if seen
           then pure ()
           else do
-            f <- unsafeRead arr a
+            f <- peekAt arr a
             unsafeWrite marks a True
             forM_ [a + 1 .. a + funArity f] markCell
       markWord w
@@ -2751,7 +3128,7 @@ collect m cont nargs = do
           else do
             a <- unsafeRead st i
             unsafeWrite st 0 (i - 1)
-            w <- unsafeRead arr a
+            w <- peekAt arr a
             if tagOf w == tagRef
               then (if valOf w /= a then markCell (valOf w) else pure ())
               else if tagOf w == tagStr then markStructure (valOf w) else pure ()
@@ -2770,6 +3147,17 @@ collect m cont nargs = do
           forM_ [fxArgs fx .. fxArgs fx + pArity (fxPred fx) - 1] markCell
           markCont (fxCont fx)
         CExitMinimize cost base _ -> Liveness.visitPattern markWord base cost
+        -- Code is immutable words and cannot be rewritten, so a suspended
+        -- stream keeps its whole activation block live: every slot the
+        -- remaining instructions could still name, plus the marker cell that
+        -- makes the block contiguous and readable. Mark-compact preserves
+        -- address order, so the block stays contiguous and every operand
+        -- offset in the code stays valid; relocating it is then one address.
+        CStream _ _ base _ _ next -> markBlock base >> markCont next
+      markBlock base = do
+        when (base > 0 && base <= top) $ do
+          marker <- peekAt arr (base - 1)
+          forM_ [base - 1 .. min top (base - 1 + markerVars marker)] markCell
       markResults ref = do
         collected <- readIORef ref
         forM_ collected (markCopy . fst)
@@ -2815,9 +3203,9 @@ collect m cont nargs = do
   readIORef (mWatched m) >>= markWatched
   pendingCount0 <- readReg s rBOUND
   when (pendingCount0 > 0) $ do
-    pending <- readIORef (bound s)
+    pending <- boundPtr s
     forM_ [0 .. pendingCount0 - 1] $ \i -> do
-      addr <- unsafeRead pending i
+      addr <- peekAt pending i
       when (addr >= 0 && addr < top) (markCell addr)
   choiceTop <- choiceTop m
   forM_ [0 .. choiceTop - 1] $ \i -> do
@@ -2847,14 +3235,14 @@ collect m cont nargs = do
         | otherwise = do
             live <- unsafeRead marks a
             when live $ do
-              w <- unsafeRead arr a
+              w <- peekAt arr a
               w' <- reloc w
               a' <- forward a
-              unsafeWrite arr a' w'
+              pokeAt arr a' w'
             slide (a + 1)
   -- Trail: keep entries of live cells, remember how many survive below
   -- each original index for the choice points' marks.
-  trailArr <- readIORef (trail s)
+  trailArr <- trailPtr s
   let keptBelow = gcTrailForward workspace
   -- Parse backwards because an old-value word has no entry tag. Record
   -- entry widths in the forwarding array, then compact forwards, replacing
@@ -2863,7 +3251,7 @@ collect m cont nargs = do
   let classify !i
         | i < 0 = pure ()
         | otherwise = do
-            entry <- unsafeRead trailArr i
+            entry <- peekAt trailArr i
             let len = if odd entry then 2 else 1
             unsafeWrite keptBelow (i + 1 - len) len
             classify (i - len)
@@ -2871,8 +3259,8 @@ collect m cont nargs = do
         | start >= trailLen = pure k
         | otherwise = do
             len <- unsafeRead keptBelow start
-            entry <- unsafeRead trailArr (start + len - 1)
-            old <- if len == 2 then unsafeRead trailArr start else pure 0
+            entry <- peekAt trailArr (start + len - 1)
+            old <- if len == 2 then peekAt trailArr start else pure 0
             unsafeWrite keptBelow start k
             when (len == 2) (unsafeWrite keptBelow (start + 1) k)
             live <- liveCell (entry `div` 2)
@@ -2880,10 +3268,10 @@ collect m cont nargs = do
               then do
                 addr' <- forward (entry `div` 2)
                 if len == 1
-                  then unsafeWrite trailArr k (addr' * 2)
+                  then pokeAt trailArr k (addr' * 2)
                   else do
-                    unsafeWrite trailArr k old
-                    unsafeWrite trailArr (k + 1) (addr' * 2 + 1)
+                    pokeAt trailArr k old
+                    pokeAt trailArr (k + 1) (addr' * 2 + 1)
                 compactTrail (start + len) (k + len)
               else compactTrail (start + len) k
   classify (trailLen - 1)
@@ -2910,6 +3298,10 @@ collect m cont nargs = do
           (\p h -> CExitFindAll sentinel results p 0 h entryOut depth) <$> Liveness.relocatePattern reloc base template <*> forward entryHeap
         CExitTable fixRef -> pure (CExitTable fixRef)
         CExitMinimize cost base ref -> (\p -> CExitMinimize p 0 ref) <$> Liveness.relocatePattern reloc base cost
+        -- The code names slots by offset, so the block must not be detached:
+        -- forward the base and keep it.
+        CStream stream pc base barrier depth next ->
+          CStream stream pc <$> forward base <*> pure barrier <*> pure depth <*> relocCont next
       relocResults ref = do
         collected <- readIORef ref
         relocated <- forM collected $ \(copy, produced) -> (\c -> (c, produced)) <$> relocCopy copy

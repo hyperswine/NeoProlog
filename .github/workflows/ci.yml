@@ -103,6 +103,12 @@ jobs:
       - run: cabal update
       - run: cabal build all --enable-tests --enable-benchmarks --enable-optimization=2
       - run: cabal test all --enable-benchmarks --enable-optimization=2 --test-show-details=direct
+      # The suite runs the clause instruction stream by default; this leg runs
+      # the tree interpreter, which stays the specification, over the parity
+      # corpus so a divergence between the two cannot reach a release.
+      - run: '"$(cabal list-bin bench:core-engine --enable-optimization=2)" parity test/core/*.nprolog'
+        env:
+          INFERA_CORE_STREAM: '0'
       - run: npm ci
         working-directory: lsp
       - run: INFERA_BIN="$(cabal list-bin exe:infera --enable-optimization=2)" npm test --prefix lsp

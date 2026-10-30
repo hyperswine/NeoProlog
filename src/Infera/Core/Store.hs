@@ -1,8 +1,9 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 
--- | The core resolution store: one growable unboxed array of tagged words,
--- a trail of addresses, a boxed-constant table and interned symbol tables.
+-- | The core resolution store: tagged words in one growable pinned block,
+-- a trail of addresses in a second, a boxed-constant table and interned
+-- symbol tables.
 --
 -- Every value is one 'Int' word whose low three bits are a tag:
 --
@@ -13,6 +14,15 @@
 -- > ATM  atom id
 -- > BOX  index into the boxed table: bignums, floats and strings
 -- > CHR  character code point
+--
+-- The heap, trail and bound-log blocks are pinned 'ForeignPtr' allocations
+-- owned by 'IORef's, but the hot path never touches the 'IORef': each
+-- block's base address (and capacity) is cached in an unboxed register
+-- slot, so a cell access is one register read plus one memory operation,
+-- and loops can hoist the base across iterations. A pointer read from a
+-- slot ('cellsPtr', 'trailPtr', 'boundPtr') is invalidated by any growth
+-- of that block; no pointer survives across an allocation that can grow.
+-- Pinning also gives the JIT tier a stable address to hand to native code.
 --
 -- Binding writes one word. A binding is trailed only when the bound cell is
 -- older than the newest choice point ('hb'), and backtracking restores the
@@ -36,11 +46,13 @@ module Infera.Core.Store
     resetSlots, resetFrame, markerWord, logicalId, nameCell, nameCellAs,
     replaceLogicalIds, collectionStats, recordCollection,
     readArg, writeArg, saveArgs, loadArgs, reserveCells, groundNowWord,
-    readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, initialCollectLimit, markerVars,
+    readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, rCAP, rTRAILCAP, initialCollectLimit, markerVars,
     drainBound, recordBoundCell,
+    -- * Pinned block pointers (invalidated by growth)
+    cellsPtr, trailPtr, boundPtr, peekAt, pokeAt,
     deref, bind, unwindTrail, trailIf, trailValueIf,
     structureWord, structure2, structure2WithGround,
-    box, boxed,
+    box, boxed, boxIn, boxedIn,
     -- * Unification and equality
     unify, equiv, isGroundWord, occursIn,
     -- * Term exchange
@@ -48,6 +60,7 @@ module Infera.Core.Store
   )
 where
 
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Monad (when)
 import Data.Array.Base (getNumElements, unsafeRead, unsafeWrite)
 import Data.Array.IO (IOArray, IOUArray, newArray, newArray_)
@@ -55,6 +68,10 @@ import Data.Bits (complement, shiftL, shiftR, (.&.), (.|.))
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
+import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes)
+import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
+import Foreign.Ptr (Ptr, intPtrToPtr, plusPtr, ptrToIntPtr)
+import Foreign.Storable (peek, poke, sizeOf)
 import Infera.Syntax (Term (..), VarId)
 
 type Word' = Int
@@ -126,20 +143,33 @@ fitsImmediate n = n >= -(2 ^ (60 :: Int)) && n < 2 ^ (60 :: Int)
 data Boxed = BInt !Integer | BFlt !Double | BStr !String
   deriving (Eq, Show)
 
--- | Atom and functor tables. Compilation interns everything a program and
--- query mention; builtins intern the rare constant they create at runtime.
+-- | Atom, functor and boxed-constant tables. Compilation interns everything a
+-- program and query mention; builtins intern the rare constant they create at
+-- runtime. A compiled plan bakes these ids into words, so the tables are
+-- program-scoped: every query's store shares the tables of the program it
+-- runs, and the tables only ever grow. Interning takes the lock because a
+-- store may be built and run from more than one thread; the read paths
+-- ('atomName', 'functorName', 'boxed') do not.
 data Symbols = Symbols
   { atomIds :: !(IORef (Map.Map String Int)),
     atomNames :: !(IORef (IM.IntMap String)),
     functorIds :: !(IORef (Map.Map (String, Int) Int)),
-    functorNames :: !(IORef (IM.IntMap (String, Int)))
+    functorNames :: !(IORef (IM.IntMap (String, Int))),
+    -- | bignums, floats and strings referenced by @BOX@ words
+    boxTable :: !(IORef (IOArray Int Boxed)),
+    boxCount :: !(IORef Int),
+    symbolLock :: !(MVar ())
   }
 
 newSymbols :: IO Symbols
-newSymbols = Symbols <$> newIORef Map.empty <*> newIORef IM.empty <*> newIORef Map.empty <*> newIORef IM.empty
+newSymbols =
+  Symbols <$> newIORef Map.empty <*> newIORef IM.empty <*> newIORef Map.empty <*> newIORef IM.empty
+    <*> (newArray_ (0, 255) >>= newIORef) <*> newIORef 0 <*> newMVar ()
 
+-- | Grow a shared table under its lock, publishing the new table before the
+-- count that indexes it.
 internAtom :: Symbols -> String -> IO Int
-internAtom symbols name = do
+internAtom symbols name = withMVar (symbolLock symbols) $ const $ do
   ids <- readIORef (atomIds symbols)
   case Map.lookup name ids of
     Just i -> pure i
@@ -150,7 +180,7 @@ internAtom symbols name = do
       pure i
 
 internFunctor :: Symbols -> String -> Int -> IO Int
-internFunctor symbols name arity = do
+internFunctor symbols name arity = withMVar (symbolLock symbols) $ const $ do
   ids <- readIORef (functorIds symbols)
   case Map.lookup (name, arity) ids of
     Just i -> pure i
@@ -166,13 +196,13 @@ atomName symbols i = (IM.! i) <$> readIORef (atomNames symbols)
 functorName :: Symbols -> Int -> IO (String, Int)
 functorName symbols i = (IM.! i) <$> readIORef (functorNames symbols)
 
--- Register slots of the unboxed register file.
-rH, rTR, rHB, rOUT, rBOX, rARITH, rFRESH, rCAP, rVAL :: Int
+-- Register slots of the unboxed register file. Slot 4 is unused: the boxed
+-- constant count moved into the program-scoped 'Symbols'.
+rH, rTR, rHB, rOUT, rARITH, rFRESH, rCAP, rVAL :: Int
 rH = 0
 rTR = 1
 rHB = 2
 rOUT = 3
-rBOX = 4
 rARITH = 5
 rFRESH = 6
 rCAP = 7
@@ -191,6 +221,28 @@ rCLP = 10
 rBOUND :: Int
 rBOUND = 11
 
+-- Register 12 is one past the highest named address (pruning on a lower
+-- heap top is needed only below it); registers 13-15 are GC counters.
+rIDENT, rGCCOUNT, rGCLIVE, rGCRECLAIM :: Int
+rIDENT = 12
+rGCCOUNT = 13
+rGCLIVE = 14
+rGCRECLAIM = 15
+
+-- Pinned-block cache slots. These hold a block's base address (as an
+-- 'Int'; see 'ptrAsInt') and, where growth needs it, its capacity in
+-- cells, so the hot path reads unboxed memory instead of an 'IORef' and
+-- loops can hoist the base across iterations. The 'ForeignPtr' that owns
+-- each block lives behind an 'IORef' and is touched only on growth (cold).
+-- A pointer read from one of these slots is invalidated by any growth of
+-- that block: it must not be cached across an operation that allocates.
+rCELLS, rTRAILB, rTRAILCAP, rBOUNDP, rBOUNDCAP :: Int
+rCELLS = 16
+rTRAILB = 17
+rTRAILCAP = 18
+rBOUNDP = 19
+rBOUNDCAP = 20
+
 initialCollectLimit :: Int
 initialCollectLimit = 262144
 
@@ -202,37 +254,93 @@ writeReg :: Store -> Int -> Int -> IO ()
 writeReg s = unsafeWrite (regs s)
 {-# INLINE writeReg #-}
 
+-- | The store's blocks. The 'IORef's own the pinned 'ForeignPtr's (cold
+-- path only); the register slots above cache their base addresses.
 data Store = Store
-  { cells :: !(IORef (IOUArray Int Int)),
-    trail :: !(IORef (IOUArray Int Int)),
-    boxes :: !(IORef (IOArray Int Boxed)),
+  { cellsFP :: !(IORef (ForeignPtr Int)),
+    trailFP :: !(IORef (ForeignPtr Int)),
     regs :: !(IOUArray Int Int),
     -- | argument registers of the call being made
     argRegs :: !(IOUArray Int Int),
-    -- | cells bound since the last reconciliation with the constraint store
-    bound :: !(IORef (IOUArray Int Int)),
+    boundFP :: !(IORef (ForeignPtr Int)),
     -- | The names of the variable cells that have left the heap, by
     -- address (see 'nameCell').
     logicalIds :: !(IORef (IM.IntMap Int)),
     symbols :: !Symbols
   }
 
--- Cells are never read before they are written, so the array need not be
+wordBytes :: Int
+wordBytes = sizeOf (undefined :: Int)
+
+-- | A pinned block of @n@ words. The address is stable (this is what the
+-- JIT tier will hand to native code); the 'ForeignPtr' owns the memory.
+pinnedBlock :: Int -> IO (ForeignPtr Int, Ptr Int)
+pinnedBlock n = do
+  fp <- mallocForeignPtrBytes (n * wordBytes)
+  pure (fp, unsafeForeignPtrToPtr fp)
+
+ptrAsInt :: Ptr Int -> Int
+ptrAsInt = fromIntegral . ptrToIntPtr
+{-# INLINE ptrAsInt #-}
+
+intAsPtr :: Int -> Ptr Int
+intAsPtr = intPtrToPtr . fromIntegral
+{-# INLINE intAsPtr #-}
+
+-- Cells are never read before they are written, so the block need not be
 -- initialised; untouched pages cost nothing.
 initialCells :: Int
 initialCells = 1048576
 
+initialTrail, initialBound :: Int
+initialTrail = 4096
+initialBound = 256
+
 newStore :: Symbols -> IO Store
 newStore syms = do
-  cs <- newArray_ (0, initialCells - 1)
-  tr <- newArray (0, 4095) 0
-  bx <- newArray_ (0, 255)
-  rs <- newArray (0, 15) 0
+  (csFP, csP) <- pinnedBlock initialCells
+  (trFP, trP) <- pinnedBlock initialTrail
+  rs <- newArray (0, 31) 0
+  ar <- newArray (0, 4095) 0
+  (bdFP, bdP) <- pinnedBlock initialBound
   unsafeWrite rs rCAP initialCells
   unsafeWrite rs rGCLIM initialCollectLimit
-  ar <- newArray (0, 4095) 0
-  bd <- newArray (0, 255) 0
-  Store <$> newIORef cs <*> newIORef tr <*> newIORef bx <*> pure rs <*> pure ar <*> newIORef bd <*> newIORef IM.empty <*> pure syms
+  unsafeWrite rs rCELLS (ptrAsInt csP)
+  unsafeWrite rs rTRAILB (ptrAsInt trP)
+  unsafeWrite rs rTRAILCAP initialTrail
+  unsafeWrite rs rBOUNDP (ptrAsInt bdP)
+  unsafeWrite rs rBOUNDCAP initialBound
+  Store <$> newIORef csFP <*> newIORef trFP <*> pure rs <*> pure ar
+    <*> newIORef bdFP <*> newIORef IM.empty <*> pure syms
+
+-- | The current cells base pointer. Invalidated by any growth of the
+-- cells block: never cache it across an operation that allocates cells.
+cellsPtr :: Store -> IO (Ptr Int)
+cellsPtr s = intAsPtr <$> unsafeRead (regs s) rCELLS
+{-# INLINE cellsPtr #-}
+
+-- | The current trail base pointer; same invalidation rule as 'cellsPtr'.
+trailPtr :: Store -> IO (Ptr Int)
+trailPtr s = intAsPtr <$> unsafeRead (regs s) rTRAILB
+{-# INLINE trailPtr #-}
+
+-- | The current bound-log base pointer; same invalidation rule as
+-- 'cellsPtr'.
+boundPtr :: Store -> IO (Ptr Int)
+boundPtr s = intAsPtr <$> unsafeRead (regs s) rBOUNDP
+{-# INLINE boundPtr #-}
+
+-- | Read one word from a pinned block. The same unchecked discipline as
+-- 'Data.Array.Base.unsafeRead': the caller guarantees the index is within
+-- the block's current capacity.
+peekAt :: Ptr Int -> Int -> IO Int
+peekAt p i = peek (p `plusPtr` (i * wordBytes))
+{-# INLINE peekAt #-}
+
+-- | Write one word to a pinned block; unchecked like 'peekAt'.
+pokeAt :: Ptr Int -> Int -> Int -> IO ()
+pokeAt p i w = poke (p `plusPtr` (i * wordBytes)) w
+{-# INLINE pokeAt #-}
 
 readArg :: Store -> Int -> IO Word'
 readArg s = unsafeRead (argRegs s)
@@ -248,20 +356,20 @@ saveArgs :: Store -> Int -> IO Int
 saveArgs s n = do
   top <- heapTop s
   ensureCells s (top + n)
-  arr <- readIORef (cells s)
+  cells <- cellsPtr s
   let go !i
         | i >= n = pure ()
-        | otherwise = unsafeRead (argRegs s) i >>= unsafeWrite arr (top + i) >> go (i + 1)
+        | otherwise = unsafeRead (argRegs s) i >>= pokeAt cells (top + i) >> go (i + 1)
   go 0
   unsafeWrite (regs s) rH (top + n)
   pure top
 
 loadArgs :: Store -> Int -> Int -> IO ()
 loadArgs s addr n = do
-  arr <- readIORef (cells s)
+  cells <- cellsPtr s
   let go !i
         | i >= n = pure ()
-        | otherwise = unsafeRead arr (addr + i) >>= unsafeWrite (argRegs s) i >> go (i + 1)
+        | otherwise = peekAt cells (addr + i) >>= unsafeWrite (argRegs s) i >> go (i + 1)
   go 0
 
 heapTop, trailTop, hb, outLen, arithData, freshId :: Store -> IO Int
@@ -302,14 +410,14 @@ bumpArithData s = unsafeRead (regs s) rARITH >>= unsafeWrite (regs s) rARITH . (
 
 readCell :: Store -> Int -> IO Word'
 readCell s i = do
-  arr <- readIORef (cells s)
-  unsafeRead arr i
+  p <- cellsPtr s
+  peekAt p i
 {-# INLINE readCell #-}
 
 writeCell :: Store -> Int -> Word' -> IO ()
 writeCell s i w = do
-  arr <- readIORef (cells s)
-  unsafeWrite arr i w
+  p <- cellsPtr s
+  pokeAt p i w
 {-# INLINE writeCell #-}
 
 ensureCells :: Store -> Int -> IO ()
@@ -320,16 +428,17 @@ ensureCells s needed = do
 
 growCells :: Store -> Int -> IO ()
 growCells s needed = do
-  arr <- readIORef (cells s)
-  size <- getNumElements arr
-  let size' = max needed (size * 4)
-  arr' <- newArray_ (0, size' - 1)
+  capacity <- unsafeRead (regs s) rCAP
+  size' <- pure (max needed (capacity * 4))
+  (fp', p') <- pinnedBlock size'
+  old <- cellsPtr s
   top <- heapTop s
   let copy !i
         | i >= top = pure ()
-        | otherwise = unsafeRead arr i >>= unsafeWrite arr' i >> copy (i + 1)
+        | otherwise = peekAt old i >>= pokeAt p' i >> copy (i + 1)
   copy 0
-  writeIORef (cells s) arr'
+  writeIORef (cellsFP s) fp'
+  unsafeWrite (regs s) rCELLS (ptrAsInt p')
   unsafeWrite (regs s) rCAP size'
 
 -- | Append one word and return its address.
@@ -368,10 +477,10 @@ allocCells :: Store -> Int -> IO Int
 allocCells s n = do
   top <- heapTop s
   ensureCells s (top + n)
-  arr <- readIORef (cells s)
+  p <- cellsPtr s
   let go !i
         | i >= top + n = pure ()
-        | otherwise = unsafeWrite arr i (refWord i) >> go (i + 1)
+        | otherwise = pokeAt p i (refWord i) >> go (i + 1)
   go top
   unsafeWrite (regs s) rH (top + n)
   pure top
@@ -394,11 +503,11 @@ allocSlots :: Store -> Int -> IO Int
 allocSlots s n = do
   top <- heapTop s
   ensureCells s (top + n + 1)
-  arr <- readIORef (cells s)
-  unsafeWrite arr top (markerWord n)
+  p <- cellsPtr s
+  pokeAt p top (markerWord n)
   let go !i
         | i > top + n = pure ()
-        | otherwise = unsafeWrite arr i (refWord i) >> go (i + 1)
+        | otherwise = pokeAt p i (refWord i) >> go (i + 1)
   go (top + 1)
   unsafeWrite (regs s) rH (top + n + 1)
   pure (top + 1)
@@ -412,13 +521,13 @@ allocFrame :: Store -> Int -> [Int] -> IO Int
 allocFrame s count initialize = do
   top <- heapTop s
   ensureCells s (top + count + 1)
-  arr <- readIORef (cells s)
-  unsafeWrite arr top (markerWord count)
+  p <- cellsPtr s
+  pokeAt p top (markerWord count)
   let base = top + 1
       go [] = pure ()
       go (offset : offsets) = do
         let addr = base + offset
-        unsafeWrite arr addr (refWord addr)
+        pokeAt p addr (refWord addr)
         go offsets
   go initialize
   unsafeWrite (regs s) rH (top + count + 1)
@@ -492,12 +601,12 @@ resetFrame s base capacity initialize = do
             (_, _, after) = IM.splitLookup (base + capacity - 1) remaining
          in writeIORef (logicalIds s) (IM.union before after)
       _ -> pure ()
-  arr <- readIORef (cells s)
-  unsafeWrite arr (base - 1) (markerWord capacity)
+  p <- cellsPtr s
+  pokeAt p (base - 1) (markerWord capacity)
   let go [] = pure ()
       go (offset : offsets) = do
         let addr = base + offset
-        unsafeWrite arr addr (refWord addr)
+        pokeAt p addr (refWord addr)
         go offsets
   go initialize
 {-# INLINE resetFrame #-}
@@ -534,14 +643,6 @@ nameCellAs s addr v = do
   current <- freshId s
   when (v >= current) (setFreshId s (v + 1))
 
--- Register 12 is one past the highest named address (pruning on a lower
--- heap top is needed only below it); the remaining registers are GC counters.
-rIDENT, rGCCOUNT, rGCLIVE, rGCRECLAIM :: Int
-rIDENT = 12
-rGCCOUNT = 13
-rGCLIVE = 14
-rGCRECLAIM = 15
-
 -- | Install the names of the cells that survived a collection, at their
 -- new addresses, below the supplied heap top.
 replaceLogicalIds :: Store -> Int -> IM.IntMap Int -> IO ()
@@ -566,10 +667,10 @@ structureWord :: Store -> Word' -> [Word'] -> IO Word'
 structureWord s functor args = do
   ground <- allGround args
   addr <- reserveCells s (funArity functor + 1)
-  arr <- readIORef (cells s)
-  unsafeWrite arr addr (if ground then functor .|. groundBit else functor)
+  p <- cellsPtr s
+  pokeAt p addr (if ground then functor .|. groundBit else functor)
   let fill !_ [] = pure ()
-      fill !i (w : ws) = unsafeWrite arr i w >> fill (i + 1) ws
+      fill !i (w : ws) = pokeAt p i w >> fill (i + 1) ws
   fill (addr + 1) args
   pure (strWord addr)
   where
@@ -598,21 +699,20 @@ structure2 s functor a b = do
 structure2WithGround :: Store -> Word' -> Bool -> Word' -> Word' -> IO Word'
 structure2WithGround s functor ground a b = do
   addr <- reserveCells s 3
-  arr <- readIORef (cells s)
-  unsafeWrite arr addr (if ground then functor .|. groundBit else functor)
-  unsafeWrite arr (addr + 1) a
-  unsafeWrite arr (addr + 2) b
+  p <- cellsPtr s
+  pokeAt p addr (if ground then functor .|. groundBit else functor)
+  pokeAt p (addr + 1) a
+  pokeAt p (addr + 2) b
   pure (strWord addr)
-{-# INLINE structure2WithGround #-}
 
 -- | Follow reference chains. The result is either a non-REF word or the
 -- REF of an unbound cell.
 deref :: Store -> Word' -> IO Word'
 deref s !w
   | tagOf w == tagRef = do
-      arr <- readIORef (cells s)
+      p <- cellsPtr s
       let go !v = do
-            v' <- unsafeRead arr (valOf v)
+            v' <- peekAt p (valOf v)
             if v' == v || tagOf v' /= tagRef then pure v' else go v'
       go w
   | otherwise = pure w
@@ -622,21 +722,24 @@ deref s !w
 -- entry @2*addr+1@ restores the word pushed just below it.
 pushTrail :: Store -> Int -> IO ()
 pushTrail s entry = do
-  tr <- readIORef (trail s)
   top <- trailTop s
-  size <- getNumElements tr
-  tr' <-
+  size <- unsafeRead (regs s) rTRAILCAP
+  p <- trailPtr s
+  p' <-
     if top < size
-      then pure tr
+      then pure p
       else do
-        grown <- newArray (0, size * 2 - 1) 0
+        let size' = size * 2
+        (fp', p'') <- pinnedBlock size'
         let copy !i
               | i >= top = pure ()
-              | otherwise = unsafeRead tr i >>= unsafeWrite grown i >> copy (i + 1)
+              | otherwise = peekAt p i >>= pokeAt p'' i >> copy (i + 1)
         copy 0
-        writeIORef (trail s) grown
-        pure grown
-  unsafeWrite tr' top entry
+        writeIORef (trailFP s) fp'
+        unsafeWrite (regs s) rTRAILB (ptrAsInt p'')
+        unsafeWrite (regs s) rTRAILCAP size'
+        pure p''
+  pokeAt p' top entry
   setTrailTop s (top + 1)
 
 trailIf :: Store -> Int -> IO ()
@@ -669,79 +772,93 @@ recordBoundCell = recordBound
 
 recordBound :: Store -> Int -> IO ()
 recordBound s addr = do
-  arr <- readIORef (bound s)
   top <- unsafeRead (regs s) rBOUND
-  size <- getNumElements arr
-  arr' <-
+  size <- unsafeRead (regs s) rBOUNDCAP
+  p <- boundPtr s
+  p' <-
     if top < size
-      then pure arr
+      then pure p
       else do
-        grown <- newArray (0, size * 2 - 1) 0
+        let size' = size * 2
+        (fp', p'') <- pinnedBlock size'
         let copy !i
               | i >= top = pure ()
-              | otherwise = unsafeRead arr i >>= unsafeWrite grown i >> copy (i + 1)
+              | otherwise = peekAt p i >>= pokeAt p'' i >> copy (i + 1)
         copy 0
-        writeIORef (bound s) grown
-        pure grown
-  unsafeWrite arr' top addr
+        writeIORef (boundFP s) fp'
+        unsafeWrite (regs s) rBOUNDP (ptrAsInt p'')
+        unsafeWrite (regs s) rBOUNDCAP size'
+        pure p''
+  pokeAt p' top addr
   unsafeWrite (regs s) rBOUND (top + 1)
 
 -- | Take the recorded bindings, oldest first, and clear the record.
 drainBound :: Store -> IO [Int]
 drainBound s = do
   top <- unsafeRead (regs s) rBOUND
-  arr <- readIORef (bound s)
-  addrs <- mapM (unsafeRead arr) [0 .. top - 1]
+  p <- boundPtr s
+  addrs <- mapM (peekAt p) [0 .. top - 1]
   unsafeWrite (regs s) rBOUND 0
   pure addrs
 
 -- | Reset every trailed cell above @mark@ to unbound and restore the mark.
+-- No allocation happens here, so both block bases are cached for the walk.
 unwindTrail :: Store -> Int -> IO ()
 unwindTrail s mark = do
-  tr <- readIORef (trail s)
   top <- trailTop s
-  arr <- readIORef (cells s)
+  tr <- trailPtr s
+  cells <- cellsPtr s
   let go !i
         | i < mark = pure ()
         | otherwise = do
-            entry <- unsafeRead tr i
+            entry <- peekAt tr i
             if even entry
               then do
                 let addr = entry `shiftR` 1
-                unsafeWrite arr addr (refWord addr)
+                pokeAt cells addr (refWord addr)
                 go (i - 1)
               else do
-                old <- unsafeRead tr (i - 1)
-                unsafeWrite arr (entry `shiftR` 1) old
+                old <- peekAt tr (i - 1)
+                pokeAt cells (entry `shiftR` 1) old
                 go (i - 2)
   go (top - 1)
   setTrailTop s mark
 
+-- | Append a constant to the program's boxed table. The table is shared by
+-- every query's store, so a @BOX@ word compiled at load time means the same
+-- value in every run; growth publishes the new table before the count that
+-- indexes it.
 box :: Store -> Boxed -> IO Word'
-box s value = do
-  bx <- readIORef (boxes s)
-  top <- unsafeRead (regs s) rBOX
-  size <- getNumElements bx
-  bx' <-
+box s = boxIn (symbols s)
+
+boxIn :: Symbols -> Boxed -> IO Word'
+boxIn syms value = withMVar (symbolLock syms) $ const $ do
+  table <- readIORef (boxTable syms)
+  top <- readIORef (boxCount syms)
+  size <- getNumElements table
+  table' <-
     if top < size
-      then pure bx
+      then pure table
       else do
         grown <- newArray_ (0, size * 2 - 1)
         let copy !i
               | i >= top = pure ()
-              | otherwise = unsafeRead bx i >>= unsafeWrite grown i >> copy (i + 1)
+              | otherwise = unsafeRead table i >>= unsafeWrite grown i >> copy (i + 1)
         copy 0
-        writeIORef (boxes s) grown
+        writeIORef (boxTable syms) grown
         pure grown
-  unsafeWrite bx' top value
-  unsafeWrite (regs s) rBOX (top + 1)
+  unsafeWrite table' top value
+  writeIORef (boxCount syms) (top + 1)
   pure (boxWord top)
 
 boxed :: Store -> Word' -> IO Boxed
-boxed s w = do
-  bx <- readIORef (boxes s)
-  unsafeRead bx (valOf w)
-{-# INLINE boxed #-}
+boxed s = boxedIn (symbols s)
+
+boxedIn :: Symbols -> Word' -> IO Boxed
+boxedIn syms w = do
+  table <- readIORef (boxTable syms)
+  unsafeRead table (valOf w)
+{-# INLINE boxedIn #-}
 
 -- | Unify two words. Bindings made before a failure stay on the trail and
 -- are undone by the caller's backtracking, exactly as in a WAM.

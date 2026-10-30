@@ -25,9 +25,17 @@ module Infera.Core.Compile
     Candidates (..),
     candidateList,
     Key (..),
+    ClauseStream (..),
+    StreamRef (..),
     CoreProgram (..),
+    ProgramScope,
+    scopeSymbols,
+    scopeImage,
+    ProgramImage,
     Unsupported (..),
+    programScope,
     compileProgram,
+    compileQueryGoals,
     compileGoalTerm,
     candidateClauses,
     keyOfWord,
@@ -39,18 +47,23 @@ import Data.Array (Array, listArray)
 import qualified Data.Array.IArray as IA
 import Data.Array.Base (numElements, unsafeAt)
 import Data.Array.Unboxed (UArray)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.IORef
 import Data.List (nub)
 import Data.Maybe (isJust)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as Map
+import Infera.Core.Jit (JitKernel, compileJitKernel)
+import Infera.Core.Ops
 import Infera.Core.Store
 import Infera.Error (PredKey, SolveError (..))
+import System.IO.Unsafe (unsafePerformIO)
 import Infera.Infer (joinSort)
 import qualified Infera.Program as P
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
+import System.Mem.StableName (StableName, makeStableName)
 
 -- | How a goal argument or head argument is obtained or matched.
 data Pattern
@@ -174,6 +187,24 @@ data Goal
   | -- | a construct outside the core: abandon the run and fall back
     GUnsupported Term
 
+-- | One side-table entry of a clause stream: the values an instruction
+-- cannot carry as an unboxed word. Calls need the callee and the contract
+-- evidence of the call site, an escape needs the goals that stay on the tree
+-- interpreter, and a structure that meets an unbound argument needs its
+-- pattern to be built and occurs-checked.
+data StreamRef
+  = SRefCall !PredRef !(Maybe Trust)
+  | SRefEscape ![Goal]
+  | SRefPattern !Pattern
+
+-- | A clause as a flat instruction stream over unboxed words, with the side
+-- table of boxed values its instructions index. See
+-- [Ops](../src/Infera/Core/Ops.hs) for the encoding.
+data ClauseStream = ClauseStream
+  { csCode :: !(UArray Int Int),
+    csRefs :: !(Array Int StreamRef)
+  }
+
 data Clause = Clause
   { clVars :: !Int,
     -- | Slots not initialized by a first head occurrence. Head construction
@@ -184,7 +215,10 @@ data Clause = Clause
     clBody :: [Goal],
     -- | the clause's result provably satisfies every declared alternative,
     -- so its return check may be skipped
-    clTrustReturn :: !Bool
+    clTrustReturn :: !Bool,
+    -- | the clause as an instruction stream, absent when a head argument is
+    -- outside the encodable fragment
+    clStream :: !(Maybe ClauseStream)
   }
 
 data Key = KAtm !Int | KInt !Int | KChr !Int | KFun !Word' | KBig !Integer | KFlt !Double | KStr !String
@@ -247,7 +281,8 @@ data Pred = Pred
     -- the call to commit after its first solution
     pSwitch :: !(Maybe [Int]),
     -- | every clause's return is trusted: calls push no return check
-    pTrustReturn :: !Bool
+    pTrustReturn :: !Bool,
+    pJit :: !(Maybe JitKernel)
   }
 
 data CoreProgram = CoreProgram
@@ -265,7 +300,10 @@ data CoreProgram = CoreProgram
 newtype Unsupported = Unsupported String deriving (Show)
 
 data Ctx = Ctx
-  { ctxStore :: Store,
+  { -- | the program's intern tables: atoms, functors and boxed constants.
+    -- Compilation never touches a live store, so a compiled image is
+    -- independent of the query that happens to be running.
+    ctxSymbols :: Symbols,
     ctxProgram :: P.Program,
     ctxPreds :: Map.Map PredKey PredRef,
     -- | compiling a goal handed to call/N at runtime: nothing is recorded
@@ -283,49 +321,151 @@ data Ctx = Ctx
 subSort :: S.Sort -> S.Sort -> Bool
 subSort a b = joinSort a b == b
 
--- | Compile the whole program for one store. Constructs outside the core
--- compile to runtime abandonment; the first one met is recorded in
--- 'cpUnsupported' for diagnostics.
-compileProgram :: Store -> P.Program -> S.Query -> IO (Either Unsupported CoreProgram)
-compileProgram store program query = do
+-- | Everything a program contributes to a run: the compiled predicates, the
+-- words compilation baked (atoms, functors and boxed constants) and the first
+-- construct that would make a run fall back. It depends only on the program
+-- and on its intern tables, never on the query, so it is built once at load
+-- and shared by every query against that program.
+data ProgramImage = ProgramImage
+  { piPreds :: Map.Map PredKey PredRef,
+    piNil :: !Word',
+    piCons :: !Word',
+    piArith :: !(IM.IntMap ArithOp),
+    piUnsupported :: Maybe String
+  }
+
+-- | A program's intern tables and its compiled image, memoized on program
+-- identity. Holding the program in the entry is what makes identity a sound
+-- key: the value cannot be collected and its address reused while the entry
+-- refers to it, so a stale hit cannot be forged.
+data ProgramScope = ProgramScope
+  { scopeName :: StableName P.Program,
+    scopeProgram :: P.Program,
+    scopeSymbols :: Symbols,
+    scopeImage :: ProgramImage
+  }
+
+{-# NOINLINE scopeCache #-}
+scopeCache :: IORef (Maybe ProgramScope)
+scopeCache = unsafePerformIO (newIORef Nothing)
+
+scopeLock :: MVar ()
+scopeLock = unsafePerformIO (newMVar ())
+{-# NOINLINE scopeLock #-}
+
+-- | The intern tables and compiled image of a program, compiling it on first
+-- use. A query against the same loaded program reuses both; a reloaded or
+-- edited program is a different value and compiles again.
+programScope :: P.Program -> IO ProgramScope
+programScope program = do
+  name <- makeStableName program
+  cached <- readIORef scopeCache
+  case cached of
+    Just scope | scopeName scope == name -> pure scope
+    _ -> withMVar scopeLock $ \() -> do
+      cached' <- readIORef scopeCache
+      case cached' of
+        Just scope | scopeName scope == name -> pure scope
+        _ -> do
+          syms <- newSymbols
+          image <- compileImage syms program
+          let scope = ProgramScope name program syms image
+          writeIORef scopeCache (Just scope)
+          pure scope
+
+compileImage :: Symbols -> P.Program -> IO ProgramImage
+compileImage syms program = do
   let preds = P.programPreds program
   problems <- newIORef []
-  nilW <- atmWord <$> internAtom (symbols store) "nil"
-  consW <- (\f -> funWord f 2) <$> internFunctor (symbols store) "cons" 2
+  nilW <- atmWord <$> internAtom syms "nil"
+  consW <- (\f -> funWord f 2) <$> internFunctor syms "cons" 2
   refs <- forM preds $ \p -> do
     ref <- newIORef (error "predicate compiled later")
     pure (P.predKey p, ref)
   facts <- newIORef IM.empty
   seen <- newIORef IS.empty
   let table = Map.fromList refs
-      ctx = Ctx store program table False problems facts seen consW nilW
+      ctx = Ctx syms program table False problems facts seen consW nilW
   forM_ preds $ \p -> do
     compiled <- compilePred ctx p
     writeIORef (table Map.! P.predKey p) compiled
-  writeIORef facts IM.empty
-  writeIORef seen IS.empty
-  goals <- compileBody ctx (S.queryGoals query)
   arith <- forM arithFunctors $ \(name, arity, op) -> do
-    fid <- internFunctor (symbols store) name arity
+    fid <- internFunctor syms name arity
     pure (funWord fid arity, op)
   found <- reverse <$> readIORef problems
-  pure (Right (CoreProgram table goals (S.queryNVars query) nilW consW (IM.fromList arith)
-    (case found of (problem : _) -> Just problem; [] -> Nothing)))
+  pure
+    ProgramImage
+      { piPreds = table,
+        piNil = nilW,
+        piCons = consW,
+        piArith = IM.fromList arith,
+        piUnsupported = case found of
+          (problem : _) -> Just problem
+          [] -> Nothing
+      }
+
+-- | The query half of compilation: its goals, against the shared image.
+compileQueryGoals :: ProgramScope -> S.Query -> IO (Maybe String, [Goal])
+compileQueryGoals scope query = do
+  let image = scopeImage scope
+  problems <- newIORef []
+  facts <- newIORef IM.empty
+  seen <- newIORef IS.empty
+  let ctx =
+        Ctx (scopeSymbols scope) (scopeProgram scope) (piPreds image) False problems
+          facts seen (piCons image) (piNil image)
+  goals <- compileBody ctx (S.queryGoals query)
+  found <- reverse <$> readIORef problems
+  pure (firstOf found, goals)
+  where
+    firstOf (problem : _) = Just problem
+    firstOf [] = Nothing
+
+-- | Compile a query against a program's shared image. Constructs outside the
+-- core compile to runtime abandonment; the first one met - a program's before
+-- a query's - is recorded in 'cpUnsupported' for diagnostics.
+compileProgram :: ProgramScope -> S.Query -> IO (Either Unsupported CoreProgram)
+compileProgram scope query = do
+  (problem, goals) <- compileQueryGoals scope query
+  let image = scopeImage scope
+  pure
+    ( Right
+        CoreProgram
+          { cpPreds = piPreds image,
+            cpQuery = goals,
+            cpQueryVars = S.queryNVars query,
+            cpNil = piNil image,
+            cpCons = piCons image,
+            cpArith = piArith image,
+            cpUnsupported = case piUnsupported image of
+              first@(Just _) -> first
+              Nothing -> problem
+          }
+    )
 
 compilePred :: Ctx -> P.Pred -> IO Pred
 compilePred ctx p = do
   let clauses = IM.elems (P.predClauses p)
       arity = snd (P.predKey p)
   compiledClauses <- mapM (compileClause ctx (P.predDecls p)) clauses
+  jitKernel <-
+    compileJitKernel
+      (ctxNil ctx)
+      (ctxCons ctx)
+      (ctxProgram ctx)
+      (P.predKey p)
+      (P.predDecls p)
+      (P.predInferred p)
+      clauses
   let count = length compiledClauses
   let ones = listArray (0, max 0 (count - 1)) (map OneCandidate [0 .. count - 1])
       shared = toCandidates ones
-  index <- mapM (\i -> buildIndex (ctxStore ctx) shared i compiledClauses) [0 .. arity - 1]
+  index <- mapM (\i -> buildIndex (ctxSymbols ctx) shared i compiledClauses) [0 .. arity - 1]
   let paths = take (if count > 1 then 32 else 0) . nub $
         [(i, path) | clause <- compiledClauses, (i, pattern) <- zip [0 ..] (clHead clause),
           path <- nestedPaths 3 pattern]
   decisions <- forM paths $ \(i, path) -> do
-    decision <- buildIndexAt (ctxStore ctx) shared i path compiledClauses
+    decision <- buildIndexAt (ctxSymbols ctx) shared i path compiledClauses
     pure (DecisionIndex i path decision)
   let guards = map leadingIntGuard compiledClauses
   pure
@@ -347,7 +487,8 @@ compilePred ctx p = do
           if P.sigDet (P.predInferred p) == S.Semidet
             then Just (filter (< arity) (P.sigSwitch (P.predInferred p)))
             else Nothing,
-        pTrustReturn = not (null (P.predDecls p)) && all clTrustReturn compiledClauses
+        pTrustReturn = not (null (P.predDecls p)) && all clTrustReturn compiledClauses,
+        pJit = jitKernel
       }
 
 -- | Ascending ordinals as a selection result, sharing the singletons.
@@ -356,14 +497,14 @@ toCandidates _ [] = NoCandidate
 toCandidates ones [i] = ones `unsafeAt` i
 toCandidates _ xs = Candidates (IA.listArray (0, length xs - 1) xs)
 
-buildIndex :: Store -> ([Int] -> Candidates) -> Int -> [Clause] -> IO ArgIndex
+buildIndex :: Symbols -> ([Int] -> Candidates) -> Int -> [Clause] -> IO ArgIndex
 buildIndex store shared position = buildIndexAt store shared position []
 
-buildIndexAt :: Store -> ([Int] -> Candidates) -> Int -> [Int] -> [Clause] -> IO ArgIndex
-buildIndexAt store shared position path clauses = do
+buildIndexAt :: Symbols -> ([Int] -> Candidates) -> Int -> [Int] -> [Clause] -> IO ArgIndex
+buildIndexAt syms shared position path clauses = do
   keyed <- forM (zip [0 ..] clauses) $ \(ordinal, clause) -> do
     key <- case patternAtPath (position : path) (clHead clause) of
-      Just pattern -> patternKey store pattern
+      Just pattern -> patternKey syms pattern
       Nothing -> pure Nothing
     pure (ordinal :: Int, key)
   let open = IS.fromList [ordinal | (ordinal, Nothing) <- keyed]
@@ -429,13 +570,29 @@ immediateKey key = case key of
   KFun w -> Just w
   _ -> Nothing
 
-patternKey :: Store -> Pattern -> IO (Maybe Key)
-patternKey store pattern = case pattern of
+patternKey :: Symbols -> Pattern -> IO (Maybe Key)
+patternKey syms pattern = case pattern of
   PSlot _ -> pure Nothing
   PFirst _ -> pure Nothing
-  PWord w -> keyOfWord store w
+  PWord w -> constantKey syms w
   PStruct f _ -> pure (Just (KFun f))
   PArith f _ _ -> pure (Just (KFun f))
+
+-- | The index key of a compiled constant. Compilation only produces atom,
+-- immediate, character and boxed words here: no structure cell exists yet.
+constantKey :: Symbols -> Word' -> IO (Maybe Key)
+constantKey syms w = case tagOf w of
+  t | t == tagAtm -> pure (Just (KAtm (valOf w)))
+    | t == tagInt -> pure (Just (KInt (valOf w)))
+    | t == tagChr -> pure (Just (KChr (valOf w)))
+    | t == tagBox -> do
+        value <- boxedIn syms w
+        pure $ case value of
+          BInt n -> Just (KBig n)
+          BFlt d | isNaN d -> Nothing
+          BFlt d -> Just (KFlt d)
+          BStr s -> Just (KStr s)
+    | otherwise -> pure Nothing
 
 -- | The index key of a dereferenced word; Nothing for an unbound variable.
 keyOfWord :: Store -> Word' -> IO (Maybe Key)
@@ -463,6 +620,208 @@ keyOfWord store w = case tagOf w of
 -- Index results are precomputed and shared; only an intersection or guard
 -- filter leaving two or more clauses, neither of its inputs, builds a new
 -- result, and a boxed key allocates its lookup key.
+-- ─── the clause stream ───────────────────────────────────────────────────────
+
+-- | Encoding state: instructions and side entries. Instructions are kept in
+-- emission order because a structure instruction carries the offset of the
+-- instruction after its operand block, which is known only once the block has
+-- been emitted; clauses are short enough that patching by index costs nothing.
+data Enc = Enc
+  { encCode :: [Int],
+    encRefs :: [StreamRef]
+  }
+
+newtype M a = M {runM :: Enc -> (Enc, a)}
+
+instance Functor M where
+  fmap f (M m) = M $ \e -> case m e of (e', a) -> (e', f a)
+
+instance Applicative M where
+  pure a = M (\e -> (e, a))
+  M mf <*> M ma = M $ \e -> case mf e of (e', f) -> case ma e' of (e'', a) -> (e'', f a)
+
+instance Monad M where
+  M m >>= k = M $ \e -> case m e of (e', a) -> runM (k a) e'
+
+-- | One instruction: the opcode followed by its inline operands.
+emit :: [Int] -> M ()
+emit words_ = M $ \e -> (e {encCode = encCode e ++ words_}, ())
+
+-- | The offset the next emitted word will occupy.
+here :: M Int
+here = M (\e -> (e, length (encCode e)))
+
+-- | Fill in an operand emitted as a placeholder.
+patch :: Int -> Int -> M ()
+patch at value = M $ \e -> (e {encCode = replaceAt at value (encCode e)}, ())
+  where
+    replaceAt i x xs = take i xs ++ [x] ++ drop (i + 1) xs
+
+-- | Add a side entry and return its index.
+side :: StreamRef -> M Int
+side entry = M $ \e -> (e {encRefs = entry : encRefs e}, length (encRefs e))
+
+-- | Encode a compiled clause, or 'Nothing' when its head is outside the
+-- fragment. The body never makes the whole clause unencodable: the first goal
+-- that is out of the fragment becomes an escape, and the rest runs on the tree
+-- interpreter with the same activation, barrier and continuation.
+encodeClause :: Clause -> Maybe ClauseStream
+encodeClause clause
+  | not (all encodablePattern (clHead clause)) = Nothing
+  -- A body that escapes at its first goal gets nothing from the stream: the
+  -- dispatch would be paid and no tree work replaced. Leave the clause on the
+  -- tree interpreter. This is what keeps `loop N <- N > 0, ...`, whose whole
+  -- body is arithmetic, at the cost it had before the stream existed.
+  | not (startsEncodably (clBody clause)) = Nothing
+  | otherwise = Just (finish (fst (runM encode (Enc [] []))))
+  where
+    encode = do
+      sequence_ [headArg i pattern | (i, pattern) <- zip [0 :: Int ..] (clHead clause)]
+      goals (clBody clause)
+
+    finish e =
+      ClauseStream
+        (IA.listArray (0, max 0 (length code - 1)) code)
+        (IA.listArray (0, max 0 (length refs - 1)) refs)
+      where
+        code = encCode e
+        refs = reverse (encRefs e)
+
+    goals [] = emit [opProceed]
+    goals (goal : rest) = do
+      emit [opCheckBound]
+      if encodableGoal goal
+        then encodeGoal goal rest
+        else escape (goal : rest)
+
+    escape goals' = do
+      entry <- side (SRefEscape goals')
+      emit [opEscape, entry]
+
+    encodeGoal goal rest = case goal of
+      GTrue -> goals rest
+      -- A conjunction is spliced: its goals are already flat.
+      GAnd inner -> goals (inner ++ rest)
+      GCut -> emit [opCut] >> goals rest
+      GFail -> emit [opFail] >> goals rest
+      GUnify a b -> do
+        emit [opArgPrep, 2]
+        putArg 0 a
+        putArg 1 b
+        emit [opDoUnify]
+        goals rest
+      GCall ref patterns trust -> do
+        let arity = length patterns
+        emit [opArgPrep, arity]
+        sequence_ [putArg i pattern | (i, pattern) <- zip [0 :: Int ..] patterns]
+        entry <- side (SRefCall ref trust)
+        -- The last goal of a body is the tail call: it offers its own
+        -- activation for reuse and continues in the caller's continuation.
+        if null rest
+          then emit [opExecute, entry, arity]
+          else emit [opCall, entry, arity] >> goals rest
+      _ -> escape (goal : rest)
+
+    headArg i pattern = case pattern of
+      PFirst off -> emit [opGetFirst, i, off]
+      PSlot off -> emit [opGetVar, i, off]
+      PWord w -> emit [opGetConst, i, w]
+      -- Two first occurrences are matched cell to cell, as the tree's matching
+      -- does for a two-argument structure.
+      PStruct f [PFirst h, PFirst t] -> do
+        entry <- side (SRefPattern pattern)
+        emit [opGetListFirst, i, entry, f, h, t]
+      PStruct f children -> do
+        entry <- side (SRefPattern pattern)
+        start <- here
+        emit [opGetStruct, i, entry, f, length children, 0]
+        unifyOperands children
+        end <- here
+        patch (start + 5) end
+      -- Unreachable: 'encodeClause' refuses an arithmetic head pattern.
+      PArith {} -> emit [opFail]
+
+    unifyOperands [] = pure ()
+    unifyOperands (child : rest) = unifyOperand child >> unifyOperands rest
+
+    unifyOperand pattern = case pattern of
+      PFirst off -> emit [opUF, off]
+      PSlot off -> emit [opUV, off]
+      PWord w -> emit [opUC, w]
+      PStruct f [PFirst h, PFirst t] -> do
+        entry <- side (SRefPattern pattern)
+        start <- here
+        emit [opUSF, entry, f, h, t, start + 6]
+      PStruct f children -> do
+        entry <- side (SRefPattern pattern)
+        start <- here
+        emit [opUS, entry, f, length children, 0]
+        unifyOperands children
+        end <- here
+        patch (start + 4) end
+      PArith {} -> emit [opFail]
+
+    putArg i pattern = case pattern of
+      PFirst off -> emit [opPutFirst, i, off]
+      PSlot off -> emit [opPutVar, i, off]
+      PWord w -> emit [opPutConst, i, w]
+      PStruct f children -> do
+        pushValues children
+        emit [opPutStruct, i, f, length children]
+      PArith {} -> emit [opFail]
+
+    pushValues [] = pure ()
+    pushValues (child : rest) = pushValue child >> pushValues rest
+
+    pushValue pattern = case pattern of
+      PFirst off -> emit [opPushFirst, off]
+      PSlot off -> emit [opPushVar, off]
+      PWord w -> emit [opPushConst, w]
+      PStruct f children -> pushValues children >> emit [opPushStruct, f, length children]
+      PArith {} -> emit [opFail]
+
+-- | Would the encoder emit an instruction for real work before reaching an
+-- escape? Trivial goals are skipped by the encoder, so they are skipped here.
+startsEncodably :: [Goal] -> Bool
+startsEncodably goals = case dropWhile trivial goals of
+  (goal : _) -> encodableGoal goal
+  [] -> True
+  where
+    trivial GTrue = True
+    trivial _ = False
+
+encodablePattern :: Pattern -> Bool
+encodablePattern pattern = case pattern of
+  PArith {} -> False
+  PStruct _ children -> all encodablePattern children
+  _ -> True
+
+-- | The goals the stream can execute in place, whose successor is a single
+-- continuation rather than a goal list of their own.
+encodableGoal :: Goal -> Bool
+encodableGoal goal = case goal of
+  GTrue -> True
+  GAnd inner -> all encodableGoal inner
+  GCut -> True
+  GFail -> True
+  GUnify a b -> small 2 [a, b]
+  GCall _ patterns _ -> small (length patterns) patterns
+  _ -> False
+  where
+    -- An arithmetic argument is evaluated (or built as data) by a path the
+    -- stream does not implement, and the operand stack lives in the argument
+    -- registers above the callee's arity, where an argument's construction
+    -- pushes at most one word per node of its pattern. Refuse both.
+    small arity patterns =
+      not (any hasArith patterns) && arity + sum (map nodes patterns) < 1024
+    nodes pattern' = case pattern' of
+      PStruct _ children -> 1 + sum (map nodes children)
+      _ -> 1
+    hasArith pattern' = case pattern' of
+      PArith {} -> True
+      PStruct _ children -> any hasArith children
+      _ -> False
+
 candidateClauses :: Store -> Pred -> IO Candidates
 candidateClauses !store p
   | not (pIndexed p) = pure (pAll p)
@@ -701,7 +1060,8 @@ compileClause ctx sigs clause = do
   let count = max 1 (S.clauseNVars clause)
       headWrites = IS.fromList (concatMap firstSlots headPatterns)
       initialize = filter (`IS.notMember` headWrites) [0 .. count - 1]
-  pure (Clause count initialize headPatterns body trusted)
+  let compiled = Clause count initialize headPatterns body trusted Nothing
+  pure compiled {clStream = encodeClause compiled}
   where
     firstSlots pattern = case pattern of
       PFirst offset -> [offset]
@@ -779,7 +1139,7 @@ constantSort ctx w
         | t == tagAtm -> pure S.SAtom
         | t == tagChr -> pure S.SChar
         | t == tagBox -> do
-            value <- boxed (ctxStore ctx) w
+            value <- boxedIn (ctxSymbols ctx) w
             pure $ case value of
               BInt _ -> S.SInt
               BFlt _ -> S.SFloat
@@ -825,19 +1185,19 @@ compileHeadArg ctx seen term = case term of
       then pure (PSlot v)
       else modifyIORef' seen (IS.insert v) >> pure (PFirst v)
   Compound f as -> do
-    fid <- internFunctor (symbols (ctxStore ctx)) f (length as)
+    fid <- internFunctor (ctxSymbols ctx) f (length as)
     PStruct (funWord fid (length as)) <$> mapM (compileHeadArg ctx seen) as
-  _ -> PWord <$> constantWord (ctxStore ctx) term
+  _ -> PWord <$> constantWord (ctxSymbols ctx) term
 
-constantWord :: Store -> Term -> IO Word'
-constantWord store term = case term of
-  Atom a -> atmWord <$> internAtom (symbols store) a
+constantWord :: Symbols -> Term -> IO Word'
+constantWord syms term = case term of
+  Atom a -> atmWord <$> internAtom syms a
   IntLit n
     | fitsImmediate n -> pure (intWord (fromInteger n))
-    | otherwise -> box store (BInt n)
-  FloatLit d -> box store (BFlt d)
+    | otherwise -> boxIn syms (BInt n)
+  FloatLit d -> boxIn syms (BFlt d)
   CharLit c -> pure (chrWord (fromEnum c))
-  StrLit s -> box store (BStr s)
+  StrLit s -> boxIn syms (BStr s)
   _ -> fail "constantWord: not a constant"
 
 -- | Goal arguments: slots, constants, structures, and arithmetic structures
@@ -852,12 +1212,12 @@ compileArg' :: Ctx -> Term -> IO Pattern
 compileArg' ctx term = case term of
   Var v -> pure (PSlot v)
   Compound f as -> do
-    fid <- internFunctor (symbols (ctxStore ctx)) f (length as)
+    fid <- internFunctor (ctxSymbols ctx) f (length as)
     args <- mapM (compileArg' ctx) as
     pure $ case arithOp f (length as) of
       Just op -> PArith (funWord fid (length as)) op args
       Nothing -> PStruct (funWord fid (length as)) args
-  _ -> PWord <$> constantWord (ctxStore ctx) term
+  _ -> PWord <$> constantWord (ctxSymbols ctx) term
 
 arithFunctors :: [(String, Int, ArithOp)]
 arithFunctors =
@@ -1015,11 +1375,11 @@ constraintBuiltins =
 -- exports it with its distinct unbound cells numbered @0, 1, ...@ and runs
 -- the result in an activation block whose slots alias those cells, so no
 -- plan ever holds a raw address.
-compileGoalTerm :: Store -> P.Program -> Map.Map PredKey PredRef -> Term -> IO Goal
-compileGoalTerm store program preds term = do
+compileGoalTerm :: Symbols -> P.Program -> Map.Map PredKey PredRef -> Term -> IO Goal
+compileGoalTerm syms program preds term = do
   problems <- newIORef []
   facts <- newIORef IM.empty
   seen <- newIORef IS.empty
-  nilW <- atmWord <$> internAtom (symbols store) "nil"
-  consW <- (\f -> funWord f 2) <$> internFunctor (symbols store) "cons" 2
-  compileGoal (Ctx store program preds True problems facts seen consW nilW) term
+  nilW <- atmWord <$> internAtom syms "nil"
+  consW <- (\f -> funWord f 2) <$> internFunctor syms "cons" 2
+  compileGoal (Ctx syms program preds True problems facts seen consW nilW) term

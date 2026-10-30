@@ -54,6 +54,8 @@ common warnings
 library
     import:           warnings
     hs-source-dirs:   src
+    c-sources:
+        cbits/infera_jit.c
     default-language: Haskell2010
     exposed-modules:
         Infera
@@ -84,7 +86,12 @@ library
         Infera.Engine.Reference
         Infera.Core
         Infera.Core.Store
+        Infera.Core.Ops
         Infera.Core.Compile
+        Infera.Core.Jit
+        Infera.Core.Jit.AsmA64
+        Infera.Core.Jit.AsmX64
+        Infera.Core.Jit.IR
         Infera.Core.Run
         Infera.Core.Constraint
         Infera.Core.Delta
