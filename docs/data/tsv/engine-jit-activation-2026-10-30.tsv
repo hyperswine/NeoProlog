@@ -1,0 +1,13 @@
+case	config	median_per_query_cpu_ms	min_ms	max_ms	per_query_alloc_mb	samples
+core-nrev	main-74c1740	8.5768	8.5480	8.5800	19.385	3
+core-nrev	jit-off	6.8935	6.8345	6.8985	17.049	3
+core-nrev	jit-on	0.8673	0.8544	0.8682	10.758	3
+core-loop	main-74c1740	8.9649	8.9447	8.9927	12.972	3
+core-loop	jit-off	8.1437	8.1387	8.1523	20.814	3
+core-loop	jit-on	0.0635	0.0504	0.0668	8.574	3
+core-fib	main-74c1740	38.4806	38.4205	38.5419	67.809	3
+core-fib	jit-off	31.8134	31.7898	31.8248	82.295	3
+core-fib	jit-on	31.8362	31.7304	31.9321	82.295	3
+core-queens	main-74c1740	8.5960	8.5883	8.6318	20.293	3
+core-queens	jit-off	7.2401	7.2222	7.3104	21.648	3
+core-queens	jit-on	3.5139	3.4958	3.6364	15.158	3

@@ -5,6 +5,72 @@ See the [current engine guide](2026-10-17-ENGINE.md),
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
+## A week over the record - 2026-10-30
+
+`455fe74` is what the tree was on 2026-10-23: before the pinned store, the
+program image, the clause instruction stream and the native JIT. Checked
+`core-major --batch 20` medians, three interleaved samples per column, both
+builds at `-O2` on this host:
+
+| Case | a week ago ms | now ms | CPU | Allocation |
+| --- | ---: | ---: | ---: | ---: |
+| core-loop | 8.850 | 0.052 | 168.7x | 12.97 -> 8.57 MB (-34%) |
+| core-nrev | 8.521 | 0.812 | 10.5x | 19.39 -> 10.11 MB (-48%) |
+| liveness | 11.704 | 2.974 | 3.9x | 18.09 -> 15.50 MB (-14%) |
+| breadboard-rc | 1.922 | 0.704 | 2.7x | 13.70 -> 12.52 MB (-8.6%) |
+| core-queens | 8.537 | 3.427 | 2.5x | 20.29 -> 14.77 MB (-27%) |
+| breadboard-div | 2.357 | 1.785 | 1.3x | 15.83 -> 14.66 MB (-7.4%) |
+| breadboard-tri | 4.523 | 3.496 | 1.3x | 25.76 -> 24.63 MB (-4.4%) |
+| table-cycle | 0.068 | 0.053 | 1.3x | 8.87 -> 8.82 MB (-0.5%) |
+| core-fib | 38.216 | 31.583 | 1.2x | 67.81 -> 82.30 MB (+21%) |
+| controls | 0.145 | 0.121 | 1.2x | 9.10 -> 9.11 MB |
+| deep-index | 2.946 | 2.620 | 1.1x | 18.91 -> 19.01 MB |
+| table-cycle240 | 1.022 | 0.928 | 1.1x | 14.35 -> 13.77 MB |
+| breadboard-wide | 10.896 | 9.932 | 1.1x | 52.17 -> 51.10 MB |
+| guards | 2.111 | 1.999 | 1.1x | 17.56 -> 18.17 MB |
+| minefield-16 | 23.338 | 22.491 | 1.04x | 117.43 -> 117.10 MB |
+
+Nothing got slower. The tail is the constraint solver and the guard/index
+paths, which the week's work did not touch, and `core-fib`, which is outside
+the JIT fragment and so keeps its interpreter allocation.
+
+The four standard cases against the reference engines, same week and same
+harness ([core_external.py](../bench/core_external.py), batch 100, checked
+results, startup and loading excluded), medians summed to per-query CPU:
+
+| Case | SWI ms | Scryer ms | week ms | now ms |
+| --- | ---: | ---: | ---: | ---: |
+| core-nrev | 0.869 | 3.100 | 8.521 (9.8x SWI) | 0.812 (0.93x SWI, 0.26x Scryer) |
+| core-loop | 1.859 | 8.440 | 8.850 (4.8x SWI) | 0.052 (0.03x SWI, 0.01x Scryer) |
+| core-fib | 10.517 | 28.530 | 38.216 (3.6x SWI) | 31.583 (3.00x SWI, 1.11x Scryer) |
+| core-queens | 2.450 | 5.280 | 8.537 (3.5x SWI) | 3.427 (1.40x SWI, 0.65x Scryer) |
+
+A week ago every standard case was 3.5x to 9.8x behind SWI and 1.0x to 2.5x
+behind Scryer. `core-nrev` is now level with SWI and ahead of Scryer, and
+`core-loop` is far ahead of both; `core-queens` is still 1.4x behind SWI and
+`core-fib` 3.0x, which is the fragment work the JIT report names next.
+
+Raw records: [jsonl](data/jsonl/engine-week-2026-10-30.jsonl),
+[TSV](data/tsv/engine-week-2026-10-30.tsv), and the external numbers in
+[TSV](data/tsv/engine-external-2026-10-30.tsv).
+
+## Native JIT reachable end to end - 2026-10-30
+
+The [activation report](2026-10-30-JIT-ACTIVATION.md) records the three
+defects that kept every compiled kernel from running: matchers that
+compared surface operators against internal names, invocation reading
+capacity from the fresh-variable counter, and a trailing boundary older
+than the JIT entry top so a bailout could not undo a binding. With them
+fixed, and with kernels restricted to atomic elements so that the occurs
+check stays with the interpreter, checked `core-major --batch 20` medians
+fall 90.3% on reverse (10.3x), 99.4% on the counting loop (168.8x) and
+60.0% on 8-queens (2.5x) against `74c1740`, with allocation per query down
+48%, 34% and 27%. Fibonacci has no kernel and shows the interpreter gain
+alone at 16.8%, with 21.4% more allocation. The same report halves the
+cost of entering a kernel, to 15 ns per call, and locates but does not
+explain the 88-byte-per-call allocation the tree path picked up since the
+release. The full suite passes with the JIT enabled.
+
 ## Compiled arithmetic plans - 2026-10-19
 
 The [arithmetic plans report](2026-10-19-ARITH-PLANS.md) records

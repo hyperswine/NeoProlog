@@ -78,3 +78,7 @@ engine design notes, before 2026-10-24.
 | 2026-10-19 | [CLAUSE-SELECTION](2026-10-19-CLAUSE-SELECTION.md) | allocation-free Core clause selection |
 | 2026-10-19 | [ARITH-PLANS](2026-10-19-ARITH-PLANS.md) | compiled arithmetic plans for `is` and comparisons |
 | 2026-10-20 | [PER-CALL-COSTS](2026-10-20-PER-CALL-COSTS.md) | where the Core's time per call goes |
+| 2026-10-29 | [WAM-JIT](2026-10-29-WAM-JIT.md) | design: pinned stable store, WAM instruction stream, Sol-style native JIT of deterministic predicates |
+| 2026-10-29 | [PINNED-STORE](2026-10-29-PINNED-STORE.md) | report: Step 1 of WAM-JIT, pinned ForeignPtr blocks with register-cached base pointers |
+| 2026-10-30 | [WAM-STREAM](2026-10-30-WAM-STREAM.md) | report: Step 2 of WAM-JIT, load-time compilation and the clause instruction stream |
+| 2026-10-30 | [JIT-ACTIVATION](2026-10-30-JIT-ACTIVATION.md) | report: the three defects that kept every native kernel from running, the occurs-check and trailing fixes they exposed, the cost of entering a kernel, and where the tree path's per-call allocation is not |
