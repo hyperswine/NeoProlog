@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               infera
-version:            2.1.0
+version:            2.2.0
 synopsis:           Prolog-inspired logic language with sorts, modes, tabling and CLP(Z)
 description:
     Infera is a Prolog-inspired logic programming language.  Predicates can
