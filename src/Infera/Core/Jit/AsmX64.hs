@@ -18,8 +18,11 @@
 --   rcx = RT0       (caller-saved working register)
 --   rsi = RT1       (caller-saved working register, after RArgs is saved to r12)
 --   rdi = RT2       (caller-saved working register, after RState is saved to rbx)
---   rbp-40           = RBudgets pointer spill slot
---   rbp-48 .. rbp-80 = spilled slots for RT3..RT7 when needed
+--   rbp-8 .. rbp-40  = saved rbx, r12, r13, r14, r15 (pushed in the prologue)
+--   rbp-48           = RBudgets pointer spill slot
+--   rbp-56 .. rbp-88 = spilled slots for RT3..RT7 when needed
+--   The spill area must stay below the callee-saved pushes: an earlier layout
+--   put RBudgets at rbp-40, overwriting the saved r15 that GHC relies on.
 --   rax, rdx, r11    = assembler scratch registers
 module Infera.Core.Jit.AsmX64
   ( assembleX64,
@@ -44,7 +47,7 @@ hwLoc :: Reg -> Either Int Int
 hwLoc = \case
   RState -> Left 3 -- rbx
   RArgs -> Left 12 -- r12
-  RBudgets -> Right (-40) -- [rbp - 40]
+  RBudgets -> Right (-48) -- [rbp - 48]
   RCells -> Left 14 -- r14
   RTrail -> Left 15 -- r15
   RH -> Left 8 -- r8
@@ -53,11 +56,11 @@ hwLoc = \case
   RT0 -> Left 1 -- rcx
   RT1 -> Left 6 -- rsi
   RT2 -> Left 7 -- rdi
-  RT3 -> Right (-48)
-  RT4 -> Right (-56)
-  RT5 -> Right (-64)
-  RT6 -> Right (-72)
-  RT7 -> Right (-80)
+  RT3 -> Right (-56)
+  RT4 -> Right (-64)
+  RT5 -> Right (-72)
+  RT6 -> Right (-80)
+  RT7 -> Right (-88)
 
 rexW :: Int -> Int -> Int -> Word8
 rexW r x b =
@@ -186,7 +189,7 @@ prologueBytes =
   ]
     ++ movRR 3 7 -- rbx (RState)   = rdi
     ++ movRR 12 6 -- r12 (RArgs)    = rsi
-    ++ storeRbp8 2 (-40) -- [rbp - 40] = rdx (RBudgets*)
+    ++ storeRbp8 2 (-48) -- [rbp - 48] = rdx (RBudgets*)
     ++ loadImmIx 13 2 budgetDepthIdx -- r13 (RDepth) = budgets[0]
     ++ loadImmIx 14 3 stateCellsIdx
     ++ loadImmIx 15 3 stateTrailIdx
@@ -198,7 +201,7 @@ epilogueBytes :: Int64 -> B
 epilogueBytes code =
   storeImmIx 8 3 stateHIdx
     ++ storeImmIx 9 3 stateTRIdx
-    ++ loadRbp8 2 (-40) -- rdx = RBudgets*
+    ++ loadRbp8 2 (-48) -- rdx = RBudgets*
     ++ storeImmIx 13 2 budgetDepthIdx -- budgets[0] = r13 (RDepth)
     ++ movImm 0 code
     ++ [ 0x48, 0x83, 0xC4, 0x30, -- add rsp, 48
@@ -304,19 +307,23 @@ emitOp = \case
   JBindRef addrReg valReg bailoutLbl ->
     let (a, loadA) = getReg 0 addrReg
         (v, loadV) = getReg 2 valReg
-        pre =
-          loadA
-            ++ loadV
-            ++ storeRegIx v 14 a
-            ++ cmpRR a 10
-            ++ [0x7D, 0x1A]
-            ++ loadImmIx 11 3 stateTrailCapIdx
-            ++ cmpRR 9 11
+        capCheck = loadImmIx 11 3 stateTrailCapIdx ++ cmpRR 9 11
         post =
           movRR 11 a
             ++ [0x49, 0xD1, 0xE3]
             ++ storeRegIx 11 15 9
             ++ [0x49, 0x83, 0xC1, 0x01]
+        -- jge over the trail push: capCheck, its jcc rel32 (6 bytes) and post.
+        -- Derived from the emitted bytes; a hard-coded 0x1A fell one byte
+        -- short and jumped into the middle of the final add.
+        skip = length capCheck + 6 + length post
+        pre =
+          loadA
+            ++ loadV
+            ++ storeRegIx v 14 a
+            ++ cmpRR a 10
+            ++ [0x7D, fromIntegral skip]
+            ++ capCheck
      in (appendFrag (appendFrag (bytes pre) (jccRel32 0x8D bailoutLbl)) (bytes post), Nothing)
   JJump lbl -> (jmpRel32 lbl, Nothing)
   JBranchCmp c a b lbl ->
