@@ -72,9 +72,9 @@ allocation regression [WAM-STREAM](2026-10-30-WAM-STREAM.md) records as an
 open problem. `core-fib` has no kernel and so shows the interpreter gain
 alone.
 
-Raw records: [jsonl](../data/jsonl/engine-jit-activation-2026-10-30.jsonl)
+Raw records: [jsonl](data/jsonl/engine-jit-activation-2026-10-30.jsonl)
 (`source_fingerprint` `0dd7e1be…` for both current columns, `41aae485…`
-for `main`) and the [TSV summary](../data/tsv/engine-jit-activation-2026-10-30.tsv).
+for `main`) and the [TSV summary](data/tsv/engine-jit-activation-2026-10-30.tsv).
 
 ## Scope
 
@@ -193,8 +193,8 @@ Same protocol as above, five interleaved samples per column, medians:
 | core-fib | 38.399 | 31.792 | 31.932 | -16.8% | 67.81 -> 82.30 MB (+21.4%) |
 | core-queens | 8.603 | 7.192 | 3.443 | -60.0% | 20.29 -> 14.77 MB (-27.2%) |
 
-Raw records: [jsonl](../data/jsonl/engine-call-path-2026-10-30.jsonl),
-[TSV](../data/tsv/engine-call-path-2026-10-30.tsv). `infera-test` passes
+Raw records: [jsonl](data/jsonl/engine-call-path-2026-10-30.jsonl),
+[TSV](data/tsv/engine-call-path-2026-10-30.tsv). `infera-test` passes
 (497 checks) with the JIT enabled, and every `parity_test/core` fixture is
 byte-identical with `INFERA_JIT=1` and `INFERA_JIT=0`.
 
@@ -243,3 +243,10 @@ interpreted, before growing the fragment further.
 2. **Fragment growth**, in the plan's order: structures as arguments,
    multi-clause selection as a jump table, single-goal builtins, then
    control constructs.
+
+### Follow-up priority update, 2026-10-31
+
+The [next optimization follow-up](2026-10-31-OPTIMIZATION-FOLLOWUP.md) puts
+boxed-value reclamation and JIT mapping/cache ownership ahead of fragment
+growth, retains the interpreter allocation investigation, and defines
+regression gates and acceptance criteria for all four work areas.

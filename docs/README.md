@@ -5,6 +5,7 @@
 | [Language and tooling reference](website/index.html) | Installation, syntax, declarations, builtins, constraints and editor support; also [published online](https://hyperswine.github.io/NeoProlog/) |
 | [Current engine](2026-10-17-ENGINE.md) | Default query execution, contracts, collection and compatibility boundaries |
 | [Performance](2026-10-15-PERFORMANCE.md) | Latest checked measurements and their scope |
+| [Next optimization priorities](2026-10-31-OPTIMIZATION-FOLLOWUP.md) | Open lifetime, allocation and performance-gate work with acceptance criteria |
 | [Raw benchmark data](data/README.md) | Original measurements, separated by file format |
 | [Dash docset](dash/README.md) | Build and subscribe to the offline reference |
 
@@ -82,3 +83,4 @@ engine design notes, before 2026-10-24.
 | 2026-10-29 | [PINNED-STORE](2026-10-29-PINNED-STORE.md) | report: Step 1 of WAM-JIT, pinned ForeignPtr blocks with register-cached base pointers |
 | 2026-10-30 | [WAM-STREAM](2026-10-30-WAM-STREAM.md) | report: Step 2 of WAM-JIT, load-time compilation and the clause instruction stream |
 | 2026-10-30 | [JIT-ACTIVATION](2026-10-30-JIT-ACTIVATION.md) | report: the three defects that kept every native kernel from running, the occurs-check and trailing fixes they exposed, the cost of entering a kernel, and where the tree path's per-call allocation is not |
+| 2026-10-31 | [OPTIMIZATION-FOLLOWUP](2026-10-31-OPTIMIZATION-FOLLOWUP.md) | next priorities: boxed-value reclamation, JIT mapping and image-cache ownership, interpreter allocation, and regression gates |

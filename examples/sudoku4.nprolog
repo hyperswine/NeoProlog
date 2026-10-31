@@ -1,0 +1,59 @@
+# Four-by-four Sudoku: a complete finite-domain model, not a generate-and-test
+# permutation search. Each row, column and two-by-two box contains 1,2,3,4.
+# Run: infera examples/sudoku4.nprolog
+#
+# Keep modeling separate from enumeration: sudoku_model can be composed with
+# extra clues before sudoku labels anything. Undeclared model predicates keep
+# their relational modes; output-mode declarations would require ground cells.
+<- notable.
+
+sudoku_model [[A,B,C,D], [E,F,G,H], [I,J,K,L], [M,N,O,P]] Cells <-
+  Cells = [A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P],
+  Cells in 1..4,
+  all_different [A,B,C,D], all_different [E,F,G,H],
+  all_different [I,J,K,L], all_different [M,N,O,P],
+  all_different [A,E,I,M], all_different [B,F,J,N],
+  all_different [C,G,K,O], all_different [D,H,L,P],
+  all_different [A,B,E,F], all_different [C,D,G,H],
+  all_different [I,J,M,N], all_different [K,L,O,P].
+
+sudoku Grid <- sudoku_model Grid Cells, label Cells.
+
+grid_count N <- findall Grid (sudoku Grid) Grids, count_grids Grids 0 N.
+count_grids [] N N.
+count_grids [_ | Grids] Acc N <- Next is Acc + 1, count_grids Grids Next N.
+
+puzzle gentle [[1,_,_,4], [_,4,1,_], [2,_,4,_], [_,3,_,1]].
+puzzle impossible [[1,1,_,_], [_,_,_,_], [_,_,_,_], [_,_,_,_]].
+
+# A ground checker uses ordinary list membership and disequality. It is also
+# useful for checking an externally supplied solution, without labeling it.
+valid_unit [A,B,C,D] <-
+  member A [1,2,3,4], member B [1,2,3,4],
+  member C [1,2,3,4], member D [1,2,3,4],
+  A != B, A != C, A != D, B != C, B != D, C != D.
+
+valid_grid [[A,B,C,D], [E,F,G,H], [I,J,K,L], [M,N,O,P]] <-
+  valid_unit [A,B,C,D], valid_unit [E,F,G,H],
+  valid_unit [I,J,K,L], valid_unit [M,N,O,P],
+  valid_unit [A,E,I,M], valid_unit [B,F,J,N],
+  valid_unit [C,G,K,O], valid_unit [D,H,L,P],
+  valid_unit [A,B,E,F], valid_unit [C,D,G,H],
+  valid_unit [I,J,M,N], valid_unit [K,L,O,P].
+
+member X [X | _].
+member X [_ | Xs] <- member X Xs.
+
+board [] -> [].
+board [Row | Rows] -> wr Row, nl, board Rows.
+solution Name ->
+  { puzzle Name Grid, sudoku Grid, valid_grid Grid },
+  "Sudoku ", wr Name, ":", nl, board Grid.
+
+> emit (solution gentle)?
+> puzzle gentle Grid, sudoku Grid, valid_grid Grid?
+# Contradictory clues fail; failure is an ordinary result, not an exception.
+> not (puzzle impossible Grid, sudoku Grid)?
+# Count the whole solution set, not just a first answer. The regression runner
+# independently enumerates all 288 grids and checks set equality as well.
+> grid_count N?

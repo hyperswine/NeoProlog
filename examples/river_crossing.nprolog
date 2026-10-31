@@ -1,0 +1,55 @@
+# The wolf, goat and cabbage crossing. The farmer takes at most one passenger.
+# Neither wolf/goat nor goat/cabbage may be left together without the farmer.
+# State = [Farmer,Wolf,Goat,Cabbage], with banks 0 (left) and 1 (right).
+# Run: infera examples/river_crossing.nprolog
+<- notable.
+
+safe [F,W,G,C] <- not (W = G, F != W), not (G = C, F != G).
+
+cross [F,W,G,C] alone [T,W,G,C] <- T is 1 - F, safe [T,W,G,C].
+cross [F,F,G,C] wolf [T,T,G,C] <- T is 1 - F, safe [T,T,G,C].
+cross [F,W,F,C] goat [T,W,T,C] <- T is 1 - F, safe [T,W,T,C].
+cross [F,W,G,F] cabbage [T,W,G,T] <- T is 1 - F, safe [T,W,G,T].
+
+# Exact-length, cycle-free search. The budget is an input, so recursion is
+# bounded even when there is no solution. Negation only sees ground states.
+crossing : nondet (int: <=) (list atom: =>).
+crossing Steps Moves <-
+  Steps >= 0, walk Steps [0,0,0,0] [[0,0,0,0]] Moves.
+
+walk 0 [1,1,1,1] _ [].
+walk N State Seen [Move | Moves] <-
+  N > 0, cross State Move Next, not (member Next Seen),
+  Rest is N - 1, walk Rest Next [Next | Seen] Moves.
+
+# Iterative deepening makes fewest crossings the objective. Sixteen states
+# imply at most fifteen edges in a simple path; the search is finite.
+depth Lo Hi Lo <- Lo <= Hi.
+depth Lo Hi N <- Lo < Hi, Next is Lo + 1, depth Next Hi N.
+shortest Moves <- once (depth 0 15 N, crossing N Moves).
+
+move_count Moves N <- count_moves Moves 0 N.
+count_moves [] N N.
+count_moves [_ | Moves] Acc N <- Next is Acc + 1, count_moves Moves Next N.
+
+# Replay independently of the search's visited set and depth counter.
+replay [] State State.
+replay [Move | Moves] State End <- cross State Move Next, replay Moves Next End.
+
+member X [X | _].
+member X [_ | Xs] <- member X Xs.
+
+side 0 left.
+side 1 right.
+trip [] _ -> [].
+trip [Move | Moves] State ->
+  { cross State Move Next, Next = [Bank,_,_,_], side Bank Name },
+  "take ", wr Move, " to ", wr Name, "  ", wr Next, nl,
+  trip Moves Next.
+report -> { shortest Moves }, "Shortest safe crossing:", nl, trip Moves [0,0,0,0].
+
+> emit report?
+> shortest Moves, replay Moves [0,0,0,0] [1,1,1,1]?
+# Both shortest plans, in search order; the regression test checks them by BFS.
+> findall Moves (crossing 7 Moves) Plans?
+> not (crossing 6 _)?

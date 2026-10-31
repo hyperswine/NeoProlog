@@ -5,6 +5,94 @@ See the [current engine guide](2026-10-17-ENGINE.md),
 [raw data conventions](data/README.md). The newest results appear first;
 the earlier sections preserve measurements from previous engine stages.
 
+Open work for the next optimization is tracked in
+[Next Core optimization priorities](2026-10-31-OPTIMIZATION-FOLLOWUP.md):
+boxed-value retention, JIT code and cache lifetime, interpreter allocation,
+and gates that preserve measured gains and prove native execution.
+
+## Cross-theme example programs - 2026-10-31
+
+Five standalone programs extend the corpus beyond the original engine
+microbenchmarks: [Sudoku](../examples/sudoku4.nprolog),
+[river crossing](../examples/river_crossing.nprolog),
+[job-shop scheduling](../examples/job_shop.nprolog),
+[courier routes](../examples/route_planning.nprolog) and
+[supply packing](../examples/supply_packing.nprolog). They separate pure models,
+bounded search and DCG reports, and include impossible and boundary cases.
+
+### Correctness and regression coverage
+
+The [independent acceptance runner](../test/example_programs.py) performs 24
+collected-answer queries in each of four configurations (`INFERA_JIT=0/1`
+crossed with `INFERA_CORE_STREAM=0/1`), and runs all five complete demos in
+each configuration. The independent models check:
+
+* Equality with the complete set of 288 Sudoku grids, unique puzzle clues and
+  contradictory clues, using permutation enumeration.
+* Both seven-crossing river plans, the shortest-plan result and infeasibility
+  in six crossings, using breadth-first search.
+* Machine exclusivity, job precedence and the six-tick optimum at multiple
+  horizons, using machine-order enumeration and longest paths in precedence DAGs.
+* Every simple courier route under three closure policies, optimal costs from
+  Dijkstra, cyclic tabled reachability and an unreachable destination.
+* Stock, weight, purchase price and maximum usefulness for six packing
+  scenarios, plus an impossible required item, using exhaustive quantities.
+
+All checks pass. The 20 inline queries also enter `CoreTest` and agree with
+Reference and the legacy machine, including Core collection forced at nearly
+every call. The full local Haskell suite passes 449 properties; existing CLI
+acceptance and all 56 benchmark-harness tests pass. The independent checks
+also pass on the pre-JIT executable. CI now runs the independent checks in
+all four configurations and checks each loaded benchmark witness. CI timings
+are descriptive, not wall-clock regression thresholds.
+
+### Fresh loaded-query comparison
+
+The runtime at `f6ac3be`, plus these examples and their benchmark fixtures,
+was compared with `74c1740`. Both were built with GHC 9.8.2 at `-O2` on
+`aarch64-darwin`; the identical new `bench/core-major.hs` and example files
+were copied to the old source snapshot. The engine itself was not changed
+for this experiment. Each query is fully drained and checked against Reference
+and a known optimum/count; the independent runner above validates the witnesses
+and full solution sets separately.
+
+Seven shuffled, interleaved samples per case/configuration produced 140 raw
+records. The configurations are old runtime, current default, current with JIT
+off, and current with both JIT and stream off. Batch sizes are respectively
+10, 600, 400, 1500 and 300 for the five table rows below. Every timed batch
+exceeded 50 ms of CPU (minimum 51.6 ms). Values are per-query medians:
+
+| Case | Old CPU ms | Current CPU ms | CPU change | GHC allocation, old -> current MB |
+| --- | ---: | ---: | ---: | ---: |
+| All 288 Sudoku grids | 16.138 | 15.958 | -1.1%, effectively flat | 85.268 -> 85.174 |
+| Shortest river plan and replay | 0.2091 | 0.1308 | -37.4% | 9.027 -> 8.876 |
+| Optimal workshop schedule and validation | 0.2675 | 0.2154 | -19.5% | 9.742 -> 9.619 |
+| Cheapest courier route and validation | 0.0739 | 0.0348 | -53.0% | 8.763 -> 8.645 |
+| Optimal supply pack and accounting | 0.5603 | 0.5109 | -8.8% | 11.137 -> 11.003 |
+
+Current won all 35 paired comparisons, but the small Sudoku difference is
+not evidence of a meaningful solver speedup on other hosts. No semantic or
+performance regression was found in this corpus. Disabling the JIT leaves
+these medians materially unchanged: the gains do not depend on native kernels.
+Disabling the stream as well changes little on these workloads.
+
+These are warm, loaded-program query measurements, including execution,
+projection and validation. Source loading, first image/JIT compilation and the
+Reference preflight are outside the clock. The machine is shared, and these
+results do not establish cross-platform performance or bounded memory in a
+long-running service. This corpus does not test long-running boxed-value
+retention or JIT mapping lifetime, and it does not address the Fibonacci
+allocation regression recorded below.
+
+Raw [JSONL](data/jsonl/engine-examples-2026-10-31.jsonl) includes workload/source
+fingerprints, binary SHA-256, commands, build settings and individual timings;
+the [TSV summary](data/tsv/engine-examples-2026-10-31.tsv) includes ranges for
+every configuration. Reproduce individual cases with, for example:
+
+```sh
+cabal run bench:core-major --enable-optimization=2 -- --case example-job-shop --batch 400 +RTS -T -RTS
+```
+
 ## A week over the record - 2026-10-30
 
 `455fe74` is what the tree was on 2026-10-23: before the pinned store, the

@@ -31,7 +31,8 @@ names :: [String]
 names = ["controls", "guards", "deep-index", "liveness", "table-cycle",
   "table-cycle240",
   "core-nrev", "core-loop", "core-fib", "core-queens",
-  "breadboard-rc", "breadboard-div", "breadboard-tri", "breadboard-wide", "minefield-16"]
+  "breadboard-rc", "breadboard-div", "breadboard-tri", "breadboard-wide", "minefield-16",
+  "example-sudoku4", "example-river", "example-job-shop", "example-routes", "example-packing"]
 
 usage :: String
 usage = "Usage: core-major --case " ++ intercalate "|" names ++
@@ -63,6 +64,19 @@ data Fixture = Fixture String String Model
 
 fixture :: String -> IO Fixture
 fixture name = case name of
+  -- These optima/counts are also computed by independent exhaustive models,
+  -- BFS, Dijkstra and precedence-DAG enumeration in test/example_programs.py.
+  -- Retain the ground witness in the query so timing includes its projection
+  -- and the full ordered answer still has to agree with Reference.
+  "example-sudoku4" -> example "sudoku4" "grid_count Result?" 288
+  "example-river" -> example "river_crossing"
+    "shortest Moves, replay Moves [0,0,0,0] [1,1,1,1], move_count Moves Result?" 7
+  "example-job-shop" -> example "job_shop"
+    "job_shop 9 Plan Result, valid_schedule Plan Result?" 6
+  "example-routes" -> example "route_planning"
+    "best_route depot clinic [] Path Result, route_cost Path [] Result?" 8
+  "example-packing" -> example "supply_packing"
+    "best_pack 10 8 Plan Weight Price Result, totals Plan Weight Price Result?" 25
   "controls" -> pure (Fixture (unlines
     ["<- notable.", "loop 0 Acc Acc.",
      "loop N Acc Result <- N > 0, once ((Picked = N ; Picked = 0)), not (Picked < 0), " ++
@@ -106,6 +120,9 @@ fixture name = case name of
         7 11 (if circuit == "tri" then 1 else 0)
   _ -> fail "Unhandled case"
   where
+    example file query answer = do
+      source <- readFile ("examples/" ++ file ++ ".nprolog")
+      pure (Fixture source query (Exact (IntLit answer)))
     core query model = do
       source <- readFile "bench/bench.nprolog"
       pure (Fixture source query model)

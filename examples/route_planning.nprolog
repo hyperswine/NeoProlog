@@ -1,0 +1,55 @@
+# A courier network with weighted directed roads, closures and cycles.
+# Costs are integer minutes. Reachability uses tabling; shortest routes use a
+# finite simple-path search plus minimize. For large networks use a priority
+# queue algorithm; this small model deliberately exposes all alternatives.
+# Run: infera examples/route_planning.nprolog
+<- notable.
+
+road depot market 4.
+road depot station 2.
+road station market 1.
+road market park 3.
+road station park 7.
+road park clinic 2.
+road market clinic 9.
+road station depot 2.
+road park station 1.
+road clinic depot 8.
+
+# Explicit tabling is appropriate here: finite ground nodes, left recursion,
+# cycles, and no path history in the table key. It is unnecessary for route.
+reachable : table.
+reachable Start Start.
+reachable Start To <- reachable Start Via, road Via To _.
+
+route From To Closed Path Cost <- travel From To Closed [From] Path 0 Cost.
+travel To To _ _ [To] Cost Cost.
+travel From To Closed Seen [From | Rest] Acc Cost <-
+  From != To, road From Next Minutes,
+  not (member (closed From Next) Closed), not (member Next Seen),
+  NextCost is Acc + Minutes,
+  travel Next To Closed [Next | Seen] Rest NextCost Cost.
+
+best_route : semidet (atom: <=) (atom: <=) (list any: <=) (list atom: =>) (int: =>).
+best_route From To Closed Path Cost <- minimize Cost (route From To Closed Path Cost).
+
+# Validate a supplied path and calculate its price without the search's Seen.
+route_cost Path Closed Cost <- price_path Path Closed 0 Cost.
+price_path [_] _ Cost Cost.
+price_path [From,To | Nodes] Closed Acc Cost <-
+  road From To Minutes, not (member (closed From To) Closed),
+  NextCost is Acc + Minutes, price_path [To | Nodes] Closed NextCost Cost.
+
+member X [X | _].
+member X [_ | Xs] <- member X Xs.
+
+report Closed ->
+  { best_route depot clinic Closed Path Cost, route_cost Path Closed Cost },
+  "closed roads: ", wr Closed, nl,
+  "route: ", wr Path, "  minutes: ", wr Cost, nl.
+
+> emit (report [])?
+> emit (report [closed station market])?
+> best_route depot clinic [] Path Cost, route_cost Path [] Cost?
+> findall Node (reachable depot Node) Nodes?
+> not (best_route depot island [] _ _)?

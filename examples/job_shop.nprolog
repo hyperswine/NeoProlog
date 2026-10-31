@@ -1,0 +1,62 @@
+# Three workshop jobs, each with two operations on the cutter and drill.
+# No machine can run two operations at once; each job respects its precedence.
+# Minimize makespan (the time when every job is finished).
+# Run: infera examples/job_shop.nprolog
+#
+# Times are integer ticks and intervals are half-open [Start,Start+Duration),
+# so one operation may start exactly when another finishes.
+<- notable.
+
+# Plan order is fixed, so clients can inspect or constrain individual starts.
+schedule_model Horizon
+  [op frame_cut cutter A 3, op frame_drill drill C 2,
+   op bracket_drill drill B 2, op bracket_cut cutter D 1,
+   op panel_cut cutter E 2, op panel_drill drill F 1]
+  [A,B,C,D,E,F,Finish] Finish <-
+  Horizon >= 0,
+  [A,B,C,D,E,F,Finish] in 0..Horizon,
+  C #>= A + 3, D #>= B + 2, F #>= E + 2,
+  separate A 3 D 1, separate A 3 E 2, separate D 1 E 2,
+  separate C 2 B 2, separate C 2 F 1, separate B 2 F 1,
+  Finish #>= C + 2, Finish #>= D + 1, Finish #>= F + 1,
+  # Machine workload lower bounds strengthen the model without choosing order.
+  Finish #>= 6, Finish #>= 5.
+
+# Reification posts a disjunction without prematurely choosing a machine order.
+separate A DA B DB <-
+  reify (A + DA #<= B) AB, reify (B + DB #<= A) BA,
+  AB + BA #>= 1.
+
+job_shop : semidet (int: <=) (list any: =>) (int: =>).
+job_shop Horizon Plan Finish <-
+  schedule_model Horizon Plan Vars Finish, labeling [min Finish] Vars.
+
+# Ground validation is ordinary arithmetic, separate from CLP propagation.
+valid_schedule [op frame_cut cutter A 3, op frame_drill drill C 2,
+                op bracket_drill drill B 2, op bracket_cut cutter D 1,
+                op panel_cut cutter E 2, op panel_drill drill F 1] Finish <-
+  A >= 0, B >= 0, E >= 0,
+  C >= A + 3, D >= B + 2, F >= E + 2,
+  apart A 3 D 1, apart A 3 E 2, apart D 1 E 2,
+  apart C 2 B 2, apart C 2 F 1, apart B 2 F 1,
+  Finish >= C + 2, Finish >= D + 1, Finish >= F + 1.
+
+apart A DA B DB <- (A + DA <= B ; B + DB <= A).
+
+operations [] -> [].
+operations [op Name Machine Start Duration | Ops] ->
+  { End is Start + Duration },
+  padr Name 16, padr Machine 8, wr Start, "..", wr End, nl,
+  operations Ops.
+report ->
+  { job_shop 9 Plan Finish, valid_schedule Plan Finish },
+  "Workshop schedule:", nl, operations Plan,
+  "makespan: ", wr Finish, nl.
+
+> emit report?
+> job_shop 9 Plan Finish, valid_schedule Plan Finish?
+# Six cutter ticks cannot fit in a five-tick deadline.
+> not (job_shop 5 _ _)?
+# Additional business constraints belong before labeling, for example:
+# > schedule_model 9 Plan [A,B,C,D,E,F,Finish] Finish,
+#   A #>= 1, labeling [min Finish] [A,B,C,D,E,F,Finish]?

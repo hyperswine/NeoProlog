@@ -1,0 +1,54 @@
+# Emergency supplies: bounded knapsack with both weight and purchase budgets.
+# Each item has finite stock, a weight, a price and a usefulness score.
+# Maximize usefulness by minimizing its negative; all accounting uses integers.
+# Run: infera examples/supply_packing.nprolog
+<- notable.
+
+# item Name Weight Price Usefulness Stock
+item water 3 2 8 2.
+item food 2 3 5 3.
+item radio 4 5 10 1.
+item blanket 2 1 4 2.
+
+# Build expressions and finite quantity domains before starting enumeration.
+packing_model Capacity Budget Plan Quantities Weight Price Value <-
+  Capacity >= 0, Budget >= 0,
+  choices [water,food,radio,blanket] Plan Quantities Weight Price Value,
+  Weight #<= Capacity, Price #<= Budget.
+
+choices [] [] [] 0 0 0.
+choices [Name | Names] [take Name N | Plan] [N | Ns] Weight Price Value <-
+  item Name W P V Stock, N in 0..Stock,
+  choices Names Plan Ns RestWeight RestPrice RestValue,
+  Weight #= W * N + RestWeight,
+  Price #= P * N + RestPrice,
+  Value #= V * N + RestValue.
+
+best_pack : semidet (int: <=) (int: <=) (list any: =>) (int: =>) (int: =>) (int: =>).
+best_pack Capacity Budget Plan Weight Price Value <-
+  packing_model Capacity Budget Plan Vars Weight Price Value,
+  Cost #= 0 - Value, labeling [min Cost] Vars.
+
+# Recompute the solver's ground packing using arithmetic, including stock limits.
+totals Plan Weight Price Value <- sum_pack Plan 0 0 0 Weight Price Value.
+sum_pack [] W P V W P V.
+sum_pack [take Name N | Plan] W0 P0 V0 Weight Price Value <-
+  item Name W P V Stock, N >= 0, N <= Stock,
+  W1 is W0 + W * N, P1 is P0 + P * N, V1 is V0 + V * N,
+  sum_pack Plan W1 P1 V1 Weight Price Value.
+
+supplies [] -> [].
+supplies [take Name N | Plan] -> padr Name 10, wr N, nl, supplies Plan.
+report Capacity Budget ->
+  { best_pack Capacity Budget Plan Weight Price Value,
+    totals Plan Weight Price Value },
+  "capacity: ", wr Capacity, "  budget: ", wr Budget, nl,
+  supplies Plan,
+  "weight: ", wr Weight, "  price: ", wr Price, "  value: ", wr Value, nl.
+
+> emit (report 10 8)?
+> best_pack 10 8 Plan Weight Price Value, totals Plan Weight Price Value?
+# Empty capacity is feasible: taking nothing is the optimum.
+> best_pack 0 0 Plan Weight Price Value?
+# A required radio is impossible in a three-unit carrying capacity.
+> not (packing_model 3 8 [take water _,take food _,take radio 1,take blanket _] Vars _ _ _, label Vars)?
