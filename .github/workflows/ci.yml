@@ -113,6 +113,14 @@ jobs:
         working-directory: lsp
       - run: INFERA_BIN="$(cabal list-bin exe:infera --enable-optimization=2)" npm test --prefix lsp
       - run: python3 test/cli.py "$(cabal list-bin exe:infera --enable-optimization=2)"
+      - run: python3 test/example_programs.py "$(cabal list-bin exe:infera --enable-optimization=2)" --all-modes
+      - name: Check loaded example benchmark witnesses
+        shell: bash
+        run: |
+          infera_example_runner="$(cabal list-bin bench:core-major --enable-optimization=2)"
+          for infera_example_case in example-sudoku4 example-river example-job-shop example-routes example-packing; do
+            "$infera_example_runner" --case "$infera_example_case" --batch 1 +RTS -T -RTS
+          done
       - run: python3 -m unittest discover -s test -p '*bench_harness_test.py'
       - run: python3 bench/check-tail-memory.py "$(cabal list-bin bench:machine-tail --enable-optimization=2)" --quick --output /tmp/infera-tail-memory.jsonl
       - run: python3 bench/check-tail-memory.py "$(cabal list-bin bench:machine-tail --enable-optimization=2)" --backend bytecode --quick --output /tmp/infera-bytecode-tail-memory.jsonl
