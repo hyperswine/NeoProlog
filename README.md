@@ -358,6 +358,28 @@ results (`infera examples/queens.nprolog`):
 | `timetable.nprolog` | a school week of teachers, courses, rooms and students | search plus CLP(Z) with reification; rules rechecked as queries |
 | `stable_matching.nprolog` | Gale-Shapley pairing, all stable pairings, electives with seats | list algorithms, a theorem checked on an instance |
 | `database_access.nprolog` | readers and writers sharing a database, four protocols | tabling as a model checker, shortest failing runs, fair loops |
+| `sudoku4.nprolog` | 4x4 Sudoku, unique clues, contradictions, all 288 grids | CLP(Z), global distinctness, separate model and labeling |
+| `river_crossing.nprolog` | wolf, goat and cabbage; both shortest safe plans | bounded search, iterative deepening, plan replay |
+| `job_shop.nprolog` | three jobs sharing a cutter and drill | precedence, reified non-overlap, minimum makespan |
+| `route_planning.nprolog` | courier routes with road closures and cycles | tabled reachability, simple paths, minimum travel cost |
+| `supply_packing.nprolog` | emergency supplies with stock, weight and money limits | bounded knapsack, integer optimization, ground accounting |
+
+The last five examples keep facts, pure models, search and DCG reports separate.
+Constraints precede labeling; negation in graph searches sees ground states.
+Contracts on optimizer entry points describe ground inputs and outputs, while
+constraint-model predicates retain relational arguments. Each file runs on its
+own and includes an impossible or boundary case.
+
+`python3 test/example_programs.py "$(cabal list-bin exe:infera --enable-optimization=2)" --all-modes`
+checks their solutions with independent Python models in all four JIT/stream
+configurations. Their inline queries also enter the Haskell parity suite,
+including forced collection. Loaded-query performance cases are
+`example-sudoku4`, `example-river`, `example-job-shop`, `example-routes` and
+`example-packing` in `bench:core-major`; for example:
+
+```sh
+cabal run bench:core-major --enable-optimization=2 -- --case example-job-shop --batch 100 +RTS -T -RTS
+```
 
 ## Modules
 
