@@ -203,8 +203,8 @@ matchCountdownLoop (name, 1) [cBase, cStep]
               JLabel "loop",
               JBranchImm JEq RT0 (fromIntegral baseVal) "success",
               JBranchImm JLe RT0 (fromIntegral guardVal) "fail",
-              -- Recursive resolution step: tick depth budget
-              JTickDepth "exhausted",
+              -- Recursive resolution step
+              -- (no depth tick: a last call keeps its caller's continuation depth)
               JSubImm RT0 RT0 (fromIntegral stepVal),
               JJump "loop",
               JLabel "success",
@@ -321,7 +321,7 @@ matchAppendLoop nilW consW (name, 3) [cBase, cStep]
                   -- Advance: RT2 = new tail refWord (RT4), RT0 = T (RT5)
                   JMov RT2 RT4,
                   JMov RT0 RT5,
-                  JTickDepth "exhausted",
+                  -- (no depth tick: a last call keeps its caller's continuation depth)
                   JJump "loop",
                   JLabel "base_case",
                   -- Bind current output REF (RT2) to RT1
@@ -398,7 +398,7 @@ matchRangeLoop nilW consW (name, 3) [cBase, cStep]
                   JBindRef RT2 RT3 "bailout",
                   JMov RT2 RT4,
                   JAddImm RT0 RT0 1,
-                  JTickDepth "exhausted",
+                  -- (no depth tick: a last call keeps its caller's continuation depth)
                   JJump "loop",
                   JLabel "base_case",
                   -- Allocate ground [N] = cons(N, nil) at RH
@@ -506,7 +506,7 @@ matchNoattLoop nilW consW (name, 3) [cBase, cStep]
                   JLoadIx RT1 RCells RT5,
                   JDeref RT1 RT1,
                   JAddImm RT2 RT2 1,
-                  JTickDepth "exhausted",
+                  -- (no depth tick: a last call keeps its caller's continuation depth)
                   JJump "loop",
                   JLabel "success",
                   JReturn jitSuccess,
@@ -572,8 +572,8 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
                   JAddImm RT4 RT3 2,
                   JLoadIx RT0 RCells RT4,
                   JDeref RT0 RT0,
-                  -- Call noatt Q Qs initD: tick depth for noatt entry
-                  JTickDepth "exhausted",
+                  -- Call noatt Q Qs initD (depth + 1; invokeJitKernel guarantees one level of headroom)
+                  -- (no depth tick: a last call keeps its caller's continuation depth)
                   JMov RT2 RT0,
                   JMovImm RT6 (fromIntegral initD),
                   -- Inner loop over Qs' in RT2 with distance D in RT6
@@ -602,11 +602,11 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
                   JLoadIx RT2 RCells RT5,
                   JDeref RT2 RT2,
                   JAddImm RT6 RT6 1,
-                  JTickDepth "exhausted",
+                  -- (no depth tick: a last call keeps its caller's continuation depth)
                   JJump "inner_loop",
                   JLabel "inner_done",
-                  -- Tail call safe Qs: tick depth
-                  JTickDepth "exhausted",
+                  -- Tail call safe Qs
+                  -- (no depth tick: a last call keeps its caller's continuation depth)
                   JJump "outer_loop",
                   JLabel "success",
                   JReturn jitSuccess,
@@ -703,7 +703,7 @@ matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
                   JAddImm RH RH 3,
                   -- Advance RT0 := T, tick resolution depth by RT6, and increment RT6
                   JMov RT0 RT5,
-                  JTickDepthReg RT6 "exhausted",
+                  JTickDepth "exhausted",
                   JAddImm RT6 RT6 1,
                   JJump "loop",
                   JLabel "base_case",
@@ -753,7 +753,12 @@ invokeJitKernel s currentDepth maxDepth kernel = do
         depthRem = maxDepth - currentDepth
     -- Decline when CLP is active, when a small test GC limit (< initialCollectLimit)
     -- is in effect to exercise collector statistics, or when room is insufficient.
-    if clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
+    -- Depth is continuation depth, as in the interpreter ('contDepth'): a
+    -- last call does not deepen it, so kernels tick only for nested
+    -- (non-last) calls. The deepest nested call any kernel makes before
+    -- its first tick is one level (noatt inside safe), so decline when
+    -- there is no headroom at all and let the interpreter decide.
+    if depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
       then pure jitDeclined
       else do
         pokeElemOff statePtr stateCellsIdx cBase
