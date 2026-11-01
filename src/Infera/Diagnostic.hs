@@ -13,6 +13,7 @@ import Infera.Error (showPredKey)
 import Infera.Arith (arithOps, evalArithSafe)
 import Infera.Infer (builtinDet)
 import Infera.Module (loadLocatedFile, loadLocatedWithSources)
+import Infera.Infer (inferProgram)
 import Infera.Program
 import Infera.Purity (clauseViolations, describeViolation)
 import Infera.Syntax
@@ -46,6 +47,8 @@ diagnose :: [LocatedTopLevel] -> [Diagnostic]
 diagnose items = concatMap inspect items
   where
     prog = buildProgram (map locatedItem items)
+    -- Graph facts and determinism, for the tabling hint only.
+    inferred = inferProgram prog
     defined = [predKey p | p <- programPreds prog, not (IM.null (predClauses p))]
     firstClauseSpans = Map.fromListWith (\_ first -> first)
       [(key, locatedSpan item) | item <- items, TLClause cl <- [locatedItem item], Just key <- [clauseKey cl]]
@@ -83,7 +86,7 @@ diagnose items = concatMap inspect items
     effects item cl = case clauseKey cl of
       Just key -> [emit item Error "unsafe-call" (describeViolation prog key g) | g <- clauseViolations prog cl]
       Nothing -> []
-    performance item cl = nonTailHint item cl ++ indexingHint item cl
+    performance item cl = nonTailHint item cl ++ indexingHint item cl ++ counterLoopHint item cl
       ++ labelingHints item (termVars (clauseHead cl)) (clauseBody cl)
     nonTailHint item _ | locatedIsDCG item = []
     nonTailHint item cl = case clauseKey cl of
@@ -101,6 +104,14 @@ diagnose items = concatMap inspect items
           all sameHeadKey (transposeArguments p) ->
             [Diagnostic (fromMaybe (locatedSpan item) (locatedHeadSpan item)) Information "perf-unselective-index"
               "These clauses have the same head key in every argument, so the current argument indexes cannot select between them. Distinct outer constructors or scalar tags can allow earlier clause selection."]
+      _ -> []
+    counterLoopHint item cl = case clauseKey cl >>= (`lookupPred` inferred) of
+      Just p
+        | not (locatedIsDCG item), predCounterLoop p, predIsTabled inferred p,
+          FlagTable `notElem` effectiveFlags inferred p,
+          Map.lookup (predKey p) firstClauseSpans == Just (locatedSpan item) ->
+            [Diagnostic (fromMaybe (locatedSpan item) (locatedHeadSpan item)) Information "perf-tabled-counter-loop"
+              ("This counter-driven loop is tabled by default because its determinism is not inferred det or semidet. Its calls never repeat, so the table cannot answer them but keeps a fixpoint frame alive per iteration; declare `" ++ fst (predKey p) ++ " : notable.` if duplicate answers are acceptable.")]
       _ -> []
     atGoal item goalTerm code message = Diagnostic (goalSpan item goalTerm) Information code message
     labelingHints item headVars goals = go emptyPrefix (concatMap straightConjunction goals)

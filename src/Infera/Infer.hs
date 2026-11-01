@@ -19,7 +19,7 @@ where
 
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
-import Data.List (foldl', nub)
+import Data.List (foldl', nub, partition)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
@@ -116,9 +116,82 @@ markGraphFacts prog =
         p
           { predRecursive = recursive (predKey p),
             predPure = not (Set.member (predKey p) impure),
-            predStructural = structurallyRecursive p
+            predStructural = structurallyRecursive p,
+            predCounterLoop = selfOnly (predKey p) && counterLoop p,
+            predGuardedCounter = selfOnly (predKey p) && counterLoop p && guardExclusive p
           }
+      -- No other predicate on a cycle through this one: mutual recursion
+      -- stays under the general rule.
+      selfOnly k = recursive k && all (\c -> c == k || not (Set.member k (reachable c))) (Map.findWithDefault [] k callees)
    in prog {progPreds = Map.map mark (progPreds prog)}
+
+-- | A counter-driven loop: at least one clause recurses; in every clause the
+-- only self-call (if any) is the last top-level body goal and occurs nowhere
+-- else in the body; and for each such call there is an argument position
+-- where the head has a variable @V@, the call has a variable @V1@, and a
+-- top-level body goal is @V1 is V - c@, @V1 is V + c@ or @V1 is c + V@ with
+-- a positive integer literal @c@. Determinism is checked separately.
+counterLoop :: Pred -> Bool
+counterLoop p = any recurses cls && all ok cls
+  where
+    key = predKey p
+    cls = IM.elems (predClauses p)
+    isSelf g = functorOf g == Just key
+    recurses cl = any isSelf (bodyGoals cl)
+    ok cl
+      | not (recurses cl) = True
+      | otherwise = case reverse (clauseBody cl) of
+          lastGoal@(Compound _ callArgs) : _
+            | isSelf lastGoal,
+              length (filter isSelf (bodyGoals cl)) == 1,
+              Compound _ headArgs <- clauseHead cl ->
+                or (zipWith (stepped (clauseBody cl)) headArgs callArgs)
+          _ -> False
+    stepped body (Var v) (Var w) = any (step v w) body
+    stepped _ _ _ = False
+    step v w g = case g of
+      Compound "is" [Var w', Compound op [Var v', IntLit c]]
+        | w' == w, v' == v, op `elem` ["minus", "plus"], c > 0 -> True
+      Compound "is" [Var w', Compound "plus" [IntLit c, Var v']]
+        | w' == w, v' == v, c > 0 -> True
+      _ -> False
+
+-- | Clause selection on the counter is mutually exclusive: exactly one clause
+-- recurses; at a counter position @i@ of that clause (head variable @V@
+-- stepped into the self-call) every other clause has a distinct integer
+-- literal, and the recursive clause has a top-level guard @V > k@, @V >= k@,
+-- @V < k@ or @V <= k@ that every one of those literals fails. So for an
+-- integer counter at most one clause applies at each step.
+guardExclusive :: Pred -> Bool
+guardExclusive p = case partition recurses (IM.elems (predClauses p)) of
+  ([rc], bases)
+    | Compound _ headArgs <- clauseHead rc,
+      lastGoal@(Compound _ callArgs) : _ <- reverse (clauseBody rc),
+      functorOf lastGoal == Just key ->
+        or [ exclusive rc v (baseLits i bases)
+           | (i, Var v, Var w) <- zip3 [0 :: Int ..] headArgs callArgs, any (isStep v w) (clauseBody rc) ]
+  _ -> False
+  where
+    key = predKey p
+    recurses cl = any (\g -> functorOf g == Just key) (bodyGoals cl)
+    isStep v w g = case g of
+      Compound "is" [Var w', Compound op [Var v', IntLit c]] -> w' == w && v' == v && op `elem` ["minus", "plus"] && c > 0
+      Compound "is" [Var w', Compound "plus" [IntLit c, Var v']] -> w' == w && v' == v && c > 0
+      _ -> False
+    baseLits i bases = mapM (lit i) bases
+    lit i cl = case clauseHead cl of
+      Compound _ hs | i < length hs, IntLit b <- hs !! i -> Just b
+      _ -> Nothing
+    exclusive _ _ Nothing = False
+    exclusive rc v (Just bs) = nub bs == bs && any (guards v bs) (clauseBody rc)
+    guards v bs g = case g of
+      Compound op [Var v', IntLit k] | v' == v -> case op of
+        "gt" -> all (<= k) bs
+        "gte" -> all (< k) bs
+        "lt" -> all (>= k) bs
+        "lte" -> all (> k) bs
+        _ -> False
+      _ -> False
 
 -- | Every direct self-call passes, at some argument position, a variable that
 -- is a proper subterm of the head argument at that position.

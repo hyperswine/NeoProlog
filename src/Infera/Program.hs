@@ -18,6 +18,7 @@ module Infera.Program
     programPreds,
     candidateClauses,
     predIsTabled,
+    predIsDetCounterLoop,
     predIsIndexed,
     predDeclaredKeys,
     effectiveFlags,
@@ -134,7 +135,16 @@ data Pred = Pred
     -- | Whether every direct self-call recurses on a proper subterm of the
     -- corresponding head argument (list walkers, tree walkers).  Such
     -- predicates always terminate and are not tabled by default.
-    predStructural :: Bool
+    predStructural :: Bool,
+    -- | Whether the predicate is a counter-driven loop (see
+    -- 'Infera.Infer.counterLoop'): only direct self-recursion, every
+    -- self-call is the last goal of its clause, and each one passes a
+    -- variable computed by @V1 is V - c@ or @V1 is V + c@ (c > 0) from the
+    -- head variable in the same position. Such calls never repeat a variant.
+    predCounterLoop :: Bool,
+    -- | A counter loop whose clause selection is mutually exclusive on the
+    -- counter (see 'Infera.Infer.guardExclusive').
+    predGuardedCounter :: Bool
   }
   deriving (Show)
 
@@ -150,7 +160,9 @@ newPred k@(_, arity) =
       predInferred = defaultSignature arity,
       predRecursive = False,
       predPure = True,
-      predStructural = False
+      predStructural = False,
+      predCounterLoop = False,
+      predGuardedCounter = False
     }
 
 data Program = Program
@@ -269,9 +281,20 @@ predIsTabled :: Program -> Pred -> Bool
 predIsTabled prog p
   | FlagNoTable `elem` flags = False
   | FlagTable `elem` flags = True
-  | otherwise = progTableDefault prog && predRecursive p && predPure p && not (predStructural p)
+  | otherwise =
+      progTableDefault prog && predRecursive p && predPure p && not (predStructural p)
+        && not (predIsDetCounterLoop p)
   where
     flags = effectiveFlags prog p
+
+-- | A deterministic counter-driven loop: a counter loop whose inferred
+-- determinism is det or semidet, or whose clauses are mutually exclusive on
+-- the counter. Its calls never repeat a variant within a derivation, so a
+-- table could never answer one and would only keep a fixpoint frame alive
+-- per iteration. Not tabled by default (an explicit @table@ still forces it).
+predIsDetCounterLoop :: Pred -> Bool
+predIsDetCounterLoop p =
+  predCounterLoop p && (predGuardedCounter p || sigDet (predInferred p) `elem` [Det, Semidet])
 
 predIsIndexed :: Program -> Pred -> Bool
 predIsIndexed prog p

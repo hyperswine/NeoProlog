@@ -1,5 +1,10 @@
 # The cost of default auto-tabling on iteration predicates (2026-11-01, report)
 
+> **Default behaviour change (implemented after this report, option A):**
+> deterministic counter-driven loops are no longer tabled by default. See
+> [Implemented: option A](#implemented-option-a) for the exact criterion,
+> what stays tabled, and measurements.
+
 Default tabling (`predIsTabled`: recursive, pure, not structurally recursive)
 also tables *iteration* predicates: tail-recursive loops driven by an integer
 counter, such as `bench_nrev K`, `loop N`, `range I N L` or `zebra`'s
@@ -92,5 +97,63 @@ D. **Documentation only.** State that loops driven by counters should be
    `<- notable.`), and add an `infera check` performance hint for tabled
    tail-recursive counter loops.
 
-The recommendation is A, restricted to det/semidet, plus D. B would be a
-later engine improvement.
+The recommendation was A, restricted to deterministic loops, plus D. It is
+now implemented (below). B would be a later engine improvement.
+
+## Implemented: option A
+
+**This changes the default.** A predicate that previously was auto-tabled is
+now untabled when it is a *deterministic counter-driven loop*. An explicit
+`table` flag still forces tabling, and `notable` / `<- notable.` behave as
+before.
+
+### Criterion
+
+A predicate is a deterministic counter-driven loop when all of these hold
+(`Infera.Infer.counterLoop`, `guardExclusive`, `Program.predIsDetCounterLoop`):
+
+1. **Direct self-recursion only.** It reaches itself, and no other predicate
+   it calls can reach it (mutual recursion keeps the general rule).
+2. **Last-call recursion.** At least one clause calls the predicate. In every
+   such clause there is exactly one self-call anywhere in the body, and it is
+   the last top-level body goal (not inside `;`, `->`, `findall`, ...).
+3. **A counter.** For each self-call there is an argument position `i` where
+   the head has a variable `V`, the self-call has a variable `V1`, and a
+   top-level body goal is `V1 is V - c`, `V1 is V + c` or `V1 is c + V`, with
+   `c` a positive integer literal.
+4. **Deterministic.** Either the inferred determinism is `det` or `semidet`,
+   or clause selection is exclusive on the counter: exactly one clause
+   recurses; every other clause has a distinct integer literal at a counter
+   position `i`; and the recursive clause has a top-level guard `V > k`,
+   `V >= k`, `V < k` or `V <= k` that every one of those literals fails.
+
+Examples that are no longer tabled: `bench_nrev K` (`bench/bench.nprolog`
+shape), `loop N` countdowns, zebra's `loop N _ O`, and accumulator counters
+such as `count N A R <- N > 0, A1 is A + 1, N1 is N - 1, count N1 A1 R`.
+
+These stay tabled: `fib` and `tak` (several self-calls, or self-calls that
+are not last), left recursion, mutual recursion, any loop without an
+`is`-stepped counter, and counter loops whose clauses are not exclusive
+(e.g. two `dup 0 a.` facts). The last case keeps its deduplicated answers
+and gets the `perf-tabled-counter-loop` information diagnostic from
+`infera check`, which suggests `notable` if duplicates are acceptable. The
+hint is suppressed when the predicate is explicitly declared `table`.
+
+Semantic note: a table also deduplicates answers. For a loop meeting the
+criterion, each call has at most one applicable clause per step, but body
+goals other than the self-call may still produce duplicate solutions. Those
+are now returned as they are, exactly as with `notable`.
+
+### Measurements (linux-x86_64, GHC 9.8.2 `-O2`, whole process, noisy VM)
+
+| program (default tabling) | before (`perf/tabling-completion-log`) | after, JIT on | after, JIT off |
+| --- | ---: | ---: | ---: |
+| nrev30 x30000 | >60 s (11.7 s at x10000) | 0.37 s | 2.7 s |
+| zebra x300 | 4.15 s | 2.04 s | 2.04 s |
+| fib 27 (memoised) | 0.008 s | 0.008 s | 0.009 s |
+| tak 24 16 8 (memoised) | 0.02 s | 0.018 s | 0.017 s |
+
+All 23 shipped examples give byte-identical output before and after, with
+the JIT on and off (46 runs). `test/autotable.py` covers the criterion:
+not tabled, still tabled, explicit `table`, deduplication, the check hint,
+and timing with the JIT on and off.

@@ -211,7 +211,13 @@ reverses the ordering; this does not change term identity.
 * **Tabling** (linear tabling with fixpoint iteration): calls are memoised by
   variant, left recursion terminates, `fib` is linear.  On by default for
   predicates that are recursive, pure (no output) and not merely structurally
-  recursive (list walkers).  Disable with `notable` / `<- notable.`, force with
+  recursive (list walkers), except *deterministic counter-driven loops*
+  (after 2.2.0; see [the criterion](docs/2026-11-01-AUTO-TABLING-COST.md#criterion)):
+  self-recursive predicates whose only self-call is the last goal and steps
+  a head variable by `V1 is V - c` / `V + c`, and whose clauses are exclusive
+  on that counter or whose inferred determinism is det/semidet.  Their calls
+  never repeat, so a table could not answer them.  `infera check` reports
+  `perf-tabled-counter-loop` for counter loops that are still tabled.  Disable with `notable` / `<- notable.`, force with
   `table`.  A tabled call collects all its answers first, so predicates with
   infinitely many answers must be declared `notable`; otherwise the fixpoint
   stops after a bound and reports "search depth limit reached".  Calls
