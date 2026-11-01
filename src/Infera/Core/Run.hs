@@ -177,7 +177,9 @@ data Fix = Fix
     fxIssues :: !(IORef [SearchItem]),
     fxCont :: Cont,
     -- | a solution bound a constrained variable: evaluate plainly instead
-    fxUnsafe :: !Bool
+    fxUnsafe :: !Bool,
+    -- | length of 'mCompletedLog' when this iteration began
+    fxCompletedMark :: !Int
   }
 
 -- | The choice stack. The marks (heap, trail, output length and scope
@@ -248,7 +250,13 @@ data Machine = Machine
     -- | addresses of watched variables (branch-local)
     mWatched :: !(IORef IS.IntSet),
     mGCWorkspace :: !(IORef (Maybe GCWorkspace)),
-    mSlotStats :: !(Maybe (IORef (Int, Int, Int)))
+    mSlotStats :: !(Maybe (IORef (Int, Int, Int))),
+    -- | Every table completed so far, newest first, with its length. Append
+    -- only and never restored on backtracking: a completed table of a pure
+    -- call is valid in every branch. A fixpoint reads only the entries
+    -- completed since its iteration began (see 'fxCompletedMark'), instead
+    -- of filtering the whole table map on every answer.
+    mCompletedLog :: !(IORef (Int, [(Term, TableEntry)]))
   }
 
 -- | Compile and start a query. Left names the construct that puts the
@@ -302,6 +310,7 @@ startCore measured measureSlots limit program query = do
         <*> newIORef guards <*> newIORef (Map.empty, IM.empty)
         <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
         <*> newIORef Nothing <*> pure measured <*> newIORef IM.empty <*> newIORef IS.empty <*> newIORef Nothing <*> pure slots
+        <*> newIORef (0, [])
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
       writeIORef (mVarCells m) (IM.fromList [(i, i) | i <- [0 .. cpQueryVars core - 1]])
@@ -697,11 +706,15 @@ run' m cont = case cont of
     fx <- readIORef fixRef
     (answer, count) <- canonicalCall m (fst (pKey (fxPred fx))) (fxArgs fx) (pArity (fxPred fx))
     produced <- outputSince m (fxEntryOut fx)
-    tables <- readIORef (mTables m)
+    (logLen, logged) <- readIORef (mCompletedLog m)
     bad <- callConstrained m (fxArgs fx) (pArity (fxPred fx))
+    -- Tables completed since this iteration began; older completed entries
+    -- are already in 'fxTables'. Newest first, so the left-biased union
+    -- keeps the latest entry for a key, as the full map did.
+    let fresh = Map.fromList (reverse (take (logLen - fxCompletedMark fx) logged))
     writeIORef fixRef fx
       { fxFound = (answer, count, produced) : fxFound fx,
-        fxCompleted = Map.union (fxCompleted fx) (Map.filter teComplete tables),
+        fxCompleted = Map.union fresh (fxCompleted fx),
         fxUnsafe = fxUnsafe fx || bad
       }
     backtrack m
@@ -2867,7 +2880,7 @@ callTabled m predicate cont0 = do
               { fxKey = callKey, fxPred = predicate, fxArgs = saved, fxEntryOut = entryOut, fxDepth = depth,
                 fxTables = tables, fxInitialTables = tables, fxDeltaClauses = delta, fxDelta = [],
                 fxAnswers = [], fxSet = Set.empty, fxIteration = 0, fxFound = [],
-                fxCompleted = Map.empty, fxIssues = issues, fxCont = returnCont, fxUnsafe = False }
+                fxCompleted = Map.empty, fxIssues = issues, fxCont = returnCont, fxUnsafe = False, fxCompletedMark = 0 }
             startIteration m fixRef
 
 -- | Does the saved call mention a constrained variable?
@@ -2891,7 +2904,8 @@ startIteration m fixRef = do
       partial = TableEntry False False visible (fxSet fx)
   writeIORef (mTables m) (Map.insert (fxKey fx) partial (fxTables fx))
   issues <- newIORef []
-  writeIORef fixRef fx {fxFound = [], fxCompleted = Map.empty, fxIssues = issues}
+  (mark, _) <- readIORef (mCompletedLog m)
+  writeIORef fixRef fx {fxFound = [], fxCompleted = Map.empty, fxIssues = issues, fxCompletedMark = mark}
   sentinel <- pushChoice m (AltTable fixRef)
   pushScope m (SBuffer issues)
   loadArgs s (fxArgs fx) (pArity (fxPred fx))
@@ -2920,8 +2934,8 @@ finishIteration m fixRef = do
       set' = foldr (\(a, _, _) -> Set.insert a) (fxSet fx) fresh
       deps = nubTerms [k | ConsumedIncomplete k <- issues, k /= fxKey fx]
       others = [i | i@(BranchError _) <- issues] ++ [BranchExhausted | any isExhausted issues]
-      completed = Map.union (Map.filter teComplete (fxTables fx)) (fxCompleted fx)
-      tables' = Map.union completed (Map.delete (fxKey fx) (fxTables fx))
+      -- Complete entries of 'fxTables' are kept by the right operand.
+      tables' = Map.union (fxCompleted fx) (Map.delete (fxKey fx) (fxTables fx))
       converged = null fresh
       gaveUp = fxIteration fx >= maxTableIterations
       deltaIssue = case fxDeltaClauses fx of
@@ -2949,6 +2963,8 @@ finishIteration m fixRef = do
               then Map.insert (fxKey fx) (TableEntry True (not converged) answers' set') tables'
               else tables'
       writeIORef (mTables m) tables''
+      when (null deps) $
+        modifyIORef' (mCompletedLog m) (\(len, xs) -> (len + 1, (fxKey fx, TableEntry True (not converged) answers' set') : xs))
       raiseItems m (map ConsumedIncomplete deps ++ others ++ [BranchExhausted | gaveUp])
         (consumeAnswers m answers' (fxArgs fx) (pArity (fxPred fx)) (fxCont fx))
     else do
