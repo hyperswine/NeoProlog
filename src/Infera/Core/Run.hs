@@ -41,6 +41,8 @@ import qualified Infera.Core.Delta as Delta
 import Infera.Core.Store
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import qualified Data.Sequence as Seq
+import Data.Foldable (toList)
 import Infera.Engine.Reference (Env (..), OutputEvent (..), SearchItem (..), SolverState (..), TableEntry (..), initialState, maxResolutionDepth, maxTableIterations, mkEnv)
 import qualified Infera.Engine.Reference as Reference
 import Infera.Error (PredKey, SolveError (..))
@@ -60,6 +62,12 @@ traceOn = unsafePerformIO (maybe False (const True) <$> lookupEnv "INFERA_CORE_T
 
 traceMsg :: String -> IO ()
 traceMsg msg = when traceOn (hPutStrLn stderr msg)
+
+
+-- | Dynamic facts per predicate, oldest first. A 'Seq' keeps @assert@ an
+-- O(1) snoc; a list appended with @old ++ [new]@ built a left-nested chain
+-- of appends that cost O(n) per fact to force, so n asserts were O(n^2).
+type DynamicDb = Map.Map PredKey (Seq.Seq (Term, Int))
 
 data Step
   = Stop
@@ -101,7 +109,7 @@ data Choice = Choice
     -- | branch-local tables
     chTables :: Map.Map Term TableEntry,
     -- | branch-local dynamic facts
-    chDynamic :: Map.Map PredKey [(Term, Int)],
+    chDynamic :: DynamicDb,
     -- | branch-local constraint store and watched cells
     chStore :: Maybe Mutable.Mark,
     chWatched :: IS.IntSet,
@@ -140,7 +148,7 @@ data Minimum = Minimum
   { mnEntryHeap :: !Int,
     mnEntryTrail :: !Int,
     mnEntryOut :: !Int,
-    mnBest :: Maybe (Integer, [(Int, Copy)], [OutputEvent], Map.Map Term TableEntry, Map.Map PredKey [(Term, Int)], CLP.Store, IS.IntSet)
+    mnBest :: Maybe (Integer, [(Int, Copy)], [OutputEvent], Map.Map Term TableEntry, DynamicDb, CLP.Store, IS.IntSet)
   }
 
 -- | The state of one tabled call's fixpoint, as in the reference engine.
@@ -182,7 +190,7 @@ data Choices = Choices
   { csMarks :: !(IOUArray Int Int),
     csAlts :: !(IOArray Int Alt),
     csTables :: !(IOArray Int (Map.Map Term TableEntry)),
-    csDynamic :: !(IOArray Int (Map.Map PredKey [(Term, Int)])),
+    csDynamic :: !(IOArray Int (DynamicDb)),
     csStore :: !(IOArray Int (Maybe Mutable.Mark)),
     csWatched :: !(IOArray Int IS.IntSet)
   }
@@ -232,7 +240,7 @@ data Machine = Machine
     mGuardKeys :: !(IORef (Map.Map PredKey Int, IM.IntMap PredKey)),
     mOutput :: !(IORef [OutputEvent]),
     mTables :: !(IORef (Map.Map Term TableEntry)),
-    mDynamic :: !(IORef (Map.Map PredKey [(Term, Int)])),
+    mDynamic :: !(IORef (DynamicDb)),
     -- | Lazily initialized mutable propagation state and its empty mark.
     -- Choices contain trail marks; immutable stores exist only at exports.
     mCLP :: !(IORef (Maybe (Mutable.MutableStore, Mutable.Mark))),
@@ -893,7 +901,7 @@ step' m goal goals base barrier depth next = case goal of
     pending <- arithData s
     when (pending > 0) (normalizeArgs m arity)
     saved <- saveArgs s arity
-    facts <- Map.findWithDefault [] key <$> readIORef (mDynamic m)
+    facts <- toList . Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
     consumeAnswers m [(fact, n, []) | (fact, n) <- facts] saved arity (CGoals goals base barrier depth next)
   GMinimize cost inner -> do
     let s = mStore m
@@ -916,7 +924,8 @@ step' m goal goals base barrier depth next = case goal of
             raiseError m (UserError (showPredKey key ++ " is not declared dynamic (add `" ++ name ++ " : dynamic.`)"))
         | otherwise -> do
             let (canon, vs) = canonicalize emptySubst fact
-            modifyIORef' (mDynamic m) (Map.insertWith (flip (++)) key [(canon, length vs)])
+                entry = (canon, length vs)
+            modifyIORef' (mDynamic m) (Map.alter (Just . maybe (Seq.singleton entry) (Seq.|> entry)) key)
             continue
   GRetract pattern -> do
     let s = mStore m
@@ -925,7 +934,7 @@ step' m goal goals base barrier depth next = case goal of
     case S.functorOf shown of
       Nothing -> raiseError m (TypeError "callable fact" shown)
       Just key -> do
-        facts <- Map.findWithDefault [] key <$> readIORef (mDynamic m)
+        facts <- toList . Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
         saved <- reserveCells s 1
         writeCell s saved word
         retractFacts m [(i, fact, n) | (i, (fact, n)) <- zip [0 ..] facts] key saved (CGoals goals base barrier depth next)
@@ -936,9 +945,9 @@ step' m goal goals base barrier depth next = case goal of
       Nothing -> raiseError m (TypeError "callable fact" shown)
       Just key -> do
         fresh <- freshId (mStore m)
-        facts <- Map.findWithDefault [] key <$> readIORef (mDynamic m)
+        facts <- toList . Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
         let keep = [(canon, n) | (canon, n) <- facts, Nothing <- [unifyPlain emptySubst shown (instantiate fresh canon)]]
-        modifyIORef' (mDynamic m) (Map.insert key keep)
+        modifyIORef' (mDynamic m) (Map.insert key (Seq.fromList keep))
         continue
   GCallDyn direct callable extra -> do
     word <- buildArg m base False callable
@@ -2776,7 +2785,7 @@ exportState m = do
         ssOutput = events,
         ssOutLen = count,
         ssTables = tables,
-        ssDynamic = dynamic
+        ssDynamic = Map.map toList dynamic
       }
 
 -- | Export a goal for @call/N@ and the leaf builtins: distinct unbound
@@ -3005,7 +3014,7 @@ retractFacts m facts key saved cont = case facts of
     ok <- unify s target imported
     if ok
       then do
-        modifyIORef' (mDynamic m) (Map.adjust (\fs -> [f | (j, f) <- zip [0 :: Int ..] fs, j /= index]) key)
+        modifyIORef' (mDynamic m) (Map.adjust (Seq.deleteAt index) key)
         run m cont
       else backtrack m
 
