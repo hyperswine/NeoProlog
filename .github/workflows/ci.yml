@@ -113,6 +113,7 @@ jobs:
         working-directory: lsp
       - run: INFERA_BIN="$(cabal list-bin exe:infera --enable-optimization=2)" npm test --prefix lsp
       - run: python3 test/cli.py "$(cabal list-bin exe:infera --enable-optimization=2)"
+      - run: python3 test/autotable.py "$(cabal list-bin exe:infera --enable-optimization=2)"
       - run: python3 test/example_programs.py "$(cabal list-bin exe:infera --enable-optimization=2)" --all-modes
       - name: Check loaded example benchmark witnesses
         shell: bash
