@@ -20,7 +20,7 @@ where
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
 import Control.Monad (zipWithM)
-import Data.List (foldl', nub, partition)
+import Data.List (foldl', nub, partition, sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
@@ -991,6 +991,64 @@ hasCut cl = any isCut (clauseBody cl)
     isCut (Atom "!") = True
     isCut _ = False
 
+-- | Are a predicate's clauses pairwise exclusive, and which argument
+-- positions must be ground for that (the union, in order of first
+-- appearance over the pairs, of each pair's 'exclusive' positions)?
+--
+-- The general case checks every pair, which is quadratic: 2000 facts took
+-- most of a second to load. Fact tables usually take 'atomicSwitch''s
+-- linear path, which gives the same answer.
+pairwiseExclusivity :: [Clause] -> (Bool, [Int])
+pairwiseExclusivity cls
+  | Just r <- atomicSwitch cls = r
+  | otherwise = (ok, sw)
+  where
+    pairs = [(a, b) | (i, a) <- zip [0 :: Int ..] cls, (j, b) <- zip [0 ..] cls, i < j]
+    ok = all (\(a, b) -> hasCut a || isJust (exclusive a b)) pairs
+    sw = if ok then nub (concat (mapMaybe (\(a, b) -> if hasCut a then Just [] else exclusive a b) pairs)) else []
+
+-- | The linear case of 'pairwiseExclusivity': no clause has a cut or a
+-- guard (so 'exclusive' can only use 'distinctPatterns'), and for some
+-- position @p@ every head argument at positions @0 .. p@ is atomic (its
+-- 'indexKey' is not a functor), with pairwise different keys at @p@. Then
+-- every pair is exclusive, and a pair's 'exclusive' result is its first
+-- position with different keys, which is at most @p@. Position @k@ is in
+-- the union when two clauses agree on @0 .. k-1@ and differ at @k@; the
+-- union is ordered by each position's first pair in (i, j) order.
+atomicSwitch :: [Clause] -> Maybe (Bool, [Int])
+atomicSwitch cls
+  | length cls < 2 = Nothing
+  | any hasCut cls || any (not . null . guardsOf) cls = Nothing
+  | otherwise = do
+      rows <- mapM headKeys cls
+      let width = minimum (map length rows)
+          atomicUpTo = length (takeWhile (\k -> all (atomicAt k) rows) [0 .. width - 1])
+          distinctAt k = let ks = map (!! k) rows in Set.size (Set.fromList ks) == length ks
+      p <- case filter distinctAt [0 .. atomicUpTo - 1] of
+        (p : _) -> Just p
+        [] -> Nothing
+      let indexed = zip [0 :: Int ..] rows
+          firstPair k =
+            -- groups agreeing on 0 .. k-1, in clause order
+            let groups = Map.elems (Map.fromListWith (flip (++)) [(take k r, [(i, r !! k)]) | (i, r) <- indexed])
+                candidates = concatMap pairIn groups
+             in if null candidates then Nothing else Just (minimum candidates)
+          -- the (i, j)-least pair in a group with different keys
+          pairIn grp = case grp of
+            ((i, ki) : rest) -> case [j | (j, kj) <- rest, kj /= ki] of
+              (j : _) -> [(i, j)]
+              [] -> pairIn rest
+            [] -> []
+          found = [(fp, k) | k <- [0 .. p], Just fp <- [firstPair k]]
+      pure (True, map snd (sortOn fst found))
+  where
+    headKeys (Clause (Compound _ as) _ _) = Just (map indexKey as)
+    headKeys _ = Nothing
+    atomicAt k r = case r !! k of
+      Just (IKFun _ _) -> False
+      Just _ -> True
+      Nothing -> False
+
 inferDets :: Program -> ModeEnv -> ModeEnv -> ModeEnv -> DetEnv
 inferDets prog ins outs deps = go env0
   where
@@ -1007,16 +1065,15 @@ inferDets prog ins outs deps = go env0
     env0 = Map.fromList [(predKey p, initial p) | p <- preds]
     initial p = case declared p of
       Just d -> (d, [])
-      Nothing -> (Semidet, switchOf p)
-    -- Positions required ground for pairwise exclusivity (union over pairs).
-    switchOf p =
-      let cls = IM.elems (predClauses p)
-          pairs = [(a, b) | (i, a) <- zip [0 :: Int ..] cls, (j, b) <- zip [0 ..] cls, i < j]
-       in nub (concat (mapMaybe (\(a, b) -> if hasCut a then Just [] else exclusive a b) pairs))
-    pairwiseOK p =
-      let cls = IM.elems (predClauses p)
-          pairs = [(a, b) | (i, a) <- zip [0 :: Int ..] cls, (j, b) <- zip [0 ..] cls, i < j]
-       in all (\(a, b) -> hasCut a || isJust (exclusive a b)) pairs
+      Nothing -> case pairwise p of
+        (True, sw) -> (Semidet, sw)
+        (False, _) -> (Nondet, [])
+    -- Pairwise exclusivity depends only on the clauses, so it is computed
+    -- once per predicate, not on every fixpoint round. A predicate that
+    -- starts Nondet stays Nondet, exactly as 'step' would make it.
+    pairInfo = Map.fromList [(predKey p, pairwiseExclusivity (IM.elems (predClauses p))) | p <- preds]
+    pairwise p = Map.findWithDefault (False, []) (predKey p) pairInfo
+    pairwiseOK p = fst (pairwise p)
 
     go env =
       let env' = Map.fromList [(predKey p, step env p) | p <- preds]

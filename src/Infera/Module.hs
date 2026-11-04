@@ -261,8 +261,10 @@ loadLocatedWithSources sources path = do
 expandLocatedItems :: ([String] -> FilePath -> IO (Either (SourceSpan, String) [LocatedTopLevel]))
   -> ModuleConf -> [String] -> [LocatedTopLevel]
   -> IO (Either (SourceSpan, String) [LocatedTopLevel])
-expandLocatedItems readItems conf visited = foldM step (Right [])
+expandLocatedItems readItems conf visited items0 = fmap reverse <$> foldM step (Right []) items0
   where
+    -- The accumulator is reversed: appending each item to the end was
+    -- quadratic in the number of clauses.
     step (Left err) _ = pure (Left err)
     step (Right acc) item = case locatedItem item of
       TLDirective [Compound "import" [StrLit ref]] ->
@@ -279,12 +281,12 @@ expandLocatedItems readItems conf visited = foldM step (Right [])
                     imported <- nested
                     let own = [i | i <- imported, case locatedItem i of TLQuery _ -> False; _ -> True]
                         known = definedNames (map locatedItem own)
-                    pure (acc ++ [i
+                    pure (reverse [i
                       { locatedItem = qualifyItem name known (locatedItem i),
                         locatedGoalSpans = [(qualifyTerm name known term, loc)
                           | (term, loc) <- locatedGoalSpans i]
-                      } | i <- own])
+                      } | i <- own] ++ acc)
       TLDirective goals
         | Nothing <- addDirective goals emptyProgram ->
             pure (Left (locatedSpan item, "Unknown directive: " ++ show goals))
-      _ -> pure (Right (acc ++ [item]))
+      _ -> pure (Right (item : acc))

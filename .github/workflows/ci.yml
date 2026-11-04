@@ -118,6 +118,7 @@ jobs:
       - run: python3 test/autotable.py "$(cabal list-bin exe:infera --enable-optimization=2)"
       - run: python3 test/det_guards.py "$(cabal list-bin exe:infera --enable-optimization=2)"
       - run: python3 test/ite_parity.py "$(cabal list-bin exe:infera --enable-optimization=2)"
+      - run: python3 test/index_semantics.py "$(cabal list-bin exe:infera --enable-optimization=2)"
       - run: python3 test/unify_scaling.py "$(cabal list-bin exe:infera --enable-optimization=2)"
       - run: python3 test/example_programs.py "$(cabal list-bin exe:infera --enable-optimization=2)" --all-modes
       - name: Check loaded example benchmark witnesses
