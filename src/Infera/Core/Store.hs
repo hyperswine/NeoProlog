@@ -964,21 +964,43 @@ isGroundWord s w0 = do
           if ok then args (i + 1) (n - 1) else pure False
 
 -- | Does the unbound cell @addr@ occur in @w@?
+--
+-- A structure the walk finds free of @addr@ and of every unbound cell gets
+-- the ground mark, as in 'isGroundWord', so the next check over the same
+-- subterm stops at its functor. Without it, building a term around an
+-- existing one (a tree insert, an accumulator) re-walked the old term on
+-- every binding and made such loops quadratic.
 occursIn :: Store -> Int -> Word' -> IO Bool
-occursIn s addr w0 = do
+occursIn s addr w0 = (== OccHit) <$> occursWalk s addr w0
+
+data Occ = OccHit | OccGround | OccOpen
+  deriving (Eq)
+
+occursWalk :: Store -> Int -> Word' -> IO Occ
+occursWalk s addr w0 = do
   w <- deref s w0
   case tagOf w of
-    t | t == tagRef -> pure (valOf w == addr)
+    t | t == tagRef -> pure (if valOf w == addr then OccHit else OccOpen)
       | t == tagStr -> do
           f <- readCell s (valOf w)
-          if funGround f then pure False else args (valOf w + 1) (funArity f)
-      | otherwise -> pure False
+          if funGround f
+            then pure OccGround
+            else do
+              r <- args (valOf w + 1) (funArity f) True
+              when (r == OccGround) $ do
+                writeCell s (valOf w) (f .|. groundBit)
+                trailValueIf s (valOf w) f
+              pure r
+      | otherwise -> pure OccGround
   where
-    args !i !n
-      | n == 0 = pure False
+    args !i !n !allGround
+      | n == 0 = pure (if allGround then OccGround else OccOpen)
       | otherwise = do
-          hit <- occursIn s addr =<< readCell s i
-          if hit then pure True else args (i + 1) (n - 1)
+          r <- occursWalk s addr =<< readCell s i
+          case r of
+            OccHit -> pure OccHit
+            OccGround -> args (i + 1) (n - 1) allGround
+            OccOpen -> args (i + 1) (n - 1) False
 
 -- | Build a term on the heap. Variables map through the supplied cell table;
 -- unknown variables get fresh cells and extend the table.
