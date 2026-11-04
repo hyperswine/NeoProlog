@@ -143,6 +143,14 @@ strings `str_concat str_length str_chars str_atom str_num str_upper str_lower`.
 Ground arithmetic inside call arguments is evaluated before head matching, so
 `fact (N - 1) R` calls `fact 4 R`, and arithmetic in answers is evaluated.
 
+The evaluated functors are `plus minus mul div mod ^ neg abs min max`; the
+operators `+ - * / % ^` are the same functors as `plus minus mul div mod ^`, so
+`plus 1 0` is evaluated like `1 + 0`. This also applies to a structure passed
+through a variable, although unification and `==` do not evaluate. Symbolic
+programs should use other constructor names (for example `add`/`sub`); `infera
+check` warns (`arith-functor-as-data`) when a clause head matches on one of
+these functors.
+
 ## Declarations
 
 ```prolog
