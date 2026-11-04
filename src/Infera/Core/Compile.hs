@@ -558,21 +558,24 @@ nestedPaths depth pattern
 -- literal (@X is I % P, X != 0@). Expressions use the plan operators, so
 -- 'guardHolds' computes exactly what the interpreter would.
 leadingIntGuard :: Clause -> Maybe IntGuard
-leadingIntGuard clause = case clBody clause of
-  GCmp op a b _ _ : _ -> IntGuard (relOf op) <$> value a <*> value b
-  GIs (PWord w) e _ : _ | tagOf w == tagInt -> IntGuard RelEq <$> value e <*> pure (GuardInt (valOf w))
-  GIs (PSlot v) e _ : rest
-    | Just target <- slotValue v -> IntGuard RelEq target <$> value e
-    | otherwise -> case rest of
-        GNeq (PSlot v') (PWord w) : _ | v' == v, tagOf w == tagInt -> against RelNe e w
-        GNeq (PWord w) (PSlot v') : _ | v' == v, tagOf w == tagInt -> against RelNe e w
-        GEquiv (PSlot v') (PWord w) : _ | v' == v, tagOf w == tagInt -> against RelEq e w
-        GEquiv (PWord w) (PSlot v') : _ | v' == v, tagOf w == tagInt -> against RelEq e w
-        GCmp op (EPat (PSlot v')) (EImm k) _ _ : _ | v' == v -> IntGuard (relOf op) <$> value e <*> pure (GuardInt k)
-        GCmp op (EImm k) (EPat (PSlot v')) _ _ : _ | v' == v -> IntGuard (relOf op) (GuardInt k) <$> value e
-        _ -> Nothing
-  _ -> Nothing
+leadingIntGuard clause = case bodyGuard of
+  Nothing -> repeatedHeadGuard clause
+  found -> found
   where
+    bodyGuard = case clBody clause of
+      GCmp op a b _ _ : _ -> IntGuard (relOf op) <$> value a <*> value b
+      GIs (PWord w) e _ : _ | tagOf w == tagInt -> IntGuard RelEq <$> value e <*> pure (GuardInt (valOf w))
+      GIs (PSlot v) e _ : rest
+        | Just target <- slotValue v -> IntGuard RelEq target <$> value e
+        | otherwise -> case rest of
+            GNeq (PSlot v') (PWord w) : _ | v' == v, tagOf w == tagInt -> against RelNe e w
+            GNeq (PWord w) (PSlot v') : _ | v' == v, tagOf w == tagInt -> against RelNe e w
+            GEquiv (PSlot v') (PWord w) : _ | v' == v, tagOf w == tagInt -> against RelEq e w
+            GEquiv (PWord w) (PSlot v') : _ | v' == v, tagOf w == tagInt -> against RelEq e w
+            GCmp op (EPat (PSlot v')) (EImm k) _ _ : _ | v' == v -> IntGuard (relOf op) <$> value e <*> pure (GuardInt k)
+            GCmp op (EImm k) (EPat (PSlot v')) _ _ : _ | v' == v -> IntGuard (relOf op) (GuardInt k) <$> value e
+            _ -> Nothing
+      _ -> Nothing
     against rel e w = IntGuard rel <$> value e <*> pure (GuardInt (valOf w))
     relOf op = case op of
       CmpGt -> RelGt
@@ -594,6 +597,27 @@ leadingIntGuard clause = case clBody clause of
       PFirst v -> [(v, path)]
       PStruct _ children -> concat [slotPaths (path ++ [i]) child | (i, child) <- zip [0 ..] children]
       PArith _ _ children -> concat [slotPaths (path ++ [i]) child | (i, child) <- zip [0 ..] children]
+      PWord _ -> []
+
+-- | A clause with no leading test whose head repeats a variable, as in
+-- @look K (t K V _ _) V@, can still be skipped at selection: the two
+-- occurrences must be identical, and two immediate integers are identical
+-- exactly when they are equal. Any other value misses the plan and keeps
+-- the clause. A path whose structure has a different functor reads a cell
+-- the head would not match anyway.
+repeatedHeadGuard :: Clause -> Maybe IntGuard
+repeatedHeadGuard clause = case repeated of
+  ((i, p) : (j, q) : _) : _ -> Just (IntGuard RelEq (GuardArg i p) (GuardArg j q))
+  _ -> Nothing
+  where
+    occurrences = IM.fromListWith (flip (++))
+      [(v, [(i, path)]) | (i, pattern) <- zip [0 ..] (clHead clause), (v, path) <- slots [] pattern, length path <= 3]
+    repeated = filter ((> 1) . length) (IM.elems occurrences)
+    slots path pattern = case pattern of
+      PSlot v -> [(v, path)]
+      PFirst v -> [(v, path)]
+      PStruct _ children -> concat [slots (path ++ [k]) child | (k, child) <- zip [0 ..] children]
+      PArith _ _ children -> concat [slots (path ++ [k]) child | (k, child) <- zip [0 ..] children]
       PWord _ -> []
 
 immediateKey :: Key -> Maybe Int

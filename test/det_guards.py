@@ -29,6 +29,10 @@ range N N [N].
 range I N [I | T] <- I < N, I1 is I + 1, range I1 N T.
 build [] T T.
 build [K - V | Ps] T0 T <- ins K V T0 T1, build Ps T1 T.
+same X X a.
+same _ _ b.
+deep (p X) (q (r X)) one.
+deep _ _ two.
 """
 
 QUERIES = [
@@ -39,6 +43,17 @@ QUERIES = [
     ("findall T (ins K x (t 2 y t t) T) L", None),  # unbound key: same as before (error)
     ("findall L (range 1 3 L) Ls", "Ls = [[1, 2, 3]]"),
     ("findall L (range 3 3 L) Ls", "Ls = [[3]]"),
+    # selection skips a repeated-variable clause only for unequal integers
+    ("findall R (same 1 1 R) L", "L = [a, b]"),
+    ("findall R (same 1 2 R) L", "L = [b]"),
+    ("findall R (same 1 1.0 R) L", "L = [b]"),
+    ("findall R (same a a R) L", "L = [a, b]"),
+    ("findall R (same (f 1) (f 1) R) L", "L = [a, b]"),
+    ("findall R (same X 3 R) L", "L = [a, b]"),
+    ("findall R (deep (p 1) (q (r 1)) R) L", "L = [one, two]"),
+    ("findall R (deep (p 1) (q (r 2)) R) L", "L = [two]"),
+    ("findall R (deep (p 1) (q s) R) L", "L = [two]"),
+    ("build [3 - a, 1 - b, 5 - c] t T, findall V (look 5 T V) L, findall V (look 2 T V) M", "T = t 3 a (t 1 b t t) (t 5 c t t), L = [c], M = []"),
 ]
 
 SIGS = {"ins": "semidet", "look": "nondet", "range": "nondet"}
