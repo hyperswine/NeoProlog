@@ -6,6 +6,7 @@
 -- identical. Structural generators retain Hedgehog's ordinary shrinking.
 module InferenceTest (inferenceGroup) where
 
+import Data.List (sort)
 import qualified Data.Map.Strict as Map
 import Hedgehog hiding (Var)
 import qualified Hedgehog.Gen as Gen
@@ -226,6 +227,43 @@ prop_positive_optimizations = unit $ do
   expectAnswers result ["R = [a, b, c]"]
   open <- equivalent program "flag N R?"
   expectAnswers open ["N = 0, R = zero", "R = nonzero, N != 0"]
+
+-- Leading `is` goals and comparisons over the same expression exclude
+-- clauses from each other: a list sieve's keep/drop clauses, residue
+-- classes against different literals, and a float literal that an integer
+-- result is not identical to.
+prop_arithmetic_guards :: Property
+prop_arithmetic_guards = unit $ do
+  program <- load $ unlines
+    [ "remove _ [] [].",
+      "remove P [I | Is] Nis <- 0 is I % P, remove P Is Nis.",
+      "remove P [I | Is] [I | Nis] <- X is I % P, X != 0, remove P Is Nis.",
+      "residue N zero <- 0 is N % 3.",
+      "residue N one <- X is N % 3, X == 1.",
+      "residue N big <- X is N % 3, X > 1.",
+      "float_guard N int <- 0 is N * 1.",
+      "float_guard N other <- X is N * 1, X != 0.0."
+    ]
+  remove <- signature program ("remove", 3)
+  sigDet remove === Semidet
+  sort (sigSwitch remove) === [0, 1]
+  filtered <- equivalent program "remove 2 [1, 2, 3, 4, 5] R?"
+  expectAnswers filtered ["R = [1, 3, 5]"]
+  residue <- signature program ("residue", 2)
+  sigDet residue === Semidet
+  sigSwitch residue === [0]
+  big <- equivalent program "residue 5 R?"
+  expectAnswers big ["R = big"]
+  one <- equivalent program "residue 4 R?"
+  expectAnswers one ["R = one"]
+  -- The guards do not exclude each other (integer 0 is not identical to
+  -- 0.0), so only the distinct result atoms make the predicate semidet:
+  -- when the result is given, not when it is asked for.
+  floatGuard <- signature program ("float_guard", 2)
+  sigDet floatGuard === Semidet
+  sigSwitch floatGuard === [1]
+  both <- equivalent program "float_guard 0 R?"
+  expectAnswers both ["R = int", "R = other"]
 
 -- Literal kinds remain explicit so a mixed integer/float case shrinks to a
 -- small cross-sort counterexample instead of disappearing into arbitrary text.
@@ -466,6 +504,7 @@ inferenceGroup = Group "Inferred pruning preserves execution"
     ("generated numeric ordering reflexivity and operand reversal", prop_numeric_order_laws),
     ("constraint does not bind arithmetic input regression", prop_arithmetic_input_regression),
     ("positive conditional semidet optimizations remain", prop_positive_optimizations),
+    ("arithmetic guard prefixes exclude clauses", prop_arithmetic_guards),
     ("generated literal guards vs unpruned execution", prop_generated_literal_guards),
     ("generated aliased nested head paths vs unpruned execution", prop_generated_head_paths),
     ("generated declared alternatives vs unpruned execution", prop_generated_declared_modes),

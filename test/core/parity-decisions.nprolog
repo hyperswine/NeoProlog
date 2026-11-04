@@ -24,6 +24,15 @@ fresh N X <- N >= 0, write X.
 late_error : nondet (any) (any).
 late_error N X <- N < 0, X is bad.
 late_error N ok <- N >= 0.
+# Arithmetic guard prefixes: inferred exclusive, so the Core commits after
+# the first answer; the reference must see the same answers and errors.
+sieve_drop _ [] [].
+sieve_drop P [I | Is] Nis <- 0 is I % P, sieve_drop P Is Nis.
+sieve_drop P [I | Is] [I | Nis] <- X is I % P, X != 0, sieve_drop P Is Nis.
+residue N zero <- 0 is N % 3.
+residue N one <- X is N % 3, X == 1.
+residue N big <- X is N % 3, X > 1.
+
 > choose -3 R?
 > choose 0 R?
 > choose 5 R?
@@ -52,3 +61,14 @@ late_error N ok <- N >= 0.
 > N in -2 .. 2, deep_guard (box (tag N)) R, label [N]?
 > N in 0 .. 1, shape (box (tag a)) right N?
 > (shape (box (tag a)) right R, fail ; shape (box (tag b)) right S)?
+> sieve_drop 2 [1, 2, 3, 4, 5, 6] R?
+> sieve_drop 2 [1, X, 3] R?
+> sieve_drop P [2, 4] R?
+> sieve_drop 2 [1, a, 3] R?
+> sieve_drop 2 [1, 2.0, 3] R?
+> residue 5 R?
+> residue 4 R?
+> residue 3 R?
+> residue N R?
+> residue 4.5 R?
+> residue a R?

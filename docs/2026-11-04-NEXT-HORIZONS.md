@@ -93,6 +93,7 @@ Status as merged (corrected 4 November 2026, see [Corrections](#corrections-afte
 
 Found by review and fixed the same day:
 
+- **Horizon 2 pruning was removed later the same day** ([`2026-11-04-UNIFICATION-HEAVY.md`](2026-11-04-UNIFICATION-HEAVY.md)): re-walking head patterns on every call cost more than the choice points it saved, on queens included (zebra -21%, deriv -16%, primes -11%, queens -5% without it). The table above records what it did while it was in.
 - **Horizon 2 pruning** rejected clauses that could match: it rebuilt a functor word from what was already a functor word, compared boxed constants by address, and dropped a recursive clause on an atom tail without checking that the clause recurses on that tail. It now rejects only clauses that provably cannot match ([`test/core/parity-basic.nprolog`](../test/core/parity-basic.nprolog) and the rest of the parity corpus cover it).
 - **Horizon 3B frame reclamation** fired after the last goal of an if-then-else branch, a disjunct or a cut arm, where the clause still continues in the same activation, so later goals read overwritten slots. It now also requires that no continuation can resume the frame (`frameDead`, shared with tail-frame reuse). [`test/core/parity-reclaim.nprolog`](../test/core/parity-reclaim.nprolog) covers it.
 - **Fused `safe/1` and `nrev/2` kernels** assumed the meaning of helpers named `noatt/3` and `app/3`. They are fused only when the program defines the helper with exactly the expected deterministic clauses, under any name.

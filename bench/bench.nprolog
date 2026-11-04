@@ -23,3 +23,54 @@ safe [].
 safe [Q | Qs] <- noatt Q Qs 1, safe Qs.
 noatt _ [] _.
 noatt Q [Q1 | Qs] D <- Q != Q1, D1 is Q1 - Q, D1 != D, D2 is Q - Q1, D2 != D, D3 is D + 1, noatt Q Qs D3.
+
+# Unification-heavy workloads (2026-11-04): structure matching and
+# backtracking with no arithmetic loop for the JIT to take.
+right_of X Y [Y, X | _].
+right_of X Y [_ | T] <- right_of X Y T.
+next_to X Y L <- right_of X Y L.
+next_to X Y L <- right_of Y X L.
+mem X [X | _].
+mem X [_ | T] <- mem X T.
+zebra Owner <-
+  Hs = [h _ norwegian _ _ _, _, h _ _ _ milk _, _, _],
+  mem (h red english _ _ _) Hs,
+  mem (h _ spanish dog _ _) Hs,
+  mem (h green _ _ coffee _) Hs,
+  mem (h _ ukrainian _ tea _) Hs,
+  right_of (h green _ _ _ _) (h ivory _ _ _ _) Hs,
+  mem (h _ _ snails _ winstons) Hs,
+  mem (h yellow _ _ _ kools) Hs,
+  next_to (h _ _ _ _ chesterfields) (h _ _ fox _ _) Hs,
+  next_to (h _ _ _ _ kools) (h _ _ horse _ _) Hs,
+  mem (h _ _ _ orange_juice lucky_strikes) Hs,
+  mem (h _ japanese _ _ parliaments) Hs,
+  next_to (h _ norwegian _ _ _) (h blue _ _ _ _) Hs,
+  mem (h _ Owner zebra _ _) Hs.
+bench_zebra 0 O <- zebra O.
+bench_zebra K O <- K > 0, once (zebra _), K1 is K - 1, bench_zebra K1 O.
+d (add U V) X (add DU DV) <- d U X DU, d V X DV.
+d (sub U V) X (sub DU DV) <- d U X DU, d V X DV.
+d (times U V) X (add (times DU V) (times U DV)) <- d U X DU, d V X DV.
+d (quo U V) X (quo (sub (times DU V) (times U DV)) (pw V 2)) <- d U X DU, d V X DV.
+d (pw U N) X (times DU (times N (pw U N1))) <- is_int N, N1 is N - 1, d U X DU.
+d (neg U) X (neg DU) <- d U X DU.
+d (ex U) X (times (ex U) DU) <- d U X DU.
+d (ln U) X (times DU (quo 1 U)) <- d U X DU.
+d X X 1.
+d C X 0 <- ground C, not (C == X).
+expr1 E <- E = add (add (pw x 3) (times 4 (pw x 2))) (sub (times 7 x) 9).
+expr2 E <- E = quo (times (ex x) (ln (add x 1))) (add (pw x 2) 1).
+expr3 E <- E = times (times (times (times (times (times (times (times (times x x) x) x) x) x) x) x) x) x.
+expr4 E <- E = quo (quo (quo (quo (quo (quo (quo (quo (quo x x) x) x) x) x) x) x) x) x.
+deriv_all <- expr1 A, d A x _, expr2 B, d B x _, expr3 C, d C x _, expr4 D, d D x _.
+bench_deriv 0.
+bench_deriv K <- K > 0, once deriv_all, K1 is K - 1, bench_deriv K1.
+remove _ [] [].
+remove P [I | Is] Nis <- 0 is I % P, remove P Is Nis.
+remove P [I | Is] [I | Nis] <- X is I % P, X != 0, remove P Is Nis.
+sieve [] [].
+sieve [P | Xs] [P | Ys] <- remove P Xs Zs, sieve Zs Ys.
+len [] 0.
+len [_ | T] N <- len T M, N is M + 1.
+primes N K <- range 2 N L, sieve L Ps, len Ps K.

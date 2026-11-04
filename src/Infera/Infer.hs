@@ -19,13 +19,14 @@ where
 
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
+import Control.Monad (zipWithM)
 import Data.List (foldl', nub, partition)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Infera.Arith (compareNumeric, evalNumeric)
+import Infera.Arith (arithOps, compareNumeric, evalNumeric)
 import Infera.Program
 import Infera.Syntax
 
@@ -702,26 +703,48 @@ flipO OGT = OLT
 flipO OEQ = OEQ
 
 -- A guard operand: a head variable, identified by every path at which it
--- occurs in the head, or a literal.
-data GuardOperand = VarPaths [[Int]] | Lit Term deriving (Eq, Show)
+-- occurs in the head, a literal, or an arithmetic expression over operands.
+data GuardOperand = VarPaths [[Int]] | Lit Term | Expr String [GuardOperand] deriving (Eq, Show)
 
 data GuardKind = TermIdentity | ValueOrdering deriving (Eq)
 
--- | The first body goal when it is a comparison between head variables and
--- literals. Term identity and value ordering have different equivalence
--- classes: in particular, integer 1 and float 1.0 are distinct terms.
-guardOf :: Clause -> Maybe (GuardOperand, GuardOperand, Set Ordering', GuardKind)
-guardOf cl = case clauseBody cl of
-  (Compound op [a, b] : _)
-    | Just rels <- relOf op -> do
-        x <- operand a
-        y <- operand b
-        pure (x, y, rels, if op `elem` ["neq", "equiv"] then TermIdentity else ValueOrdering)
-  _ -> Nothing
+type Guard = (GuardOperand, GuardOperand, Set Ordering', GuardKind)
+
+-- | The constraints a clause's leading arithmetic goals place on its head
+-- variables: comparisons between head variables, literals and expressions,
+-- and @is@ goals whose left side is a literal or a head variable. An @is@
+-- into a fresh body variable defines that variable as its expression for
+-- the goals that follow. The prefix ends at the first other goal.
+--
+-- Term identity and value ordering have different equivalence classes
+-- (integer 1 and float 1.0 are distinct terms, and @is@ unifies its result
+-- by identity: @0 is 0.0@ fails), but a term identical to a literal has
+-- that literal's value, so an identity equality is also a value equality.
+guardsOf :: Clause -> [Guard]
+guardsOf cl = go Map.empty (clauseBody cl)
   where
     paths = headPaths cl
-    operand t = case t of
-      Var v -> VarPaths <$> Map.lookup v paths
+    go defs goals = case goals of
+      Compound "is" [lhs, rhs] : rest
+        | Just e <- operand defs rhs -> case lhs of
+            Var v
+              | Map.notMember v paths, Map.notMember v defs -> go (Map.insert v e defs) rest
+            _ | Just l <- operand defs lhs -> equality l e ++ go defs rest
+            _ -> []
+      Compound op [a, b] : rest
+        | Just rels <- relOf op,
+          Just x <- operand defs a,
+          Just y <- operand defs b ->
+            if op `elem` ["neq", "equiv"]
+              then (x, y, rels, TermIdentity) : [g | rels == Set.singleton OEQ, g <- equality x y] ++ go defs rest
+              else (x, y, rels, ValueOrdering) : go defs rest
+      _ -> []
+    equality x y = [(x, y, Set.singleton OEQ, TermIdentity), (x, y, Set.singleton OEQ, ValueOrdering)]
+    operand defs t = case t of
+      Var v -> case Map.lookup v defs of
+        Just e -> Just e
+        Nothing -> VarPaths <$> Map.lookup v paths
+      Compound op xs | op `elem` arithOps -> Expr op <$> mapM (operand defs) xs
       _ | isLit t -> Just (Lit t)
       _ -> Nothing
     isLit t = case t of
@@ -746,13 +769,17 @@ guardOf cl = case clauseBody cl of
 -- * the same literal: always;
 -- * variables sharing a head path: only when the argument containing that
 --   path is ground. Aliases among query arguments can otherwise let the two
---   clause heads bind the same variable to different values before the guard.
+--   clause heads bind the same variable to different values before the guard;
+-- * the same operation over compatible operands: when every operand's
+--   requirement holds (arithmetic is a function of its ground inputs).
 compatibleOperands :: GuardOperand -> GuardOperand -> Maybe [Int]
 compatibleOperands (Lit a) (Lit b) = if a == b then Just [] else Nothing
 compatibleOperands (VarPaths p) (VarPaths q) =
     case [i | path@(i : _) <- p, path `elem` q] of
       (i : _) -> Just [i]
       [] -> Nothing
+compatibleOperands (Expr f xs) (Expr g ys)
+  | f == g && length xs == length ys = nub . concat <$> zipWithM compatibleOperands xs ys
 compatibleOperands _ _ = Nothing
 
 -- | Does a ground call argument distinguish the two head patterns?  True when
@@ -777,28 +804,27 @@ exclusive c1 c2 = case options of
     options =
       [[i] | i <- switchPositions]
         ++ guardOption
-        ++ maybe [] pure (literalVsGuard c1 c2)
-        ++ maybe [] pure (literalVsGuard c2 c1)
-    guardOption = case (guardOf c1, guardOf c2) of
-      (Just (x1, y1, r1, kind1), Just (x2, y2, r2, kind2)) | kind1 == kind2 ->
-        let option rx ry disjoint = do
-              px <- rx
-              py <- ry
-              if disjoint then Just (nub (px ++ py)) else Nothing
-            same = option (compatibleOperands x1 x2) (compatibleOperands y1 y2) (Set.null (Set.intersection r1 r2))
-            swapped = option (compatibleOperands x1 y2) (compatibleOperands y1 x2) (Set.null (Set.intersection r1 (Set.map flipO r2)))
-         in maybe [] pure same ++ maybe [] pure swapped
-      _ -> []
+        ++ literalVsGuard c1 c2
+        ++ literalVsGuard c2 c1
+    -- Any guard of one clause against any guard of the other, in every
+    -- orientation: both hold when their clauses succeed, so one
+    -- contradiction excludes the pair.
+    guardOption =
+      [ o
+        | g1 <- guardsOf c1,
+          g2 <- guardsOf c2,
+          a <- [g1, swapGuard g1],
+          b <- [g2, swapGuard g2],
+          o <- maybe [] pure (contradiction a b)
+      ]
     args (Clause (Compound _ as) _ _) = as
     args _ = []
     switchPositions =
       [i | (i, (a, b)) <- zip [0 ..] (zip (args c1) (args c2)), distinctPatterns 3 a b]
     -- c1 has a literal where c2 has a variable (occurring only there) guarded
     -- by a comparison against a literal that excludes c1's.
-    literalVsGuard lit gd = case guardOf gd of
-      Just (x, y, rels, kind)
-        | Just i <- excluded kind x y rels -> Just [i]
-      _ -> Nothing
+    literalVsGuard lit gd =
+      [[i] | (x, y, rels, kind) <- guardsOf gd, Just i <- [excluded kind x y rels]]
       where
         excluded kind (VarPaths [p]) (Lit l) rels = check kind p l rels
         excluded kind (Lit l) (VarPaths [p]) rels = check kind p l (Set.map flipO rels)
@@ -809,20 +835,56 @@ exclusive c1 c2 = case options of
             not (o `Set.member` rels) =
               Just i
         check _ _ _ _ = Nothing
-        -- ordering of the head literal relative to the guard literal
-        compareLits TermIdentity a b
-          | null (termVarIds a) = Just (if a == b then OEQ else OLT)
-          | otherwise = Nothing
-        compareLits ValueOrdering a b = case (a, b) of
-          (Atom p, Atom q) -> Just (ordOf (compare p q))
-          (StrLit p, StrLit q) -> Just (ordOf (compare p q))
-          (CharLit p, CharLit q) -> Just (ordOf (compare p q))
-          _ -> case (evalNumeric IM.empty a, evalNumeric IM.empty b) of
-            (Right (Just p), Right (Just q)) -> Just (ordOf (compareNumeric p q))
-            _ -> Nothing
-        ordOf LT = OLT
-        ordOf EQ = OEQ
-        ordOf GT = OGT
+
+swapGuard :: Guard -> Guard
+swapGuard (x, y, rels, kind) = (y, x, Set.map flipO rels, kind)
+
+-- | Can the two guards not hold together? Their left operands must denote
+-- the same value; their right operands are either the same value with
+-- disjoint orderings, or two literals that the orderings keep apart.
+-- Returns the positions that must be ground for the contradiction to hold.
+contradiction :: Guard -> Guard -> Maybe [Int]
+contradiction (x1, y1, r1, kind1) (x2, y2, r2, kind2)
+  | kind1 /= kind2 = Nothing
+  | otherwise = do
+      px <- compatibleOperands x1 x2
+      py <- apart
+      pure (nub (px ++ py))
+  where
+    apart
+      | Just py <- compatibleOperands y1 y2 = if Set.null (Set.intersection r1 r2) then Just py else Nothing
+      | Lit a <- y1, Lit b <- y2, Just o <- compareLits kind1 a b = if jointlySat r1 r2 o then Nothing else Just []
+      | otherwise = Nothing
+
+-- | Can @e r1 a@ and @e r2 b@ hold together, given the ordering @o@ of
+-- @a@ against @b@? Every position of @e@ relative to the two literals is
+-- tried, and a position strictly between them is assumed to exist.
+jointlySat :: Set Ordering' -> Set Ordering' -> Ordering' -> Bool
+jointlySat r1 r2 o = or [Set.member p1 r1 && Set.member p2 r2 | (p1, p2) <- positions]
+  where
+    positions = case o of
+      OEQ -> [(p, p) | p <- [OLT, OEQ, OGT]]
+      OLT -> [(OLT, OLT), (OEQ, OLT), (OGT, OLT), (OGT, OEQ), (OGT, OGT)]
+      OGT -> [(OLT, OLT), (OLT, OEQ), (OLT, OGT), (OEQ, OGT), (OGT, OGT)]
+
+-- | The ordering of one literal relative to another under a guard kind:
+-- identity tells equal from different only; value ordering compares
+-- numbers numerically and atoms, strings and characters lexically.
+compareLits :: GuardKind -> Term -> Term -> Maybe Ordering'
+compareLits TermIdentity a b
+  | null (termVarIds a) = Just (if a == b then OEQ else OLT)
+  | otherwise = Nothing
+compareLits ValueOrdering a b = case (a, b) of
+  (Atom p, Atom q) -> Just (ordOf (compare p q))
+  (StrLit p, StrLit q) -> Just (ordOf (compare p q))
+  (CharLit p, CharLit q) -> Just (ordOf (compare p q))
+  _ -> case (evalNumeric IM.empty a, evalNumeric IM.empty b) of
+    (Right (Just p), Right (Just q)) -> Just (ordOf (compareNumeric p q))
+    _ -> Nothing
+  where
+    ordOf LT = OLT
+    ordOf EQ = OEQ
+    ordOf GT = OGT
 
 hasCut :: Clause -> Bool
 hasCut cl = any isCut (clauseBody cl)

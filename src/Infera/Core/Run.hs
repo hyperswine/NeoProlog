@@ -1423,8 +1423,7 @@ callPlain m frame predicate cont0 = do
     enterPlainInterpreted frame' cont depth = do
       let !s = mStore m
       entry <- choiceTop m
-      rawCands <- candidateClauses s predicate
-      cands <- pruneCandidates s predicate rawCands
+      cands <- candidateClauses s predicate
       case cands of
         NoCandidate -> backtrack m
         OneCandidate ordinal
@@ -1821,14 +1820,6 @@ streamSidePattern stream entry = case unsafeAt (csRefs stream) entry of
 callClauses :: Machine -> Pred -> Int -> Int -> Cont -> IO Step
 callClauses m = callClausesWithFrame m 0
 
-clauseAcceptsInt0 :: Clause -> Int -> Bool
-clauseAcceptsInt0 cl !n = case (clHead cl, clBody cl) of
-  (PFirst s : _, GCmp op _ _ (PlanSlot s') (PlanImm rhs) : _) | s == s' ->
-    cmpAccepts op (compare n rhs)
-  (PFirst s : _, GCmp op _ _ (PlanImm lhs) (PlanSlot s') : _) | s == s' ->
-    cmpAccepts op (compare lhs n)
-  _ -> True
-{-# INLINE clauseAcceptsInt0 #-}
 
 -- | Horizon 5B: Canonical 64-bit packed tuple key for 1- and 2-argument
 -- immediate/single-output tabled subgoals, avoiding full heap Term AST traversal
@@ -1916,108 +1907,6 @@ tryReclaimFrame s !base = do
     checkLoop base
 {-# INLINE tryReclaimFrame #-}
 
--- | Horizon 2: Multi-argument structural compatibility and 1-step list-tail
--- lookahead before allocating saveArgs or pushing a choice point.
---
--- It only rejects a clause that provably cannot match: a different immediate
--- constant, a structure against an immediate, or a structure with a different
--- functor. Anything else (boxed values, strings, unbound) is left to unify.
-clauseAcceptsWordAt :: Store -> PredKey -> Bool -> Clause -> Int -> Word' -> IO Bool
-clauseAcceptsWordAt s key !allNeedConsAt1 cl !idx !w
-  | tagOf w == tagRef = pure True
-  | otherwise = case drop idx (clHead cl) of
-      (PWord pw : _)
-        | isImmediate w && isImmediate pw -> pure (w == pw)
-        | otherwise -> pure True
-      (PStruct functor subpats : _)
-        | isImmediate w -> pure False
-        | tagOf w /= tagStr -> pure True
-        | otherwise -> do
-            hdr <- readCell s (valOf w)
-            if funKey hdr /= funKey functor
-              then pure False
-              else case (idx, allNeedConsAt1, subpats) of
-                (1, True, [_, PFirst tailSlot])
-                  | not (headUsesSlotExcept1 tailSlot (clHead cl)) -> do
-                      -- The clause's first goal re-calls this predicate on the
-                      -- tail; with an atom tail that call cannot match any
-                      -- clause (all need a cons there), so the clause fails.
-                      recursesOnTail <- case clBody cl of
-                        GCall ref (_ : PSlot t : _) _ : _ | t == tailSlot -> do
-                          callee <- readIORef ref
-                          pure (pKey callee == key)
-                        _ -> pure False
-                      if not recursesOnTail
-                        then pure True
-                        else do
-                          tailW <- readCell s (valOf w + 2) >>= deref s
-                          pure (tagOf tailW /= tagAtm)
-                _ -> pure True
-      _ -> pure True
-  where
-    isImmediate x = let t = tagOf x in t == tagInt || t == tagAtm
-{-# INLINE clauseAcceptsWordAt #-}
-
-headUsesSlotExcept1 :: Int -> [Pattern] -> Bool
-headUsesSlotExcept1 !slot pats = case pats of
-  p0 : PStruct _ [hPat, _] : rest -> any (patUsesSlot slot) (p0 : hPat : rest)
-  _ -> True
-  where
-    patUsesSlot !k pat = case pat of
-      PSlot j -> j == k
-      PFirst j -> j == k
-      PStruct _ ps -> any (patUsesSlot k) ps
-      _ -> False
-
-allClausesRequireCons1 :: Pred -> Bool
-allClausesRequireCons1 predicate =
-  pArity predicate >= 2
-    && numElements clauses == 2
-    && isConsAt1 (clauses ! 0)
-    && isConsAt1 (clauses ! 1)
-  where
-    !clauses = pClauses predicate
-    isConsAt1 cl = case drop 1 (clHead cl) of
-      (PStruct _ [_, _] : _) -> True
-      _ -> False
-{-# INLINE allClausesRequireCons1 #-}
-
-clauseAcceptsCall :: Store -> PredKey -> Bool -> Int -> Word' -> Word' -> Clause -> IO Bool
-clauseAcceptsCall s key !cons1 !arity !w0 !w1 cl = do
-  let !ok0 = arity == 0 || tagOf w0 /= tagInt || clauseAcceptsInt0 cl (valOf w0)
-  if not ok0
-    then pure False
-    else do
-      okHead0 <- if arity >= 1 then clauseAcceptsWordAt s key False cl 0 w0 else pure True
-      if not okHead0
-        then pure False
-        else if arity >= 2
-          then clauseAcceptsWordAt s key cons1 cl 1 w1
-          else pure True
-{-# INLINE clauseAcceptsCall #-}
-
-pruneCandidates s predicate cands = case cands of
-  Candidates ordinals | pArity predicate > 0 -> do
-    let !arity = pArity predicate
-        !clauses = pClauses predicate
-        !len = numElements ordinals
-        !cons1 = allClausesRequireCons1 predicate
-    w0 <- readArg s 0 >>= deref s
-    w1 <- if arity >= 2 then readArg s 1 >>= deref s else pure 0
-    let filterLoop !i acc
-          | i >= len = pure (reverse acc)
-          | otherwise = do
-              let !ord = ordinals `unsafeAt` i
-              keep <- clauseAcceptsCall s (pKey predicate) cons1 arity w0 w1 (clauses ! ord)
-              filterLoop (i + 1) (if keep then ord : acc else acc)
-    kept <- filterLoop 0 []
-    pure $! case kept of
-      [] -> NoCandidate
-      [ord] -> OneCandidate ord
-      _ | length kept == len -> cands
-        | otherwise -> Candidates (IA.listArray (0, length kept - 1) kept)
-  _ -> pure cands
-{-# INLINE pruneCandidates #-}
 
 callClausesWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
 callClausesWithFrame m frame predicate barrier depth returnCont =
@@ -2034,8 +1923,7 @@ callClausesWithFrame m frame predicate barrier depth returnCont =
 callClausesInterpreted :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
 callClausesInterpreted m frame predicate barrier depth returnCont = do
   let !s = mStore m
-  rawCands <- candidateClauses s predicate
-  cands <- pruneCandidates s predicate rawCands
+  cands <- candidateClauses s predicate
   dispatchCandidates m frame predicate barrier depth returnCont cands
 
 dispatchCandidates m frame predicate barrier depth returnCont candidates = do
@@ -2610,26 +2498,6 @@ runPlan s base plan = case plan of
       w <- deref s (refWord (base + i))
       pure $! if tagOf w == tagInt then valOf w else planMiss
 {-# INLINE runPlan #-}
-
--- | No immediate integer is 'minBound', so it marks a plan that missed.
-planMiss :: Int
-planMiss = minBound
-
--- | 'evalFast''s binary operators and bounds over immediate integers.
-planApply :: ArithOp -> Int -> Int -> Int
-planApply op x y = case op of
-  OpPlus -> fits (x + y)
-  OpMinus -> fits (x - y)
-  OpMul
-    | abs x < 2 ^ (30 :: Int) && abs y < 2 ^ (30 :: Int) -> x * y
-    | otherwise -> planMiss
-  OpDiv -> if y == 0 then planMiss else fits (x `div` y)
-  OpMod -> if y == 0 then planMiss else x `mod` y
-  OpMin -> min x y
-  OpMax -> max x y
-  _ -> planMiss
-  where
-    fits r = if r >= -(2 ^ (60 :: Int)) && r < 2 ^ (60 :: Int) then r else planMiss
 
 evalExpr :: Machine -> Int -> Expr -> IO (Either SolveError (Maybe NumericValue))
 evalExpr m base expr = case expr of

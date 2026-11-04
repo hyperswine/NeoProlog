@@ -12,6 +12,8 @@ module Infera.Core.Compile
     Expr (..),
     Plan (..),
     exprPlan,
+    planMiss,
+    planApply,
     ArithOp (..),
     CmpOp (..),
     Check (..),
@@ -258,8 +260,17 @@ data DecisionIndex = DecisionIndex !Int [Int] !ArgIndex
 -- Only a leading comparison between immediate integers can reject a
 -- clause here. Unknown values remain on the ordinary execution path,
 -- including its instantiation and type errors.
-data GuardValue = GuardInt !Int | GuardArg !Int [Int]
-data IntGuard = IntGuard !CmpOp !GuardValue !GuardValue
+-- | An operand of a selection guard: an integer literal, an argument
+-- register (or a sub-term of one at a short path), or an arithmetic
+-- operation over operands, evaluated like the interpreter's plans.
+data GuardValue = GuardInt !Int | GuardArg !Int [Int] | GuardOp !ArithOp GuardValue GuardValue
+
+data GuardRel = RelGt | RelLt | RelGte | RelLte | RelEq | RelNe deriving (Eq, Show)
+
+-- | A clause's leading test, decidable from the argument registers alone
+-- when every operand is an immediate integer: the clause is skipped when
+-- the test fails, and tried as usual when it cannot be decided.
+data IntGuard = IntGuard !GuardRel !GuardValue !GuardValue
 
 data Pred = Pred
   { pKey :: !PredKey,
@@ -541,16 +552,39 @@ nestedPaths depth pattern
     discriminates (PArith _ _ _) = True
     discriminates _ = False
 
+-- | The guard a clause's leading goals give: a comparison, an @is@ whose
+-- target is an integer literal or a head variable, or an @is@ into a fresh
+-- body variable followed by a test of that variable against an integer
+-- literal (@X is I % P, X != 0@). Expressions use the plan operators, so
+-- 'guardHolds' computes exactly what the interpreter would.
 leadingIntGuard :: Clause -> Maybe IntGuard
 leadingIntGuard clause = case clBody clause of
-  GCmp op a b _ _ : _ -> IntGuard op <$> value a <*> value b
+  GCmp op a b _ _ : _ -> IntGuard (relOf op) <$> value a <*> value b
+  GIs (PWord w) e _ : _ | tagOf w == tagInt -> IntGuard RelEq <$> value e <*> pure (GuardInt (valOf w))
+  GIs (PSlot v) e _ : rest
+    | Just target <- slotValue v -> IntGuard RelEq target <$> value e
+    | otherwise -> case rest of
+        GNeq (PSlot v') (PWord w) : _ | v' == v, tagOf w == tagInt -> against RelNe e w
+        GNeq (PWord w) (PSlot v') : _ | v' == v, tagOf w == tagInt -> against RelNe e w
+        GEquiv (PSlot v') (PWord w) : _ | v' == v, tagOf w == tagInt -> against RelEq e w
+        GEquiv (PWord w) (PSlot v') : _ | v' == v, tagOf w == tagInt -> against RelEq e w
+        GCmp op (EPat (PSlot v')) (EImm k) _ _ : _ | v' == v -> IntGuard (relOf op) <$> value e <*> pure (GuardInt k)
+        GCmp op (EImm k) (EPat (PSlot v')) _ _ : _ | v' == v -> IntGuard (relOf op) (GuardInt k) <$> value e
+        _ -> Nothing
   _ -> Nothing
   where
+    against rel e w = IntGuard rel <$> value e <*> pure (GuardInt (valOf w))
+    relOf op = case op of
+      CmpGt -> RelGt
+      CmpLt -> RelLt
+      CmpGte -> RelGte
+      CmpLte -> RelLte
     slots = IM.fromListWith (\_ first -> first)
       [(v, (i, path)) | (i, pattern) <- zip [0 ..] (clHead clause), (v, path) <- slotPaths [] pattern]
     value (EImm n) = Just (GuardInt n)
     value (EPat (PSlot v)) = slotValue v
     value (EPat (PFirst v)) = slotValue v
+    value (EOp op [a, b]) | op `elem` [OpPlus, OpMinus, OpMul, OpDiv, OpMod, OpMin, OpMax] = GuardOp op <$> value a <*> value b
     value _ = Nothing
     slotValue v = case IM.lookup v slots of
       Just (i, path) | length path <= 3 -> Just (GuardArg i path)
@@ -943,26 +977,60 @@ keepGuards store p selected@(Candidates ordinals) = do
       ok <- guardHolds store p ordinal
       if ok then (ordinal :) <$> filterOrdinals rest else filterOrdinals rest
 
+-- | A guard holds unless every operand is an immediate integer, every
+-- operation stays within the plan bounds, and the test then fails.
 guardHolds :: Store -> Pred -> Int -> IO Bool
 guardHolds store p ordinal = case pIntGuards p `unsafeAt` ordinal of
   Nothing -> pure True
-  Just (IntGuard op a b) -> do
-    left <- guardWord a
-    right <- guardWord b
-    pure $!
-      if tagOf left /= tagInt || tagOf right /= tagInt
-        then True
-        else
-          let x = valOf left
-              y = valOf right
-           in case op of
-                CmpGt -> x > y
-                CmpLt -> x < y
-                CmpGte -> x >= y
-                CmpLte -> x <= y
+  Just (IntGuard rel a b) -> do
+    x <- guardInt store a
+    if x == planMiss
+      then pure True
+      else do
+        y <- guardInt store b
+        pure $!
+          y == planMiss || case rel of
+            RelGt -> x > y
+            RelLt -> x < y
+            RelGte -> x >= y
+            RelLte -> x <= y
+            RelEq -> x == y
+            RelNe -> x /= y
+
+-- | A guard operand as an immediate integer, or 'planMiss'.
+guardInt :: Store -> GuardValue -> IO Int
+guardInt store v = case v of
+  GuardInt n -> pure n
+  GuardArg i path -> do
+    w <- argumentAtPath store i path
+    pure $! if tagOf w == tagInt then valOf w else planMiss
+  GuardOp op a b -> do
+    x <- guardInt store a
+    if x == planMiss
+      then pure planMiss
+      else do
+        y <- guardInt store b
+        pure $! if y == planMiss then planMiss else planApply op x y
+
+-- | No immediate integer is 'minBound', so it marks a plan that missed.
+planMiss :: Int
+planMiss = minBound
+
+-- | 'evalFast''s binary operators and bounds over immediate integers.
+planApply :: ArithOp -> Int -> Int -> Int
+planApply op x y = case op of
+  OpPlus -> fits (x + y)
+  OpMinus -> fits (x - y)
+  OpMul
+    | abs x < 2 ^ (30 :: Int) && abs y < 2 ^ (30 :: Int) -> x * y
+    | otherwise -> planMiss
+  OpDiv -> if y == 0 then planMiss else fits (x `div` y)
+  OpMod -> if y == 0 then planMiss else x `mod` y
+  OpMin -> min x y
+  OpMax -> max x y
+  _ -> planMiss
   where
-    guardWord (GuardInt n) = pure (intWord n)
-    guardWord (GuardArg i path) = argumentAtPath store i path
+    fits r = if r >= -(2 ^ (60 :: Int)) && r < 2 ^ (60 :: Int) then r else planMiss
 
 -- | The intersection of two ascending selections. An input equal to the
 -- result is returned itself, and a singleton is the shared one, so only a

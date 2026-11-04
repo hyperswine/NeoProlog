@@ -152,8 +152,40 @@ prop_fixture = withTests 1 . property $ do
         annotate (show (queryGoals query))
         assertParity program program query
 
+-- Leading `is` guards over expressions of the arguments are decided at
+-- selection when every operand is an integer: the sieve's two cons clauses
+-- leave one candidate, residue classes pick one of three, and a float,
+-- an atom or an unbound operand leaves every candidate for the clauses.
+prop_arithmetic_guards :: Property
+prop_arithmetic_guards = withTests 1 . property $ do
+  let source = unlines
+        [ "<- notable.",
+          "sieve_drop _ [] [].",
+          "sieve_drop P [I | Is] Nis <- 0 is I % P, sieve_drop P Is Nis.",
+          "sieve_drop P [I | Is] [I | Nis] <- X is I % P, X != 0, sieve_drop P Is Nis.",
+          "residue N zero <- 0 is N % 3.",
+          "residue N one <- X is N % 3, X == 1.",
+          "residue N big <- X is N % 3, X > 1."
+        ]
+      list = foldr (\x t -> Compound "cons" [x, t]) (Atom "nil")
+  program <- programOf source
+  plain <- programOf ("<- noindex.\n" ++ source)
+  selected program ("sieve_drop", 3) [IntLit 2, list [IntLit 1, IntLit 2], Var 0] False >>= (=== [2])
+  selected program ("sieve_drop", 3) [IntLit 2, list [IntLit 4, IntLit 5], Var 0] False >>= (=== [1])
+  selected program ("sieve_drop", 3) [IntLit 2, list [Atom "a"], Var 0] False >>= (=== [1, 2])
+  selected program ("sieve_drop", 3) [Var 1, list [IntLit 4], Var 0] False >>= (=== [1, 2])
+  selected program ("sieve_drop", 3) [IntLit 0, list [IntLit 4], Var 0] False >>= (=== [1, 2])
+  selected program ("sieve_drop", 3) [IntLit 2, list [IntLit 4], Var 0] True >>= (=== [1, 2])
+  selected program ("residue", 2) [IntLit 5, Var 0] False >>= (=== [2])
+  selected program ("residue", 2) [IntLit 4, Var 0] False >>= (=== [1])
+  selected program ("residue", 2) [IntLit 0, Var 0] False >>= (=== [0])
+  selected program ("residue", 2) [FloatLit 4.5, Var 0] False >>= (=== [0, 1, 2])
+  forM_ ["sieve_drop 2 [1, 2, 3, 4] R?", "sieve_drop 2 [1, a, 3] R?", "sieve_drop 0 [1, 2] R?",
+      "sieve_drop P [2, 4] R?", "residue 5 R?", "residue 4.5 R?", "residue N R?"] $ \source' ->
+    queryOf source' >>= assertParity program plain
+
 coreDecisionGroup :: Group
 coreDecisionGroup = Group "compiled clause decisions"
   [("compiled_paths", prop_compiled_paths), ("generated_guards", prop_generated_guards),
    ("generated_patterns", prop_generated_patterns), ("scalar_decisions", prop_scalar_decisions),
-   ("decision_fixture", prop_fixture)]
+   ("decision_fixture", prop_fixture), ("arithmetic_guards", prop_arithmetic_guards)]

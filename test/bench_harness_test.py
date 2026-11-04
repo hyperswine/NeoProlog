@@ -17,6 +17,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "bench" / "run.py"
+CASES = ("nrev", "loop", "fib", "queens", "zebra", "deriv", "primes")
 
 STUB = r'''import json
 import os
@@ -42,7 +43,8 @@ if mode == "late_exit":
             sys.exit(42)
 marker = "INFERA_BENCH_OK:" + case
 answers = {"nrev": list(range(30, 0, -1)), "loop": 90000,
-           "fib": 75025, "queens": [1, 5, 8, 6, 3, 7, 2, 4]}
+           "fib": 75025, "queens": [1, 5, 8, 6, 3, 7, 2, 4],
+           "zebra": 300, "deriv": 30000, "primes": 2262}
 answer = json.dumps(answers[case])
 if mode == "exit":
     print(marker)
@@ -72,7 +74,8 @@ if mode == "marker_only":
     sys.exit(0)
 if mode == "wrong_result":
     answer = json.dumps({"nrev": list(range(1, 31)), "loop": 89999,
-                         "fib": 75024, "queens": [1, 2, 3, 4, 5, 6, 7, 8]}[case])
+                         "fib": 75024, "queens": [1, 2, 3, 4, 5, 6, 7, 8],
+                         "zebra": 299, "deriv": 29999, "primes": 2261}[case])
 if mode == "malformed_result":
     answer = "[1, broken"
 if mode == "duplicate_result":
@@ -144,9 +147,9 @@ class BenchmarkHarnessTest(unittest.TestCase):
                              "--runs", "1", "--warmup", "0", base=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.rows(result)
-        self.assertEqual({row["case"] for row in rows}, {"nrev", "loop", "fib", "queens"})
+        self.assertEqual({row["case"] for row in rows}, set(CASES))
         calls = self.invocations()
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), len(CASES))
         for call in calls:
             workdir = Path(call["cwd"])
             self.assertNotEqual(workdir, ROOT / "bench")
@@ -180,7 +183,7 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assert_failed(self.invoke(mode="marker_only"))
 
     def test_wrong_answer_for_each_workload_is_not_success(self):
-        for case in ("nrev", "loop", "fib", "queens"):
+        for case in CASES:
             with self.subTest(case=case):
                 self.assert_failed(self.invoke("--binary", str(self.binary), "--engine", "infera",
                                                "--case", case, "--runs", "1", "--warmup", "0",

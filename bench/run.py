@@ -22,10 +22,11 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
-CASES = ("nrev", "loop", "fib", "queens")
+CASES = ("nrev", "loop", "fib", "queens", "zebra", "deriv", "primes")
 RESULT = "INFERA_BENCH_RESULT:"
 MARKER = "INFERA_BENCH_OK:"
 ERROR = re.compile(r"\b(?:error|exception):|search depth limit", re.IGNORECASE)
+INTEGER_ANSWERS = {"fib": 75025, "loop": 90000, "zebra": 300, "deriv": 30000, "primes": 2262}
 FALSE = re.compile(r"^\s*(?:>\s*)?(?:false\.|fail\.)\s*$", re.MULTILINE)
 
 
@@ -98,12 +99,18 @@ def goals(case):
         "loop": "loop 90000, Result = 90000",
         "fib": "fib 25 Result",
         "queens": "queens 8 Result",
+        "zebra": "bench_zebra 300 Owner, Owner == japanese, Result = 300",
+        "deriv": "bench_deriv 30000, Result = 30000",
+        "primes": "primes 20000 Result",
     }[case]
     prolog = {
         "nrev": "bench_nrev(3000),range(1,30,L),nrev(L,Result)",
         "loop": "loop(90000),Result=90000",
         "fib": "fib(25,Result)",
         "queens": "queens(8,Result)",
+        "zebra": "bench_zebra(300,Owner),Owner==japanese,Result=300",
+        "deriv": "bench_deriv(30000),Result=30000",
+        "primes": "primes(20000,Result)",
     }[case]
     infera = 'once (' + infera + '), write "' + RESULT + '", writeln Result, writeln "' + MARKER + case + '"'
     prolog = "once((" + prolog + ")),write('" + RESULT + "'),write(Result),nl,write('" + MARKER + case + "'),nl"
@@ -124,8 +131,8 @@ def validate(case, stdout, stderr):
         value = ast.literal_eval(results[0])
     except (ValueError, SyntaxError, RecursionError) as error:
         raise BenchmarkError("malformed result") from error
-    if case in ("fib", "loop"):
-        expected = 75025 if case == "fib" else 90000
+    if case in INTEGER_ANSWERS:
+        expected = INTEGER_ANSWERS[case]
         if type(value) is not int or value != expected:
             raise BenchmarkError("incorrect " + case + " result")
     elif case == "nrev":

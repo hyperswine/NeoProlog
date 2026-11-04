@@ -10,6 +10,32 @@ Open work for the next optimization is tracked in
 boxed-value retention, JIT code and cache lifetime, interpreter allocation,
 and gates that preserve measured gains and prove native execution.
 
+## Unification-heavy programs - 2026-11-04
+
+Three cases joined `bench/run.py`: `zebra`, `deriv` and `primes`, the
+programs on which [the 2026-11-01 comparison](2026-11-01-INFERA-PERF-RESULTS.md)
+found Infera about 3x behind SWI-Prolog. The JIT declines every predicate
+in them; the time is clause selection, backtracking and head matching in the
+interpreter. [The report](2026-11-04-UNIFICATION-HEAVY.md) has the profile
+and the ranked plan. Three changes landed the same day: the Horizon 2
+runtime pruning (`pruneCandidates`) removed, arithmetic guard prefixes in
+determinism inference (`Infer.guardsOf`), and `is`-expression guards
+decided at clause selection (`Compile.leadingIntGuard`, `guardHolds`).
+
+Hand-timed user seconds on an Apple Silicon Mac, `-O1` library, median of
+three to five; SWI-Prolog 10 on the same programs without cuts:
+
+| case | before | after | SWI | before ÷ SWI | after ÷ SWI |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| zebra x300 | 0.83 | 0.65 | 0.27 | 3.1x | 2.4x |
+| deriv x30000 | 0.53 | 0.44 | 0.13 | 4.1x | 3.4x |
+| primes 20000 | 0.98 | 0.63 | 0.39 | 2.5x | 1.6x |
+| queens 9, all solutions | 0.42 | 0.40 | - | - | - |
+
+nrev, loop, fib and queens 8 are unchanged within noise. Correctness: full
+suite, `core-engine parity` over `test/core/*.nprolog` (two new corpora
+entries for the guarded sieve and residue classes), and every CI script.
+
 ## Cross-theme example programs - 2026-10-31
 
 Five standalone programs extend the corpus beyond the original engine
