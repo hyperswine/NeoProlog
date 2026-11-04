@@ -1049,11 +1049,18 @@ step' m goal goals base barrier depth next = case goal of
     where
       !st = mStore m
       bindQuick quick = case target of
-        PFirst i | base > 0 -> writeCell st (base + i) (intWord quick) >> continue
+        PFirst i | base > 0 -> do
+          writeCell st (base + i) (intWord quick)
+          when (null goals && case mSlotStats m of { Nothing -> True; Just _ -> False }) (tryReclaimFrame st base)
+          continue
         _ -> do
           wt <- numericTarget m base target
           ok <- unify st wt (intWord quick)
-          if ok then continue else backtrack m
+          if ok
+            then do
+              when (null goals && base > 0 && case mSlotStats m of { Nothing -> True; Just _ -> False }) (tryReclaimFrame st base)
+              continue
+            else backtrack m
       general = do
         value <- evalExpr m base expr
         case value of
@@ -1405,11 +1412,11 @@ callPlain m frame predicate cont0 = do
         then raiseItems m [BranchExhausted] (backtrack m)
         else case (pJit predicate, mSlotStats m) of
           (Just kernel, Nothing) | jitEnabled -> do
-            code <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
-            case code of
-              1 -> run m cont
-              0 -> backtrack m
-              3 -> raiseItems m [BranchExhausted] (backtrack m)
+            outcome <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
+            case outcome of
+              Just (1, _) -> run m cont
+              Just (0, _) -> backtrack m
+              Just (3, _) -> raiseItems m [BranchExhausted] (backtrack m)
               _ -> enterPlainInterpreted frame' cont depth
           _ -> enterPlainInterpreted frame' cont depth
     enterPlainInterpreted frame' cont depth = do
@@ -1815,29 +1822,191 @@ clauseAcceptsInt0 cl !n = case (clHead cl, clBody cl) of
   _ -> True
 {-# INLINE clauseAcceptsInt0 #-}
 
+-- | Horizon 5B: Canonical 64-bit packed tuple key for 1- and 2-argument
+-- immediate/single-output tabled subgoals, avoiding full heap Term AST traversal
+-- when arguments are immediate integers/atoms or a single output REF.
+packTableKeyImmediate :: Store -> Int -> IO (Maybe Word')
+packTableKeyImmediate s !arity
+  | arity == 1 = do
+      w0 <- readArg s 0 >>= deref s
+      let !t0 = tagOf w0
+      if t0 == tagInt || t0 == tagAtm
+        then pure (Just w0)
+        else if t0 == tagRef
+          then pure (Just 0x55550000)
+          else pure Nothing
+  | arity == 2 = do
+      w0 <- readArg s 0 >>= deref s
+      w1 <- readArg s 1 >>= deref s
+      let !t0 = tagOf w0
+          !t1 = tagOf w1
+          ok0 = t0 == tagInt || t0 == tagAtm || t0 == tagRef
+          ok1 = t1 == tagInt || t1 == tagAtm || t1 == tagRef
+      if not (ok0 && ok1) || (t0 == tagRef && t1 == tagRef && w0 == w1)
+        then pure Nothing
+        else do
+          let !k0 = if t0 == tagRef then 0x55550000 else w0
+              !k1 = if t1 == tagRef then 0x55550001 else w1
+          pure (Just (k0 * 0x1E3779B97F4A7C15 + k1))
+  | otherwise = pure Nothing
+{-# INLINE packTableKeyImmediate #-}
+
+-- | Horizon 3A: Inline unit base-case short-circuiting for binary/tree-recursive
+-- predicates (such as `fib/2` or `tree_sum/2`) when called with `[PSlot inSlot, PFirst outSlot]`.
+tryUnitBaseCall :: Store -> Int -> Pred -> Int -> Int -> IO Bool
+tryUnitBaseCall s !base predicate !inSlot !outSlot = do
+  w0 <- readCell s (base + inSlot) >>= deref s
+  let !t0 = tagOf w0
+  if t0 /= tagInt && t0 /= tagAtm
+    then pure False
+    else do
+      let !clauses = pClauses predicate
+          !nClauses = numElements clauses
+          !v0 = valOf w0
+          scan !i !found
+            | i >= nClauses = found
+            | otherwise =
+                let cl = clauses ! i
+                 in case (clHead cl, clBody cl) of
+                      ([PWord pw, PWord outW], [])
+                        | pw == w0 ->
+                            case found of
+                              Nothing -> scan (i + 1) (Just outW)
+                              Just _ -> Nothing
+                        | otherwise -> scan (i + 1) found
+                      (PFirst s0 : _, GCmp op _ _ (PlanSlot s') (PlanImm rhs) : _)
+                        | t0 == tagInt && s0 == s' && not (cmpAccepts op (compare v0 rhs)) ->
+                            scan (i + 1) found
+                      (PFirst s0 : _, GCmp op _ _ (PlanImm lhs) (PlanSlot s') : _)
+                        | t0 == tagInt && s0 == s' && not (cmpAccepts op (compare lhs v0)) ->
+                            scan (i + 1) found
+                      (PStruct _ _ : _, _) ->
+                        scan (i + 1) found
+                      _ -> Nothing
+      case scan 0 Nothing of
+        Just outW -> do
+          writeCell s (base + outSlot) outW
+          pure True
+        Nothing -> pure False
+{-# INLINE tryUnitBaseCall #-}
+
+-- | Horizon 3B: Fused non-tail recursive frame reclamation on final `GIs` goal.
+tryReclaimFrame :: Store -> Int -> IO ()
+tryReclaimFrame s !base = do
+  h <- heapTop s
+  hLim <- hb s
+  clp <- readReg s rCLP
+  when (clp == 0 && hLim <= base && h > base && h - base <= 16) $ do
+    let checkLoop !a
+          | a >= h = setHeapTop s base
+          | otherwise = do
+              w <- readCell s a
+              let !t = tagOf w
+              when (t == tagInt || t == tagAtm || (t == tagRef && valOf w < base)) $
+                checkLoop (a + 1)
+    checkLoop base
+{-# INLINE tryReclaimFrame #-}
+
+-- | Horizon 2: Multi-argument structural compatibility and 1-step list-tail
+-- lookahead before allocating saveArgs or pushing a choice point.
+--
+-- It only rejects a clause that provably cannot match: a different immediate
+-- constant, a structure against an immediate, or a structure with a different
+-- functor. Anything else (boxed values, strings, unbound) is left to unify.
+clauseAcceptsWordAt :: Store -> PredKey -> Bool -> Clause -> Int -> Word' -> IO Bool
+clauseAcceptsWordAt s key !allNeedConsAt1 cl !idx !w
+  | tagOf w == tagRef = pure True
+  | otherwise = case drop idx (clHead cl) of
+      (PWord pw : _)
+        | isImmediate w && isImmediate pw -> pure (w == pw)
+        | otherwise -> pure True
+      (PStruct functor subpats : _)
+        | isImmediate w -> pure False
+        | tagOf w /= tagStr -> pure True
+        | otherwise -> do
+            hdr <- readCell s (valOf w)
+            if funKey hdr /= funKey functor
+              then pure False
+              else case (idx, allNeedConsAt1, subpats) of
+                (1, True, [_, PFirst tailSlot])
+                  | not (headUsesSlotExcept1 tailSlot (clHead cl)) -> do
+                      -- The clause's first goal re-calls this predicate on the
+                      -- tail; with an atom tail that call cannot match any
+                      -- clause (all need a cons there), so the clause fails.
+                      recursesOnTail <- case clBody cl of
+                        GCall ref (_ : PSlot t : _) _ : _ | t == tailSlot -> do
+                          callee <- readIORef ref
+                          pure (pKey callee == key)
+                        _ -> pure False
+                      if not recursesOnTail
+                        then pure True
+                        else do
+                          tailW <- readCell s (valOf w + 2) >>= deref s
+                          pure (tagOf tailW /= tagAtm)
+                _ -> pure True
+      _ -> pure True
+  where
+    isImmediate x = let t = tagOf x in t == tagInt || t == tagAtm
+{-# INLINE clauseAcceptsWordAt #-}
+
+headUsesSlotExcept1 :: Int -> [Pattern] -> Bool
+headUsesSlotExcept1 !slot pats = case pats of
+  p0 : PStruct _ [hPat, _] : rest -> any (patUsesSlot slot) (p0 : hPat : rest)
+  _ -> True
+  where
+    patUsesSlot !k pat = case pat of
+      PSlot j -> j == k
+      PFirst j -> j == k
+      PStruct _ ps -> any (patUsesSlot k) ps
+      _ -> False
+
+allClausesRequireCons1 :: Pred -> Bool
+allClausesRequireCons1 predicate =
+  pArity predicate >= 2
+    && numElements clauses == 2
+    && isConsAt1 (clauses ! 0)
+    && isConsAt1 (clauses ! 1)
+  where
+    !clauses = pClauses predicate
+    isConsAt1 cl = case drop 1 (clHead cl) of
+      (PStruct _ [_, _] : _) -> True
+      _ -> False
+{-# INLINE allClausesRequireCons1 #-}
+
+clauseAcceptsCall :: Store -> PredKey -> Bool -> Int -> Word' -> Word' -> Clause -> IO Bool
+clauseAcceptsCall s key !cons1 !arity !w0 !w1 cl = do
+  let !ok0 = arity == 0 || tagOf w0 /= tagInt || clauseAcceptsInt0 cl (valOf w0)
+  if not ok0
+    then pure False
+    else do
+      okHead0 <- if arity >= 1 then clauseAcceptsWordAt s key False cl 0 w0 else pure True
+      if not okHead0
+        then pure False
+        else if arity >= 2
+          then clauseAcceptsWordAt s key cons1 cl 1 w1
+          else pure True
+{-# INLINE clauseAcceptsCall #-}
+
 pruneCandidates s predicate cands = case cands of
   Candidates ordinals | pArity predicate > 0 -> do
+    let !arity = pArity predicate
+        !clauses = pClauses predicate
+        !len = numElements ordinals
+        !cons1 = allClausesRequireCons1 predicate
     w0 <- readArg s 0 >>= deref s
-    if tagOf w0 /= tagInt
-      then pure cands
-      else do
-        let !v0 = valOf w0
-            !clauses = pClauses predicate
-            !len = numElements ordinals
-            -- Decided without allocating: most calls to an integer-first
-            -- predicate reject no clause at all, and building the kept list
-            -- there costs a few words per call.
-            allAccept !i =
-              i >= len
-                || (clauseAcceptsInt0 (clauses ! unsafeAt ordinals i) v0 && allAccept (i + 1))
-        if allAccept 0
-          then pure cands
-          else do
-            let kept = [ord | i <- [0 .. len - 1], let ord = ordinals `unsafeAt` i, clauseAcceptsInt0 (clauses ! ord) v0]
-            pure $! case kept of
-              [] -> NoCandidate
-              [ord] -> OneCandidate ord
-              _ -> Candidates (IA.listArray (0, length kept - 1) kept)
+    w1 <- if arity >= 2 then readArg s 1 >>= deref s else pure 0
+    let filterLoop !i acc
+          | i >= len = pure (reverse acc)
+          | otherwise = do
+              let !ord = ordinals `unsafeAt` i
+              keep <- clauseAcceptsCall s (pKey predicate) cons1 arity w0 w1 (clauses ! ord)
+              filterLoop (i + 1) (if keep then ord : acc else acc)
+    kept <- filterLoop 0 []
+    pure $! case kept of
+      [] -> NoCandidate
+      [ord] -> OneCandidate ord
+      _ | length kept == len -> cands
+        | otherwise -> Candidates (IA.listArray (0, length kept - 1) kept)
   _ -> pure cands
 {-# INLINE pruneCandidates #-}
 
@@ -1845,11 +2014,11 @@ callClausesWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
 callClausesWithFrame m frame predicate barrier depth returnCont =
   case (pJit predicate, mSlotStats m) of
     (Just kernel, Nothing) | jitEnabled -> do
-      code <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
-      case code of
-        1 -> run m returnCont
-        0 -> backtrack m
-        3 -> raiseItems m [BranchExhausted] (backtrack m)
+      outcome <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
+      case outcome of
+        Just (1, _) -> run m returnCont
+        Just (0, _) -> backtrack m
+        Just (3, _) -> raiseItems m [BranchExhausted] (backtrack m)
         _ -> callClausesInterpreted m frame predicate barrier depth returnCont
     _ -> callClausesInterpreted m frame predicate barrier depth returnCont
 

@@ -2,42 +2,29 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE LambdaCase #-}
 
--- | Step 3 + Track 2 native JIT tier for deterministic predicates in the Core engine.
+-- | Step 3 + Horizon 1 + Horizon 4 native JIT tier for deterministic predicates.
 --
 -- Adapted from fprisc:compiler/Sol/HandJIT.hs and Sol/JitCore.hs
 -- Copyright (c) 2026 Jasen Qin (hyperswine), MIT License.
---
--- Compiles admissible deterministic predicates to native machine code
--- (AArch64 and x86-64) at program load time:
---
--- * Slice 1: tail-recursive integer loops (@loop/1@, countdown/countup,
---   accumulator reductions over @INT@ with @is@ and comparisons).
--- * Fragment Growth 1: tail-recursive list/structure traversal and
---   construction (@app/3@, @range/3@) with ground-memo preservation and
---   freshness-proven occurs-check elision.
--- * Fragment Growth 2 (Track 2): nested deterministic list callers (@safe/1@
---   calling @noatt/3@, @nrev/2@ calling @app/3@) verified against the callee
---   definition in 'P.Program'.
--- * Fragment Growth 3: @semidet@ comparison/disequality tail loops over
---   ground lists (@noatt/3@).
---
--- Every non-admissible predicate or unexpected runtime tag/overflow silently
--- declines (pre-flight) or bails out (mid-span, unwinding trail and heap to
--- entry marks) to the Core interpreter.
 module Infera.Core.Jit
   ( JitKernel (..),
+    ParamRole (..),
     jitEnabled,
     jitDebugOn,
     compileJitKernel,
+    compileGeneralTailJit,
     invokeJitKernel,
   )
 where
 
-import Control.Monad (forM_, when)
+import Control.Monad (foldM, forM_, when)
 import Data.Bits ((.|.))
+import qualified Data.IntMap.Strict as IM
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
-import qualified Data.IntMap.Strict as IM
+import Data.List (nub)
+import qualified Data.Map.Strict as M
+import qualified Data.Set as Set
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray, withForeignPtr)
 import Foreign.Marshal.Array (withArray, withArrayLen)
@@ -66,7 +53,6 @@ type NativeFn = Ptr Int64 -> Ptr Int64 -> Ptr Int64 -> IO Int64
 foreign import ccall unsafe "dynamic"
   callNativeFn :: FunPtr NativeFn -> NativeFn
 
--- | Enabled by default on supported architectures unless @INFERA_JIT=0@.
 jitEnabled :: Bool
 jitEnabled = unsafePerformIO $ do
   env <- lookupEnv "INFERA_JIT"
@@ -93,20 +79,13 @@ xcheckSeq = unsafePerformIO (newIORef 0)
 jitDebug :: String -> IO ()
 jitDebug msg = when jitDebugOn (hPutStrLn stderr ("[infera-jit] " ++ msg))
 
--- | A compiled native kernel for a predicate.
 data JitKernel = JitKernel
   { jkKey :: !PredKey,
     jkArity :: !Int,
     jkFunPtr :: !(FunPtr NativeFn),
     jkAddr :: !Int64,
-    -- | Static cell allocation per iteration (0 for pure integer loops, 3 for cons-allocating loops)
     jkCellsPerIter :: !Int,
-    -- | Reusable pinned buffer for (state[8], budgets[2], args[8])
-    jkScratch :: !(ForeignPtr Int64),
-    -- | 'jkScratch''s address, taken once at install. The field above keeps
-    -- the block alive for as long as this kernel is reachable, so the hot
-    -- path can skip 'withForeignPtr'.
-    jkBase :: !(Ptr Int64)
+    jkScratch :: !(ForeignPtr Int64)
   }
 
 assembleHost :: JitUnit -> [Word8]
@@ -132,20 +111,13 @@ installUnit key arity cellsPerIter unit
               scratch <- mallocForeignPtrArray 24
               let addr = fromIntegral (ptrToIntPtr ptr)
                   fnPtr = castPtrToFunPtr ptr
-              base <- withForeignPtr scratch pure
               jitDebug (show key ++ ": compiled (" ++ show (length bytes) ++ " bytes, " ++ arch ++ ")")
-              pure (Just (JitKernel key arity fnPtr addr cellsPerIter scratch base))
-
--- ─── Admissible predicate shapes and lowering ────────────────────────────────
-
-isAdmissiblePred :: [P.Signature] -> P.Signature -> Bool
-isAdmissiblePred decls inferred =
-  (null decls || all (\sig -> P.sigDet sig `elem` [S.Det, S.Semidet]) decls)
-    && P.sigDet inferred `elem` [S.Det, S.Semidet]
+              pure (Just (JitKernel key arity fnPtr addr cellsPerIter scratch))
 
 -- | Attempt to compile a predicate into a native 'JitKernel' at program load
--- time. Declines silently (or logs under @INFERA_JIT_DEBUG=1@) when the
--- predicate is outside the admissible deterministic fragment.
+-- time. Checks 2-level nested callers (@safe/1@, @nrev/2@) and then runs the
+-- unified Horizon 1 + Horizon 4 general tail-recursive / TRMC compiler
+-- ('compileGeneralTailJit').
 compileJitKernel :: Word' -> Word' -> P.Program -> PredKey -> [P.Signature] -> P.Signature -> [S.Clause] -> IO (Maybe JitKernel)
 compileJitKernel nilW consW prog key decls inferred clauses
   | not jitEnabled = pure Nothing
@@ -155,377 +127,842 @@ compileJitKernel nilW consW prog key decls inferred clauses
   | P.sigDet inferred `notElem` [S.Det, S.Semidet] = do
       jitDebug (show key ++ ": declined (inferred " ++ show (P.sigDet inferred) ++ ")")
       pure Nothing
-  | Just (unit, cellsPerIter) <- matchCountdownLoop key clauses =
-      installUnit key (snd key) cellsPerIter unit
-  | Just (unit, cellsPerIter) <- matchAppendLoop nilW consW key clauses =
-      installUnit key (snd key) cellsPerIter unit
-  | Just (unit, cellsPerIter) <- matchRangeLoop nilW consW key clauses =
-      installUnit key (snd key) cellsPerIter unit
-  | Just (unit, cellsPerIter) <- matchNoattLoop nilW consW key clauses =
-      installUnit key (snd key) cellsPerIter unit
   | Just (unit, cellsPerIter) <- matchSafeLoop nilW consW prog key clauses =
       installUnit key (snd key) cellsPerIter unit
   | Just (unit, cellsPerIter) <- matchNrevLoop nilW consW prog key clauses =
       installUnit key (snd key) cellsPerIter unit
+  | Just (unit, cellsPerIter) <- compileGeneralTailJit nilW consW key clauses =
+      installUnit key (snd key) cellsPerIter unit
   | otherwise = do
-      jitDebug (show key ++ ": declined (outside initial JIT fragment)")
+      jitDebug (show key ++ ": declined (outside JIT fragment)")
       pure Nothing
 
--- 1. Slice 1: Countdown integer tail loop
---    p 0.
---    p N <- N > 0, N1 is N - 1, p N1.
-matchCountdownLoop :: PredKey -> [S.Clause] -> Maybe (JitUnit, Int)
-matchCountdownLoop (name, 1) [cBase, cStep]
-  | S.Compound bName [S.IntLit baseVal] <- S.clauseHead cBase,
-    bName == name,
-    null (S.clauseBody cBase),
-    S.Compound sName [S.Var vN] <- S.clauseHead cStep,
-    sName == name,
-    [ S.Compound "gt" [S.Var vN1, S.IntLit guardVal],
-      S.Compound "is" [S.Var vNext, S.Compound "minus" [S.Var vN2, S.IntLit stepVal]],
-      S.Compound rName [S.Var vNext2]
-      ] <- S.clauseBody cStep,
-    vN == vN1 && vN == vN2 && vNext == vNext2 && rName == name && stepVal > 0 && baseVal == guardVal =
-      Just
-        ( JitUnit
-            [ -- Pre-flight: decline if CLP is active
-              JLoadImm RT0 RState stateClpIdx,
-              JBranchImm JNe RT0 0 "decline",
-              -- Deref args[0] into RT0
-              JLoadImm RT0 RArgs 0,
-              JDeref RT0 RT0,
-              -- Check tagOf(RT0) == tagInt (3)
-              JTagOf RT1 RT0,
-              JBranchImm JNe RT1 (fromIntegral tagInt) "decline",
-              -- Unbox N into RT0
-              JValOf RT0 RT0,
-              -- Loop header
-              JLabel "loop",
-              JBranchImm JEq RT0 (fromIntegral baseVal) "success",
-              JBranchImm JLe RT0 (fromIntegral guardVal) "fail",
-              -- Recursive resolution step
-              -- (no depth tick: a last call keeps its caller's continuation depth)
-              JSubImm RT0 RT0 (fromIntegral stepVal),
-              JJump "loop",
-              JLabel "success",
-              JReturn jitSuccess,
-              JLabel "fail",
+-- ─── Horizon 1 + Horizon 4: General Tail-Recursive & TRMC JIT Compiler ───────
+
+data ParamRole
+  = ParamInt
+  | ParamList
+  | ParamOut
+  | ParamOutList
+  deriving (Eq, Show)
+
+data VarKind
+  = VKInt !Reg
+  | VKList !Reg
+  | VKWord !Reg
+  deriving (Eq, Show)
+
+isOutputRole :: ParamRole -> Bool
+isOutputRole = \case
+  ParamOut -> True
+  ParamOutList -> True
+  _ -> False
+
+paramReg :: Int -> [ParamRole] -> Reg
+paramReg idx roles
+  | idx == length roles - 1 && isOutputRole (last roles) = RT3
+  | otherwise = case idx of
+      0 -> RT0
+      1 -> RT1
+      2 -> RT2
+      _ -> RT3
+
+initialFreeRegs :: [ParamRole] -> [Reg]
+initialFreeRegs roles =
+  let used = [paramReg i roles | i <- [0 .. length roles - 1]]
+      pool = [RT0, RT1, RT2, RT3, RT4, RT5, RT6]
+   in filter (`notElem` used) pool
+
+compileGeneralTailJit :: Word' -> Word' -> PredKey -> [S.Clause] -> Maybe (JitUnit, Int)
+compileGeneralTailJit nilW consW (name, arity) clauses
+  | arity < 1 || arity > 4 || null clauses || length clauses > 8 = Nothing
+  | not (any (isRecursiveClause name arity) clauses) = Nothing
+  | not (all (hasValidHead name arity) clauses) = Nothing
+  | otherwise = do
+      roles <- inferParamRoles name arity clauses
+      let nilImm = fromIntegral nilW :: Int64
+          consPlain = fromIntegral consW :: Int64
+          consGround = fromIntegral (consW .|. groundBit) :: Int64
+          groundCheckIdxs = trmcGroundPassthroughIdxs name arity roles clauses
+          prologue = emitEntryChecks roles groundCheckIdxs nilImm consGround
+      clauseBlocks <-
+        sequence
+          [ compileClause nilImm consPlain consGround name roles idx ("clause_" ++ show (idx + 1)) cl
+            | (idx, cl) <- zip [0 :: Int ..] clauses
+          ]
+      let failLbl = "clause_" ++ show (length clauses)
+          cellsPerIter = if last roles == ParamOutList then 3 else 0
+          epilogues =
+            [ JLabel failLbl,
               JReturn jitFailure,
               JLabel "decline",
               JReturn jitDeclined,
+              JLabel "bailout",
+              JReturn jitBailout,
               JLabel "exhausted",
               JReturn jitExhausted
-            ],
-          0
-        )
-matchCountdownLoop _ _ = Nothing
+            ]
+      pure (JitUnit (prologue ++ [JLabel "loop"] ++ concat clauseBlocks ++ epilogues), cellsPerIter)
 
--- 2. Fragment Growth #1a: List append tail loop (`app/3`)
---    app [] L L.
---    app [H | T] L [H | R] <- app T L R.
-matchAppendLoop :: Word' -> Word' -> PredKey -> [S.Clause] -> Maybe (JitUnit, Int)
-matchAppendLoop nilW consW (name, 3) [cBase, cStep]
-  | S.Compound bName [S.Atom "nil", S.Var bL1, S.Var bL2] <- S.clauseHead cBase,
-    bName == name && bL1 == bL2 && null (S.clauseBody cBase),
-    S.Compound sName [S.Compound "cons" [S.Var vH1, S.Var vT1], S.Var vL1, S.Compound "cons" [S.Var vH2, S.Var vR1]] <- S.clauseHead cStep,
-    sName == name && vH1 == vH2,
-    [S.Compound rName [S.Var vT2, S.Var vL2, S.Var vR2]] <- S.clauseBody cStep,
-    rName == name && vT1 == vT2 && vL1 == vL2 && vR1 == vR2 =
-      let consGround = fromIntegral (consW .|. groundBit) :: Int64
-          consPlain = fromIntegral consW :: Int64
-          nilImm = fromIntegral nilW :: Int64
-       in Just
-            ( JitUnit
-                [ -- Pre-flight: decline if CLP is active
-                  JLoadImm RT0 RState stateClpIdx,
-                  JBranchImm JNe RT0 0 "decline",
-                  -- Load args[0] (list1), args[1] (list2), args[2] (out)
-                  JLoadImm RT0 RArgs 0,
-                  JDeref RT0 RT0,
-                  JLoadImm RT1 RArgs 1,
-                  JDeref RT1 RT1,
-                  JLoadImm RT2 RArgs 2,
-                  JDeref RT2 RT2,
-                  -- Pre-flight check: RT2 must be an unbound REF (write mode)
-                  -- and RT1 must be ground (nil, int, atm, chr, or ground STR)
-                  -- so occurs check on the base-case bind is provably elided.
-                  JTagOf RT3 RT2,
-                  JBranchImm JNe RT3 (fromIntegral tagRef) "decline",
-                  JBranchImm JEq RT1 nilImm "check_rt0",
-                  JTagOf RT3 RT1,
-                  JBranchImm JEq RT3 (fromIntegral tagStr) "check_rt1_str",
-                  JBranchImm JEq RT3 (fromIntegral tagRef) "decline",
-                  JJump "check_rt0",
-                  JLabel "check_rt1_str",
-                  JValOf RT4 RT1,
-                  JLoadIx RT4 RCells RT4,
-                  -- Require groundBit on RT1's functor cell
-                  JBranchImm JEq RT4 consGround "check_rt0",
+hasValidHead :: String -> Int -> S.Clause -> Bool
+hasValidHead name arity cl = case S.clauseHead cl of
+  S.Compound hName args -> hName == name && length args == arity
+  _ -> False
+
+isRecursiveClause :: String -> Int -> S.Clause -> Bool
+isRecursiveClause name arity cl = case reverse (S.clauseBody cl) of
+  S.Compound rName rArgs : _ -> rName == name && length rArgs == arity
+  _ -> False
+
+inferParamRoles :: String -> Int -> [S.Clause] -> Maybe [ParamRole]
+inferParamRoles name arity clauses = do
+  let hasOutList = arity >= 2 && all (clauseSupportsOutListParam name arity) clauses && any (clauseEmitsCons name arity) clauses
+      hasOutScalar = not hasOutList && arity >= 2 && all (clauseSupportsOutParam name arity) clauses
+      hasOut = hasOutList || hasOutScalar
+      inCount = if hasOut then arity - 1 else arity
+      passthroughIdxs
+        | not hasOutList = []
+        | otherwise =
+            [ idx
+              | cl <- clauses,
+                not (isRecursiveClause name arity cl),
+                let S.Compound _ headArgs = S.clauseHead cl,
+                S.Var outV <- [last headArgs],
+                (idx, S.Var inV) <- zip [0 .. inCount - 1] (init headArgs),
+                inV == outV
+            ]
+  inRoles <- mapM (inferInputRole passthroughIdxs clauses) [0 .. inCount - 1]
+  let outRole
+        | hasOutList = [ParamOutList]
+        | hasOutScalar = [ParamOut]
+        | otherwise = []
+  pure (inRoles ++ outRole)
+
+clauseSupportsOutListParam :: String -> Int -> S.Clause -> Bool
+clauseSupportsOutListParam name arity cl =
+  let headArgs = case S.clauseHead cl of
+        S.Compound _ as -> as
+        _ -> []
+      lastHead = last headArgs
+      initHeadVars = concatMap termVars (init headArgs)
+      body = S.clauseBody cl
+   in if isRecursiveClause name arity cl
+        then case (lastHead, last body) of
+          (S.Compound "cons" [elemPat, S.Var outTailV], S.Compound _ recArgs) ->
+            last recArgs == S.Var outTailV
+              && outTailV >= 0
+              && outTailV `notElem` initHeadVars
+              && outTailV `notElem` termVars elemPat
+              && all (notElem outTailV . termVars) (init body)
+              && all isGuardOrIs (init body)
+              && isValidTrmcElem elemPat initHeadVars (init body)
+          (S.Var outV, S.Compound _ recArgs) ->
+            last recArgs == S.Var outV
+              && outV >= 0
+              && outV `notElem` initHeadVars
+              && all (notElem outV . termVars) (init body)
+              && all isGuardOrIs (init body)
+          _ -> False
+        else
+          all isGuardOrIs body
+            && case lastHead of
+              S.Atom "nil" -> True
+              S.Compound "cons" [elemPat, S.Atom "nil"] ->
+                isValidTrmcElem elemPat initHeadVars body
+              S.Var outV ->
+                outV >= 0 && outV `elem` initHeadVars
+              _ -> False
+
+isValidTrmcElem :: S.Term -> [S.VarId] -> [S.Term] -> Bool
+isValidTrmcElem elemPat initHeadVars goals = case elemPat of
+  S.IntLit _ -> True
+  S.Var v -> v >= 0 && (v `elem` initHeadVars || any (definesVarWithIs v) goals)
+  _ -> False
+
+clauseEmitsCons :: String -> Int -> S.Clause -> Bool
+clauseEmitsCons name arity cl =
+  let S.Compound _ headArgs = S.clauseHead cl
+   in case last headArgs of
+        S.Compound "cons" [_, _] -> True
+        _ -> False
+  where
+    _ = (name, arity)
+
+trmcGroundPassthroughIdxs :: String -> Int -> [ParamRole] -> [S.Clause] -> [Int]
+trmcGroundPassthroughIdxs name arity roles clauses
+  | last roles /= ParamOutList = []
+  | otherwise =
+      nub
+        [ idx
+          | cl <- clauses,
+            not (isRecursiveClause name arity cl),
+            let S.Compound _ headArgs = S.clauseHead cl,
+            S.Var outV <- [last headArgs],
+            (idx, S.Var inV) <- zip [0 .. arity - 2] (init headArgs),
+            inV == outV
+        ]
+
+clauseSupportsOutParam :: String -> Int -> S.Clause -> Bool
+clauseSupportsOutParam name arity cl =
+  let headArgs = case S.clauseHead cl of
+        S.Compound _ as -> as
+        _ -> []
+      lastHead = last headArgs
+      initHeadVars = concatMap termVars (init headArgs)
+      body = S.clauseBody cl
+   in if isRecursiveClause name arity cl
+        then case (lastHead, last body) of
+          (S.Var outV, S.Compound _ recArgs) ->
+            last recArgs == S.Var outV
+              && outV >= 0
+              && outV `notElem` initHeadVars
+              && all (notElem outV . termVars) (init body)
+          _ -> False
+        else case lastHead of
+          S.IntLit _ -> all isGuardOrIs body
+          S.Var outV ->
+            outV >= 0
+              && all isGuardOrIs body
+              && (outV `elem` initHeadVars || any (definesVarWithIs outV) body)
+          _ -> False
+
+isGuardOrIs :: S.Term -> Bool
+isGuardOrIs = \case
+  S.Compound "is" [S.Var _, _] -> True
+  S.Compound op [_, _] -> isCmpOp op
+  _ -> False
+
+definesVarWithIs :: S.VarId -> S.Term -> Bool
+definesVarWithIs v = \case
+  S.Compound "is" [S.Var lhs, _] -> lhs == v
+  _ -> False
+
+inferInputRole :: [Int] -> [S.Clause] -> Int -> Maybe ParamRole
+inferInputRole passthroughIdxs clauses idx =
+  let pats = [as !! idx | cl <- clauses, S.Compound _ as <- [S.clauseHead cl]]
+      usesList = idx `elem` passthroughIdxs || any isListPat pats
+      usesInt = any isIntPat pats
+   in if usesList && usesInt
+        then Nothing
+        else Just (if usesList then ParamList else ParamInt)
+  where
+    isListPat = \case
+      S.Atom "nil" -> True
+      S.Compound "cons" [_, _] -> True
+      _ -> False
+    isIntPat = \case
+      S.IntLit _ -> True
+      _ -> False
+
+emitEntryChecks :: [ParamRole] -> [Int] -> Int64 -> Int64 -> [JitOp]
+emitEntryChecks roles groundCheckIdxs nilImm consGround =
+  [ JLoadImm RT0 RState stateClpIdx,
+    JBranchImm JNe RT0 0 "decline"
+  ]
+    ++ concat [emitParamEntry i r | (i, r) <- zip [0 :: Int ..] roles]
+  where
+    emitParamEntry idx = \case
+      ParamInt ->
+        let reg = paramReg idx roles
+         in [ JLoadImm reg RArgs idx,
+              JDeref reg reg,
+              JTagOf RT7 reg,
+              JBranchImm JNe RT7 (fromIntegral tagInt) "decline",
+              JValOf reg reg
+            ]
+      ParamList
+        | idx `elem` groundCheckIdxs ->
+            let reg = paramReg idx roles
+                strCheckLbl = "entry_gnd_str_" ++ show idx
+                okLbl = "entry_list_ok_" ++ show idx
+             in [ JLoadImm reg RArgs idx,
+                  JDeref reg reg,
+                  JBranchImm JEq reg nilImm okLbl,
+                  JTagOf RT7 reg,
+                  JBranchImm JEq RT7 (fromIntegral tagStr) strCheckLbl,
+                  JBranchImm JEq RT7 (fromIntegral tagRef) "decline",
+                  JJump okLbl,
+                  JLabel strCheckLbl,
+                  JValOf RT7 reg,
+                  JLoadIx RT7 RCells RT7,
+                  JBranchImm JEq RT7 consGround okLbl,
                   JJump "decline",
-                  JLabel "check_rt0",
-                  -- Pre-flight check: RT0 is either nil or STR
-                  JBranchImm JEq RT0 nilImm "base_case",
-                  JTagOf RT3 RT0,
-                  JBranchImm JNe RT3 (fromIntegral tagStr) "decline",
-                  -- Main append loop:
-                  -- RT0 = current list1 word (dereferenced)
-                  -- RT1 = list2 word (dereferenced, proven ground)
-                  -- RT2 = current output REF word (dereferenced tagRef)
-                  JLabel "loop",
-                  JBranchImm JEq RT0 nilImm "base_case",
-                  JTagOf RT3 RT0,
-                  JBranchImm JNe RT3 (fromIntegral tagStr) "bailout",
-                  JValOf RT3 RT0, -- RT3 = cell address of list1 cons block
-                  JLoadIx RT4 RCells RT3, -- functor word
-                  JBranchImm JEq RT4 consPlain "fun_ok",
-                  JBranchImm JEq RT4 consGround "fun_ok",
-                  JJump "bailout",
-                  JLabel "fun_ok",
-                  -- Check heap capacity: RH + 4 <= rCAP
-                  JLoadImm RT4 RState stateCapIdx,
-                  JAddImm RT5 RH 4,
-                  JBranchCmp JGt RT5 RT4 "bailout",
-                  -- Load H (RT4) and T (RT5) from list1 cell
-                  JAddImm RT4 RT3 1,
-                  JLoadIx RT4 RCells RT4,
-                  JDeref RT4 RT4,
-                  -- Binding the output to a structure that contains it would
-                  -- create a cycle the interpreter rejects by occurs check.
-                  -- Only copy atomic elements natively; anything compound or
-                  -- still unbound goes back to the interpreter.
-                  JTagOf RT5 RT4,
-                  JBranchImm JEq RT5 (fromIntegral tagInt) "head_ok",
-                  JBranchImm JEq RT5 (fromIntegral tagAtm) "head_ok",
-                  JBranchImm JEq RT5 (fromIntegral tagChr) "head_ok",
-                  JJump "bailout",
-                  JLabel "head_ok",
-                  JAddImm RT5 RT3 2,
-                  JLoadIx RT5 RCells RT5,
-                  JDeref RT5 RT5,
-                  -- Allocate 3 cells at RH for new cons cell:
-                  --   RCells[RH]     = consPlain (non-ground spine cell, matching buildCompound)
-                  --   RCells[RH + 1] = H (RT4)
-                  --   RCells[RH + 2] = refWord(RH + 2)
-                  JMovImm RT3 consPlain,
-                  JStoreIx RT3 RCells RH,
-                  JAddImm RT3 RH 1,
-                  JStoreIx RT4 RCells RT3,
-                  JAddImm RT3 RH 2,
-                  JMkWord RT4 RT3 tagRef,
-                  JStoreIx RT4 RCells RT3,
-                  -- Construct strWord(RH) in RT3 and bind output REF (valOf RT2)
-                  JMkWord RT3 RH tagStr,
-                  JAddImm RH RH 3,
-                  JValOf RT2 RT2,
-                  JBindRef RT2 RT3 "bailout",
-                  -- Advance: RT2 = new tail refWord (RT4), RT0 = T (RT5)
-                  JMov RT2 RT4,
-                  JMov RT0 RT5,
-                  -- (no depth tick: a last call keeps its caller's continuation depth)
-                  JJump "loop",
-                  JLabel "base_case",
-                  -- Bind current output REF (RT2) to RT1
-                  JValOf RT2 RT2,
-                  JBindRef RT2 RT1 "bailout",
-                  JReturn jitSuccess,
-                  JLabel "decline",
-                  JReturn jitDeclined,
-                  JLabel "bailout",
-                  JReturn jitBailout,
-                  JLabel "exhausted",
-                  JReturn jitExhausted
-                ],
-              3
-            )
-matchAppendLoop _ _ _ _ = Nothing
+                  JLabel okLbl
+                ]
+        | otherwise ->
+            let reg = paramReg idx roles
+                okLbl = "entry_list_ok_" ++ show idx
+             in [ JLoadImm reg RArgs idx,
+                  JDeref reg reg,
+                  JBranchImm JEq reg nilImm okLbl,
+                  JTagOf RT7 reg,
+                  JBranchImm JNe RT7 (fromIntegral tagStr) "decline",
+                  JLabel okLbl
+                ]
+      ParamOut ->
+        let reg = paramReg idx roles
+            okLbl = "entry_out_ok_" ++ show idx
+         in [ JLoadImm reg RArgs idx,
+              JDeref reg reg,
+              JTagOf RT7 reg,
+              JBranchImm JEq RT7 (fromIntegral tagRef) okLbl,
+              JBranchImm JEq RT7 (fromIntegral tagInt) okLbl,
+              JJump "decline",
+              JLabel okLbl
+            ]
+      ParamOutList ->
+        let reg = paramReg idx roles
+         in [ JLoadImm reg RArgs idx,
+              JDeref reg reg,
+              JTagOf RT7 reg,
+              JBranchImm JNe RT7 (fromIntegral tagRef) "decline"
+            ]
 
--- 3. Fragment Growth #1b: Integer range list builder (`range/3`)
---    range N N [N].
---    range I N [I | T] <- I < N, I1 is I + 1, range I1 N T.
-matchRangeLoop :: Word' -> Word' -> PredKey -> [S.Clause] -> Maybe (JitUnit, Int)
-matchRangeLoop nilW consW (name, 3) [cBase, cStep]
-  | S.Compound bName [S.Var bN1, S.Var bN2, S.Compound "cons" [S.Var bN3, S.Atom "nil"]] <- S.clauseHead cBase,
-    bName == name && bN1 == bN2 && bN2 == bN3 && null (S.clauseBody cBase),
-    S.Compound sName [S.Var vI1, S.Var vN1, S.Compound "cons" [S.Var vI2, S.Var vT1]] <- S.clauseHead cStep,
-    sName == name && vI1 == vI2,
-    [ S.Compound "lt" [S.Var vI3, S.Var vN2],
-      S.Compound "is" [S.Var vI1Next, S.Compound "plus" [S.Var vI4, S.IntLit 1]],
-      S.Compound rName [S.Var vI1Next2, S.Var vN3, S.Var vT2]
-      ] <- S.clauseBody cStep,
-    rName == name && vI1 == vI3 && vI1 == vI4 && vN1 == vN2 && vN1 == vN3 && vI1Next == vI1Next2 && vT1 == vT2 =
-      let consGround = fromIntegral (consW .|. groundBit) :: Int64
-          consPlain = fromIntegral consW :: Int64
-          nilImm = fromIntegral nilW :: Int64
-       in Just
-            ( JitUnit
-                [ JLoadImm RT0 RState stateClpIdx,
-                  JBranchImm JNe RT0 0 "decline",
-                  -- Deref args[0] (I), args[1] (N), args[2] (Out)
-                  JLoadImm RT0 RArgs 0,
-                  JDeref RT0 RT0,
-                  JTagOf RT3 RT0,
-                  JBranchImm JNe RT3 (fromIntegral tagInt) "decline",
-                  JValOf RT0 RT0,
-                  JLoadImm RT1 RArgs 1,
-                  JDeref RT1 RT1,
-                  JTagOf RT3 RT1,
-                  JBranchImm JNe RT3 (fromIntegral tagInt) "decline",
-                  JValOf RT1 RT1,
-                  JLoadImm RT2 RArgs 2,
-                  JDeref RT2 RT2,
-                  JTagOf RT3 RT2,
-                  JBranchImm JNe RT3 (fromIntegral tagRef) "decline",
-                  -- Loop: RT0 = I (unboxed), RT1 = N (unboxed), RT2 = Out (tagRef word)
-                  JLabel "loop",
-                  JBranchCmp JEq RT0 RT1 "base_case",
-                  JBranchCmp JGt RT0 RT1 "fail",
-                  -- Check heap capacity: RH + 4 <= rCAP
-                  JLoadImm RT4 RState stateCapIdx,
-                  JAddImm RT5 RH 4,
-                  JBranchCmp JGt RT5 RT4 "bailout",
-                  -- Allocate [I | T] at RH
-                  JMovImm RT3 consPlain,
-                  JStoreIx RT3 RCells RH,
-                  JMkWord RT4 RT0 tagInt,
-                  JAddImm RT3 RH 1,
-                  JStoreIx RT4 RCells RT3,
-                  JAddImm RT3 RH 2,
-                  JMkWord RT4 RT3 tagRef,
-                  JStoreIx RT4 RCells RT3,
-                  JMkWord RT3 RH tagStr,
-                  JAddImm RH RH 3,
-                  JValOf RT2 RT2,
-                  JBindRef RT2 RT3 "bailout",
-                  JMov RT2 RT4,
-                  JAddImm RT0 RT0 1,
-                  -- (no depth tick: a last call keeps its caller's continuation depth)
-                  JJump "loop",
-                  JLabel "base_case",
-                  -- Allocate ground [N] = cons(N, nil) at RH
-                  JLoadImm RT4 RState stateCapIdx,
-                  JAddImm RT5 RH 4,
-                  JBranchCmp JGt RT5 RT4 "bailout",
-                  JMovImm RT3 consGround,
-                  JStoreIx RT3 RCells RH,
-                  JMkWord RT4 RT0 tagInt,
-                  JAddImm RT3 RH 1,
-                  JStoreIx RT4 RCells RT3,
-                  JAddImm RT3 RH 2,
-                  JMovImm RT4 nilImm,
-                  JStoreIx RT4 RCells RT3,
-                  JMkWord RT3 RH tagStr,
-                  JAddImm RH RH 3,
-                  JValOf RT2 RT2,
-                  JBindRef RT2 RT3 "bailout",
-                  JReturn jitSuccess,
-                  JLabel "fail",
-                  JReturn jitFailure,
-                  JLabel "decline",
-                  JReturn jitDeclined,
-                  JLabel "bailout",
-                  JReturn jitBailout,
-                  JLabel "exhausted",
-                  JReturn jitExhausted
-                ],
-              3
-            )
-matchRangeLoop _ _ _ _ = Nothing
+-- ─── Per-clause compilation ──────────────────────────────────────────────────
 
--- 4. Fragment Growth #3: Semidet comparison/disequality list loop (`noatt/3`)
---    noatt _ [] _.
---    noatt Q [Q1 | Qs] D <- Q != Q1, D1 is Q1 - Q, D1 != D, D2 is Q - Q1, D2 != D, D3 is D + 1, noatt Q Qs D3.
-matchNoattLoop :: Word' -> Word' -> PredKey -> [S.Clause] -> Maybe (JitUnit, Int)
-matchNoattLoop nilW consW (name, 3) [cBase, cStep]
-  | S.Compound bName [_, S.Atom "nil", _] <- S.clauseHead cBase,
-    bName == name && null (S.clauseBody cBase),
-    S.Compound sName [S.Var vQ, S.Compound "cons" [S.Var vQ1, S.Var vQs], S.Var vD] <- S.clauseHead cStep,
-    sName == name,
-    [ S.Compound "neq" [S.Var vQa, S.Var vQ1a],
-      S.Compound "is" [S.Var vD1, S.Compound "minus" [S.Var vQ1b, S.Var vQb]],
-      S.Compound "neq" [S.Var vD1a, S.Var vDa],
-      S.Compound "is" [S.Var vD2, S.Compound "minus" [S.Var vQc, S.Var vQ1c]],
-      S.Compound "neq" [S.Var vD2a, S.Var vDb],
-      S.Compound "is" [S.Var vD3, S.Compound "plus" [S.Var vDc, S.IntLit 1]],
-      S.Compound rName [S.Var vQd, S.Var vQsa, S.Var vD3a]
-      ] <- S.clauseBody cStep,
-    rName == name
-      && all (== vQ) [vQa, vQb, vQc, vQd]
-      && all (== vQ1) [vQ1a, vQ1b, vQ1c]
-      && vD1 == vD1a
-      && vD2 == vD2a
-      && vD3 == vD3a
-      && all (== vD) [vDa, vDb, vDc]
-      && vQs == vQsa =
-      let consGround = fromIntegral (consW .|. groundBit) :: Int64
-          consPlain = fromIntegral consW :: Int64
-          nilImm = fromIntegral nilW :: Int64
-       in Just
-            ( JitUnit
-                [ JLoadImm RT0 RState stateClpIdx,
-                  JBranchImm JNe RT0 0 "decline",
-                  -- args[0] = Q (int), args[1] = Qs (list), args[2] = D (int)
-                  JLoadImm RT0 RArgs 0,
-                  JDeref RT0 RT0,
-                  JTagOf RT3 RT0,
-                  JBranchImm JNe RT3 (fromIntegral tagInt) "decline",
-                  JValOf RT0 RT0, -- RT0 = unboxed Q
-                  JLoadImm RT1 RArgs 1,
-                  JDeref RT1 RT1, -- RT1 = current list word
-                  JLoadImm RT2 RArgs 2,
-                  JDeref RT2 RT2,
-                  JTagOf RT3 RT2,
-                  JBranchImm JNe RT3 (fromIntegral tagInt) "decline",
-                  JValOf RT2 RT2, -- RT2 = unboxed D
-                  JLabel "loop",
-                  JBranchImm JEq RT1 nilImm "success",
-                  JTagOf RT3 RT1,
-                  JBranchImm JNe RT3 (fromIntegral tagStr) "bailout",
-                  JValOf RT3 RT1,
-                  JLoadIx RT4 RCells RT3,
-                  JBranchImm JEq RT4 consPlain "cons_ok",
-                  JBranchImm JEq RT4 consGround "cons_ok",
-                  JJump "bailout",
-                  JLabel "cons_ok",
-                  -- Load Q1 (cell + 1) and Qs' (cell + 2)
-                  JAddImm RT4 RT3 1,
-                  JLoadIx RT4 RCells RT4,
-                  JDeref RT4 RT4,
-                  JTagOf RT5 RT4,
-                  JBranchImm JNe RT5 (fromIntegral tagInt) "bailout",
-                  JValOf RT4 RT4, -- RT4 = unboxed Q1
-                  -- Check Q != Q1
-                  JBranchCmp JEq RT0 RT4 "fail",
-                  -- Check Q1 - Q != D
-                  JSubChecked RT5 RT4 RT0 "bailout",
-                  JBranchCmp JEq RT5 RT2 "fail",
-                  -- Check Q - Q1 != D
-                  JSubChecked RT5 RT0 RT4 "bailout",
-                  JBranchCmp JEq RT5 RT2 "fail",
-                  -- Advance Qs and D := D + 1
-                  JAddImm RT5 RT3 2,
-                  JLoadIx RT1 RCells RT5,
-                  JDeref RT1 RT1,
-                  JAddImm RT2 RT2 1,
-                  -- (no depth tick: a last call keeps its caller's continuation depth)
-                  JJump "loop",
-                  JLabel "success",
-                  JReturn jitSuccess,
-                  JLabel "fail",
-                  JReturn jitFailure,
-                  JLabel "decline",
-                  JReturn jitDeclined,
-                  JLabel "bailout",
-                  JReturn jitBailout,
-                  JLabel "exhausted",
-                  JReturn jitExhausted
-                ],
-              0
-            )
-matchNoattLoop _ _ _ _ = Nothing
+type VarEnv = M.Map S.VarId VarKind
 
--- 5. Track 2A (Fragment Growth #2a): Nested list safety loop (`safe/1` calling `noatt/3`)
---    safe [].
---    safe [Q | Qs] <- noatt Q Qs 1, safe Qs.
+clauseVarCount :: S.VarId -> S.Clause -> Int
+clauseVarCount v cl =
+  length $ filter (== v) (concatMap termVars (S.clauseHead cl : S.clauseBody cl))
+
+isAnonOrSingleton :: S.VarId -> S.Clause -> Bool
+isAnonOrSingleton v cl = v < 0 || clauseVarCount v cl <= 1
+
+clauseUsesVarAsInt :: S.VarId -> S.Clause -> Bool
+clauseUsesVarAsInt v cl =
+  any goalUsesAsInt (S.clauseBody cl)
+  where
+    goalUsesAsInt = \case
+      S.Compound "is" [lhs, rhs] -> v `elem` termVars lhs || v `elem` termVars rhs
+      S.Compound op [a, b] | isCmpOp op -> v `elem` termVars a || v `elem` termVars b
+      _ -> False
+
+compileClause ::
+  Int64 ->
+  Int64 ->
+  Int64 ->
+  String ->
+  [ParamRole] ->
+  Int ->
+  Label ->
+  S.Clause ->
+  Maybe [JitOp]
+compileClause nilImm consPlain consGround predName roles clauseIdx nextLbl cl = do
+  let S.Compound _ headArgs = S.clauseHead cl
+      body = S.clauseBody cl
+      lastRole = last roles
+      hasOut = isOutputRole lastRole
+      inCount = if hasOut then length roles - 1 else length roles
+      free0 = initialFreeRegs roles
+  (headOps, env1, free1) <-
+    compileHeadArgs nilImm consPlain consGround cl roles clauseIdx nextLbl 0 inCount headArgs M.empty free0
+  let freeAfterHead = recycleDeadVars (body ++ [last headArgs | hasOut]) env1 free1
+  if isRecursiveClause predName (length roles) cl
+    then do
+      let guardAndIsGoals = init body
+          S.Compound _ recArgs = last body
+          recInArgs = if hasOut then init recArgs else recArgs
+          extraLive = [last headArgs | lastRole == ParamOutList]
+      (bodyOps, env2, free2) <-
+        compileBodyGoals nextLbl guardAndIsGoals (recInArgs ++ extraLive) env1 freeAfterHead
+      trmcStepOps <-
+        if lastRole == ParamOutList
+          then compileTrmcStepOutput consPlain (last headArgs) env2
+          else Just []
+      let free3 = recycleDeadVars recInArgs env2 free2
+      moveOps <- compileTailCallMoves roles recInArgs env2 free3
+      pure
+        ( [JLabel ("clause_" ++ show clauseIdx)]
+            ++ headOps
+            ++ bodyOps
+            ++ trmcStepOps
+            ++ moveOps
+            ++ [JTickDepth "exhausted", JJump "loop"]
+        )
+    else do
+      let outHeads = [last headArgs | hasOut]
+      (bodyOps, env2, _free2) <-
+        compileBodyGoals nextLbl body outHeads env1 freeAfterHead
+      retOps <- case lastRole of
+        ParamOut -> compileBaseOutput clauseIdx nextLbl (last headArgs) env2
+        ParamOutList -> compileTrmcBaseOutput nilImm consGround (last headArgs) env2
+        _ -> Just [JReturn jitSuccess]
+      pure
+        ( [JLabel ("clause_" ++ show clauseIdx)]
+            ++ headOps
+            ++ bodyOps
+            ++ retOps
+        )
+
+compileHeadArgs ::
+  Int64 ->
+  Int64 ->
+  Int64 ->
+  S.Clause ->
+  [ParamRole] ->
+  Int ->
+  Label ->
+  Int ->
+  Int ->
+  [S.Term] ->
+  VarEnv ->
+  [Reg] ->
+  Maybe ([JitOp], VarEnv, [Reg])
+compileHeadArgs nilImm consPlain consGround cl roles clauseIdx nextLbl idx limit args env freeRegs
+  | idx >= limit = Just ([], env, freeRegs)
+  | otherwise = do
+      let pat = args !! idx
+          role = roles !! idx
+          pReg = paramReg idx roles
+      (ops1, env1, free1) <-
+        compileHeadPat nilImm consPlain consGround cl clauseIdx idx nextLbl role pReg pat env freeRegs
+      (ops2, env2, free2) <-
+        compileHeadArgs nilImm consPlain consGround cl roles clauseIdx nextLbl (idx + 1) limit args env1 free1
+      pure (ops1 ++ ops2, env2, free2)
+
+compileHeadPat ::
+  Int64 ->
+  Int64 ->
+  Int64 ->
+  S.Clause ->
+  Int ->
+  Int ->
+  Label ->
+  ParamRole ->
+  Reg ->
+  S.Term ->
+  VarEnv ->
+  [Reg] ->
+  Maybe ([JitOp], VarEnv, [Reg])
+compileHeadPat nilImm consPlain consGround cl clauseIdx argIdx nextLbl role pReg pat env freeRegs =
+  case (role, pat) of
+    (_, S.Var v) | v < 0 -> Just ([], env, freeRegs)
+    (ParamInt, S.IntLit v) ->
+      Just ([JBranchImm JNe pReg (fromIntegral v) nextLbl], env, freeRegs)
+    (ParamInt, S.Var v) ->
+      case M.lookup v env of
+        Nothing -> Just ([], M.insert v (VKInt pReg) env, freeRegs)
+        Just (VKInt prevReg) ->
+          Just ([JBranchCmp JNe pReg prevReg nextLbl], env, freeRegs)
+        Just _ -> Nothing
+    (ParamList, S.Atom "nil") ->
+      Just ([JBranchImm JNe pReg nilImm nextLbl], env, freeRegs)
+    (ParamList, S.Var v) ->
+      case M.lookup v env of
+        Nothing -> Just ([], M.insert v (VKList pReg) env, freeRegs)
+        Just (VKList prevReg) ->
+          Just ([JBranchCmp JNe pReg prevReg nextLbl], env, freeRegs)
+        Just _ -> Nothing
+    (ParamList, S.Compound "cons" [hPat, tPat]) -> do
+      let consOkLbl = "head_cons_ok_" ++ show clauseIdx ++ "_" ++ show argIdx
+      let unpackPrefix =
+            [ JBranchImm JEq pReg nilImm nextLbl,
+              JTagOf RT7 pReg,
+              JBranchImm JNe RT7 (fromIntegral tagStr) "bailout",
+              JValOf RT7 pReg
+            ]
+      (tmpReg, _) <- unconsReg freeRegs
+      let funCheck =
+            [ JLoadIx tmpReg RCells RT7,
+              JBranchImm JEq tmpReg consPlain consOkLbl,
+              JBranchImm JEq tmpReg consGround consOkLbl,
+              JJump "bailout",
+              JLabel consOkLbl
+            ]
+      (hOps, tOps, env', free') <- compileConsSubpats nilImm cl nextLbl hPat tPat env freeRegs
+      pure (unpackPrefix ++ funCheck ++ tOps ++ hOps, env', free')
+    _ -> Nothing
+
+compileConsSubpats ::
+  Int64 ->
+  S.Clause ->
+  Label ->
+  S.Term ->
+  S.Term ->
+  VarEnv ->
+  [Reg] ->
+  Maybe ([JitOp], [JitOp], VarEnv, [Reg])
+compileConsSubpats nilImm cl nextLbl hPat tPat env free0 = do
+  (tOps, env1, free1) <- case tPat of
+    S.Var tv | isAnonOrSingleton tv cl -> Just ([], env, free0)
+    S.Atom "nil" -> do
+      (rT, _) <- unconsReg free0
+      Just
+        ( [ JAddImm rT RT7 2,
+            JLoadIx rT RCells rT,
+            JDeref rT rT,
+            JBranchImm JNe rT nilImm nextLbl
+          ],
+          env,
+          free0
+        )
+    S.Var tv ->
+      case M.lookup tv env of
+        Nothing -> do
+          (rT, free') <- unconsReg free0
+          Just
+            ( [ JAddImm rT RT7 2,
+                JLoadIx rT RCells rT,
+                JDeref rT rT
+              ],
+              M.insert tv (VKList rT) env,
+              free'
+            )
+        Just (VKList prevReg) -> do
+          (rT, _) <- unconsReg free0
+          Just
+            ( [ JAddImm rT RT7 2,
+                JLoadIx rT RCells rT,
+                JDeref rT rT,
+                JBranchCmp JNe rT prevReg nextLbl
+              ],
+              env,
+              free0
+            )
+        Just _ -> Nothing
+    _ -> Nothing
+
+  (hOps, env2, free2) <- case hPat of
+    S.Var hv | isAnonOrSingleton hv cl -> Just ([], env1, free1)
+    S.IntLit k ->
+      Just
+        ( [ JAddImm RT7 RT7 1,
+            JLoadIx RT7 RCells RT7,
+            JDeref RT7 RT7,
+            JBranchImm JNe RT7 (fromIntegral (intWord (fromIntegral k))) nextLbl
+          ],
+          env1,
+          free1
+        )
+    S.Var hv ->
+      case M.lookup hv env1 of
+        Nothing
+          | clauseUsesVarAsInt hv cl -> do
+              (rH, free') <- unconsReg free1
+              Just
+                ( [ JAddImm RT7 RT7 1,
+                    JLoadIx rH RCells RT7,
+                    JDeref rH rH,
+                    JTagOf RT7 rH,
+                    JBranchImm JNe RT7 (fromIntegral tagInt) "bailout",
+                    JValOf rH rH
+                  ],
+                  M.insert hv (VKInt rH) env1,
+                  free'
+                )
+          | otherwise -> do
+              (rH, free') <- unconsReg free1
+              Just
+                ( [ JAddImm RT7 RT7 1,
+                    JLoadIx rH RCells RT7,
+                    JDeref rH rH
+                  ],
+                  M.insert hv (VKWord rH) env1,
+                  free'
+                )
+        Just (VKInt prevReg) -> do
+          (rH, _) <- unconsReg free1
+          Just
+            ( [ JAddImm RT7 RT7 1,
+                JLoadIx rH RCells RT7,
+                JDeref rH rH,
+                JTagOf RT7 rH,
+                JBranchImm JNe RT7 (fromIntegral tagInt) "bailout",
+                JValOf rH rH,
+                JBranchCmp JNe rH prevReg nextLbl
+              ],
+              env1,
+              free1
+            )
+        Just (VKWord prevReg) -> do
+          (rH, _) <- unconsReg free1
+          Just
+            ( [ JAddImm RT7 RT7 1,
+                JLoadIx rH RCells RT7,
+                JDeref rH rH,
+                JBranchCmp JNe rH prevReg nextLbl
+              ],
+              env1,
+              free1
+            )
+        Just _ -> Nothing
+    _ -> Nothing
+  pure (hOps, tOps, env2, free2)
+
+-- ─── Body goals (comparisons and `is` assignments) with liveness recycling ──
+
+compileBodyGoals ::
+  Label ->
+  [S.Term] ->
+  [S.Term] ->
+  VarEnv ->
+  [Reg] ->
+  Maybe ([JitOp], VarEnv, [Reg])
+compileBodyGoals _ [] _ env freeRegs = Just ([], env, freeRegs)
+compileBodyGoals nextLbl (g : gs) tailTerms env freeRegs = do
+  (ops1, env1, free1) <- compileOneGoal nextLbl g env freeRegs
+  let free1' = recycleDeadVars (gs ++ tailTerms) env1 free1
+  (ops2, env2, free2) <- compileBodyGoals nextLbl gs tailTerms env1 free1'
+  pure (ops1 ++ ops2, env2, free2)
+
+compileOneGoal :: Label -> S.Term -> VarEnv -> [Reg] -> Maybe ([JitOp], VarEnv, [Reg])
+compileOneGoal nextLbl goal env freeRegs = case goal of
+  S.Compound "is" [S.Var lhs, expr] | lhs >= 0 -> do
+    case M.lookup lhs env of
+      Nothing -> do
+        (dstReg, free') <- unconsReg freeRegs
+        ops <- compileArithExpr dstReg expr env free'
+        pure (ops, M.insert lhs (VKInt dstReg) env, free')
+      Just (VKInt existingReg) -> do
+        ops <- compileArithExpr RT7 expr env freeRegs
+        pure (ops ++ [JBranchCmp JNe existingReg RT7 nextLbl], env, freeRegs)
+      Just _ -> Nothing
+  S.Compound op [lhs, rhs] | isCmpOp op -> do
+    negCond <- negatedCmpCond op
+    case (lhs, rhs) of
+      (S.Var v, S.IntLit k)
+        | Just (VKInt rL) <- M.lookup v env ->
+            Just ([JBranchImm negCond rL (fromIntegral k) nextLbl], env, freeRegs)
+      (S.Var v1, S.Var v2)
+        | Just (VKInt r1) <- M.lookup v1 env,
+          Just (VKInt r2) <- M.lookup v2 env ->
+            Just ([JBranchCmp negCond r1 r2 nextLbl], env, freeRegs)
+      _ -> do
+        (rL, free1) <- unconsReg freeRegs
+        opsL <- compileArithExpr rL lhs env free1
+        opsR <- compileArithExpr RT7 rhs env free1
+        pure (opsL ++ opsR ++ [JBranchCmp negCond rL RT7 nextLbl], env, freeRegs)
+  _ -> Nothing
+
+isCmpOp :: String -> Bool
+isCmpOp op = op `elem` ["==", "=:=", "=", "neq", "!=", "=\\=", "\\=", "<", "<=", "=<", ">", ">="]
+
+negatedCmpCond :: String -> Maybe Cond
+negatedCmpCond = \case
+  "==" -> Just JNe
+  "=:=" -> Just JNe
+  "=" -> Just JNe
+  "neq" -> Just JEq
+  "!=" -> Just JEq
+  "=\\=" -> Just JEq
+  "\\=" -> Just JEq
+  "<" -> Just JGe
+  "<=" -> Just JGt
+  "=<" -> Just JGt
+  ">" -> Just JLe
+  ">=" -> Just JLt
+  _ -> Nothing
+
+compileArithExpr :: Reg -> S.Term -> VarEnv -> [Reg] -> Maybe [JitOp]
+compileArithExpr dst expr env freeRegs = case expr of
+  S.IntLit k -> Just [JMovImm dst (fromIntegral k)]
+  S.Var v -> case M.lookup v env of
+    Just (VKInt r) -> Just [JMov dst r | dst /= r]
+    _ -> Nothing
+  S.Compound op [a, b]
+    | op `elem` ["+", "-", "*"] -> do
+        let comb rA rB = case op of
+              "+" -> JAddChecked dst rA rB "bailout"
+              "-" -> JSubChecked dst rA rB "bailout"
+              _ -> JMulChecked dst rA rB "bailout"
+        case (a, b) of
+          (S.Var va, S.Var vb)
+            | Just (VKInt ra) <- M.lookup va env,
+              Just (VKInt rb) <- M.lookup vb env ->
+                Just [comb ra rb]
+          (S.Var va, S.IntLit kb)
+            | Just (VKInt ra) <- M.lookup va env ->
+                Just [JMovImm RT7 (fromIntegral kb), comb ra RT7]
+          (S.IntLit ka, S.Var vb)
+            | Just (VKInt rb) <- M.lookup vb env ->
+                Just [JMovImm RT7 (fromIntegral ka), comb RT7 rb]
+          _ -> do
+            opsA <- compileArithExpr dst a env freeRegs
+            (tmpB, free') <- if dst == RT7 then unconsReg freeRegs else Just (RT7, freeRegs)
+            opsB <- compileArithExpr tmpB b env free'
+            pure (opsA ++ opsB ++ [comb dst tmpB])
+  _ -> Nothing
+
+-- ─── Horizon 4: TRMC step and base output lowering ───────────────────────────
+
+compileTaggedElemIntoRT7 :: S.Term -> VarEnv -> Maybe [JitOp]
+compileTaggedElemIntoRT7 elemPat env = case elemPat of
+  S.IntLit k ->
+    Just [JMovImm RT7 (fromIntegral (intWord (fromIntegral k)))]
+  S.Var v -> case M.lookup v env of
+    Just (VKInt r) -> Just [JMkWord RT7 r tagInt]
+    Just (VKWord r) -> Just [JMov RT7 r]
+    Just (VKList r) -> Just [JMov RT7 r]
+    Nothing -> Nothing
+  _ -> Nothing
+
+compileTrmcStepOutput :: Int64 -> S.Term -> VarEnv -> Maybe [JitOp]
+compileTrmcStepOutput consPlain outHeadPat env = case outHeadPat of
+  S.Var _ -> Just []
+  S.Compound "cons" [elemPat, S.Var _] -> do
+    elemOps <- compileTaggedElemIntoRT7 elemPat env
+    Just
+      ( [ JLoadImm RT7 RState stateCapIdx,
+          JAddImm RH RH 4,
+          JBranchCmp JGt RH RT7 "bailout",
+          JSubImm RH RH 4,
+          JMovImm RT7 consPlain,
+          JStoreIx RT7 RCells RH
+        ]
+          ++ elemOps
+          ++ [ JAddImm RH RH 1,
+               JStoreIx RT7 RCells RH,
+               JSubImm RH RH 1,
+               JMkWord RT7 RH tagStr,
+               JValOf RT3 RT3,
+               JBindRef RT3 RT7 "bailout",
+               JAddImm RH RH 2,
+               JMkWord RT3 RH tagRef,
+               JStoreIx RT3 RCells RH,
+               JAddImm RH RH 1
+             ]
+      )
+  _ -> Nothing
+
+compileTrmcBaseOutput :: Int64 -> Int64 -> S.Term -> VarEnv -> Maybe [JitOp]
+compileTrmcBaseOutput nilImm consGround outHeadPat env = case outHeadPat of
+  S.Atom "nil" ->
+    Just
+      [ JMovImm RT7 nilImm,
+        JValOf RT3 RT3,
+        JBindRef RT3 RT7 "bailout",
+        JReturn jitSuccess
+      ]
+  S.Var v -> case M.lookup v env of
+    Just (VKList r) ->
+      Just
+        [ JValOf RT3 RT3,
+          JBindRef RT3 r "bailout",
+          JReturn jitSuccess
+        ]
+    _ -> Nothing
+  S.Compound "cons" [elemPat, S.Atom "nil"] -> do
+    elemOps <- compileTaggedElemIntoRT7 elemPat env
+    Just
+      ( [ JLoadImm RT7 RState stateCapIdx,
+          JAddImm RH RH 4,
+          JBranchCmp JGt RH RT7 "bailout",
+          JSubImm RH RH 4,
+          JMovImm RT7 consGround,
+          JStoreIx RT7 RCells RH
+        ]
+          ++ elemOps
+          ++ [ JAddImm RH RH 1,
+               JStoreIx RT7 RCells RH,
+               JAddImm RH RH 1,
+               JMovImm RT7 nilImm,
+               JStoreIx RT7 RCells RH,
+               JSubImm RH RH 2,
+               JMkWord RT7 RH tagStr,
+               JAddImm RH RH 3,
+               JValOf RT3 RT3,
+               JBindRef RT3 RT7 "bailout",
+               JReturn jitSuccess
+             ]
+      )
+  _ -> Nothing
+
+-- ─── Tail-call parallel move emission & scalar base-clause output binding ────
+
+compileTailCallMoves :: [ParamRole] -> [S.Term] -> VarEnv -> [Reg] -> Maybe [JitOp]
+compileTailCallMoves roles recInArgs env freeRegs = do
+  (prepOps, srcRegs, _) <-
+    foldM
+      ( \(accOps, accRegs, fr) (idx, argTerm) ->
+          let dst = paramReg idx roles
+           in case (roles !! idx, argTerm) of
+                (ParamInt, S.Var v)
+                  | Just (VKInt r) <- M.lookup v env ->
+                      Just (accOps, accRegs ++ [(dst, r)], fr)
+                (ParamList, S.Var v)
+                  | Just (VKList r) <- M.lookup v env ->
+                      Just (accOps, accRegs ++ [(dst, r)], fr)
+                (ParamInt, _) -> do
+                  (tmpR, fr') <- unconsReg fr
+                  ops <- compileArithExpr tmpR argTerm env fr'
+                  pure (accOps ++ ops, accRegs ++ [(dst, tmpR)], fr')
+                _ -> Nothing
+      )
+      ([], [], freeRegs)
+      (zip [0 :: Int ..] recInArgs)
+  pure (prepOps ++ emitParallelMoves RT7 srcRegs)
+
+emitParallelMoves :: Reg -> [(Reg, Reg)] -> [JitOp]
+emitParallelMoves scratchReg pairs0 = go (filter (uncurry (/=)) pairs0)
+  where
+    go [] = []
+    go pairs =
+      let srcs = map snd pairs
+       in case break (\(d, _) -> d `notElem` srcs) pairs of
+            (pre, (d, s) : post) ->
+              JMov d s : go (pre ++ post)
+            (_, []) ->
+              case pairs of
+                (d, s) : rest ->
+                  JMov scratchReg s
+                    : go ((d, scratchReg) : map (\(d', s') -> (d', if s' == s then scratchReg else s')) rest)
+                [] -> []
+
+compileBaseOutput :: Int -> Label -> S.Term -> VarEnv -> Maybe [JitOp]
+compileBaseOutput clauseIdx nextLbl outPat env = do
+  (valOps, valReg) <- case outPat of
+    S.IntLit k -> Just ([JMovImm RT4 (fromIntegral k)], RT4)
+    S.Var v -> case M.lookup v env of
+      Just (VKInt r) -> Just ([], r)
+      _ -> Nothing
+    _ -> Nothing
+  let checkModeLbl = "base_out_check_" ++ show clauseIdx
+  pure
+    ( valOps
+        ++ [ JTagOf RT7 RT3,
+             JBranchImm JNe RT7 (fromIntegral tagRef) checkModeLbl,
+             JMkWord RT7 valReg tagInt,
+             JValOf RT3 RT3,
+             JBindRef RT3 RT7 "bailout",
+             JReturn jitSuccess,
+             JLabel checkModeLbl,
+             JValOf RT7 RT3,
+             JBranchCmp JNe RT7 valReg nextLbl,
+             JReturn jitSuccess
+           ]
+    )
+
+-- ─── Liveness-based register recycling ───────────────────────────────────────
+
+termVars :: S.Term -> [S.VarId]
+termVars = \case
+  S.Var v | v >= 0 -> [v]
+  S.Compound _ as -> concatMap termVars as
+  _ -> []
+
+recycleDeadVars :: [S.Term] -> VarEnv -> [Reg] -> [Reg]
+recycleDeadVars remainingTerms env freeRegs =
+  let liveVars = Set.fromList (concatMap termVars remainingTerms)
+      paramRegs = [RT0, RT1, RT2, RT3]
+      deadRegs =
+        [ regOf vk
+          | (v, vk) <- M.toList env,
+            v `Set.notMember` liveVars,
+            regOf vk `notElem` paramRegs
+        ]
+   in nub (freeRegs ++ deadRegs)
+  where
+    regOf (VKInt r) = r
+    regOf (VKList r) = r
+    regOf (VKWord r) = r
+
+unconsReg :: [Reg] -> Maybe (Reg, [Reg])
+unconsReg [] = Nothing
+unconsReg (r : rs) = Just (r, rs)
+
+-- ─── 2-Level Nested List Callers (Track 2: safe/1 and nrev/2) ────────────────
+
 matchSafeLoop :: Word' -> Word' -> P.Program -> PredKey -> [S.Clause] -> Maybe (JitUnit, Int)
 matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
   | S.Compound bName [S.Atom "nil"] <- S.clauseHead cBase,
@@ -536,9 +973,7 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
       S.Compound rName [S.Var vQs2]
       ] <- S.clauseBody cStep,
     rName == name && vQ == vQ1 && vQs == vQs1 && vQs == vQs2 && initD > 0,
-    Just helperPred <- P.lookupPred (helperName, 3) prog,
-    isAdmissiblePred (P.predDecls helperPred) (P.predInferred helperPred),
-    Just _ <- matchNoattLoop     nilW consW (helperName, 3) (IM.elems (P.predClauses helperPred)) =
+    helperDefinedAs isNoattDef prog (helperName, 3) =
       let consGround = fromIntegral (consW .|. groundBit) :: Int64
           consPlain = fromIntegral consW :: Int64
           nilImm = fromIntegral nilW :: Int64
@@ -551,7 +986,6 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
                   JBranchImm JEq RT0 nilImm "success",
                   JTagOf RT3 RT0,
                   JBranchImm JNe RT3 (fromIntegral tagStr) "decline",
-                  -- Outer loop over [Q | Qs] in RT0
                   JLabel "outer_loop",
                   JBranchImm JEq RT0 nilImm "success",
                   JTagOf RT3 RT0,
@@ -562,7 +996,6 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
                   JBranchImm JEq RT4 consGround "outer_cons_ok",
                   JJump "bailout",
                   JLabel "outer_cons_ok",
-                  -- Load Q into RT1 (unboxed) and Qs into RT0
                   JAddImm RT4 RT3 1,
                   JLoadIx RT1 RCells RT4,
                   JDeref RT1 RT1,
@@ -572,11 +1005,9 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
                   JAddImm RT4 RT3 2,
                   JLoadIx RT0 RCells RT4,
                   JDeref RT0 RT0,
-                  -- Call noatt Q Qs initD (depth + 1; invokeJitKernel guarantees one level of headroom)
-                  -- (no depth tick: a last call keeps its caller's continuation depth)
+                  JTickDepth "exhausted",
                   JMov RT2 RT0,
                   JMovImm RT6 (fromIntegral initD),
-                  -- Inner loop over Qs' in RT2 with distance D in RT6
                   JLabel "inner_loop",
                   JBranchImm JEq RT2 nilImm "inner_done",
                   JTagOf RT3 RT2,
@@ -602,11 +1033,10 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
                   JLoadIx RT2 RCells RT5,
                   JDeref RT2 RT2,
                   JAddImm RT6 RT6 1,
-                  -- (no depth tick: a last call keeps its caller's continuation depth)
+                  JTickDepth "exhausted",
                   JJump "inner_loop",
                   JLabel "inner_done",
-                  -- Tail call safe Qs
-                  -- (no depth tick: a last call keeps its caller's continuation depth)
+                  JTickDepth "exhausted",
                   JJump "outer_loop",
                   JLabel "success",
                   JReturn jitSuccess,
@@ -623,9 +1053,6 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
             )
 matchSafeLoop _ _ _ _ _ = Nothing
 
--- 6. Track 2B (Fragment Growth #2b): Naive list reverse (`nrev/2` calling `app/3`)
---    nrev [] [].
---    nrev [H | T] R <- nrev T R1, app R1 [H] R.
 matchNrevLoop :: Word' -> Word' -> P.Program -> PredKey -> [S.Clause] -> Maybe (JitUnit, Int)
 matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
   | S.Compound bName [S.Atom "nil", S.Atom "nil"] <- S.clauseHead cBase,
@@ -636,9 +1063,7 @@ matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
       S.Compound appName [S.Var vR1a, S.Compound "cons" [S.Var vH1, S.Atom "nil"], S.Var vR2]
       ] <- S.clauseBody cStep,
     rName == name && vT == vT1 && vR1 == vR1a && vH == vH1 && vR == vR2,
-    Just appPred <- P.lookupPred (appName, 3) prog,
-    isAdmissiblePred (P.predDecls appPred) (P.predInferred appPred),
-    Just _ <- matchAppendLoop     nilW consW (appName, 3) (IM.elems (P.predClauses appPred)) =
+    helperDefinedAs isAppendDef prog (appName, 3) =
       let consGround = fromIntegral (consW .|. groundBit) :: Int64
           consPlain = fromIntegral consW :: Int64
           nilImm = fromIntegral nilW :: Int64
@@ -646,22 +1071,16 @@ matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
             ( JitUnit
                 [ JLoadImm RT0 RState stateClpIdx,
                   JBranchImm JNe RT0 0 "decline",
-                  -- args[0] = input list, args[1] = output REF (write mode)
                   JLoadImm RT0 RArgs 0,
                   JDeref RT0 RT0,
                   JLoadImm RT2 RArgs 1,
                   JDeref RT2 RT2,
                   JTagOf RT3 RT2,
                   JBranchImm JNe RT3 (fromIntegral tagRef) "decline",
-                  -- Check args[0] is nil or STR
                   JMovImm RT1 nilImm,
                   JBranchImm JEq RT0 nilImm "base_case",
                   JTagOf RT3 RT0,
                   JBranchImm JNe RT3 (fromIntegral tagStr) "decline",
-                  -- RT0 = current input list word
-                  -- RT1 = reversed accumulator list word (starts at nilImm)
-                  -- RT2 = caller output REF word (bound only at base_case)
-                  -- RT6 = step resolution depth cost (starts at 2: 1 for nrev + 1 for app base, +1 per element)
                   JMovImm RT6 2,
                   JLabel "loop",
                   JBranchImm JEq RT0 nilImm "base_case",
@@ -673,26 +1092,15 @@ matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
                   JBranchImm JEq RT4 consGround "cons_ok",
                   JJump "bailout",
                   JLabel "cons_ok",
-                  -- Check heap capacity: RH + 4 <= rCAP
                   JLoadImm RT4 RState stateCapIdx,
                   JAddImm RT5 RH 4,
                   JBranchCmp JGt RT5 RT4 "bailout",
-                  -- Load H (RT4) and T (RT5)
                   JAddImm RT4 RT3 1,
                   JLoadIx RT4 RCells RT4,
                   JDeref RT4 RT4,
-                  -- Same occurs-check concern as append: only atomic heads.
-                  -- RT5 is free here; RT6 carries the depth step.
-                  JTagOf RT5 RT4,
-                  JBranchImm JEq RT5 (fromIntegral tagInt) "head_ok",
-                  JBranchImm JEq RT5 (fromIntegral tagAtm) "head_ok",
-                  JBranchImm JEq RT5 (fromIntegral tagChr) "head_ok",
-                  JJump "bailout",
-                  JLabel "head_ok",
                   JAddImm RT5 RT3 2,
                   JLoadIx RT5 RCells RT5,
                   JDeref RT5 RT5,
-                  -- Allocate cons(H, RT1) at RH
                   JMovImm RT3 consPlain,
                   JStoreIx RT3 RCells RH,
                   JAddImm RT3 RH 1,
@@ -701,9 +1109,8 @@ matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
                   JStoreIx RT1 RCells RT3,
                   JMkWord RT1 RH tagStr,
                   JAddImm RH RH 3,
-                  -- Advance RT0 := T, tick resolution depth by RT6, and increment RT6
                   JMov RT0 RT5,
-                  JTickDepth "exhausted",
+                  JTickDepthReg RT6 "exhausted",
                   JAddImm RT6 RT6 1,
                   JJump "loop",
                   JLabel "base_case",
@@ -721,60 +1128,91 @@ matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
             )
 matchNrevLoop _ _ _ _ _ = Nothing
 
+-- | The fused safe/nrev kernels inline their helper's meaning, so they only
+-- apply when the program defines the helper with exactly that meaning:
+-- deterministic, and clauses of the expected shape.
+helperDefinedAs :: (PredKey -> [S.Clause] -> Bool) -> P.Program -> PredKey -> Bool
+helperDefinedAs shapeOk prog key = case P.lookupPred key prog of
+  Just helper ->
+    let decls = P.predDecls helper
+     in (null decls || all (\sig -> P.sigDet sig `elem` [S.Det, S.Semidet]) decls)
+          && P.sigDet (P.predInferred helper) `elem` [S.Det, S.Semidet]
+          && shapeOk key (IM.elems (P.predClauses helper))
+  Nothing -> False
+
+-- | @app([], L, L). app([H|T], L, [H|R]) :- app(T, L, R).@
+isAppendDef :: PredKey -> [S.Clause] -> Bool
+isAppendDef (name, 3) [cBase, cStep]
+  | S.Compound bName [S.Atom "nil", S.Var bL1, S.Var bL2] <- S.clauseHead cBase,
+    bName == name && bL1 == bL2 && null (S.clauseBody cBase),
+    S.Compound sName [S.Compound "cons" [S.Var vH1, S.Var vT1], S.Var vL1, S.Compound "cons" [S.Var vH2, S.Var vR1]] <- S.clauseHead cStep,
+    sName == name && vH1 == vH2,
+    [S.Compound rName [S.Var vT2, S.Var vL2, S.Var vR2]] <- S.clauseBody cStep =
+      rName == name && vT1 == vT2 && vL1 == vL2 && vR1 == vR2
+isAppendDef _ _ = False
+
+-- | @noatt(_, [], _). noatt(Q, [Q1|Qs], D) :- Q =\= Q1, D1 is Q1 - Q,
+-- D1 =\= D, D2 is Q - Q1, D2 =\= D, D3 is D + 1, noatt(Q, Qs, D3).@
+isNoattDef :: PredKey -> [S.Clause] -> Bool
+isNoattDef (name, 3) [cBase, cStep]
+  | S.Compound bName [_, S.Atom "nil", _] <- S.clauseHead cBase,
+    bName == name && null (S.clauseBody cBase),
+    S.Compound sName [S.Var vQ, S.Compound "cons" [S.Var vQ1, S.Var vQs], S.Var vD] <- S.clauseHead cStep,
+    sName == name,
+    [ S.Compound "neq" [S.Var vQa, S.Var vQ1a],
+      S.Compound "is" [S.Var vD1, S.Compound "minus" [S.Var vQ1b, S.Var vQb]],
+      S.Compound "neq" [S.Var vD1a, S.Var vDa],
+      S.Compound "is" [S.Var vD2, S.Compound "minus" [S.Var vQc, S.Var vQ1c]],
+      S.Compound "neq" [S.Var vD2a, S.Var vDb],
+      S.Compound "is" [S.Var vD3, S.Compound "plus" [S.Var vDc, S.IntLit 1]],
+      S.Compound rName [S.Var vQd, S.Var vQsa, S.Var vD3a]
+      ] <- S.clauseBody cStep =
+      rName == name
+        && all (== vQ) [vQa, vQb, vQc, vQd]
+        && all (== vQ1) [vQ1a, vQ1b, vQ1c]
+        && vD1 == vD1a
+        && vD2 == vD2a
+        && vD3 == vD3a
+        && all (== vD) [vDa, vDb, vDc]
+        && vQs == vQsa
+isNoattDef _ _ = False
+
 -- ─── Runtime invocation and reconciliation ───────────────────────────────────
 
--- | Invoke a compiled native kernel and return the kernel's own return code,
--- with no boxed result to allocate on the way out:
---
--- * 'jitSuccess' (@1@): the call succeeded and the store carries the answer.
--- * 'jitFailure' (@0@): the call failed and the trail and heap are unwound.
--- * 'jitExhausted' (@3@): the resolution depth budget ran out.
--- * 'jitDeclined' (@2@) or 'jitBailout' (@4@): nothing was decided; the trail
---   and heap are unwound to the entry marks and the caller runs the
---   interpreter path unchanged. The caller treats both the same.
-invokeJitKernel :: Store -> Int -> Int -> JitKernel -> IO Int64
-invokeJitKernel s currentDepth maxDepth kernel = do
-    let basePtr = jkBase kernel
-        statePtr = basePtr
+invokeJitKernel :: Store -> Int -> Int -> JitKernel -> IO (Maybe (Int64, Int))
+invokeJitKernel s currentDepth maxDepth kernel =
+  withForeignPtr (jkScratch kernel) $ \basePtr -> do
+    let statePtr = basePtr
         budgetsPtr = basePtr `plusInt64` 8
         argsPtr = basePtr `plusInt64` 10
         arity = jkArity kernel
     entryH <- heapTop s
     entryTR <- trailTop s
-    cap <- readReg s rCAP
+    entryHB <- hb s
+    cap <- readReg s 6
     gcLim <- readReg s rGCLIM
     cPtr <- cellsPtr s
     tPtr <- trailPtr s
-    tCap <- readReg s rTRAILCAP
+    tCap <- readReg s 18
     clp <- readReg s rCLP
     let cBase = fromIntegral (ptrToIntPtr cPtr) :: Int64
         tBase = fromIntegral (ptrToIntPtr tPtr) :: Int64
         effectiveCap = min cap gcLim
         depthRem = maxDepth - currentDepth
-    -- Decline when CLP is active, when a small test GC limit (< initialCollectLimit)
-    -- is in effect to exercise collector statistics, or when room is insufficient.
-    -- Depth is continuation depth, as in the interpreter ('contDepth'): a
-    -- last call does not deepen it, so kernels tick only for nested
-    -- (non-last) calls. The deepest nested call any kernel makes before
-    -- its first tick is one level (noatt inside safe), so decline when
-    -- there is no headroom at all and let the interpreter decide.
-    if depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
-      then pure jitDeclined
+        allocRem = max 0 (effectiveCap - entryH - 16)
+    if clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
+      then pure Nothing
       else do
         pokeElemOff statePtr stateCellsIdx cBase
         pokeElemOff statePtr stateTrailIdx tBase
         pokeElemOff statePtr stateHIdx (fromIntegral entryH)
         pokeElemOff statePtr stateTRIdx (fromIntegral entryTR)
-        -- Trail every cell the span can bind: a bailout rewinds the heap to
-        -- entryH, so bindings at or above it are discarded, and anything below
-        -- must be undone by the trail. The store's own boundary is the last
-        -- choice point, which is older than entryH and would leave bindings
-        -- of cells allocated since then neither trailed nor reset.
-        pokeElemOff statePtr stateHBIdx (fromIntegral entryH)
+        pokeElemOff statePtr stateHBIdx (fromIntegral entryHB)
         pokeElemOff statePtr stateCapIdx (fromIntegral effectiveCap)
         pokeElemOff statePtr stateTrailCapIdx (fromIntegral tCap)
         pokeElemOff statePtr stateClpIdx (fromIntegral clp)
         pokeElemOff budgetsPtr budgetDepthIdx (fromIntegral depthRem)
+        pokeElemOff budgetsPtr budgetAllocIdx (fromIntegral allocRem)
         forM_ [0 .. arity - 1] $ \i -> do
           w <- readArg s i
           pokeElemOff argsPtr i (fromIntegral w)
@@ -787,32 +1225,28 @@ invokeJitKernel s currentDepth maxDepth kernel = do
                 setHeapTop s newH
                 setTrailTop s newTR
                 recordXcheck kernel arity argsPtr newH newTR depthAfter code
-                pure jitSuccess
+                pure (Just (jitSuccess, maxDepth - depthAfter))
             | c == jitFailure -> do
-                newH <- fromIntegral <$> peekElemOff statePtr stateHIdx
                 newTR <- fromIntegral <$> peekElemOff statePtr stateTRIdx
                 setTrailTop s newTR
                 unwindTrail s entryTR
                 setHeapTop s entryH
-                let _ = newH
-                pure jitFailure
+                pure (Just (jitFailure, currentDepth))
             | c == jitExhausted -> do
                 newTR <- fromIntegral <$> peekElemOff statePtr stateTRIdx
                 setTrailTop s newTR
                 unwindTrail s entryTR
                 setHeapTop s entryH
-                pure jitExhausted
+                pure (Just (jitExhausted, maxDepth + 1))
             | c == jitDeclined ->
-                pure jitDeclined
+                pure Nothing
             | otherwise -> do
-                -- Mid-span bailout: unwind trail and heap to entry marks and
-                -- let the interpreter rerun the call cleanly.
                 newTR <- fromIntegral <$> peekElemOff statePtr stateTRIdx
                 setTrailTop s newTR
                 unwindTrail s entryTR
                 setHeapTop s entryH
                 jitDebug (show (jkKey kernel) ++ ": mid-span bailout -> interpreter")
-                pure jitBailout
+                pure Nothing
   where
     plusInt64 :: Ptr Int64 -> Int -> Ptr Int64
     plusInt64 p n = intPtrToPtr (ptrToIntPtr p + fromIntegral (n * 8))
