@@ -110,6 +110,9 @@ installUnit key arity cellsPerIter unit
               pure Nothing
             else do
               scratch <- mallocForeignPtrArray 24
+              withForeignPtr scratch $ \sp -> do
+                pokeElemOff sp scratchBailCapIdx (-1)
+                pokeElemOff sp scratchBailHIdx (-1)
               let addr = fromIntegral (ptrToIntPtr ptr)
                   fnPtr = castPtrToFunPtr ptr
               jitDebug (show key ++ ": compiled (" ++ show (length bytes) ++ " bytes, " ++ arch ++ ")")
@@ -1369,6 +1372,12 @@ isNoattDef _ _ = False
 
 -- ─── Runtime invocation and reconciliation ───────────────────────────────────
 
+-- | Scratch slots (past state, budgets and arguments) holding the heap limit
+-- and entry heap top of the kernel's last mid-span bailout.
+scratchBailCapIdx, scratchBailHIdx :: Int
+scratchBailCapIdx = 22
+scratchBailHIdx = 23
+
 invokeJitKernel :: Store -> Int -> Int -> JitKernel -> IO (Maybe (Int64, Int))
 invokeJitKernel s currentDepth maxDepth kernel =
   withForeignPtr (jkScratch kernel) $ \basePtr -> do
@@ -1395,7 +1404,16 @@ invokeJitKernel s currentDepth maxDepth kernel =
     -- (non-last) calls. The deepest nested call any kernel makes before
     -- its first tick is one level (noatt inside safe), so decline when
     -- there is no headroom at all and let the interpreter decide.
-    if depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
+    -- Allocation-budget backoff: after a mid-span bailout the kernel would
+    -- bail again on every re-entry under the same heap limit from at least
+    -- as high a heap top, redoing (and unwinding) the whole remaining span
+    -- each time, which made long list builds quadratic. Decline until a
+    -- collection or growth moves the limit, or the heap top drops below the
+    -- bailout's entry.
+    bailCap <- peekElemOff basePtr scratchBailCapIdx
+    bailH <- peekElemOff basePtr scratchBailHIdx
+    let backoff = bailCap == fromIntegral effectiveCap && fromIntegral entryH >= bailH
+    if backoff || depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
       then pure Nothing
       else do
         pokeElemOff statePtr stateCellsIdx cBase
@@ -1445,6 +1463,8 @@ invokeJitKernel s currentDepth maxDepth kernel =
                 setTrailTop s newTR
                 unwindTrail s entryTR
                 setHeapTop s entryH
+                pokeElemOff basePtr scratchBailCapIdx (fromIntegral effectiveCap)
+                pokeElemOff basePtr scratchBailHIdx (fromIntegral entryH)
                 jitDebug (show (jkKey kernel) ++ ": mid-span bailout -> interpreter")
                 pure Nothing
   where
