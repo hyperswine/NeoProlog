@@ -144,7 +144,10 @@ data Pred = Pred
     predCounterLoop :: Bool,
     -- | A counter loop whose clause selection is mutually exclusive on the
     -- counter (see 'Infera.Infer.guardExclusive').
-    predGuardedCounter :: Bool
+    predGuardedCounter :: Bool,
+    -- | A counter loop whose answers are pairwise distinct and finite (see
+    -- 'Infera.Infer.distinctCounterGenerator'), such as @between/3@.
+    predDistinctCounter :: Bool
   }
   deriving (Show)
 
@@ -162,7 +165,8 @@ newPred k@(_, arity) =
       predPure = True,
       predStructural = False,
       predCounterLoop = False,
-      predGuardedCounter = False
+      predGuardedCounter = False,
+      predDistinctCounter = False
     }
 
 data Program = Program
@@ -284,6 +288,7 @@ predIsTabled prog p
   | otherwise =
       progTableDefault prog && predRecursive p && predPure p && not (predStructural p)
         && not (predIsDetCounterLoop p)
+        && not (predDistinctCounter p)
   where
     flags = effectiveFlags prog p
 

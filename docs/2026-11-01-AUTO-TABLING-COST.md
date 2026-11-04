@@ -127,6 +127,50 @@ A predicate is a deterministic counter-driven loop when all of these hold
    position `i`; and the recursive clause has a top-level guard `V > k`,
    `V >= k`, `V < k` or `V <= k` that every one of those literals fails.
 
+**Distinct-answer counter generators (2026-11-05).** A nondeterministic
+counter loop is also left untabled when its answers are provably the same,
+in the same multiplicity, with and without a table
+(`Infera.Infer.distinctCounterGenerator`, `Program.predDistinctCounter`).
+That is the `between/3` shape, and it needs points 1-3 above plus all of these:
+
+5. **Two clauses.** Exactly one base clause and one recursive clause.
+6. **Only arithmetic in the bodies.** Apart from the final self-call, every
+   body goal is a comparison (`<`, `>`, `<=`, `>=`) or, in the recursive
+   clause only, an `is` goal. No goal can produce more than one solution.
+7. **A bounded, monotonic counter.** The counter `V` is stepped `V1 is V + c`
+   (`c + V`) with a guard `V < B` or `V <= B`, or stepped `V1 is V - c` with
+   `V > B` or `V >= B`. `B` is an integer literal or a variable passed
+   unchanged to the self-call at the same position.
+8. **The answer is the counter.** At some other position `j` the recursive
+   clause has a variable that it passes unchanged to the self-call and uses
+   nowhere else, and the base clause has the same variable at `j` as at the
+   counter position.
+
+Why tabling cannot change the answers:
+- Every answer is the counter value at the depth where the base clause
+  succeeded, read at position `j`.
+- The base clause gives at most one answer per depth, and the counter takes
+  a different value at every depth, so no answer repeats. There is nothing
+  for the table to deduplicate.
+- The guard stops the recursion at the bound, so the untabled call
+  terminates.
+- Untabled answers come in SLD order, which is the order SWI-Prolog gives.
+
+Stays tabled:
+- the answer is not the counter (`g L H a`: untabled it would repeat `a`);
+- there is no guard (`nat`);
+- the bound moves with the counter;
+- there are two base clauses that can give the same answer.
+
+The one edge case is a float counter beyond 2^53, where `V + 1 = V`. There,
+the untabled loop never ends, but a table would stop at the repeated variant.
+Integers are unbounded, so integer counters cannot overflow.
+
+Effect, linux-x86_64 on a noisy VM, whole process, median of 5:
+`findall X (btw 1 N X) L` took 0.134 / 1.169 / 10.29 s at N = 100 / 200 / 400
+when tabled. Untabled it takes 0.008 / 0.007 / 0.007 s, then 0.011 s at
+N = 2000 and 0.097 s at N = 50000.
+
 Examples that are no longer tabled: `bench_nrev K` (`bench/bench.nprolog`
 shape), `loop N` countdowns, zebra's `loop N _ O`, and accumulator counters
 such as `count N A R <- N > 0, A1 is A + 1, N1 is N - 1, count N1 A1 R`.
