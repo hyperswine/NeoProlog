@@ -57,6 +57,7 @@ diagnose items = concatMap inspect items
       TLClause cl ->
         shadowedBuiltin item cl ++ calls item (clauseBody cl)
           ++ singletons item (clauseHead cl : clauseBody cl)
+          ++ arithFunctorAsData item cl
           ++ headSort item cl ++ effects item cl ++ performance item cl
       -- Query variables are answer variables: a variable used once names an
       -- answer to report, so it is never a singleton mistake.
@@ -83,6 +84,14 @@ diagnose items = concatMap inspect items
                       then "a DCG rule adds two arguments, so rename the nonterminal (for example my_" ++ name ++ ")"
                       else "rename the predicate (for example " ++ showPredKey ("my_" ++ name, arity) ++ ")"))]
       _ -> []
+    -- Arithmetic functors in call arguments are evaluated when ground, so a
+    -- head pattern on one never matches a ground argument.
+    arithFunctorAsData item cl =
+      [ Diagnostic (fromMaybe (locatedSpan item) (locatedHeadSpan item)) Warning "arith-functor-as-data"
+          ("head pattern on arithmetic functor `" ++ f ++ "` can never match a ground argument: ground "
+            ++ "arithmetic in call arguments is evaluated before head matching; rename the constructor (for example add/sub)")
+      | Compound _ args <- [clauseHead cl], arg <- args, Compound f as <- [arg],
+        f `elem` arithOps, not (null as) ]
     effects item cl = case clauseKey cl of
       Just key -> [emit item Error "unsafe-call" (describeViolation prog key g) | g <- clauseViolations prog cl]
       Nothing -> []
