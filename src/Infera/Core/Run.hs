@@ -1104,11 +1104,24 @@ step' m goal goals base barrier depth next = case goal of
     _ <- pushChoice m (AltGoals right base barrier depth rest)
     runGoals m left base barrier depth rest
   GIf condition thenGoals elseGoals -> do
-    counter <- newIORef 0
     let rest = CGoals goals base barrier depth next
-    sentinel <- pushChoice m (AltIf counter (fmap (\gs -> (gs, base, barrier, depth)) elseGoals) rest)
-    pushScope m (SCount counter)
-    runGoals m condition base (sentinel + 1) depth (CExitIf sentinel thenGoals base barrier depth rest)
+    decided <- case condition of
+      [test] -> quickTest m base test
+      _ -> pure Nothing
+    case decided of
+      -- A test that binds nothing, raises nothing and has one answer at
+      -- most is decided here: no choice point, scope or counter.
+      Just True -> runGoals m thenGoals base barrier depth rest
+      Just False -> case elseGoals of
+        Just gs -> runGoals m gs base barrier depth rest
+        Nothing -> backtrack m
+      Nothing -> generalIf rest
+    where
+     generalIf rest = do
+      counter <- newIORef 0
+      sentinel <- pushChoice m (AltIf counter (fmap (\gs -> (gs, base, barrier, depth)) elseGoals) rest)
+      pushScope m (SCount counter)
+      runGoals m condition base (sentinel + 1) depth (CExitIf sentinel thenGoals base barrier depth rest)
   GOnce inner -> step m (GIf inner [] Nothing) goals base barrier depth next
   GNot inner -> do
     flag <- newIORef False
@@ -1937,6 +1950,53 @@ dispatchCandidates m frame predicate barrier depth returnCont candidates = do
       choice <- pushChoice m alt
       let !barrier' = min barrier choice
       tryClause m predicate (ordinals `unsafeAt` 0) barrier' depth returnCont
+
+-- | The outcome of an if-then-else condition that is a single test which
+-- cannot bind, raise or leave alternatives: @==@ or @!=@ between bound
+-- slots and constants (both ground for @!=@), or an arithmetic comparison
+-- whose operands both evaluate on the fast path, or @=@ between two
+-- ground terms. Anything else is
+-- 'Nothing' and runs through the general choice-point protocol, as does
+-- every case the fast evaluators decline (errors included).
+quickTest :: Machine -> Int -> Goal -> IO (Maybe Bool)
+quickTest m base goal = case goal of
+  GEquiv a b | simple a && simple b -> do
+    wa <- buildArg m base False a
+    wb <- buildArg m base False b
+    Just <$> equiv st wa wb
+  -- Unifying two ground terms binds nothing: it is their identity.
+  GUnify a b | simple a && simple b -> do
+    wa <- buildArg m base False a
+    wb <- buildArg m base False b
+    ga <- isGroundWord st wa
+    gb <- if ga then isGroundWord st wb else pure False
+    if ga && gb then Just <$> equiv st wa wb else pure Nothing
+  GNeq a b | simple a && simple b -> do
+    wa <- buildArg m base False a
+    wb <- buildArg m base False b
+    ga <- isGroundWord st wa
+    gb <- if ga then isGroundWord st wb else pure False
+    if ga && gb then Just . not <$> equiv st wa wb else pure Nothing
+  GCmp op a b pa pb
+    | planned pa && planned pb -> do
+        qa <- runPlan st base pa
+        qb <- if qa /= planMiss then runPlan st base pb else pure planMiss
+        pure $ if qa /= planMiss && qb /= planMiss then Just (cmpAccepts op (compare qa qb)) else Nothing
+    | otherwise -> do
+        fa <- evalFast m base a
+        qa <- readReg st rVAL
+        fb <- if fa then evalFast m base b else pure False
+        qb <- readReg st rVAL
+        pure $ if fa && fb then Just (cmpAccepts op (compare qa qb)) else Nothing
+  _ -> pure Nothing
+  where
+    st = mStore m
+    simple p = case p of
+      PSlot _ -> True
+      PWord _ -> True
+      _ -> False
+    planned PlanNone = False
+    planned _ = True
 
 -- | Try one clause against the argument registers.
 tryClause :: Machine -> Pred -> Int -> Int -> Int -> Cont -> IO Step
