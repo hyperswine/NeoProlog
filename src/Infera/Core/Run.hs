@@ -392,6 +392,33 @@ pushChoiceWithStore m store alt = do
   setHb s h
   pure top
 
+-- | Push a choice point whose heap and trail marks are given rather than
+-- read: the state before a shallow head match. The next candidate's position
+-- is @next@.
+pushChoiceMarked :: Machine -> Int -> Int -> Int -> Alt -> IO Int
+pushChoiceMarked m h tr next alt = do
+  store <- constraintMark m
+  let s = mStore m
+  out <- outLen s
+  scopes <- unsafeRead (mCounters m) counterScopes
+  top <- choiceTop m
+  cs <- choicesFor m top
+  let marks = csMarks cs
+      at = top * markStride
+  unsafeWrite marks (at + markH) h
+  unsafeWrite marks (at + markTR) tr
+  unsafeWrite marks (at + markOut) out
+  unsafeWrite marks (at + markScopes) scopes
+  unsafeWrite marks (at + markNext) next
+  unsafeWrite (csAlts cs) top alt
+  readIORef (mTables m) >>= unsafeWrite (csTables cs) top
+  readIORef (mDynamic m) >>= unsafeWrite (csDynamic cs) top
+  unsafeWrite (csStore cs) top store
+  readIORef (mWatched m) >>= unsafeWrite (csWatched cs) top
+  setChoiceTop m (top + 1)
+  setHb s h
+  pure top
+
 newChoices :: Int -> IO Choices
 newChoices n =
   Choices <$> newArray (0, n * markStride - 1) 0 <*> newArray_ (0, n - 1) <*> newArray_ (0, n - 1)
@@ -1443,15 +1470,18 @@ callPlain m frame predicate cont0 = do
           | null (clBody (pClauses predicate ! ordinal)) ->
               tryClauseWithFrame m frame' predicate ordinal entry depth cont
         _ -> do
-          commits <- case pSwitch predicate of
-            Nothing -> pure False
-            Just positions -> switchGround s positions
-          returnCont <-
-            if not commits
-              then pure cont
-              else case cont of
-                CReturn h _ Nothing _ | h >= 0 -> pure cont
-                _ -> do
+          -- A continuation that already commits at an older height covers
+          -- this call's choice points as well: the call keeps it whether or
+          -- not it would commit, so the groundness test is skipped.
+          returnCont <- case cont of
+            CReturn h _ Nothing _ | h >= 0 -> pure cont
+            _ -> do
+              commits <- case pSwitch predicate of
+                Nothing -> pure False
+                Just positions -> switchGround s positions
+              if not commits
+                then pure cont
+                else do
                   guardBase <- guardTop m
                   pure (CReturn entry guardBase Nothing cont)
           dispatchCandidates m frame' predicate entry depth returnCont cands
@@ -1669,8 +1699,23 @@ streamStructure s functor sp n = case n of
     a <- readArg s (sp - 2)
     b <- readArg s (sp - 1)
     structure2 s functor a b
-  _ -> structureWord s functor =<< mapM (readArg s) [sp - n .. sp - 1]
+  _ -> do
+    addr <- reserveCells s (n + 1)
+    ground <- copyPushed s (sp - n) (addr + 1) n True
+    writeCell s addr (if ground then functor .|. groundBit else functor)
+    pure (strWord addr)
 {-# INLINE streamStructure #-}
+
+-- | Move @n@ pushed values from the operand stack into argument cells,
+-- returning whether all of them are ground.
+copyPushed :: Store -> Int -> Int -> Int -> Bool -> IO Bool
+copyPushed s !from !to !n !ground
+  | n <= 0 = pure ground
+  | otherwise = do
+      w <- readArg s from
+      writeCell s to w
+      g <- if ground then groundNowWord s w else pure False
+      copyPushed s (from + 1) (to + 1) (n - 1) g
 
 -- | Match every consecutive head-argument instruction, returning the offset of
 -- the first instruction after them or 'streamFailed'.
@@ -1721,7 +1766,7 @@ streamHead m !stream !base !pc = case () of
             if funKey f /= functor
               then pure streamFailed
               else do
-                rest <- streamOperands m stream base [valOf d + 1 .. valOf d + n] (pc + 6)
+                rest <- streamOperands m stream base (valOf d + 1) n (pc + 6)
                 if rest == streamFailed then pure streamFailed else streamHead m stream base rest
             | tag == tagRef -> do
                 -- Building the pattern, occurs-checking it and binding is the
@@ -1742,11 +1787,13 @@ streamIfUnify m stream base after arg word = do
   if ok then streamHead m stream base after else pure streamFailed
 {-# INLINE streamIfUnify #-}
 
-streamOperands :: Machine -> ClauseStream -> Int -> [Int] -> Int -> IO Int
-streamOperands _ _ _ [] pc = pure pc
-streamOperands m stream base (cell : rest) pc = do
-  next <- streamOperand m stream base cell pc
-  if next == streamFailed then pure streamFailed else streamOperands m stream base rest next
+-- | The @n@ unify operands for the argument cells from @cell@ upwards.
+streamOperands :: Machine -> ClauseStream -> Int -> Int -> Int -> Int -> IO Int
+streamOperands m !stream !base !cell !n !pc
+  | n <= 0 = pure pc
+  | otherwise = do
+      next <- streamOperand m stream base cell pc
+      if next == streamFailed then pure streamFailed else streamOperands m stream base (cell + 1) (n - 1) next
 
 -- | One unify operand: the word to match is the contents of @cell@.
 streamOperand :: Machine -> ClauseStream -> Int -> Int -> Int -> IO Int
@@ -1798,7 +1845,7 @@ streamOperand m !stream !base !cell !pc = case () of
             f <- readCell s (valOf d)
             if funKey f /= functor
               then pure streamFailed
-              else streamOperands m stream base [valOf d + 1 .. valOf d + n] (pc + 5)
+              else streamOperands m stream base (valOf d + 1) n (pc + 5)
             | tag == tagRef -> do
                 ok <- unifyPattern m base (streamSidePattern stream entry) word
                 pure (if ok then after else streamFailed)
@@ -1945,11 +1992,78 @@ dispatchCandidates m frame predicate barrier depth returnCont candidates = do
     NoCandidate -> backtrack m
     OneCandidate ordinal -> tryClauseWithFrame m frame predicate ordinal barrier depth returnCont
     Candidates ordinals -> do
+      clp <- readReg s rCLP
       saved <- saveArgs s (pArity predicate)
-      let !alt = AltClauses predicate ordinals saved depth returnCont
-      choice <- pushChoice m alt
-      let !barrier' = min barrier choice
-      tryClause m predicate (ordinals `unsafeAt` 0) barrier' depth returnCont
+      if clp == 0
+        then do
+          h0 <- heapTop s
+          tr0 <- trailTop s
+          older <- hb s
+          setHb s h0
+          shallowCandidates m frame predicate ordinals saved h0 tr0 older 0 barrier depth returnCont
+        else do
+          let !alt = AltClauses predicate ordinals saved depth returnCont
+          choice <- pushChoice m alt
+          let !barrier' = min barrier choice
+          tryClause m predicate (ordinals `unsafeAt` 0) barrier' depth returnCont
+
+-- | Shallow backtracking over a call's candidates, as in WAM: try each
+-- head with the choice boundary raised to the entry heap top, so that every
+-- binding it makes is trailed, but push no choice point yet. A head that
+-- fails is undone by unwinding the trail and resetting the heap, and the
+-- next candidate is tried. The choice point is pushed only once a head
+-- matches while candidates remain, with the marks from before that head,
+-- so backtracking into it undoes the head as well as the body. The last
+-- candidate runs as a single candidate, with no choice point at all.
+--
+-- Matching a head only binds cells, writes its fresh activation and builds
+-- heap terms; it touches no tables, facts, output, scopes or constraints
+-- (callers take this path only while no constraint watches a binding), so
+-- the heap and trail marks are the whole of what a failed head changed.
+shallowCandidates :: Machine -> Int -> Pred -> UArray Int Int -> Int -> Int -> Int -> Int -> Int -> Int -> Int -> Cont -> IO Step
+shallowCandidates m !frame predicate ordinals !saved !h0 !tr0 !older !k !barrier !depth returnCont
+  | k + 1 >= numElements ordinals = do
+      -- Nothing would remain to retry: drop the saved arguments and run the
+      -- last candidate exactly as a single one.
+      setHeapTop s saved
+      setHb s older
+      tryClauseWithFrame m frame predicate (ordinals `unsafeAt` k) barrier depth returnCont
+  | otherwise = do
+      let !ordinal = ordinals `unsafeAt` k
+          !clause = pClauses predicate ! ordinal
+          !cont' = case returnCont of
+            CReturn h g (Just _) next | clTrustReturn clause -> CReturn h g Nothing next
+            _ -> returnCont
+      base <- allocFrame s (clVars clause) (clInitSlots clause)
+      recordSlots m False (clVars clause)
+      resume <- matchClauseHead m clause base
+      if resume == streamFailed
+        then do
+          unwindTrail s tr0
+          setHeapTop s h0
+          shallowCandidates m frame predicate ordinals saved h0 tr0 older (k + 1) barrier depth returnCont
+        else do
+          choice <- pushChoiceMarked m h0 tr0 (k + 1) (AltClauses predicate ordinals saved depth returnCont)
+          let !barrier' = min barrier choice
+          case clStream clause of
+            Just stream | streamEnabled -> streamCode m stream resume 0 base barrier' depth cont'
+            _ -> runGoals m (clBody clause) base barrier' depth cont'
+  where
+    !s = mStore m
+
+-- | Match a clause's head against the argument registers: the offset of the
+-- first body instruction of its stream (0 for a tree clause), or
+-- 'streamFailed'.
+matchClauseHead :: Machine -> Clause -> Int -> IO Int
+matchClauseHead m clause base = case clStream clause of
+  Just stream | streamEnabled -> do
+    let !op = unsafeAt (csCode stream) 0
+    if op >= opGetFirst && op <= opGetListFirst
+      then streamHead m stream base 0
+      else pure 0
+  _ -> do
+    ok <- matchHead m base (clHead clause) 0
+    pure (if ok then 0 else streamFailed)
 
 -- | The outcome of an if-then-else condition that is a single test which
 -- cannot bind, raise or leave alternatives: @==@ or @!=@ between bound
@@ -2179,27 +2293,7 @@ numericTarget m base pattern = case pattern of
 
 buildCompound :: Machine -> Int -> Bool -> Pattern -> IO Word'
 buildCompound m base normalize pattern = case pattern of
-  -- A first-occurrence head variable is still unbound. It proves this
-  -- constructor non-ground without inspecting either child.
-  PStruct functor [a, PFirst b] -> do
-    wa <- buildArg m base normalize a
-    wb <- buildArg m base normalize (PFirst b)
-    structure2WithGround s functor False wa wb
-  PStruct functor [PFirst a, b] -> do
-    wa <- buildArg m base normalize (PFirst a)
-    wb <- buildArg m base normalize b
-    structure2WithGround s functor False wa wb
-  PStruct functor [a, b] -> do
-    wa <- buildArg m base normalize a
-    wb <- buildArg m base normalize b
-    structure2 s functor wa wb
-  PStruct functor children -> do
-    let n = funArity functor
-    addr <- reserveCells s (n + 1)
-    writeCell s addr functor
-    ground <- fill (addr + 1) children True
-    when ground (writeCell s addr (functor .|. groundBit))
-    pure (strWord addr)
+  PStruct functor children -> buildStructure m base normalize functor children
   PArith functor op children -> do
     words' <- mapM (buildArg m base normalize) children
     evaluated <-
@@ -2218,16 +2312,57 @@ buildCompound m base normalize pattern = case pattern of
   _ -> buildArg m base normalize pattern
   where
     s = mStore m
-    fill _ [] !ground = pure ground
-    fill !i (child : rest) !ground = do
-      w <- case child of
-        PSlot k -> slotWord s base k
-        PFirst k -> buildArg m base normalize (PFirst k)
-        PWord cw -> pure cw
-        _ -> buildArg m base normalize child
+
+-- | Build a constructor: reserve its cells, then fill each argument cell in
+-- order (a nested constructor is built above its parent). The functor
+-- carries the ground mark when every argument is ground.
+--
+-- An unbound activation variable met here gets its cell inside the
+-- structure, as WAM's @unify_variable@ does in write mode: the argument
+-- cell becomes the variable and the slot refers to it. That is the stable
+-- cell 'operandAt' would otherwise allocate separately and bind the slot to.
+-- Query roots (base 0) already name stable cells and keep 'slotWord'.
+buildStructure :: Machine -> Int -> Bool -> Word' -> [Pattern] -> IO Word'
+buildStructure m !base normalize !functor children = do
+  let !s = mStore m
+  addr <- reserveCells s (funArity functor + 1)
+  ground <- fillArguments m base normalize (addr + 1) children True
+  writeCell s addr (if ground then functor .|. groundBit else functor)
+  pure (strWord addr)
+
+fillArguments :: Machine -> Int -> Bool -> Int -> [Pattern] -> Bool -> IO Bool
+fillArguments _ !_ !_ !_ [] !ground = pure ground
+fillArguments m !base !normalize !i (child : rest) !ground = do
+  let !s = mStore m
+  g <- case child of
+    PFirst k
+      | base > 0 -> do
+          writeCell s i (refWord i)
+          writeCell s (base + k) (refWord i)
+          pure False
+    PSlot k
+      | base > 0 -> do
+          let !slot = base + k
+          value <- readCell s slot
+          if value == refWord slot
+            then do
+              -- An unbound local escapes into this argument. Redirecting the
+              -- slot is an ordinary binding, trailed when an older choice
+              -- point could restore its self-reference.
+              writeCell s i (refWord i)
+              bind s slot (refWord i)
+              pure False
+            else do
+              writeCell s i value
+              if ground then groundNowWord s value else pure False
+    PWord w -> do
       writeCell s i w
-      g <- if ground then groundNowWord s w else pure False
-      fill (i + 1) rest g
+      if ground then groundNowWord s w else pure False
+    _ -> do
+      w <- buildArg m base normalize child
+      writeCell s i w
+      if ground then groundNowWord s w else pure False
+  fillArguments m base normalize (i + 1) rest g
 
 structure :: Store -> Word' -> [Word'] -> IO Word'
 structure = structureWord

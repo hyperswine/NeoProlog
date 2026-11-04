@@ -1,0 +1,85 @@
+<- notable.
+# Shallow backtracking and variables placed inside built structures.
+# A candidate's head is matched before any choice point exists; a failed
+# head is undone from the trail alone, and the choice point is pushed with
+# the marks from before the head that succeeded. Answers, their order and
+# the bindings they leave must match the reference engine exactly.
+
+# The first head binds the caller's variable, then fails on a later
+# argument: the binding must be undone before the next clause.
+sh (f a Z) b Z.
+sh (f W c) d W.
+sh (f e e) d e.
+
+# A head that succeeds with candidates left, and bindings made by the head
+# that backtracking must undo before the later clauses.
+nd (k A) A.
+nd (k B) b.
+nd _ c.
+
+# Cut in a clause reached after shallow failures, and in the first one.
+ct : unsafe.
+ct 1 x <- !.
+ct 2 y <- !.
+ct _ z.
+
+# Membership with a head that fails on most elements.
+mem X [X | _].
+mem X [_ | T] <- mem X T.
+
+# Repeated head variables over structures: the head binds inside the
+# argument and fails on the repeat.
+same X X.
+same (g Y) (g 1) <- Y == 2.
+same _ none.
+
+# Variables escaping into structures built in write mode, across tail calls
+# that reuse the activation.
+wrap 0 L L.
+wrap N A L <- N > 0, N1 is N - 1, wrap N1 (s A V) L.
+pair X (p X Y) Y.
+twice (t A B) A B.
+twice (u A) A A.
+
+# Shallow selection must not run while constraints watch bindings.
+pick X [X | _].
+pick X [_ | T] <- pick X T.
+
+# Nested nondeterminism under findall and not.
+both X Y <- mem X [1, 2, 3], mem Y [3, 2, 1], X == Y.
+
+> sh (f A B) d R?
+> sh (f a B) b R?
+> sh (f e B) d R?
+> sh (f A B) Q R?
+> nd (k Q) R?
+> nd (k 1) R?
+> nd Z R?
+> findall R (nd (k Q) R) L?
+> ct 1 R?
+> ct 2 R?
+> ct 3 R?
+> ct N R?
+> findall R (ct N R) L?
+> mem 3 [1, 2, 3, 4, 3]?
+> findall X (mem X [a, b, c]) L?
+> mem (h A b) [h 1 a, h 2 b, h 3 b]?
+> findall A (mem (h A b) [h 1 a, h 2 b, h 3 b]) L?
+> not (mem 9 [1, 2, 3])?
+> same (g X) (g 1) R?
+> same (g 2) (g 1) R?
+> same (g Z) W R?
+> same A B R?
+> wrap 3 z L?
+> wrap 2 z L, L = s (s z 1) 2?
+> wrap 2 z L, L = s (s z V) V, V = 7?
+> pair 1 P Y, Y = 2?
+> pair X P Y, X = Y?
+> findall P (pair Q P R) L?
+> twice T 1 B?
+> findall T (twice T 1 1) L?
+> X in 1 .. 5, pick X [7, 3, 9, 4], label [X]?
+> X in 1 .. 5, findall X (pick X [7, 3, 9, 4]) L?
+> findall (pr X Y) (both X Y) L?
+> once (mem X [p, q])?
+> once (mem X Y)?
