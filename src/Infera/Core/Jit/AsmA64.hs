@@ -4,6 +4,27 @@
 --
 -- Adapted from fprisc:compiler/Sol/AsmA64.hs
 -- Copyright (c) 2026 Jasen Qin (hyperswine), MIT License.
+--
+-- Register mapping (AAPCS64):
+--   Entry parameters: x0 = state*, x1 = args*, x2 = budgets*
+--   x19 = RState    (callee-saved)
+--   x20 = RArgs     (callee-saved)
+--   x21 = RBudgets  (callee-saved)
+--   x22 = RCells    (callee-saved)
+--   x23 = RTrail    (callee-saved)
+--   x24 = RH        (callee-saved)
+--   x25 = RTR       (callee-saved)
+--   x26 = RHB       (callee-saved)
+--   x27 = RDepth    (callee-saved cached budgets[0] resolution depth budget)
+--   x9  = RT0       (caller-saved working register)
+--   x10 = RT1       (caller-saved working register)
+--   x11 = RT2       (caller-saved working register)
+--   x12 = RT3       (caller-saved working register)
+--   x13 = RT4       (caller-saved working register)
+--   x14 = RT5       (caller-saved working register)
+--   x6  = RT6       (caller-saved working register)
+--   x7  = RT7       (caller-saved working register)
+--   x15, x16, x17 = internal assembler scratch registers
 module Infera.Core.Jit.AsmA64
   ( assembleA64,
   )
@@ -18,7 +39,7 @@ import Infera.Core.Jit.IR
 type I = Word32
 
 w :: I -> [Word8]
-w x = [fromIntegral (x `shiftR` s .&. 0xFF) | s <- [0, 8, 16, 24 :: Int]]
+w x = [fromIntegral (x `shiftR` s .&. 0xFF) | s <- [0, 8, 16, 24]]
 
 hwReg :: Reg -> Int
 hwReg = \case
@@ -45,70 +66,72 @@ rScratch0 = 15
 rScratch1 = 16
 rScratch2 = 17
 
+-- ─── AArch64 instruction encoders ────────────────────────────────────────────
+
+-- mov xD, xN  (orr xD, xzr, xN)
 movRR :: Int -> Int -> I
 movRR d n = 0xAA0003E0 .|. fromIntegral (n `shiftL` 16) .|. fromIntegral d
 
+-- ldr / str xT, [xN, #imm12*8]
 ldrImm, strImm :: Int -> Int -> Int -> I
 ldrImm t n idx = 0xF9400000 .|. fromIntegral (idx `shiftL` 10) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral t
 strImm t n idx = 0xF9000000 .|. fromIntegral (idx `shiftL` 10) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral t
 
+-- ldr / str xT, [xN, xM, lsl #3]
 ldrIx, strIx :: Int -> Int -> Int -> I
 ldrIx t n m = 0xF8607800 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral t
 strIx t n m = 0xF8207800 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral t
 
+-- add / sub xD, xN, #imm12
 addImm, subImm :: Int -> Int -> Int -> I
 addImm d n imm = 0x91000000 .|. fromIntegral (imm `shiftL` 10) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 subImm d n imm = 0xD1000000 .|. fromIntegral (imm `shiftL` 10) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 
+-- cmp xN, #imm12  (subs xzr, xN, #imm12)
 cmpImm12 :: Int -> Int -> I
 cmpImm12 n imm = 0xF100001F .|. fromIntegral (imm `shiftL` 10) .|. fromIntegral (n `shiftL` 5)
 
+-- add / sub / adds / subs / mul / smulh xD, xN, xM
 addsRR, subsRR, mulRR, smulhRR :: Int -> Int -> Int -> I
 addsRR d n m = 0xAB000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 subsRR d n m = 0xEB000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 mulRR d n m = 0x9B007C00 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 smulhRR d n m = 0x9B407C00 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 
+-- cmp xN, xM  (subs xzr, xN, xM)
 cmpRR :: Int -> Int -> I
 cmpRR n m = subsRR 31 n m
 
+-- cmp xN, xM, asr #63  (subs xzr, xN, xM, asr #63)
 cmpAsr63 :: Int -> Int -> I
 cmpAsr63 n m = 0xEB80FC1F .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5)
 
+-- lsl / asr by 3 bits:
+-- lsl xD, xN, #3  -> ubfm xD, xN, #61, #60
+-- asr xD, xN, #3  -> sbfm xD, xN, #3, #63
 lsl3, asr3 :: Int -> Int -> I
 lsl3 d n = 0xD37DF000 .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 asr3 d n = 0x9343FC00 .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 
+-- and xD, xN, #7  (N=1, immr=0, imms=2 -> 0x92400800)
 and7 :: Int -> Int -> I
 and7 d n = 0x92400800 .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 
+-- orr xD, xN, xM
 orrRR :: Int -> Int -> Int -> I
 orrRR d n m = 0xAA000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
-
-cbnzScratch0 :: Int -> I
-cbnzScratch0 offsetWords =
-  0xB5000000 .|. (fromIntegral (offsetWords .&. 0x7FFFF) `shiftL` 5) .|. fromIntegral rScratch0
-
-bCondRel :: I -> Int -> I
-bCondRel c offsetWords =
-  0x54000000 .|. (fromIntegral (offsetWords .&. 0x7FFFF) `shiftL` 5) .|. c
-
-bRel :: Int -> I
-bRel offsetWords =
-  0x14000000 .|. fromIntegral (offsetWords .&. 0x3FFFFFF)
 
 movImm64 :: Int -> Int64 -> [I]
 movImm64 r v =
   let u = fromIntegral v :: Integer
-      hs = [(fromIntegral ((u `shiftR` (16 * k)) .&. 0xFFFF) :: I, k) | k <- [0 .. 3 :: Int]]
-      movz :: (I, Int) -> I
+      hs = [(fromIntegral ((u `shiftR` (16 * k)) .&. 0xFFFF) :: I, k) | k <- [0 .. 3]]
       movz (h, k) = 0xD2800000 .|. (fromIntegral k `shiftL` 21) .|. (h `shiftL` 5) .|. fromIntegral r
-      movk :: (I, Int) -> I
       movk (h, k) = 0xF2800000 .|. (fromIntegral k `shiftL` 21) .|. (h `shiftL` 5) .|. fromIntegral r
    in case hs of
         [] -> []
         (h0 : rest) -> movz h0 : [movk hk | hk@(h, _) <- rest, h /= 0]
 
+-- Condition codes for B.cond:
 condEQ, condNE, condMI, condVS, condGE, condLT, condGT, condLE :: I
 condEQ = 0x0
 condNE = 0x1
@@ -128,17 +151,22 @@ a64Cond = \case
   JGt -> condGT
   JGe -> condGE
 
+-- B.cond offset (imm19 in bits 23..5)
 bCondPlaceholder :: I -> I
 bCondPlaceholder c = 0x54000000 .|. c
 
+-- Unconditional B offset (imm26 in bits 25..0)
 bUncondPlaceholder :: I
 bUncondPlaceholder = 0x14000000
 
+-- Fixup: (word offset inside fragment, target label, isCondBranch)
 data Frag = Frag [I] [(Int, Label, Bool)]
 
 ws :: [I] -> Frag
 ws is = Frag is []
 
+-- Check that value in register `rd` fits in 61-bit signed immediate:
+-- lsl xScratch0, xRd, #3; asr xScratch0, xScratch0, #3; cmp xScratch0, xRd; b.ne bailoutLbl
 checkFitsImmediate :: Int -> Label -> Frag
 checkFitsImmediate rd bailoutLbl =
   Frag
@@ -154,15 +182,16 @@ appendFrag (Frag a fa) (Frag b fb) =
   let n = length a
    in Frag (a ++ b) (fa ++ [(i + n, l, c) | (i, l, c) <- fb])
 
+-- Save callee-saved x19..x28 and load RState..RHB + RDepth from x0..x2
 prologueWords :: [I]
 prologueWords =
-  [ 0xA9BF7BFD,
-    addImm 29 31 0,
-    0xA9BF53F3,
-    0xA9BF5BF5,
-    0xA9BF63F7,
-    0xA9BF6BF9,
-    0xA9BF73FB,
+  [ 0xA9BF7BFD, -- stp x29, x30, [sp, #-16]!
+    addImm 29 31 0, -- mov x29, sp
+    0xA9BF53F3, -- stp x19, x20, [sp, #-16]!
+    0xA9BF5BF5, -- stp x21, x22, [sp, #-16]!
+    0xA9BF63F7, -- stp x23, x24, [sp, #-16]!
+    0xA9BF6BF9, -- stp x25, x26, [sp, #-16]!
+    0xA9BF73FB, -- stp x27, x28, [sp, #-16]!
     movRR (hwReg RState) 0,
     movRR (hwReg RArgs) 1,
     movRR (hwReg RBudgets) 2,
@@ -181,13 +210,13 @@ epilogueWords code =
     strImm rDepth (hwReg RBudgets) budgetDepthIdx
   ]
     ++ movImm64 0 code
-    ++ [ 0xA8C173FB,
-         0xA8C16BF9,
-         0xA8C163F7,
-         0xA8C15BF5,
-         0xA8C153F3,
-         0xA8C17BFD,
-         0xD65F03C0
+    ++ [ 0xA8C173FB, -- ldp x27, x28, [sp], #16
+         0xA8C16BF9, -- ldp x25, x26, [sp], #16
+         0xA8C163F7, -- ldp x23, x24, [sp], #16
+         0xA8C15BF5, -- ldp x21, x22, [sp], #16
+         0xA8C153F3, -- ldp x19, x20, [sp], #16
+         0xA8C17BFD, -- ldp x29, x30, [sp], #16
+         0xD65F03C0 -- ret
        ]
 
 emitOp :: Int -> JitOp -> (Frag, Maybe Label)
@@ -210,16 +239,22 @@ emitOp seqId = \case
   JDeref dst src ->
     let d = hwReg dst
         s = hwReg src
+        cbnzScratch0 :: Int -> I
+        cbnzScratch0 offsetWords = 0xB5000000 .|. (fromIntegral (offsetWords .&. 0x7FFFF) `shiftL` 5) .|. fromIntegral rScratch0
+        bCondRel :: I -> Int -> I
+        bCondRel c offsetWords = 0x54000000 .|. (fromIntegral (offsetWords .&. 0x7FFFF) `shiftL` 5) .|. c
+        bRel :: Int -> I
+        bRel offsetWords = 0x14000000 .|. fromIntegral (offsetWords .&. 0x3FFFFFF)
      in ( ws
             ( [movRR d s | d /= s]
-                ++ [ and7 rScratch0 d,
-                     cbnzScratch0 7,
-                     asr3 rScratch1 d,
-                     ldrIx rScratch2 (hwReg RCells) rScratch1,
-                     cmpRR rScratch2 d,
-                     bCondRel condEQ 3,
-                     movRR d rScratch2,
-                     bRel (-7)
+                ++ [ and7 rScratch0 d, -- 0
+                     cbnzScratch0 7, -- 1 -> jumps to word 8 (done)
+                     asr3 rScratch1 d, -- 2
+                     ldrIx rScratch2 (hwReg RCells) rScratch1, -- 3
+                     cmpRR rScratch2 d, -- 4
+                     bCondRel condEQ 3, -- 5 -> jumps to word 8 (done)
+                     movRR d rScratch2, -- 6
+                     bRel (-7) -- 7 -> jumps back to word 0 (loop)
                    ]
             ),
           Nothing
@@ -249,6 +284,8 @@ emitOp seqId = \case
   JAddImm dst src imm -> (ws [addImm (hwReg dst) (hwReg src) imm], Nothing)
   JSubImm dst src imm -> (ws [subImm (hwReg dst) (hwReg src) imm], Nothing)
   JTickDepth exhaustedLbl ->
+    -- subs rDepth, rDepth, #1
+    -- b.mi exhaustedLbl
     ( Frag
         [ 0xF1000400 .|. fromIntegral (rDepth `shiftL` 5) .|. fromIntegral rDepth,
           bCondPlaceholder condMI
@@ -257,6 +294,8 @@ emitOp seqId = \case
       Nothing
     )
   JTickDepthReg stepReg exhaustedLbl ->
+    -- subs rDepth, rDepth, stepReg
+    -- b.mi exhaustedLbl
     ( Frag
         [ subsRR rDepth rDepth (hwReg stepReg),
           bCondPlaceholder condMI
@@ -267,16 +306,18 @@ emitOp seqId = \case
   JBindRef addrReg valReg bailoutLbl ->
     let a = hwReg addrReg
         v = hwReg valReg
+        bCondRel :: I -> Int -> I
+        bCondRel c offsetWords = 0x54000000 .|. (fromIntegral (offsetWords .&. 0x7FFFF) `shiftL` 5) .|. c
      in ( Frag
-            [ strIx v (hwReg RCells) a,
-              cmpRR a (hwReg RHB),
-              bCondRel condGE 7,
-              ldrImm rScratch0 (hwReg RState) stateTrailCapIdx,
-              cmpRR (hwReg RTR) rScratch0,
-              bCondPlaceholder condGE,
-              addImm rScratch1 31 0,
-              strIx rScratch1 (hwReg RTrail) (hwReg RTR),
-              addImm (hwReg RTR) (hwReg RTR) 1
+            [ strIx v (hwReg RCells) a, -- 0: RCells[addr] = val
+              cmpRR a (hwReg RHB), -- 1: cmp addr, RHB
+              bCondRel condGE 7, -- 2: if addr >= RHB, skip trailing (to word 9)
+              ldrImm rScratch0 (hwReg RState) stateTrailCapIdx, -- 3: trailCap
+              cmpRR (hwReg RTR) rScratch0, -- 4: cmp RTR, trailCap
+              bCondPlaceholder condGE, -- 5: if RTR >= trailCap -> bailoutLbl
+              addImm rScratch1 31 0, -- 6: nop/placeholder replaced below by lsl #1
+              strIx rScratch1 (hwReg RTrail) (hwReg RTR), -- 7: RTrail[RTR] = 2 * addr
+              addImm (hwReg RTR) (hwReg RTR) 1 -- 8: RTR += 1
             ]
             [(5, bailoutLbl, True)]
             `replaceWord6` (0xD37FF800 .|. fromIntegral (a `shiftL` 5) .|. fromIntegral rScratch1),
@@ -300,7 +341,7 @@ emitOp seqId = \case
 assembleA64 :: JitUnit -> [Word8]
 assembleA64 (JitUnit ops) = concatMap w patched
   where
-    laid = (ws prologueWords, Nothing) : [emitOp i op | (i, op) <- zip [0 :: Int ..] ops]
+    laid = (ws prologueWords, Nothing) : [emitOp i op | (i, op) <- zip [0 ..] ops]
     offs = scanl (\acc (Frag is _, _) -> acc + length is) 0 laid
     labels = M.fromList [(lbl, off) | ((_, Just lbl), off) <- zip laid offs]
     patched = concat [patchFrag base frag | ((frag, _), base) <- zip laid offs]

@@ -1,0 +1,26 @@
+<- notable.
+# Frame reclamation after a last `is` goal. The last goal of a branch, a
+# disjunct or a cut arm is not the end of the clause: the clause continues in
+# the same activation, so its slots must survive the next call's allocation.
+k2 A <- B is A * 100, C is B + 1, D is C + 1, E is D + 1.
+dbl N <- A is N * 2, B is A + 0, M0 is B + 0, M1 is M0 + 0.
+pick X R <- (X > 10 -> Y is X - 10 ; Y is X + 10), dbl X, R = Y.
+p X R <- (X > 0 -> Y is X + 1 ; Y = 0), k2 X, R = Y.
+q X R <- (fail ; Y is X + 1), k2 X, R = Y.
+cutor : unsafe.
+cutor X R <- (!, Y is X * 3 ; Y = 0), dbl X, R = Y.
+# Where the frame really is dead, reclaiming must not change answers.
+fib 0 0.
+fib 1 1.
+fib N F <- N > 1, N1 is N - 1, N2 is N - 2, fib N1 F1, fib N2 F2, F is F1 + F2.
+tsum leaf 0.
+tsum (node L V R) S <- tsum L SL, tsum R SR, S is SL + V + SR.
+> pick 5 R?
+> pick 50 R?
+> p 5 R?
+> p 0 R?
+> q 5 R?
+> X = 5, p X R?
+> cutor 4 R?
+> fib 15 F?
+> tsum (node (node leaf 1 leaf) 2 (node (node leaf 3 leaf) 4 leaf)) S?

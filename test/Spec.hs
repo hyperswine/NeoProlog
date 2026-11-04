@@ -31,6 +31,7 @@ import MachineGeneralReclaimTest (machineGeneralReclaimGroup)
 import MachineInternalTailTest (machineInternalTailGroup)
 import MachineNormalizeTest (machineNormalizeGroup)
 import CompileTest (compileGroup)
+import JitEncodingTest (jitEncodingGroup)
 import MachineBytecodeTest (machineBytecodeGroup)
 import MachineBytecodeHeapTest (machineBytecodeHeapGroup)
 import MachineHeadTest (machineHeadGroup)
@@ -68,6 +69,7 @@ groups =
     ("machine-internal-tail", machineInternalTailGroup),
     ("machine-normalize", machineNormalizeGroup),
     ("compile", compileGroup),
+    ("jit-encoding", jitEncodingGroup),
     ("machine-bytecode", machineBytecodeGroup),
     ("machine-bytecode-heap", machineBytecodeHeapGroup),
     ("machine-head", machineHeadGroup),

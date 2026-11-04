@@ -1,70 +1,71 @@
-/*
- * cbits/infera_jit.c
+/* infera_jit.c — executable memory for the Infera native JIT tier.
  *
- * Executable page allocation and CPU feature detection for Infera's native WAM JIT tier.
  * Adapted from fprisc:compiler/cbits/handjit.c
  * Copyright (c) 2026 Jasen Qin (hyperswine), MIT License.
+ *
+ * On macOS arm64, supports both MAP_JIT + pthread_jit_write_protect_np
+ * and W^X mprotect(PROT_READ | PROT_EXEC) with page-aligned sizing and
+ * instruction-cache invalidation.
  */
-
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #if defined(__APPLE__)
-#include <pthread.h>
 #include <libkern/OSCacheControl.h>
+#include <pthread.h>
 #endif
 
-static size_t round_page(size_t n) {
-    size_t page = 16384;
-    return (n + page - 1) & ~(page - 1);
-}
+void *infera_jit_alloc(const uint8_t *buf, long n) {
+  if (n <= 0) return 0;
+  long page = sysconf(_SC_PAGESIZE);
+  if (page <= 0) page = 16384;
+  long sz = (n + page - 1) & ~(page - 1);
 
-void *infera_jit_alloc(const uint8_t *code, int len) {
-    if (len <= 0 || !code) return 0;
-    size_t sz = round_page((size_t)len);
-    int flags = MAP_PRIVATE | MAP_ANON;
 #if defined(__APPLE__) && defined(__aarch64__)
-    flags |= MAP_JIT;
-#endif
-    void *p = mmap(0, sz, PROT_READ | PROT_WRITE | PROT_EXEC, flags, -1, 0);
-    if (p == MAP_FAILED) {
-        p = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (p == MAP_FAILED) return 0;
-        memcpy(p, code, (size_t)len);
-        if (mprotect(p, sz, PROT_READ | PROT_EXEC) != 0) {
-            munmap(p, sz);
-            return 0;
-        }
-    } else {
-#if defined(__APPLE__) && defined(__aarch64__)
-        pthread_jit_write_protect_np(0);
-#endif
-        memcpy(p, code, (size_t)len);
-#if defined(__APPLE__) && defined(__aarch64__)
-        pthread_jit_write_protect_np(1);
-#endif
-    }
-#if defined(__APPLE__)
-    sys_icache_invalidate(p, (size_t)len);
-#elif defined(__GNUC__) || defined(__clang__)
-    __builtin___clear_cache((char *)p, (char *)p + len);
-#endif
+  void *p = mmap(0, (size_t)sz, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+  if (p != MAP_FAILED) {
+    pthread_jit_write_protect_np(0);
+    memcpy(p, buf, (size_t)n);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(p, (size_t)sz);
     return p;
-}
-
-void infera_jit_free(void *ptr, int len) {
-    if (!ptr || len <= 0) return;
-    munmap(ptr, round_page((size_t)len));
-}
-
-int infera_jit_has_sse41(void) {
-#if defined(__x86_64__) || defined(_M_X64)
-    uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0;
-    __asm__ volatile("cpuid"
-                     : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-    return (ecx & (1u << 19)) ? 1 : 0;
-#else
-    return 0;
+  }
 #endif
+
+  void *p2 = mmap(0, (size_t)sz, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p2 == MAP_FAILED) return 0;
+  memcpy(p2, buf, (size_t)n);
+  if (mprotect(p2, (size_t)sz, PROT_READ | PROT_EXEC) != 0) {
+    munmap(p2, (size_t)sz);
+    return 0;
+  }
+#if defined(__APPLE__)
+  sys_icache_invalidate(p2, (size_t)sz);
+#else
+  __builtin___clear_cache((char *)p2, (char *)p2 + sz);
+#endif
+  return p2;
 }
+
+void infera_jit_free(void *p, long n) {
+  if (!p || n <= 0) return;
+  long page = sysconf(_SC_PAGESIZE);
+  if (page <= 0) page = 16384;
+  long sz = (n + page - 1) & ~(page - 1);
+  munmap(p, (size_t)sz);
+}
+
+#if defined(__x86_64__)
+#include <cpuid.h>
+int infera_jit_has_sse41(void) {
+  unsigned a, b, c, d;
+  if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
+  return (c & bit_SSE4_1) ? 1 : 0;
+}
+#else
+int infera_jit_has_sse41(void) { return 1; }
+#endif

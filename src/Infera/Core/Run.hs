@@ -1048,17 +1048,18 @@ step' m goal goals base barrier depth next = case goal of
       if quick /= planMiss then bindQuick quick else general
     where
       !st = mStore m
+      noSlotStats = case mSlotStats m of { Nothing -> True; Just _ -> False }
       bindQuick quick = case target of
         PFirst i | base > 0 -> do
           writeCell st (base + i) (intWord quick)
-          when (null goals && case mSlotStats m of { Nothing -> True; Just _ -> False }) (tryReclaimFrame st base)
+          when (null goals && noSlotStats && frameDead base next) (tryReclaimFrame st base)
           continue
         _ -> do
           wt <- numericTarget m base target
           ok <- unify st wt (intWord quick)
           if ok
             then do
-              when (null goals && base > 0 && case mSlotStats m of { Nothing -> True; Just _ -> False }) (tryReclaimFrame st base)
+              when (null goals && base > 0 && noSlotStats && frameDead base next) (tryReclaimFrame st base)
               continue
             else backtrack m
       general = do
@@ -1490,12 +1491,19 @@ callDeclared m frame predicate trust cont0 = do
 -- plans into PWord operands and invalidates the offered frame.
 tailFrame :: Store -> Int -> Cont -> IO Int
 tailFrame s base cont
-  | base <= 0 || not (dead cont) = pure 0
+  | base <= 0 || not (frameDead base cont) = pure 0
   | otherwise = do
       oldest <- hb s
       if base - 1 < oldest then pure 0 else do
         marker <- readCell s (base - 1)
         pure $ if tagOf marker == tagFun then markerVars marker else 0
+
+-- | Whether no pending continuation can resume the activation at @base@,
+-- so its slots are dead once the current goal list ends. The last goal of a
+-- goal list is not enough: an if-then-else branch, a disjunct or a cut
+-- continues in the same activation through its continuation.
+frameDead :: Int -> Cont -> Bool
+frameDead base = dead
   where
     dead CDone = True
     -- Activations are allocated above their callers; in-place tail reuse
@@ -1891,6 +1899,7 @@ tryUnitBaseCall s !base predicate !inSlot !outSlot = do
 {-# INLINE tryUnitBaseCall #-}
 
 -- | Horizon 3B: Fused non-tail recursive frame reclamation on final `GIs` goal.
+-- Callers must first prove the frame dead with 'frameDead'.
 tryReclaimFrame :: Store -> Int -> IO ()
 tryReclaimFrame s !base = do
   h <- heapTop s

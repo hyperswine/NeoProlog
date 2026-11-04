@@ -4,8 +4,32 @@
 --
 -- Adapted from fprisc:compiler/Sol/AsmX64.hs
 -- Copyright (c) 2026 Jasen Qin (hyperswine), MIT License.
+--
+-- Register mapping (SysV x86-64):
+--   Entry parameters: rdi = state*, rsi = args*, rdx = budgets*
+--   rbx = RState    (callee-saved)
+--   r12 = RArgs     (callee-saved)
+--   r13 = RDepth    (callee-saved cached budgets[0] resolution depth budget)
+--   r14 = RCells    (callee-saved)
+--   r15 = RTrail    (callee-saved)
+--   r8  = RH        (caller-saved)
+--   r9  = RTR       (caller-saved)
+--   r10 = RHB       (caller-saved)
+--   rcx = RT0       (caller-saved working register)
+--   rsi = RT1       (caller-saved working register, after RArgs is saved to r12)
+--   rdi = RT2       (caller-saved working register, after RState is saved to rbx)
+--   rbp-8 .. rbp-40  = saved rbx, r12, r13, r14, r15 (pushed in the prologue)
+--   rbp-48           = RBudgets pointer spill slot
+--   rbp-56 .. rbp-88 = spilled slots for RT3..RT7 when needed
+--   The spill area must stay below the callee-saved pushes: an earlier layout
+--   put RBudgets at rbp-40, overwriting the saved r15 that GHC relies on.
+--   rax, rdx, r11    = assembler scratch registers
 module Infera.Core.Jit.AsmX64
   ( assembleX64,
+
+    -- * Exposed for the encoding tests
+    hwLoc,
+    prologueBytes,
   )
 where
 
@@ -25,22 +49,22 @@ imm64 v = [fromIntegral (fromIntegral v `shiftR` s .&. (0xFF :: Integer)) | s <-
 
 hwLoc :: Reg -> Either Int Int
 hwLoc = \case
-  RState -> Left 3
-  RArgs -> Left 12
-  RBudgets -> Right (-40)
-  RCells -> Left 14
-  RTrail -> Left 15
-  RH -> Left 8
-  RTR -> Left 9
-  RHB -> Left 10
-  RT0 -> Left 1
-  RT1 -> Left 6
-  RT2 -> Left 7
-  RT3 -> Right (-48)
-  RT4 -> Right (-56)
-  RT5 -> Right (-64)
-  RT6 -> Right (-72)
-  RT7 -> Right (-80)
+  RState -> Left 3 -- rbx
+  RArgs -> Left 12 -- r12
+  RBudgets -> Right (-48) -- [rbp - 48]
+  RCells -> Left 14 -- r14
+  RTrail -> Left 15 -- r15
+  RH -> Left 8 -- r8
+  RTR -> Left 9 -- r9
+  RHB -> Left 10 -- r10
+  RT0 -> Left 1 -- rcx
+  RT1 -> Left 6 -- rsi
+  RT2 -> Left 7 -- rdi
+  RT3 -> Right (-56)
+  RT4 -> Right (-64)
+  RT5 -> Right (-72)
+  RT6 -> Right (-80)
+  RT7 -> Right (-88)
 
 rexW :: Int -> Int -> Int -> Word8
 rexW r x b =
@@ -158,19 +182,19 @@ checkFitsImmediate r bailoutLbl =
 
 prologueBytes :: B
 prologueBytes =
-  [ 0x55,
-    0x48, 0x89, 0xE5,
-    0x53,
-    0x41, 0x54,
-    0x41, 0x55,
-    0x41, 0x56,
-    0x41, 0x57,
-    0x48, 0x83, 0xEC, 0x30
+  [ 0x55, -- push rbp
+    0x48, 0x89, 0xE5, -- mov rbp, rsp
+    0x53, -- push rbx
+    0x41, 0x54, -- push r12
+    0x41, 0x55, -- push r13
+    0x41, 0x56, -- push r14
+    0x41, 0x57, -- push r15
+    0x48, 0x83, 0xEC, 0x30 -- sub rsp, 48 (spill area for RBudgets, RT3..RT7)
   ]
-    ++ movRR 3 7
-    ++ movRR 12 6
-    ++ storeRbp8 2 (-40)
-    ++ loadImmIx 13 2 budgetDepthIdx
+    ++ movRR 3 7 -- rbx (RState)   = rdi
+    ++ movRR 12 6 -- r12 (RArgs)    = rsi
+    ++ storeRbp8 2 (-48) -- [rbp - 48] = rdx (RBudgets*)
+    ++ loadImmIx 13 2 budgetDepthIdx -- r13 (RDepth) = budgets[0]
     ++ loadImmIx 14 3 stateCellsIdx
     ++ loadImmIx 15 3 stateTrailIdx
     ++ loadImmIx 8 3 stateHIdx
@@ -181,17 +205,17 @@ epilogueBytes :: Int64 -> B
 epilogueBytes code =
   storeImmIx 8 3 stateHIdx
     ++ storeImmIx 9 3 stateTRIdx
-    ++ loadRbp8 2 (-40)
-    ++ storeImmIx 13 2 budgetDepthIdx
+    ++ loadRbp8 2 (-48) -- rdx = RBudgets*
+    ++ storeImmIx 13 2 budgetDepthIdx -- budgets[0] = r13 (RDepth)
     ++ movImm 0 code
-    ++ [ 0x48, 0x83, 0xC4, 0x30,
-         0x41, 0x5F,
-         0x41, 0x5E,
-         0x41, 0x5D,
-         0x41, 0x5C,
-         0x5B,
-         0x5D,
-         0xC3
+    ++ [ 0x48, 0x83, 0xC4, 0x30, -- add rsp, 48
+         0x41, 0x5F, -- pop r15
+         0x41, 0x5E, -- pop r14
+         0x41, 0x5D, -- pop r13
+         0x41, 0x5C, -- pop r12
+         0x5B, -- pop rbx
+         0x5D, -- pop rbp
+         0xC3 -- ret
        ]
 
 emitOp :: JitOp -> (Frag, Maybe Label)
@@ -277,27 +301,33 @@ emitOp = \case
     let (s, loadS) = getReg 0 src
      in (bytes (loadS ++ movRR 0 s ++ subImm32 0 imm ++ putReg dst 0), Nothing)
   JTickDepth exhaustedLbl ->
+    -- sub r13, 1 (49 83 ED 01); js exhaustedLbl
     (appendFrag (bytes [0x49, 0x83, 0xED, 0x01]) (jccRel32 0x88 exhaustedLbl), Nothing)
   JTickDepthReg stepReg exhaustedLbl ->
     let (rs, loadS) = getReg 0 stepReg
+        -- sub r13, rs (rexW rs 0 13, 0x29, modRM 3 rs 13); js exhaustedLbl
         pre = loadS ++ [rexW rs 0 13, 0x29, modRM 3 rs 13]
      in (appendFrag (bytes pre) (jccRel32 0x88 exhaustedLbl), Nothing)
   JBindRef addrReg valReg bailoutLbl ->
     let (a, loadA) = getReg 0 addrReg
         (v, loadV) = getReg 2 valReg
-        pre =
-          loadA
-            ++ loadV
-            ++ storeRegIx v 14 a
-            ++ cmpRR a 10
-            ++ [0x7D, 0x1A]
-            ++ loadImmIx 11 3 stateTrailCapIdx
-            ++ cmpRR 9 11
+        capCheck = loadImmIx 11 3 stateTrailCapIdx ++ cmpRR 9 11
         post =
           movRR 11 a
             ++ [0x49, 0xD1, 0xE3]
             ++ storeRegIx 11 15 9
             ++ [0x49, 0x83, 0xC1, 0x01]
+        -- jge over the trail push: capCheck, its jcc rel32 (6 bytes) and post.
+        -- Derived from the emitted bytes; a hard-coded 0x1A fell one byte
+        -- short and jumped into the middle of the final add.
+        skip = length capCheck + 6 + length post
+        pre =
+          loadA
+            ++ loadV
+            ++ storeRegIx v 14 a
+            ++ cmpRR a 10
+            ++ [0x7D, fromIntegral skip]
+            ++ capCheck
      in (appendFrag (appendFrag (bytes pre) (jccRel32 0x8D bailoutLbl)) (bytes post), Nothing)
   JJump lbl -> (jmpRel32 lbl, Nothing)
   JBranchCmp c a b lbl ->

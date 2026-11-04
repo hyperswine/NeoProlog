@@ -147,7 +147,7 @@ test-suite infera-test
                       MachineGraphReuseTest MachineEnvironmentTest MachineGeneralReclaimTest
                       MachineInternalTailTest
                       MachineNormalizeTest
-                      CompileTest MachineBytecodeTest MachineBytecodeHeapTest MachineHeadTest
+                      CompileTest JitEncodingTest MachineBytecodeTest MachineBytecodeHeapTest MachineHeadTest
                       MachineLifetimeTest
                       MachineCompiledControlTest
                       MachineCacheTest

@@ -1,0 +1,103 @@
+<- notable.
+# Predicates the native JIT compiles, called in modes it must hand back to
+# the interpreter: unbound or partial inputs, non-integer elements, bound
+# outputs, big integers and overflow, and elements that would make the output
+# contain itself. Answers must match the reference engine exactly.
+loop 0.
+loop N <- N > 0, N1 is N - 1, loop N1.
+gcd X 0 X.
+gcd X Y G <- Y > 0, X >= Y, Z is X - Y, gcd Z Y G.
+gcd X Y G <- Y > 0, X < Y, gcd Y X G.
+sum_to 0 Acc Acc.
+sum_to N Acc Out <- N > 0, A1 is Acc + N, N1 is N - 1, sum_to N1 A1 Out.
+fact_acc 0 Acc Acc.
+fact_acc N Acc Out <- N > 0, A1 is Acc * N, N1 is N - 1, fact_acc N1 A1 Out.
+fib_acc 0 A _ A.
+fib_acc N A B Out <- N > 0, N1 is N - 1, C is A + B, fib_acc N1 B C Out.
+list_sum [] Acc Acc.
+list_sum [H | T] Acc Out <- A1 is Acc + H, list_sum T A1 Out.
+mem_chk X [X | _].
+mem_chk X [_ | T] <- mem_chk X T.
+range N N [N].
+range I N [I | T] <- I < N, I1 is I + 1, range I1 N T.
+app [] L L.
+app [H | T] L [H | R] <- app T L R.
+map_linear [] _ _ [].
+map_linear [X | Xs] A B [Y | Ys] <- AX is A * X, Y is AX + B, map_linear Xs A B Ys.
+filter_gt [] _ [].
+filter_gt [X | T] K [X | R] <- X > K, filter_gt T K R.
+filter_gt [X | T] K R <- X <= K, filter_gt T K R.
+countdown_list 0 [].
+countdown_list N [N | Rest] <- N > 0, N1 is N - 1, countdown_list N1 Rest.
+cp [] [].
+cp [H | T] [H | R] <- H != 0, cp T R.
+z [] N N.
+z [0 | T] A N <- z T A N.
+z [1 | T] A N <- z T A N.
+eqh [] [] 0.
+eqh [X | T] [X | U] N <- eqh T U N.
+pk [] [X | _] [X].
+pk [_ | C] [_ | T] R <- pk C T R.
+zz [] 18446744073709551621 0.
+zz [_ | T] A N <- zz T A N.
+# Registers of dead variables are reused by later ones (w3 runs natively).
+w3 [] 0.
+w3 [_ | T] N <- P is 9, P != 0, X is 1, X != 0, Y is 2, Z is 3, B is 4, Y != Z, B != 5, w3 T N.
+w4 [] 0.
+w4 [_ | T] N <- P is 9, P != 0, X is 1, X != 0, Y is 2, Z is 3, B is 4, C is 5, Y != Z, B != 5, C != 0, w4 T N.
+mk 0 [].
+mk N [N | T] <- N > 0, N1 is N - 1, mk N1 T.
+> loop 50000?
+> loop 90000?
+> loop -1?
+> loop X?
+> sum_to 1000 0 Out?
+> sum_to 1000 0 500500?
+> sum_to 1000 0 7?
+> sum_to 5 0 a?
+> fact_acc 19 1 F?
+> fact_acc 25 1 F?
+> fib_acc 50 0 1 F?
+> fib_acc 100 0 1 F?
+> list_sum [1, 2, 3] 0 S?
+> list_sum [1, a, 3] 0 S?
+> list_sum [1, X] 0 S?
+> once (list_sum [1 | T] 0 S)?
+> list_sum [1, 2.5] 0 S?
+> mk 500 L, list_sum L 0 S?
+> app [1, 2] [3] M?
+> app [1, a, f(b)] [x] M?
+> app [X, Y] [z] M?
+> app [X] [] X?
+> app [f(X)] [] X?
+> app [1, 2] [3] [1, 2, 3]?
+> app [1, 2] [3] [1 | R]?
+> once (app [1 | T] [2] M)?
+> mk 500 L, app L [x] M, M = [A | _]?
+> map_linear [1, 2, 3] 3 5 Out?
+> map_linear [1, b] 3 5 Out?
+> filter_gt [1, 5, 2, 8] 3 Out?
+> filter_gt [1, X, 8] 3 Out?
+> countdown_list 5 L?
+> countdown_list 0 L?
+> countdown_list -1 L?
+> cp [1, 2, 3] R?
+> cp [1, a, 3] R?
+> cp [1, 2, 0] R?
+> once (cp [1, 2 | T] R)?
+> cp [1, 2] [1, 2]?
+> cp [1, 2] [1, 3]?
+> z [0, 1, 0] 5 N?
+> z [0, X] 5 N?
+> z [0, 2] 5 N?
+> eqh [f(1)] [f(1)] N?
+> eqh [1.5] [1.5] N?
+> eqh ["ab"] ["ab"] N?
+> eqh [A] [1] N?
+> eqh [1, 2] [1, 3] N?
+> eqh [a, b] [a, b] N?
+> pk [] [V] R, R != [1], V = 1?
+> pk [a] [p, q] R?
+> zz [1] 5 N?
+> w3 [1, 2] N?
+> w4 [1, 2] N?

@@ -26,6 +26,7 @@ import Data.List (nub)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as Set
 import Data.Word (Word8)
+import Foreign.C.Types (CInt (..), CLong (..))
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray, withForeignPtr)
 import Foreign.Marshal.Array (withArray, withArrayLen)
 import Foreign.Ptr (FunPtr, Ptr, castPtrToFunPtr, intPtrToPtr, nullPtr, ptrToIntPtr)
@@ -43,10 +44,10 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Info (arch)
 
 foreign import ccall unsafe "infera_jit_alloc"
-  c_inferaJitAlloc :: Ptr Word8 -> Int -> IO (Ptr Word8)
+  c_inferaJitAlloc :: Ptr Word8 -> CLong -> IO (Ptr Word8)
 
 foreign import ccall unsafe "infera_jit_has_sse41"
-  c_inferaJitHasSse41 :: IO Int
+  c_inferaJitHasSse41 :: IO CInt
 
 type NativeFn = Ptr Int64 -> Ptr Int64 -> Ptr Int64 -> IO Int64
 
@@ -102,7 +103,7 @@ installUnit key arity cellsPerIter unit
       if null bytes
         then pure Nothing
         else do
-          ptr <- withArray bytes $ \pb -> c_inferaJitAlloc pb (length bytes)
+          ptr <- withArray bytes $ \pb -> c_inferaJitAlloc pb (fromIntegral (length bytes))
           if ptr == nullPtr
             then do
               jitDebug (show key ++ ": infera_jit_alloc failed")
@@ -131,7 +132,7 @@ compileJitKernel nilW consW prog key decls inferred clauses
       installUnit key (snd key) cellsPerIter unit
   | Just (unit, cellsPerIter) <- matchNrevLoop nilW consW prog key clauses =
       installUnit key (snd key) cellsPerIter unit
-  | Just (unit, cellsPerIter) <- compileGeneralTailJit nilW consW key clauses =
+  | Just (unit, cellsPerIter) <- compileGeneralTailJit nilW consW key inferred clauses =
       installUnit key (snd key) cellsPerIter unit
   | otherwise = do
       jitDebug (show key ++ ": declined (outside JIT fragment)")
@@ -173,17 +174,27 @@ initialFreeRegs roles =
       pool = [RT0, RT1, RT2, RT3, RT4, RT5, RT6]
    in filter (`notElem` used) pool
 
-compileGeneralTailJit :: Word' -> Word' -> PredKey -> [S.Clause] -> Maybe (JitUnit, Int)
-compileGeneralTailJit nilW consW (name, arity) clauses
+compileGeneralTailJit :: Word' -> Word' -> PredKey -> P.Signature -> [S.Clause] -> Maybe (JitUnit, Int)
+compileGeneralTailJit nilW consW (name, arity) inferred clauses
   | arity < 1 || arity > 4 || null clauses || length clauses > 8 = Nothing
   | not (any (isRecursiveClause name arity) clauses) = Nothing
   | not (all (hasValidHead name arity) clauses) = Nothing
+  | not (all clauseLitsImmediate clauses) = Nothing
   | otherwise = do
       roles <- inferParamRoles name arity clauses
+      let inCount = if isOutputRole (last roles) then arity - 1 else arity
+          switchIdxs = P.sigSwitch inferred
+          commitsOnSuccess = P.sigDet inferred == S.Semidet && all (< inCount) switchIdxs
+      reliesOnCommit <- commitSafety name arity inCount commitsOnSuccess clauses
       let nilImm = fromIntegral nilW :: Int64
           consPlain = fromIntegral consW :: Int64
           consGround = fromIntegral (consW .|. groundBit) :: Int64
-          groundCheckIdxs = trmcGroundPassthroughIdxs name arity roles clauses
+          -- When a matching base clause stands in for the interpreter's
+          -- committed first answer, every input must be ground as the
+          -- interpreter's switch check requires; integers already are.
+          listIdxs = [i | (i, ParamList) <- zip [0 :: Int ..] roles]
+          groundCheckIdxs =
+            nub (trmcGroundPassthroughIdxs name arity roles clauses ++ [i | reliesOnCommit, i <- listIdxs])
           prologue = emitEntryChecks roles groundCheckIdxs nilImm consGround
       clauseBlocks <-
         sequence
@@ -415,8 +426,135 @@ emitEntryChecks roles groundCheckIdxs nilImm consGround =
          in [ JLoadImm reg RArgs idx,
               JDeref reg reg,
               JTagOf RT7 reg,
-              JBranchImm JNe RT7 (fromIntegral tagRef) "decline"
+              JBranchImm JNe RT7 (fromIntegral tagRef) "decline",
+              -- The occurs guard compares copied elements with this word.
+              JStoreImm reg RArgs idx
             ]
+
+-- ─── Commit safety ───────────────────────────────────────────────────────────
+
+-- | Literals must fit an immediate integer; a wider one would be truncated.
+clauseLitsImmediate :: S.Clause -> Bool
+clauseLitsImmediate cl = all fits (concatMap termInts (S.clauseHead cl : S.clauseBody cl))
+  where
+    fits k = k >= -(2 ^ (60 :: Int)) && k < 2 ^ (60 :: Int)
+    termInts = \case
+      S.IntLit k -> [k]
+      S.Compound _ as -> concatMap termInts as
+      _ -> []
+
+-- | Native code commits to the first clause whose head and guards match,
+-- but the interpreter tries later clauses again if that clause fails in its
+-- recursive call, and offers them as further answers after a base clause
+-- succeeds. So a recursive clause must exclude every later clause outright.
+-- A base clause may overlap later ones only when the interpreter commits on
+-- success too: an inferred semidet predicate whose switch arguments are
+-- input positions, ground at the call. Returns whether that is relied on.
+commitSafety :: String -> Int -> Int -> Bool -> [S.Clause] -> Maybe Bool
+commitSafety name arity inCount commitsOnSuccess clauses =
+  foldM step False [(ci, cj) | (i, ci) <- indexed, (j, cj) <- indexed, i < j]
+  where
+    indexed = zip [0 :: Int ..] clauses
+    step acc (ci, cj)
+      | clausesExclusive inCount ci cj = Just acc
+      | not (isRecursiveClause name arity ci) && commitsOnSuccess = Just True
+      | otherwise = Nothing
+
+-- | A position in the input arguments: argument index, then cons cell
+-- offsets (1 for the head, 2 for the tail).
+type ArgPath = (Int, [Int])
+
+data Shape = ShNil | ShCons Shape Shape | ShInt Integer | ShAny
+
+shapeOf :: S.Term -> Shape
+shapeOf = \case
+  S.Atom "nil" -> ShNil
+  S.Compound "cons" [h, t] -> ShCons (shapeOf h) (shapeOf t)
+  S.IntLit k -> ShInt k
+  _ -> ShAny
+
+shapesDisjoint :: Shape -> Shape -> Bool
+shapesDisjoint a b = case (a, b) of
+  (ShAny, _) -> False
+  (_, ShAny) -> False
+  (ShNil, ShNil) -> False
+  (ShInt x, ShInt y) -> x /= y
+  (ShCons h1 t1, ShCons h2 t2) -> shapesDisjoint h1 h2 || shapesDisjoint t1 t2
+  _ -> True
+
+-- | Integer bounds on a path (inclusive) and values excluded by @!=@.
+data IntRange = IntRange (Maybe Integer) (Maybe Integer) [Integer]
+
+-- | Whether no input can satisfy the heads and guards of both clauses. The
+-- compiled code only gets this far with integers at guarded paths (other
+-- values go to the interpreter), so integer ranges are enough.
+clausesExclusive :: Int -> S.Clause -> S.Clause -> Bool
+clausesExclusive inCount ci cj =
+  or [shapesDisjoint (shapeOf a) (shapeOf b) | (a, b) <- zip (inputs ci) (inputs cj)]
+    || or [rangesDisjoint r1 r2 | (path, r1) <- M.toList rangesI, Just r2 <- [M.lookup path rangesJ]]
+    || or [contradicts g1 g2 | g1 <- relsI, g2 <- relsJ]
+  where
+    inputs cl = case S.clauseHead cl of
+      S.Compound _ as -> take inCount as
+      _ -> []
+    (rangesI, relsI) = clauseConstraints (inputs ci) (S.clauseBody ci)
+    (rangesJ, relsJ) = clauseConstraints (inputs cj) (S.clauseBody cj)
+    rangesDisjoint (IntRange lo1 hi1 ex1) (IntRange lo2 hi2 ex2) =
+      let lo = maxBound' lo1 lo2
+          hi = minBound' hi1 hi2
+       in case (lo, hi) of
+            (Just l, Just h) -> l > h || (l == h && l `elem` (ex1 ++ ex2))
+            _ -> False
+    maxBound' a b = case (a, b) of
+      (Just x, Just y) -> Just (max x y)
+      _ -> maybe b Just a
+    minBound' a b = case (a, b) of
+      (Just x, Just y) -> Just (min x y)
+      _ -> maybe b Just a
+    contradicts (x1, op1, y1) (x2, op2, y2)
+      | x1 == x2 && y1 == y2 = clash op1 op2
+      | x1 == y2 && y1 == x2 = clash op1 (flipCmp op2)
+      | otherwise = False
+    clash a b = (a, b) `elem` [("gt", "lt"), ("gt", "lte"), ("lt", "gt"), ("lt", "gte"), ("gte", "lt"), ("lte", "gt")]
+
+flipCmp :: String -> String
+flipCmp = \case
+  "gt" -> "lt"
+  "lt" -> "gt"
+  "gte" -> "lte"
+  "lte" -> "gte"
+  op -> op
+
+-- | Integer ranges per head path, from literals in the head and guards
+-- against literals, and comparisons between two head paths.
+clauseConstraints :: [S.Term] -> [S.Term] -> (M.Map ArgPath IntRange, [(ArgPath, String, ArgPath)])
+clauseConstraints headArgs body = (foldl refine litRanges guards, relations)
+  where
+    walk path = \case
+      S.Var v | v >= 0 -> [(Left v, path)]
+      S.IntLit k -> [(Right k, path)]
+      S.Compound "cons" [h, t] -> walk (second' (++ [1]) path) h ++ walk (second' (++ [2]) path) t
+      _ -> []
+    second' f (a, b) = (a, f b)
+    occurrences = concat [walk (i, []) a | (i, a) <- zip [0 ..] headArgs]
+    varPaths = M.fromListWith (\_ first -> first) [(v, path) | (Left v, path) <- occurrences]
+    litRanges = M.fromList [(path, IntRange (Just k) (Just k) []) | (Right k, path) <- occurrences]
+    operand = \case
+      S.Var v | Just path <- M.lookup v varPaths -> Just (Left path)
+      S.IntLit k -> Just (Right k)
+      _ -> Nothing
+    cmps = [(op, a, b) | S.Compound op [l, r] <- body, isCmpOp op, Just a <- [operand l], Just b <- [operand r]]
+    guards = [(x, op, k) | (op, Left x, Right k) <- cmps] ++ [(x, flipCmp op, k) | (op, Right k, Left x) <- cmps]
+    relations = [(x, op, y) | (op, Left x, Left y) <- cmps, op /= "neq"]
+    refine ranges (x, op, k) =
+      let IntRange lo hi ex = M.findWithDefault (IntRange Nothing Nothing []) x ranges
+          tighten = case op of
+            "gt" -> IntRange (Just (maybe (k + 1) (max (k + 1)) lo)) hi ex
+            "gte" -> IntRange (Just (maybe k (max k) lo)) hi ex
+            "lt" -> IntRange lo (Just (maybe (k - 1) (min (k - 1)) hi)) ex
+            "lte" -> IntRange lo (Just (maybe k (min k) hi)) ex
+            _ -> IntRange lo hi (k : ex)
+       in M.insert x tighten ranges
 
 -- ─── Per-clause compilation ──────────────────────────────────────────────────
 
@@ -468,7 +606,7 @@ compileClause nilImm consPlain consGround predName roles clauseIdx nextLbl cl = 
         compileBodyGoals nextLbl guardAndIsGoals (recInArgs ++ extraLive) env1 freeAfterHead
       trmcStepOps <-
         if lastRole == ParamOutList
-          then compileTrmcStepOutput consPlain (last headArgs) env2
+          then compileTrmcStepOutput consPlain consGround (show clauseIdx) (length roles - 1) (last headArgs) env2
           else Just []
       let free3 = recycleDeadVars recInArgs env2 free2
       moveOps <- compileTailCallMoves roles recInArgs env2 free3
@@ -478,7 +616,8 @@ compileClause nilImm consPlain consGround predName roles clauseIdx nextLbl cl = 
             ++ bodyOps
             ++ trmcStepOps
             ++ moveOps
-            ++ [JTickDepth "exhausted", JJump "loop"]
+            -- A last call keeps its caller's continuation depth: no tick.
+            ++ [JJump "loop"]
         )
     else do
       let outHeads = [last headArgs | hasOut]
@@ -486,7 +625,7 @@ compileClause nilImm consPlain consGround predName roles clauseIdx nextLbl cl = 
         compileBodyGoals nextLbl body outHeads env1 freeAfterHead
       retOps <- case lastRole of
         ParamOut -> compileBaseOutput clauseIdx nextLbl (last headArgs) env2
-        ParamOutList -> compileTrmcBaseOutput nilImm consGround (last headArgs) env2
+        ParamOutList -> compileTrmcBaseOutput nilImm consPlain consGround (show clauseIdx) (length roles - 1) (last headArgs) env2
         _ -> Just [JReturn jitSuccess]
       pure
         ( [JLabel ("clause_" ++ show clauseIdx)]
@@ -547,17 +686,19 @@ compileHeadPat nilImm consPlain consGround cl clauseIdx argIdx nextLbl role pReg
           Just ([JBranchCmp JNe pReg prevReg nextLbl], env, freeRegs)
         Just _ -> Nothing
     (ParamList, S.Atom "nil") ->
-      Just ([JBranchImm JNe pReg nilImm nextLbl], env, freeRegs)
+      Just (nilCheckOps ("nil_" ++ tag) nextLbl pReg nilImm, env, freeRegs)
     (ParamList, S.Var v) ->
       case M.lookup v env of
         Nothing -> Just ([], M.insert v (VKList pReg) env, freeRegs)
         Just (VKList prevReg) ->
-          Just ([JBranchCmp JNe pReg prevReg nextLbl], env, freeRegs)
+          Just (sameWordOps ("leq_" ++ tag) nextLbl pReg prevReg, env, freeRegs)
         Just _ -> Nothing
     (ParamList, S.Compound "cons" [hPat, tPat]) -> do
-      let consOkLbl = "head_cons_ok_" ++ show clauseIdx ++ "_" ++ show argIdx
+      let consOkLbl = "head_cons_ok_" ++ tag
       let unpackPrefix =
-            [ JBranchImm JEq pReg nilImm nextLbl,
+            [ -- [] never matches [_ | _]; anything but a structure (an
+              -- unbound tail above all) goes back to the interpreter.
+              JBranchImm JEq pReg nilImm nextLbl,
               JTagOf RT7 pReg,
               JBranchImm JNe RT7 (fromIntegral tagStr) "bailout",
               JValOf RT7 pReg
@@ -570,125 +711,115 @@ compileHeadPat nilImm consPlain consGround cl clauseIdx argIdx nextLbl role pReg
               JJump "bailout",
               JLabel consOkLbl
             ]
-      (hOps, tOps, env', free') <- compileConsSubpats nilImm cl nextLbl hPat tPat env freeRegs
-      pure (unpackPrefix ++ funCheck ++ tOps ++ hOps, env', free')
+      (subOps, env', free') <- compileConsSubpats nilImm cl tag nextLbl hPat tPat env freeRegs
+      pure (unpackPrefix ++ funCheck ++ subOps, env', free')
     _ -> Nothing
+  where
+    tag = show clauseIdx ++ "_" ++ show argIdx
 
+-- | Match the head and tail of the cons cell at RT7. Both are loaded before
+-- any check, since the checks use RT7 as scratch. A check jumps to the next
+-- clause only on a definite mismatch between bound values; an unbound value,
+-- a compound or a boxed number goes to the interpreter instead.
 compileConsSubpats ::
   Int64 ->
   S.Clause ->
+  String ->
   Label ->
   S.Term ->
   S.Term ->
   VarEnv ->
   [Reg] ->
-  Maybe ([JitOp], [JitOp], VarEnv, [Reg])
-compileConsSubpats nilImm cl nextLbl hPat tPat env free0 = do
-  (tOps, env1, free1) <- case tPat of
-    S.Var tv | isAnonOrSingleton tv cl -> Just ([], env, free0)
-    S.Atom "nil" -> do
-      (rT, _) <- unconsReg free0
-      Just
-        ( [ JAddImm rT RT7 2,
-            JLoadIx rT RCells rT,
-            JDeref rT rT,
-            JBranchImm JNe rT nilImm nextLbl
-          ],
-          env,
-          free0
-        )
-    S.Var tv ->
-      case M.lookup tv env of
-        Nothing -> do
-          (rT, free') <- unconsReg free0
-          Just
-            ( [ JAddImm rT RT7 2,
-                JLoadIx rT RCells rT,
-                JDeref rT rT
-              ],
-              M.insert tv (VKList rT) env,
-              free'
-            )
-        Just (VKList prevReg) -> do
-          (rT, _) <- unconsReg free0
-          Just
-            ( [ JAddImm rT RT7 2,
-                JLoadIx rT RCells rT,
-                JDeref rT rT,
-                JBranchCmp JNe rT prevReg nextLbl
-              ],
-              env,
-              free0
-            )
-        Just _ -> Nothing
-    _ -> Nothing
+  Maybe ([JitOp], VarEnv, [Reg])
+compileConsSubpats nilImm cl tag nextLbl hPat tPat env free0 = do
+  let anon = \case
+        S.Var v -> isAnonOrSingleton v cl
+        _ -> False
+      needT = not (anon tPat)
+      needH = not (anon hPat)
+  (rT, free1) <- if needT then unconsReg free0 else Just (RT7, free0)
+  (rH, free2) <- if needH then unconsReg free1 else Just (RT7, free1)
+  let loads =
+        [op | needT, op <- [JAddImm rT RT7 2, JLoadIx rT RCells rT, JDeref rT rT]]
+          ++ [op | needH, op <- [JAddImm rH RT7 1, JLoadIx rH RCells rH, JDeref rH rH]]
+  (tOps, env1, keepT) <-
+    if not needT
+      then Just ([], env, False)
+      else case tPat of
+        S.Atom "nil" -> Just (nilCheckOps ("tnil_" ++ tag) nextLbl rT nilImm, env, False)
+        S.Var tv -> case M.lookup tv env of
+          Nothing -> Just ([], M.insert tv (VKList rT) env, True)
+          Just (VKList prevReg) -> Just (sameWordOps ("teq_" ++ tag) nextLbl rT prevReg, env, False)
+          Just _ -> Nothing
+        _ -> Nothing
+  (hOps, env2, keepH) <-
+    if not needH
+      then Just ([], env1, False)
+      else case hPat of
+        S.IntLit k -> Just (intLitWordOps ("hlit_" ++ tag) nextLbl rH k, env1, False)
+        S.Var hv -> case M.lookup hv env1 of
+          Nothing
+            | clauseUsesVarAsInt hv cl -> Just (intCheckOps rH, M.insert hv (VKInt rH) env1, True)
+            | otherwise -> Just ([], M.insert hv (VKWord rH) env1, True)
+          Just (VKInt prevReg) ->
+            Just (intCheckOps rH ++ [JBranchCmp JNe rH prevReg nextLbl], env1, False)
+          Just (VKWord prevReg) -> Just (sameWordOps ("heq_" ++ tag) nextLbl rH prevReg, env1, False)
+          Just _ -> Nothing
+        _ -> Nothing
+  let free3 = free2 ++ [rT | needT, not keepT] ++ [rH | needH, not keepH]
+  pure (loads ++ tOps ++ hOps, env2, free3)
 
-  (hOps, env2, free2) <- case hPat of
-    S.Var hv | isAnonOrSingleton hv cl -> Just ([], env1, free1)
-    S.IntLit k ->
-      Just
-        ( [ JAddImm RT7 RT7 1,
-            JLoadIx RT7 RCells RT7,
-            JDeref RT7 RT7,
-            JBranchImm JNe RT7 (fromIntegral (intWord (fromIntegral k))) nextLbl
-          ],
-          env1,
-          free1
-        )
-    S.Var hv ->
-      case M.lookup hv env1 of
-        Nothing
-          | clauseUsesVarAsInt hv cl -> do
-              (rH, free') <- unconsReg free1
-              Just
-                ( [ JAddImm RT7 RT7 1,
-                    JLoadIx rH RCells RT7,
-                    JDeref rH rH,
-                    JTagOf RT7 rH,
-                    JBranchImm JNe RT7 (fromIntegral tagInt) "bailout",
-                    JValOf rH rH
-                  ],
-                  M.insert hv (VKInt rH) env1,
-                  free'
-                )
-          | otherwise -> do
-              (rH, free') <- unconsReg free1
-              Just
-                ( [ JAddImm RT7 RT7 1,
-                    JLoadIx rH RCells RT7,
-                    JDeref rH rH
-                  ],
-                  M.insert hv (VKWord rH) env1,
-                  free'
-                )
-        Just (VKInt prevReg) -> do
-          (rH, _) <- unconsReg free1
-          Just
-            ( [ JAddImm RT7 RT7 1,
-                JLoadIx rH RCells RT7,
-                JDeref rH rH,
-                JTagOf RT7 rH,
-                JBranchImm JNe RT7 (fromIntegral tagInt) "bailout",
-                JValOf rH rH,
-                JBranchCmp JNe rH prevReg nextLbl
-              ],
-              env1,
-              free1
-            )
-        Just (VKWord prevReg) -> do
-          (rH, _) <- unconsReg free1
-          Just
-            ( [ JAddImm RT7 RT7 1,
-                JLoadIx rH RCells RT7,
-                JDeref rH rH,
-                JBranchCmp JNe rH prevReg nextLbl
-              ],
-              env1,
-              free1
-            )
-        Just _ -> Nothing
-    _ -> Nothing
-  pure (hOps, tOps, env2, free2)
+-- | Jump to @target@ when @r@ holds an immediate constant (RT7 keeps the tag).
+constTagOps :: Reg -> Label -> [JitOp]
+constTagOps r target =
+  [ JTagOf RT7 r,
+    JBranchImm JEq RT7 (fromIntegral tagInt) target,
+    JBranchImm JEq RT7 (fromIntegral tagAtm) target,
+    JBranchImm JEq RT7 (fromIntegral tagChr) target
+  ]
+
+-- | A repeated variable: equal words unify, two different constants do not,
+-- and anything else is decided by the interpreter's unification.
+sameWordOps :: String -> Label -> Reg -> Reg -> [JitOp]
+sameWordOps lbl nextLbl a b =
+  [JBranchCmp JEq a b okLbl]
+    ++ constTagOps a constLbl
+    ++ [JJump "bailout", JLabel constLbl]
+    ++ constTagOps b nextLbl
+    ++ [JJump "bailout", JLabel okLbl]
+  where
+    okLbl = lbl ++ "_ok"
+    constLbl = lbl ++ "_const"
+
+-- | @[]@ against a word: an unbound word could still become @[]@.
+nilCheckOps :: String -> Label -> Reg -> Int64 -> [JitOp]
+nilCheckOps lbl nextLbl r nilImm =
+  [ JBranchImm JEq r nilImm okLbl,
+    JTagOf RT7 r,
+    JBranchImm JEq RT7 (fromIntegral tagRef) "bailout",
+    JJump nextLbl,
+    JLabel okLbl
+  ]
+  where
+    okLbl = lbl ++ "_ok"
+
+-- | An integer literal against a word: a different constant is a mismatch,
+-- a boxed number or an unbound word is not decided here.
+intLitWordOps :: String -> Label -> Reg -> Integer -> [JitOp]
+intLitWordOps lbl nextLbl r k =
+  [JBranchImm JEq r (fromIntegral (intWord (fromIntegral k))) okLbl]
+    ++ constTagOps r nextLbl
+    ++ [JJump "bailout", JLabel okLbl]
+  where
+    okLbl = lbl ++ "_ok"
+
+-- | Unbox an integer element; anything else goes to the interpreter.
+intCheckOps :: Reg -> [JitOp]
+intCheckOps r =
+  [ JTagOf RT7 r,
+    JBranchImm JNe RT7 (fromIntegral tagInt) "bailout",
+    JValOf r r
+  ]
 
 -- ─── Body goals (comparisons and `is` assignments) with liveness recycling ──
 
@@ -718,6 +849,21 @@ compileOneGoal nextLbl goal env freeRegs = case goal of
         ops <- compileArithExpr RT7 expr env freeRegs
         pure (ops ++ [JBranchCmp JNe existingReg RT7 nextLbl], env, freeRegs)
       Just _ -> Nothing
+  -- != is structural: 3 + 1 != 4 holds. It is an integer test only when
+  -- both sides are integers already.
+  S.Compound "neq" [lhs, rhs] -> do
+    let operand = \case
+          S.Var v | Just (VKInt r) <- M.lookup v env -> Just (Left r)
+          S.IntLit k -> Just (Right k)
+          _ -> Nothing
+    l <- operand lhs
+    r <- operand rhs
+    let ops = case (l, r) of
+          (Left rl, Left rr) -> [JBranchCmp JEq rl rr nextLbl]
+          (Left rl, Right k) -> [JBranchImm JEq rl (fromIntegral k) nextLbl]
+          (Right k, Left rr) -> [JBranchImm JEq rr (fromIntegral k) nextLbl]
+          (Right a, Right b) -> [JJump nextLbl | a == b]
+    Just (ops, env, freeRegs)
   S.Compound op [lhs, rhs] | isCmpOp op -> do
     negCond <- negatedCmpCond op
     case (lhs, rhs) of
@@ -735,23 +881,19 @@ compileOneGoal nextLbl goal env freeRegs = case goal of
         pure (opsL ++ opsR ++ [JBranchCmp negCond rL RT7 nextLbl], env, freeRegs)
   _ -> Nothing
 
+-- | Guards the compiler accepts, by the parser's names: the arithmetic
+-- comparisons (both sides evaluated) and structural @!=@. Unification and
+-- @==@ are not integer tests and stay with the interpreter.
 isCmpOp :: String -> Bool
-isCmpOp op = op `elem` ["==", "=:=", "=", "neq", "!=", "=\\=", "\\=", "<", "<=", "=<", ">", ">="]
+isCmpOp op = op `elem` ["gt", "lt", "gte", "lte", "neq"]
 
+-- | The branch taken when an arithmetic comparison fails.
 negatedCmpCond :: String -> Maybe Cond
 negatedCmpCond = \case
-  "==" -> Just JNe
-  "=:=" -> Just JNe
-  "=" -> Just JNe
-  "neq" -> Just JEq
-  "!=" -> Just JEq
-  "=\\=" -> Just JEq
-  "\\=" -> Just JEq
-  "<" -> Just JGe
-  "<=" -> Just JGt
-  "=<" -> Just JGt
-  ">" -> Just JLe
-  ">=" -> Just JLt
+  "lt" -> Just JGe
+  "lte" -> Just JGt
+  "gt" -> Just JLe
+  "gte" -> Just JLt
   _ -> Nothing
 
 compileArithExpr :: Reg -> S.Term -> VarEnv -> [Reg] -> Maybe [JitOp]
@@ -761,10 +903,10 @@ compileArithExpr dst expr env freeRegs = case expr of
     Just (VKInt r) -> Just [JMov dst r | dst /= r]
     _ -> Nothing
   S.Compound op [a, b]
-    | op `elem` ["+", "-", "*"] -> do
+    | op `elem` ["plus", "minus", "mul"] -> do
         let comb rA rB = case op of
-              "+" -> JAddChecked dst rA rB "bailout"
-              "-" -> JSubChecked dst rA rB "bailout"
+              "plus" -> JAddChecked dst rA rB "bailout"
+              "minus" -> JSubChecked dst rA rB "bailout"
               _ -> JMulChecked dst rA rB "bailout"
         case (a, b) of
           (S.Var va, S.Var vb)
@@ -786,30 +928,61 @@ compileArithExpr dst expr env freeRegs = case expr of
 
 -- ─── Horizon 4: TRMC step and base output lowering ───────────────────────────
 
-compileTaggedElemIntoRT7 :: S.Term -> VarEnv -> Maybe [JitOp]
-compileTaggedElemIntoRT7 elemPat env = case elemPat of
+-- | Load an output element into RT7, with a guard run first. Unification
+-- has an occurs check, so a copied element that could contain the output
+-- variable (the variable itself, or a compound not known to be ground) goes
+-- to the interpreter. The entry checks left the output word in args.
+compileTaggedElemIntoRT7 :: Int64 -> String -> Int -> S.Term -> VarEnv -> Maybe ([JitOp], [JitOp])
+compileTaggedElemIntoRT7 consGround lbl outIdx elemPat env = case elemPat of
   S.IntLit k ->
-    Just [JMovImm RT7 (fromIntegral (intWord (fromIntegral k)))]
+    Just ([], [JMovImm RT7 (fromIntegral (intWord (fromIntegral k)))])
   S.Var v -> case M.lookup v env of
-    Just (VKInt r) -> Just [JMkWord RT7 r tagInt]
-    Just (VKWord r) -> Just [JMov RT7 r]
-    Just (VKList r) -> Just [JMov RT7 r]
+    Just (VKInt r) -> Just ([], [JMkWord RT7 r tagInt])
+    Just (VKWord r) -> Just (occursGuardOps consGround lbl outIdx r, [JMov RT7 r])
+    Just (VKList r) -> Just (occursGuardOps consGround lbl outIdx r, [JMov RT7 r])
     Nothing -> Nothing
   _ -> Nothing
 
-compileTrmcStepOutput :: Int64 -> S.Term -> VarEnv -> Maybe [JitOp]
-compileTrmcStepOutput consPlain outHeadPat env = case outHeadPat of
+-- | Whether an element is an integer, so a cell holding it is ground.
+elemIsGround :: S.Term -> VarEnv -> Bool
+elemIsGround elemPat env = case elemPat of
+  S.IntLit _ -> True
+  S.Var v | Just (VKInt _) <- M.lookup v env -> True
+  _ -> False
+
+occursGuardOps :: Int64 -> String -> Int -> Reg -> [JitOp]
+occursGuardOps consGround lbl outIdx r =
+  constTagOps r okLbl
+    ++ [ JBranchImm JEq RT7 (fromIntegral tagBox) okLbl,
+         JBranchImm JEq RT7 (fromIntegral tagRef) refLbl,
+         JBranchImm JNe RT7 (fromIntegral tagStr) "bailout",
+         JValOf RT7 r,
+         JLoadIx RT7 RCells RT7,
+         JBranchImm JEq RT7 consGround okLbl,
+         JJump "bailout",
+         JLabel refLbl,
+         JLoadImm RT7 RArgs outIdx,
+         JBranchCmp JEq RT7 r "bailout",
+         JLabel okLbl
+       ]
+  where
+    okLbl = "occ_ok_" ++ lbl
+    refLbl = "occ_ref_" ++ lbl
+
+compileTrmcStepOutput :: Int64 -> Int64 -> String -> Int -> S.Term -> VarEnv -> Maybe [JitOp]
+compileTrmcStepOutput consPlain consGround lbl outIdx outHeadPat env = case outHeadPat of
   S.Var _ -> Just []
   S.Compound "cons" [elemPat, S.Var _] -> do
-    elemOps <- compileTaggedElemIntoRT7 elemPat env
+    (guardOps, elemOps) <- compileTaggedElemIntoRT7 consGround lbl outIdx elemPat env
     Just
-      ( [ JLoadImm RT7 RState stateCapIdx,
-          JAddImm RH RH 4,
-          JBranchCmp JGt RH RT7 "bailout",
-          JSubImm RH RH 4,
-          JMovImm RT7 consPlain,
-          JStoreIx RT7 RCells RH
-        ]
+      ( guardOps
+          ++ [ JLoadImm RT7 RState stateCapIdx,
+               JAddImm RH RH 4,
+               JBranchCmp JGt RH RT7 "bailout",
+               JSubImm RH RH 4,
+               JMovImm RT7 consPlain,
+               JStoreIx RT7 RCells RH
+             ]
           ++ elemOps
           ++ [ JAddImm RH RH 1,
                JStoreIx RT7 RCells RH,
@@ -825,8 +998,8 @@ compileTrmcStepOutput consPlain outHeadPat env = case outHeadPat of
       )
   _ -> Nothing
 
-compileTrmcBaseOutput :: Int64 -> Int64 -> S.Term -> VarEnv -> Maybe [JitOp]
-compileTrmcBaseOutput nilImm consGround outHeadPat env = case outHeadPat of
+compileTrmcBaseOutput :: Int64 -> Int64 -> Int64 -> String -> Int -> S.Term -> VarEnv -> Maybe [JitOp]
+compileTrmcBaseOutput nilImm consPlain consGround lbl outIdx outHeadPat env = case outHeadPat of
   S.Atom "nil" ->
     Just
       [ JMovImm RT7 nilImm,
@@ -837,21 +1010,25 @@ compileTrmcBaseOutput nilImm consGround outHeadPat env = case outHeadPat of
   S.Var v -> case M.lookup v env of
     Just (VKList r) ->
       Just
-        [ JValOf RT3 RT3,
-          JBindRef RT3 r "bailout",
-          JReturn jitSuccess
-        ]
+        ( occursGuardOps consGround lbl outIdx r
+            ++ [ JValOf RT3 RT3,
+                 JBindRef RT3 r "bailout",
+                 JReturn jitSuccess
+               ]
+        )
     _ -> Nothing
   S.Compound "cons" [elemPat, S.Atom "nil"] -> do
-    elemOps <- compileTaggedElemIntoRT7 elemPat env
+    (guardOps, elemOps) <- compileTaggedElemIntoRT7 consGround lbl outIdx elemPat env
+    let header = if elemIsGround elemPat env then consGround else consPlain
     Just
-      ( [ JLoadImm RT7 RState stateCapIdx,
-          JAddImm RH RH 4,
-          JBranchCmp JGt RH RT7 "bailout",
-          JSubImm RH RH 4,
-          JMovImm RT7 consGround,
-          JStoreIx RT7 RCells RH
-        ]
+      ( guardOps
+          ++ [ JLoadImm RT7 RState stateCapIdx,
+               JAddImm RH RH 4,
+               JBranchCmp JGt RH RT7 "bailout",
+               JSubImm RH RH 4,
+               JMovImm RT7 header,
+               JStoreIx RT7 RCells RH
+             ]
           ++ elemOps
           ++ [ JAddImm RH RH 1,
                JStoreIx RT7 RCells RH,
@@ -945,13 +1122,17 @@ recycleDeadVars :: [S.Term] -> VarEnv -> [Reg] -> [Reg]
 recycleDeadVars remainingTerms env freeRegs =
   let liveVars = Set.fromList (concatMap termVars remainingTerms)
       paramRegs = [RT0, RT1, RT2, RT3]
+      -- Dead variables stay in the environment, so a register freed once
+      -- and handed to a live variable must not be freed again through them.
+      liveRegs = [regOf vk | (v, vk) <- M.toList env, v `Set.member` liveVars]
       deadRegs =
         [ regOf vk
           | (v, vk) <- M.toList env,
             v `Set.notMember` liveVars,
-            regOf vk `notElem` paramRegs
+            regOf vk `notElem` paramRegs,
+            regOf vk `notElem` liveRegs
         ]
-   in nub (freeRegs ++ deadRegs)
+   in nub (filter (`notElem` liveRegs) freeRegs ++ deadRegs)
   where
     regOf (VKInt r) = r
     regOf (VKList r) = r
@@ -1005,7 +1186,8 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
                   JAddImm RT4 RT3 2,
                   JLoadIx RT0 RCells RT4,
                   JDeref RT0 RT0,
-                  JTickDepth "exhausted",
+                  -- Call noatt Q Qs initD (depth + 1; invokeJitKernel guarantees
+                  -- one level of headroom), then its last calls: no ticks.
                   JMov RT2 RT0,
                   JMovImm RT6 (fromIntegral initD),
                   JLabel "inner_loop",
@@ -1033,10 +1215,9 @@ matchSafeLoop nilW consW prog (name, 1) [cBase, cStep]
                   JLoadIx RT2 RCells RT5,
                   JDeref RT2 RT2,
                   JAddImm RT6 RT6 1,
-                  JTickDepth "exhausted",
                   JJump "inner_loop",
                   JLabel "inner_done",
-                  JTickDepth "exhausted",
+                  -- Tail call safe Qs: a last call keeps its caller's depth
                   JJump "outer_loop",
                   JLabel "success",
                   JReturn jitSuccess,
@@ -1098,6 +1279,14 @@ matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
                   JAddImm RT4 RT3 1,
                   JLoadIx RT4 RCells RT4,
                   JDeref RT4 RT4,
+                  -- Only constants are copied: a variable or compound element
+                  -- could hold the output and need the occurs check.
+                  JTagOf RT5 RT4,
+                  JBranchImm JEq RT5 (fromIntegral tagInt) "head_ok",
+                  JBranchImm JEq RT5 (fromIntegral tagAtm) "head_ok",
+                  JBranchImm JEq RT5 (fromIntegral tagChr) "head_ok",
+                  JJump "bailout",
+                  JLabel "head_ok",
                   JAddImm RT5 RT3 2,
                   JLoadIx RT5 RCells RT5,
                   JDeref RT5 RT5,
@@ -1110,7 +1299,8 @@ matchNrevLoop nilW consW prog (name, 2) [cBase, cStep]
                   JMkWord RT1 RH tagStr,
                   JAddImm RH RH 3,
                   JMov RT0 RT5,
-                  JTickDepthReg RT6 "exhausted",
+                  -- One nested (non-last) nrev call per element
+                  JTickDepth "exhausted",
                   JAddImm RT6 RT6 1,
                   JJump "loop",
                   JLabel "base_case",
@@ -1155,8 +1345,8 @@ isAppendDef _ _ = False
 -- D1 =\= D, D2 is Q - Q1, D2 =\= D, D3 is D + 1, noatt(Q, Qs, D3).@
 isNoattDef :: PredKey -> [S.Clause] -> Bool
 isNoattDef (name, 3) [cBase, cStep]
-  | S.Compound bName [_, S.Atom "nil", _] <- S.clauseHead cBase,
-    bName == name && null (S.clauseBody cBase),
+  | S.Compound bName [S.Var bQ, S.Atom "nil", S.Var bD] <- S.clauseHead cBase,
+    bName == name && null (S.clauseBody cBase) && (bQ /= bD || bQ < 0),
     S.Compound sName [S.Var vQ, S.Compound "cons" [S.Var vQ1, S.Var vQs], S.Var vD] <- S.clauseHead cStep,
     sName == name,
     [ S.Compound "neq" [S.Var vQa, S.Var vQ1a],
@@ -1189,25 +1379,35 @@ invokeJitKernel s currentDepth maxDepth kernel =
     entryH <- heapTop s
     entryTR <- trailTop s
     entryHB <- hb s
-    cap <- readReg s 6
+    cap <- readReg s rCAP
     gcLim <- readReg s rGCLIM
     cPtr <- cellsPtr s
     tPtr <- trailPtr s
-    tCap <- readReg s 18
+    tCap <- readReg s rTRAILCAP
     clp <- readReg s rCLP
     let cBase = fromIntegral (ptrToIntPtr cPtr) :: Int64
         tBase = fromIntegral (ptrToIntPtr tPtr) :: Int64
         effectiveCap = min cap gcLim
         depthRem = maxDepth - currentDepth
         allocRem = max 0 (effectiveCap - entryH - 16)
-    if clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
+    -- Depth is continuation depth, as in the interpreter ('contDepth'): a
+    -- last call does not deepen it, so kernels tick only for nested
+    -- (non-last) calls. The deepest nested call any kernel makes before
+    -- its first tick is one level (noatt inside safe), so decline when
+    -- there is no headroom at all and let the interpreter decide.
+    if depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
       then pure Nothing
       else do
         pokeElemOff statePtr stateCellsIdx cBase
         pokeElemOff statePtr stateTrailIdx tBase
         pokeElemOff statePtr stateHIdx (fromIntegral entryH)
         pokeElemOff statePtr stateTRIdx (fromIntegral entryTR)
-        pokeElemOff statePtr stateHBIdx (fromIntegral entryHB)
+        -- Kernels see every cell that existed at entry as older than the
+        -- choice boundary, so each binding of such a cell is trailed and a
+        -- bailout's unwind to entryTR undoes it before the interpreter
+        -- re-runs the call. Cells the kernel allocates sit above entryH and
+        -- are dropped with the heap top.
+        pokeElemOff statePtr stateHBIdx (fromIntegral (max entryHB entryH))
         pokeElemOff statePtr stateCapIdx (fromIntegral effectiveCap)
         pokeElemOff statePtr stateTrailCapIdx (fromIntegral tCap)
         pokeElemOff statePtr stateClpIdx (fromIntegral clp)
