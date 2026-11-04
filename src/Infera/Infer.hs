@@ -119,7 +119,8 @@ markGraphFacts prog =
             predPure = not (Set.member (predKey p) impure),
             predStructural = structurallyRecursive p,
             predCounterLoop = selfOnly (predKey p) && counterLoop p,
-            predGuardedCounter = selfOnly (predKey p) && counterLoop p && guardExclusive p
+            predGuardedCounter = selfOnly (predKey p) && counterLoop p && guardExclusive p,
+            predDistinctCounter = selfOnly (predKey p) && counterLoop p && distinctCounterGenerator p
           }
       -- No other predicate on a cycle through this one: mutual recursion
       -- stays under the general rule.
@@ -193,6 +194,84 @@ guardExclusive p = case partition recurses (IM.elems (predClauses p)) of
         "lte" -> all (> k) bs
         _ -> False
       _ -> False
+
+-- | A nondeterministic counter generator whose untabled answers are exactly
+-- the tabled ones, in the same multiplicity, and finitely many (the
+-- @between/3@ shape). All of these hold:
+--
+-- * exactly two clauses: one base clause and one recursive clause;
+-- * every body goal of both, except the recursive clause's last goal (the
+--   self-call), is an arithmetic comparison (@<@, @>@, @<=@, @>=@) or, in the
+--   recursive clause only, an @is@ goal;
+-- * the recursive clause steps a counter: head position @i@ holds variable
+--   @V@, the self-call holds @V1@, and @V1 is V + c@ (or @c + V@) with a
+--   positive literal @c@ and a guard @V < B@ / @V <= B@ (or, for
+--   @V1 is V - c@, @V > B@ / @V >= B@), where @B@ is an integer literal or a
+--   variable passed unchanged at the same position to the self-call;
+-- * an output position @j /= i@: the recursive clause has a variable there
+--   that it passes unchanged to the self-call and uses nowhere else, and
+--   the base clause has the same variable at @j@ as at @i@.
+--
+-- Every answer of a call is then the counter value of the base clause at
+-- some depth, at position @j@; the counter moves strictly in one direction
+-- (integers are unbounded), so the answers at different depths differ and
+-- each depth gives at most one; and the guard ends the recursion at the
+-- bound. Edge case: a float counter beyond 2^53 does not move under @+ c@,
+-- and then the untabled loop runs forever where a table would stop at the
+-- repeated variant.
+distinctCounterGenerator :: Pred -> Bool
+distinctCounterGenerator p = case partition recurses (IM.elems (predClauses p)) of
+  ([rc], [bc])
+    | Compound _ rHead <- clauseHead rc,
+      Compound _ bHead <- clauseHead bc,
+      lastGoal@(Compound _ callArgs) : before <- reverse (clauseBody rc),
+      functorOf lastGoal == Just key,
+      all (\g -> isCmp g || isIs g) before,
+      all isCmp (clauseBody bc),
+      length rHead == length callArgs,
+      length bHead == length rHead ->
+        or
+          [ True
+          | (i, Var v, Var w) <- zip3 [0 :: Int ..] rHead callArgs,
+            dir <- [d | g <- before, Just d <- [stepDir v w g]],
+            any (bounded dir v rHead callArgs) before,
+            (j, Var x, Var x') <- zip3 [0 :: Int ..] rHead callArgs,
+            j /= i,
+            x == x',
+            length (filter (== x) (concatMap termVarIds (rHead ++ callArgs ++ before))) == 2,
+            Var bi <- [bHead !! i],
+            Var bj <- [bHead !! j],
+            bi == bj
+          ]
+  _ -> False
+  where
+    key = predKey p
+    recurses cl = any (\g -> functorOf g == Just key) (bodyGoals cl)
+    isCmp g = case g of
+      Compound op [_, _] -> op `elem` ["gt", "lt", "gte", "lte"]
+      _ -> False
+    isIs g = case g of
+      Compound "is" [_, _] -> True
+      _ -> False
+    stepDir v w g = case g of
+      Compound "is" [Var w', Compound "plus" [Var v', IntLit c]] | w' == w, v' == v, c > 0 -> Just Up
+      Compound "is" [Var w', Compound "plus" [IntLit c, Var v']] | w' == w, v' == v, c > 0 -> Just Up
+      Compound "is" [Var w', Compound "minus" [Var v', IntLit c]] | w' == w, v' == v, c > 0 -> Just Down
+      _ -> Nothing
+    bounded dir v hs cs g = case g of
+      Compound op [Var v', b] | v' == v, invariant b -> case dir of
+        Up -> op `elem` ["lt", "lte"]
+        Down -> op `elem` ["gt", "gte"]
+      Compound op [b, Var v'] | v' == v, invariant b -> case dir of
+        Up -> op `elem` ["gt", "gte"]
+        Down -> op `elem` ["lt", "lte"]
+      _ -> False
+      where
+        invariant (IntLit _) = True
+        invariant (Var b) = b /= v && or [h == Var b && c == Var b | (h, c) <- zip hs cs]
+        invariant _ = False
+
+data StepDir = Up | Down
 
 -- | Every direct self-call passes, at some argument position, a variable that
 -- is a proper subterm of the head argument at that position.

@@ -216,7 +216,9 @@ reverses the ordering; this does not change term identity.
   self-recursive predicates whose only self-call is the last goal and steps
   a head variable by `V1 is V - c` / `V + c`, and whose clauses are exclusive
   on that counter or whose inferred determinism is det/semidet.  Their calls
-  never repeat, so a table could not answer them.  `infera check` reports
+  never repeat, so a table could not answer them.  Nondeterministic `between/3`-shaped
+  generators whose answer is the bounded counter itself are also untabled:
+  their answers are distinct, so a table would not change them.  `infera check` reports
   `perf-tabled-counter-loop` for counter loops that are still tabled.  Disable with `notable` / `<- notable.`, force with
   `table`.  A tabled call collects all its answers first, so predicates with
   infinitely many answers must be declared `notable`; otherwise the fixpoint
