@@ -891,7 +891,7 @@ exclusive c1 c2 = case options of
     guardOption =
       [ o
         | g1 <- guardsOf c1,
-          g2 <- guardsOf c2,
+          g2 <- guardsOf c2 ++ repeatGuards c2,
           a <- [g1, swapGuard g1],
           b <- [g2, swapGuard g2],
           o <- maybe [] pure (contradiction a b)
@@ -914,6 +914,26 @@ exclusive c1 c2 = case options of
             not (o `Set.member` rels) =
               Just i
         check _ _ _ _ = Nothing
+
+-- | A head variable at two or more paths equates the terms there: for
+-- example @ins K V (t K _ L R) _@ requires the key at argument 0 to be the
+-- one at path 2.0. Identical terms also compare equal, so this is recorded
+-- as a value equality, which a comparison guard such as @K < K0@ in another
+-- clause contradicts.
+--
+-- 'exclusive' uses these for the later clause of a pair only. When the
+-- comparison clause comes first, it runs first: for terms it cannot
+-- compare it raises its error before the repeated-variable clause is
+-- reached, and committing after its success cannot skip an answer. In the
+-- other order (@range N N [N]@ before @range I N _ <- I < N@), committing
+-- after the first clause would hide the error the second raises for equal
+-- non-numbers, so that pair stays non-exclusive.
+repeatGuards :: Clause -> [Guard]
+repeatGuards cl =
+  [ (VarPaths ps, VarPaths ps, Set.singleton OEQ, ValueOrdering)
+    | ps <- Map.elems (headPaths cl),
+      length ps > 1
+  ]
 
 swapGuard :: Guard -> Guard
 swapGuard (x, y, rels, kind) = (y, x, Set.map flipO rels, kind)
