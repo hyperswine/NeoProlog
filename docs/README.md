@@ -95,3 +95,4 @@ engine design notes, before 2026-10-24.
 | 2026-11-05 | [FILTER-KERNEL](2026-11-05-FILTER-KERNEL.md) | `remove/3` compiled natively: floored `%`, `k is E` guards, clause exclusivity through shared expressions; primes -90% instructions, 4.6x faster than SWI-Prolog |
 | 2026-11-05 | [BINDREF-TRAIL-ORDER](2026-11-05-BINDREF-TRAIL-ORDER.md) | fix: `JBindRef` checks trail room and trails before writing the cell, so a full-trail bailout leaves nothing untrailed |
 | 2026-11-05 | [BENCHMARKS-EVENING](2026-11-05-BENCHMARKS-EVENING.md) | report after the list kernels: primes 5x faster than SWI-Prolog, zebra 1.26x, deriv 4.2x behind; fix for a unify/occurs allocation regression (fib -32% allocation); choice-point copying measured at 2% |
+| 2026-11-05 | [SHARED-EXCLUSIVITY](2026-11-05-SHARED-EXCLUSIVITY.md) | fix: the JIT no longer skips a later clause that could raise (`%` by zero); JIT accepts clause pairs inference proves exclusive |

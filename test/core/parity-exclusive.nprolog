@@ -1,0 +1,45 @@
+<- notable.
+# Which clause pairs the JIT may treat as exclusive. Native code commits to
+# the first clause whose head and guards hold, so a later clause it skips
+# must neither succeed nor raise an error the earlier one would not. Pairs
+# come from the JIT's own analysis or from determinism inference.
+
+# The later clause divides by an element; the earlier one does not. After
+# a failure further down the list the interpreter backtracks into it and
+# raises, so the JIT must not commit here.
+rem3 _ [] [].
+rem3 P [I | Is] Nis <- 0 is I % P, rem3 P Is Nis.
+rem3 P [I | Is] [I | Nis] <- Y is 7 % I, X is I % P, X != 0, X < 5, rem3 P Is Nis.
+
+# A non-zero literal divisor cannot raise: safe to commit.
+rem4 _ [] [].
+rem4 P [I | Is] Nis <- 0 is I % P, rem4 P Is Nis.
+rem4 P [I | Is] [I | Nis] <- Y is I % 7, X is I % P, X != 0, Y < 5, rem4 P Is Nis.
+
+# The same divisor as the earlier clause: it raises there first.
+rem5 _ [] [].
+rem5 P [I | Is] Nis <- 0 is I % P, rem5 P Is Nis.
+rem5 P [I | Is] [I | Nis] <- Y is 9 % P, X is I % P, X != 0, Y < 5, rem5 P Is Nis.
+
+# Exclusive only by inference: the same expression against the same head
+# variable with disjoint orderings, which needs the list ground.
+below _ [] [].
+below N [I | Is] [I | Os] <- I + 1 < N, below N Is Os.
+below N [I | Is] Os <- I + 1 >= N, below N Is Os.
+
+> rem3 10 [0, 7] L?
+> rem3 10 [10, 3] L?
+> findall L (rem3 10 [20, 3, 30] L) R?
+> rem4 10 [0, 7] L?
+> rem4 10 [10, 3, 13] L?
+> rem4 0 [1] L?
+> rem5 10 [0, 7] L?
+> rem5 0 [0, 7] L?
+> rem5 3 [3, 4, 9, 1] L?
+> below 5 [1, 4, 7, 3, 5] L?
+> below 5 [] L?
+> findall L (below 3 [3, 2, 1, 0] L) R?
+> below 5 [1, X, 3] L?
+> below N [1, 2] L?
+> below 5 [1, 2.5, 3] L?
+> below 5 [1, 4] [1]?
