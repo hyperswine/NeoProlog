@@ -89,6 +89,22 @@ prop_large_declared_tail = withTests 1 . property $ do
   outcome <- evalIO (Core.coreOutcome program query)
   outcome === Right 1
 
+-- Thousands of native kernel calls each bind a variable older than the
+-- choice point, so the trail fills past its initial 4096 entries between
+-- collections. A binding left in place without a trail entry would survive
+-- the backtrack and show up as a bound variable. Answers are fixed, so only
+-- the core engine runs (the reference engine is quadratic on this program).
+prop_trail_fills_under_kernels :: Property
+prop_trail_fills_under_kernels = withTests 1 . property $ do
+  loaded <- evalIO (loadFile "test/core/parity-jit.nprolog")
+  (program, _) <- either (\e -> annotate e >> failure) pure loaded
+  forM_ [("bound_then_undone 6000 F?", "F = 6000"), ("bound_sum 6000 S?", "S = 36000")] $ \(text, answer) -> do
+    query <- either (\e -> annotate e >> failure) pure (parseQuery text)
+    let expected = Observed [answer] [] False
+    forM_ [Core.solveQuery program query, Core.solveQueryWith 1 program query] $ \run -> case run of
+      Nothing -> failure
+      Just items -> observe query items === expected
+
 -- A wide structure grows the unboxed mark stack beyond its initial size.
 -- Repeated temporary structures then grow and reuse the collection scratch
 -- arrays; stale forwarding entries must not resurrect an earlier graph.
@@ -108,4 +124,5 @@ coreGroup :: Group
 coreGroup = Group "core engine"
   ([(fromString ("parity_" ++ file), prop_parity file) | file <- parityFiles]
     ++ [("fallback", prop_fallback), ("large_declared_tail", prop_large_declared_tail),
+        ("trail_fills_under_kernels", prop_trail_fills_under_kernels),
         ("collection_workspace", prop_collection_workspace)])

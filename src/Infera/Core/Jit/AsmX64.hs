@@ -335,26 +335,27 @@ emitOp = \case
         pre = loadS ++ [rexW rs 0 13, 0x29, modRM 3 rs 13]
      in (appendFrag (bytes pre) (jccRel32 0x88 exhaustedLbl), Nothing)
   JBindRef addrReg valReg bailoutLbl ->
+    -- The cell is written last: a bailout on a full trail must leave it
+    -- untouched, since the caller's unwind only undoes trailed bindings.
     let (a, loadA) = getReg 0 addrReg
         (v, loadV) = getReg 2 valReg
         capCheck = loadImmIx 11 3 stateTrailCapIdx ++ cmpRR 9 11
-        post =
+        push =
           movRR 11 a
             ++ [0x49, 0xD1, 0xE3]
             ++ storeRegIx 11 15 9
             ++ [0x49, 0x83, 0xC1, 0x01]
-        -- jge over the trail push: capCheck, its jcc rel32 (6 bytes) and post.
-        -- Derived from the emitted bytes; a hard-coded 0x1A fell one byte
-        -- short and jumped into the middle of the final add.
-        skip = length capCheck + 6 + length post
+        -- jge over capCheck, its jcc rel32 (6 bytes) and the push, onto the
+        -- store. Derived from the emitted bytes; a hard-coded 0x1A once fell
+        -- one byte short and jumped into the middle of an instruction.
+        skip = length capCheck + 6 + length push
         pre =
           loadA
             ++ loadV
-            ++ storeRegIx v 14 a
             ++ cmpRR a 10
             ++ [0x7D, fromIntegral skip]
             ++ capCheck
-     in (appendFrag (appendFrag (bytes pre) (jccRel32 0x8D bailoutLbl)) (bytes post), Nothing)
+     in (appendFrag (appendFrag (bytes pre) (jccRel32 0x8D bailoutLbl)) (bytes (push ++ storeRegIx v 14 a)), Nothing)
   JJump lbl -> (jmpRel32 lbl, Nothing)
   JBranchCmp c a b lbl ->
     let (ra, loadA) = getReg 0 a
