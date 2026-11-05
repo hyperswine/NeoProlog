@@ -17,6 +17,10 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 
 
+# Below one byte per iteration of the 1,000,000-iteration runs.
+LIVE_ALLOWANCE = 256 * 1024
+
+
 def source_hash():
     digest = hashlib.sha256()
     for path in sorted((ROOT / "src").rglob("*.hs")):
@@ -69,11 +73,15 @@ def main():
             live = row["process_max_live_bytes"]
             if count < 1000000:
                 prefix_rss, prefix_live = max(prefix_rss, rss), max(prefix_live, live)
-            passed = rss <= 1.5 * prefix_rss and live <= 1.5 * prefix_live
+            # Live bytes get a fixed allowance below one byte per iteration of
+            # the million-iteration runs: a constant per-mode cost (measured
+            # runs keep their metric counters) passes, while retaining even a
+            # byte per iteration (1 MB or more) still fails.
+            passed = rss <= 1.5 * prefix_rss and live <= 1.5 * prefix_live + LIVE_ALLOWANCE
             row.update(peak_rss_bytes=rss, repeat=repeat, runtime_source_sha256=fingerprint,
                        build_profile="Cabal --enable-optimization=2; runner -O2",
                        process_command=command,
-                       residency_policy="RSS and RTS maximum live bytes <= 1.5x prefix maxima",
+                       residency_policy="RSS <= 1.5x prefix maximum; RTS maximum live bytes <= 1.5x prefix maximum + 256 KiB",
                        residency_check_passed=passed)
             destination.write(json.dumps(row) + "\n")
             destination.flush()
