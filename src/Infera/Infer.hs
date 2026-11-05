@@ -14,6 +14,7 @@ module Infera.Infer
     builtinDet,
     impureBuiltins,
     joinSort,
+    exclusive,
   )
 where
 

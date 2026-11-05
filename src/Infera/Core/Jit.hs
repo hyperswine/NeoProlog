@@ -38,6 +38,7 @@ import Infera.Core.Jit.AsmX64 (assembleX64)
 import Infera.Core.Jit.IR
 import Infera.Core.Store
 import Infera.Error (PredKey)
+import qualified Infera.Infer as I
 import qualified Infera.Program as P
 import qualified Infera.Syntax as S
 import System.Environment (lookupEnv)
@@ -203,7 +204,7 @@ compileGeneralTailJit nilW consW (name, arity) inferred clauses
       let inCount = if isOutputRole (last roles) then arity - 1 else arity
           switchIdxs = P.sigSwitch inferred
           commitsOnSuccess = P.sigDet inferred == S.Semidet && all (< inCount) switchIdxs
-      reliesOnCommit <- commitSafety name arity inCount commitsOnSuccess clauses
+      (reliesOnCommit, exclGroundIdxs) <- commitSafety name arity inCount roles commitsOnSuccess clauses
       let nilImm = fromIntegral nilW :: Int64
           consPlain = fromIntegral consW :: Int64
           consGround = fromIntegral (consW .|. groundBit) :: Int64
@@ -212,7 +213,7 @@ compileGeneralTailJit nilW consW (name, arity) inferred clauses
           -- interpreter's switch check requires; integers already are.
           listIdxs = [i | (i, ParamList) <- zip [0 :: Int ..] roles]
           groundCheckIdxs =
-            nub (trmcGroundPassthroughIdxs name arity roles clauses ++ [i | reliesOnCommit, i <- listIdxs])
+            nub (trmcGroundPassthroughIdxs name arity roles clauses ++ [i | reliesOnCommit, i <- listIdxs] ++ exclGroundIdxs)
           prologue = emitEntryChecks roles groundCheckIdxs nilImm consGround
       clauseBlocks <-
         sequence
@@ -469,15 +470,31 @@ clauseLitsImmediate cl = all fits (concatMap termInts (S.clauseHead cl : S.claus
 -- A base clause may overlap later ones only when the interpreter commits on
 -- success too: an inferred semidet predicate whose switch arguments are
 -- input positions, ground at the call. Returns whether that is relied on.
-commitSafety :: String -> Int -> Int -> Bool -> [S.Clause] -> Maybe Bool
-commitSafety name arity inCount commitsOnSuccess clauses =
-  foldM step False [(ci, cj) | (i, ci) <- indexed, (j, cj) <- indexed, i < j]
+--
+-- A pair is exclusive by this module's own analysis ('clausesExclusive'),
+-- or by determinism inference ('Infer.exclusive') when every argument it
+-- needs ground is an input the entry checks make ground: integers already
+-- are, and list arguments are returned for a ground check. Either way the
+-- later clause must not raise an error the earlier one would not
+-- ('laterRaisesNothingNew').
+commitSafety :: String -> Int -> Int -> [ParamRole] -> Bool -> [S.Clause] -> Maybe (Bool, [Int])
+commitSafety name arity inCount roles commitsOnSuccess clauses =
+  foldM step (False, []) [(ci, cj) | (i, ci) <- indexed, (j, cj) <- indexed, i < j]
   where
     indexed = zip [0 :: Int ..] clauses
-    step acc (ci, cj)
-      | clausesExclusive inCount ci cj = Just acc
-      | not (isRecursiveClause name arity ci) && commitsOnSuccess = Just True
+    step (acc, gnd) (ci, cj)
+      -- Heads that cannot both match: the later clause's guards never run.
+      | headsExclusive inCount ci cj = Just (acc, gnd)
+      | laterRaisesNothingNew inCount ci cj,
+        clausesExclusive inCount ci cj =
+          Just (acc, gnd)
+      | laterRaisesNothingNew inCount ci cj,
+        Just ps <- I.exclusive ci cj,
+        all groundable ps =
+          Just (acc, nub (gnd ++ [p | p <- ps, roles !! p == ParamList]))
+      | not (isRecursiveClause name arity ci) && commitsOnSuccess = Just (True, gnd)
       | otherwise = Nothing
+    groundable p = p < inCount && roles !! p `elem` [ParamInt, ParamList]
 
 -- | A position in the input arguments: argument index, then cons cell
 -- offsets (1 for the head, 2 for the tail).
@@ -500,6 +517,14 @@ shapesDisjoint a b = case (a, b) of
   (ShInt x, ShInt y) -> x /= y
   (ShCons h1 t1, ShCons h2 t2) -> shapesDisjoint h1 h2 || shapesDisjoint t1 t2
   _ -> True
+
+-- | Whether the two heads' input patterns differ at some path.
+headsExclusive :: Int -> S.Clause -> S.Clause -> Bool
+headsExclusive inCount ci cj = or [shapesDisjoint (shapeOf a) (shapeOf b) | (a, b) <- zip (inputs ci) (inputs cj)]
+  where
+    inputs cl = case S.clauseHead cl of
+      S.Compound _ as -> take inCount as
+      _ -> []
 
 -- | Integer bounds on a path (inclusive) and values excluded by @!=@.
 data IntRange = IntRange (Maybe Integer) (Maybe Integer) [Integer]
@@ -577,7 +602,13 @@ clauseConstraints headArgs body = (foldl refineRange litRanges guards, relations
 -- for the same call. @!=@ is structural, so it counts only on a variable
 -- defined by @is@, which holds an evaluated integer.
 exprConstraints :: [S.Term] -> [S.Term] -> M.Map S.Term IntRange
-exprConstraints headArgs body = go M.empty M.empty body
+exprConstraints headArgs body = fst (exprFacts headArgs body)
+
+-- | 'exprConstraints', and the divisor of every @%@ the clause's guards
+-- evaluate, keyed the same way ('Nothing' where it has no key). Structural
+-- @!=@ evaluates nothing.
+exprFacts :: [S.Term] -> [S.Term] -> (M.Map S.Term IntRange, [Maybe S.Term])
+exprFacts headArgs body = go M.empty (M.empty, []) body
   where
     walk path = \case
       S.Var v | v >= 0 -> [(v, path)]
@@ -600,25 +631,53 @@ exprConstraints headArgs body = go M.empty M.empty body
     defined defs = \case
       S.Var v -> M.member v defs
       _ -> False
-    go defs ranges = \case
-      [] -> ranges
-      g : gs -> case g of
-        S.Compound "is" [S.Var x, e]
-          | x >= 0,
-            not (M.member x varPaths),
-            not (M.member x defs),
-            Just key <- exprKey defs e ->
-              go (M.insert x key defs) ranges gs
-        S.Compound "is" [S.IntLit k, e]
-          | Just key <- exprKey defs e -> go defs (refineRange ranges (key, "eq", k)) gs
-        S.Compound op [l, r]
-          | isCmpOp op,
-            op /= "neq" || defined defs l || defined defs r ->
-              case (l, r) of
-                (_, S.IntLit k) | Just key <- exprKey defs l -> go defs (refineRange ranges (key, op, k)) gs
-                (S.IntLit k, _) | Just key <- exprKey defs r -> go defs (refineRange ranges (key, flipCmp op, k)) gs
-                _ -> go defs ranges gs
-        _ -> go defs ranges gs
+    divisorsIn defs = \case
+      S.Compound "mod" [a, b] -> keyOf defs b : divisorsIn defs a ++ divisorsIn defs b
+      S.Compound _ as -> concatMap (divisorsIn defs) as
+      _ -> []
+    evaluated defs = \case
+      S.Compound "is" [_, e] -> divisorsIn defs e
+      S.Compound op [l, r] | isCmpOp op, op /= "neq" -> divisorsIn defs l ++ divisorsIn defs r
+      _ -> []
+    go defs (ranges, divs) = \case
+      [] -> (ranges, divs)
+      g : gs ->
+        let acc' r = (r, divs ++ evaluated defs g)
+         in case g of
+              S.Compound "is" [S.Var x, e]
+                | x >= 0,
+                  not (M.member x varPaths),
+                  not (M.member x defs),
+                  Just key <- exprKey defs e ->
+                    go (M.insert x key defs) (acc' ranges) gs
+              S.Compound "is" [S.IntLit k, e]
+                | Just key <- exprKey defs e -> go defs (acc' (refineRange ranges (key, "eq", k))) gs
+              S.Compound op [l, r]
+                | isCmpOp op,
+                  op /= "neq" || defined defs l || defined defs r ->
+                    case (l, r) of
+                      (_, S.IntLit k) | Just key <- exprKey defs l -> go defs (acc' (refineRange ranges (key, op, k))) gs
+                      (S.IntLit k, _) | Just key <- exprKey defs r -> go defs (acc' (refineRange ranges (key, flipCmp op, k))) gs
+                      _ -> go defs (acc' ranges) gs
+              _ -> go defs (acc' ranges) gs
+
+-- | Committing to an earlier clause skips a later one, so the later one must
+-- not be able to raise an error the earlier one would not. On the compiled
+-- path the only arithmetic error is a zero divisor: every @%@ the later
+-- clause evaluates must divide by a non-zero literal or by a divisor the
+-- earlier clause evaluates (which raises first, and is a bailout there).
+laterRaisesNothingNew :: Int -> S.Clause -> S.Clause -> Bool
+laterRaisesNothingNew inCount ci cj = all safe (snd (facts cj))
+  where
+    facts cl = exprFacts (inputs cl) (S.clauseBody cl)
+    inputs cl = case S.clauseHead cl of
+      S.Compound _ as -> take inCount as
+      _ -> []
+    earlier = snd (facts ci)
+    safe = \case
+      Just (S.IntLit k) -> k /= 0
+      Just d -> Just d `elem` earlier
+      Nothing -> False
 
 -- | Narrow the range at a key by @key op k@; @neq@ excludes a value and
 -- @eq@ pins it.
