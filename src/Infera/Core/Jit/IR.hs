@@ -155,6 +155,10 @@ data JitOp
     JSubChecked Reg Reg Reg Label
   | -- | @JMulChecked dst a b bailoutLbl@: @dst = a * b@; jump to @bailoutLbl@ on 64-bit or 61-bit overflow
     JMulChecked Reg Reg Reg Label
+  | -- | @JModChecked dst a b bailoutLbl@: @dst = a `mod` b@ (floored, the
+    -- sign of @b@, as Haskell's 'mod'); jump to @bailoutLbl@ when @b == 0@.
+    -- Operands are unboxed immediates, so the result fits one too.
+    JModChecked Reg Reg Reg Label
   | -- | @JAddImm dst src imm@: @dst = src + imm@ (unboxed counter/address step, small imm >= 0)
     JAddImm Reg Reg Int
   | -- | @JSubImm dst src imm@: @dst = src - imm@ (unboxed counter/address step, small imm >= 0)

@@ -358,6 +358,7 @@ clauseSupportsOutParam name arity cl =
 isGuardOrIs :: S.Term -> Bool
 isGuardOrIs = \case
   S.Compound "is" [S.Var _, _] -> True
+  S.Compound "is" [S.IntLit _, _] -> True
   S.Compound op [_, _] -> isCmpOp op
   _ -> False
 
@@ -511,7 +512,10 @@ clausesExclusive inCount ci cj =
   or [shapesDisjoint (shapeOf a) (shapeOf b) | (a, b) <- zip (inputs ci) (inputs cj)]
     || or [rangesDisjoint r1 r2 | (path, r1) <- M.toList rangesI, Just r2 <- [M.lookup path rangesJ]]
     || or [contradicts g1 g2 | g1 <- relsI, g2 <- relsJ]
+    || or [rangesDisjoint r1 r2 | (e, r1) <- M.toList exprsI, Just r2 <- [M.lookup e exprsJ]]
   where
+    exprsI = exprConstraints (inputs ci) (S.clauseBody ci)
+    exprsJ = exprConstraints (inputs cj) (S.clauseBody cj)
     inputs cl = case S.clauseHead cl of
       S.Compound _ as -> take inCount as
       _ -> []
@@ -546,7 +550,7 @@ flipCmp = \case
 -- | Integer ranges per head path, from literals in the head and guards
 -- against literals, and comparisons between two head paths.
 clauseConstraints :: [S.Term] -> [S.Term] -> (M.Map ArgPath IntRange, [(ArgPath, String, ArgPath)])
-clauseConstraints headArgs body = (foldl refine litRanges guards, relations)
+clauseConstraints headArgs body = (foldl refineRange litRanges guards, relations)
   where
     walk path = \case
       S.Var v | v >= 0 -> [(Left v, path)]
@@ -564,15 +568,71 @@ clauseConstraints headArgs body = (foldl refine litRanges guards, relations)
     cmps = [(op, a, b) | S.Compound op [l, r] <- body, isCmpOp op, Just a <- [operand l], Just b <- [operand r]]
     guards = [(x, op, k) | (op, Left x, Right k) <- cmps] ++ [(x, flipCmp op, k) | (op, Right k, Left x) <- cmps]
     relations = [(x, op, y) | (op, Left x, Left y) <- cmps, op /= "neq"]
-    refine ranges (x, op, k) =
-      let IntRange lo hi ex = M.findWithDefault (IntRange Nothing Nothing []) x ranges
-          tighten = case op of
-            "gt" -> IntRange (Just (maybe (k + 1) (max (k + 1)) lo)) hi ex
-            "gte" -> IntRange (Just (maybe k (max k) lo)) hi ex
-            "lt" -> IntRange lo (Just (maybe (k - 1) (min (k - 1)) hi)) ex
-            "lte" -> IntRange lo (Just (maybe k (min k) hi)) ex
-            _ -> IntRange lo hi (k : ex)
-       in M.insert x tighten ranges
+
+-- | Integer ranges on arithmetic expressions over head paths, from guards
+-- that evaluate them: @k is E@ (E equals k), @X is E@ followed by a
+-- comparison or @!=@ on X, and a comparison of E with a literal. Each
+-- expression is keyed by its form with head variables replaced by their
+-- paths, so the same key in two clauses of one predicate is the same value
+-- for the same call. @!=@ is structural, so it counts only on a variable
+-- defined by @is@, which holds an evaluated integer.
+exprConstraints :: [S.Term] -> [S.Term] -> M.Map S.Term IntRange
+exprConstraints headArgs body = go M.empty M.empty body
+  where
+    walk path = \case
+      S.Var v | v >= 0 -> [(v, path)]
+      S.Compound "cons" [h, t] -> walk (fst path, snd path ++ [1]) h ++ walk (fst path, snd path ++ [2]) t
+      _ -> []
+    varPaths = M.fromListWith (\_ first -> first) (concat [walk (i, []) a | (i, a) <- zip [0 ..] headArgs])
+    pathTerm (i, offs) = S.Compound "$path" (map (S.IntLit . fromIntegral) (i : offs))
+    keyOf defs = \case
+      S.Var v
+        | Just path <- M.lookup v varPaths -> Just (pathTerm path)
+        | Just e <- M.lookup v defs -> Just e
+      S.IntLit k -> Just (S.IntLit k)
+      S.Compound op as | op `elem` ["plus", "minus", "mul", "mod"] -> S.Compound op <$> mapM (keyOf defs) as
+      _ -> Nothing
+    -- Only an expression that is not a lone head path: those are ranged by
+    -- 'clauseConstraints' already.
+    exprKey defs t = case keyOf defs t of
+      Just e@(S.Compound op _) | op /= "$path" -> Just e
+      _ -> Nothing
+    defined defs = \case
+      S.Var v -> M.member v defs
+      _ -> False
+    go defs ranges = \case
+      [] -> ranges
+      g : gs -> case g of
+        S.Compound "is" [S.Var x, e]
+          | x >= 0,
+            not (M.member x varPaths),
+            not (M.member x defs),
+            Just key <- exprKey defs e ->
+              go (M.insert x key defs) ranges gs
+        S.Compound "is" [S.IntLit k, e]
+          | Just key <- exprKey defs e -> go defs (refineRange ranges (key, "eq", k)) gs
+        S.Compound op [l, r]
+          | isCmpOp op,
+            op /= "neq" || defined defs l || defined defs r ->
+              case (l, r) of
+                (_, S.IntLit k) | Just key <- exprKey defs l -> go defs (refineRange ranges (key, op, k)) gs
+                (S.IntLit k, _) | Just key <- exprKey defs r -> go defs (refineRange ranges (key, flipCmp op, k)) gs
+                _ -> go defs ranges gs
+        _ -> go defs ranges gs
+
+-- | Narrow the range at a key by @key op k@; @neq@ excludes a value and
+-- @eq@ pins it.
+refineRange :: Ord k => M.Map k IntRange -> (k, String, Integer) -> M.Map k IntRange
+refineRange ranges (x, op, k) =
+  let IntRange lo hi ex = M.findWithDefault (IntRange Nothing Nothing []) x ranges
+      tighten = case op of
+        "gt" -> IntRange (Just (maybe (k + 1) (max (k + 1)) lo)) hi ex
+        "gte" -> IntRange (Just (maybe k (max k) lo)) hi ex
+        "lt" -> IntRange lo (Just (maybe (k - 1) (min (k - 1)) hi)) ex
+        "lte" -> IntRange lo (Just (maybe k (min k) hi)) ex
+        "eq" -> IntRange (Just (maybe k (max k) lo)) (Just (maybe k (min k) hi)) ex
+        _ -> IntRange lo hi (k : ex)
+   in M.insert x tighten ranges
 
 -- ─── Per-clause compilation ──────────────────────────────────────────────────
 
@@ -867,6 +927,11 @@ compileOneGoal nextLbl goal env freeRegs = case goal of
         ops <- compileArithExpr RT7 expr env freeRegs
         pure (ops ++ [JBranchCmp JNe existingReg RT7 nextLbl], env, freeRegs)
       Just _ -> Nothing
+  -- `k is E` evaluates E and compares it with the literal: both integers
+  -- here, so identity is equality.
+  S.Compound "is" [S.IntLit k, expr] -> do
+    ops <- compileArithExpr RT7 expr env freeRegs
+    pure (ops ++ [JBranchImm JNe RT7 (fromIntegral k) nextLbl], env, freeRegs)
   -- != is structural: 3 + 1 != 4 holds. It is an integer test only when
   -- both sides are integers already.
   S.Compound "neq" [lhs, rhs] -> do
@@ -921,10 +986,11 @@ compileArithExpr dst expr env freeRegs = case expr of
     Just (VKInt r) -> Just [JMov dst r | dst /= r]
     _ -> Nothing
   S.Compound op [a, b]
-    | op `elem` ["plus", "minus", "mul"] -> do
+    | op `elem` ["plus", "minus", "mul", "mod"] -> do
         let comb rA rB = case op of
               "plus" -> JAddChecked dst rA rB "bailout"
               "minus" -> JSubChecked dst rA rB "bailout"
+              "mod" -> JModChecked dst rA rB "bailout"
               _ -> JMulChecked dst rA rB "bailout"
         case (a, b) of
           (S.Var va, S.Var vb)
