@@ -16,6 +16,7 @@ module Infera.Core.Jit
     invokeJitKernel,
     invokeScanKernel,
     scanShape,
+    runNativeUnit,
   )
 where
 
@@ -99,6 +100,20 @@ assembleHost unit = case arch of
   "aarch64" -> assembleA64 unit
   "x86_64" -> assembleX64 unit
   _ -> []
+
+-- | Assemble a unit for this host and call it once with the given state,
+-- args and budgets blocks, for tests of single ops. 'Nothing' where the JIT
+-- is off or the host has no backend. The code is never freed.
+runNativeUnit :: JitUnit -> Ptr Int64 -> Ptr Int64 -> Ptr Int64 -> IO (Maybe Int64)
+runNativeUnit unit statePtr argsPtr budgetsPtr
+  | not jitEnabled || null bytes = pure Nothing
+  | otherwise = do
+      ptr <- withArray bytes $ \pb -> c_inferaJitAlloc pb (fromIntegral (length bytes))
+      if ptr == nullPtr
+        then pure Nothing
+        else Just <$> callNativeFn (castPtrToFunPtr ptr) statePtr argsPtr budgetsPtr
+  where
+    bytes = assembleHost unit
 
 installUnit :: PredKey -> Int -> Int -> JitUnit -> IO (Maybe JitKernel)
 installUnit key arity cellsPerIter = installUnitAs key arity cellsPerIter (-1)
@@ -1638,7 +1653,7 @@ scanShape _ _ = Nothing
 -- the cons being matched.
 compileScanKernel :: Word' -> Int -> Int -> [Maybe Int] -> JitUnit
 compileScanKernel consW arity pos pattern =
-  JitUnit . concatMap roomFirst $
+  JitUnit $
     [ JLoadImm RT0 RState stateClpIdx,
       JBranchImm JNe RT0 0 "decline",
       JLoadImm RT0 RArgs pos,
@@ -1674,13 +1689,6 @@ compileScanKernel consW arity pos pattern =
            JReturn jitDeclined
          ]
   where
-    -- 'JBindRef' writes the cell before it checks the trail's capacity, so
-    -- a full trail would bail with an untrailed binding that no unwind
-    -- undoes. Check first; RT7 is free at every bind below.
-    roomFirst op = case op of
-      JBindRef _ _ "elem_bail" ->
-        [JLoadImm RT7 RState stateTrailCapIdx, JBranchCmp JGe RTR RT7 "elem_bail", op]
-      _ -> [op]
     spillTR = arity
     spillCons = arity + 1
     consPlain = fromIntegral consW :: Int64
