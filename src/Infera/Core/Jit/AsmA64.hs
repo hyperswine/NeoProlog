@@ -122,6 +122,22 @@ andRR :: Int -> Int -> Int -> I
 andRR d n m = 0x8A000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 
 -- asr xD, xN, #k  (sbfm xD, xN, #k, #63)
+-- | @sdiv d, n, m@
+sdivRR :: Int -> Int -> Int -> I
+sdivRR d n m = 0x9AC00C00 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
+
+-- | @msub d, n, m, a@: @d = a - n * m@
+msubRRR :: Int -> Int -> Int -> Int -> I
+msubRRR d n m a = 0x9B008000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (a `shiftL` 10) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
+
+-- | @eor d, n, m@
+eorRR :: Int -> Int -> Int -> I
+eorRR d n m = 0xCA000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
+
+-- | @add d, n, m@
+addRR :: Int -> Int -> Int -> I
+addRR d n m = 0x8B000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
+
 asrImm :: Int -> Int -> Int -> I
 asrImm d n k = 0x9340FC00 .|. fromIntegral (k `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 
@@ -291,6 +307,29 @@ emitOp seqId = \case
             ]
             [(3, bailoutLbl, True)]
      in (appendFrag f1 (checkFitsImmediate d bailoutLbl), Nothing)
+  JModChecked dst a b bailoutLbl ->
+    -- Truncated remainder, then moved toward the divisor's sign when the
+    -- two signs differ, as Haskell's 'mod'.
+    let ra = hwReg a
+        rb = hwReg b
+        bCondRel :: I -> Int -> I
+        bCondRel c offsetWords = 0x54000000 .|. (fromIntegral (offsetWords .&. 0x7FFFF) `shiftL` 5) .|. c
+     in ( Frag
+            [ cmpImm12 rb 0, -- 0
+              bCondPlaceholder condEQ, -- 1 -> bailout
+              sdivRR rScratch1 ra rb, -- 2
+              msubRRR rScratch1 rScratch1 rb ra, -- 3
+              cmpImm12 rScratch1 0, -- 4
+              bCondRel condEQ 5, -- 5 -> word 10
+              eorRR rScratch2 rScratch1 rb, -- 6
+              cmpImm12 rScratch2 0, -- 7
+              bCondRel condGE 2, -- 8 -> word 10
+              addRR rScratch1 rScratch1 rb, -- 9
+              movRR (hwReg dst) rScratch1 -- 10
+            ]
+            [(1, bailoutLbl, True)],
+          Nothing
+        )
   JAddImm dst src imm -> (ws [addImm (hwReg dst) (hwReg src) imm], Nothing)
   JSubImm dst src imm -> (ws [subImm (hwReg dst) (hwReg src) imm], Nothing)
   JTickDepth exhaustedLbl ->

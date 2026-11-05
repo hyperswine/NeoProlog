@@ -92,3 +92,4 @@ engine design notes, before 2026-10-24.
 | 2026-11-05 | [PER-CALL-WORK](2026-11-05-PER-CALL-WORK.md) | shallow backtracking, structures built in place, selection that only narrows; zebra -16%, deriv -11%, primes -8% instructions |
 | 2026-11-05 | [SCAN-KERNEL](2026-11-05-SCAN-KERNEL.md) | native list-search kernels for `mem`/`right_of`-shaped predicates, choice points through the step clause; zebra -69% instructions |
 | 2026-11-05 | [UNIFICATION-REFACTOR](2026-11-05-UNIFICATION-REFACTOR.md) | design: compiled write mode and static occurs elision, deferred `saveArgs`, single-pass decision trees, unboxed control stack, stream JIT |
+| 2026-11-05 | [FILTER-KERNEL](2026-11-05-FILTER-KERNEL.md) | `remove/3` compiled natively: floored `%`, `k is E` guards, clause exclusivity through shared expressions; primes -90% instructions, 4.6x faster than SWI-Prolog |
