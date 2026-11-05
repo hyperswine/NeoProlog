@@ -1,0 +1,78 @@
+<- notable.
+# Head structures built in write mode on the clause stream: an unbound
+# argument meets a structure in a head and the stream builds it from the
+# same operand instructions read mode matches. Only repeated variables
+# inside the structure are occurs-checked. Answers, bindings and failures
+# must match the reference engine exactly.
+
+# Fresh variables and constants only: no occurs check is needed.
+fresh_out (p A B) (f A B c).
+pair_out X Y (pr X Y).
+list_out H T [H | T].
+nested_out (n (m A) (k B 1) [A, B]).
+
+# Repeated variables inside the output can hold the target.
+self X (f X).
+self2 X Y (g X (h Y X)).
+deep X (a (b (c X))).
+twin (t X X) X.
+
+# A repeated variable that is still an unbound local when the structure is
+# built escapes into the structure.
+escape (w L) <- L = L.
+late (q X) X <- true.
+
+# Structures in a recursive output position, as in symbolic differentiation.
+d (add U V) X (add DU DV) <- d U X DU, d V X DV.
+d (mul U V) X (add (mul DU V) (mul U DV)) <- d U X DU, d V X DV.
+d (pw U N) X (mul DU (mul N (pw U N1))) <- is_int N, N1 is N - 1, d U X DU.
+d X X 1.
+d C X 0 <- ground C, not (C == X).
+
+# Lists built by tail recursion in write mode.
+copy [] [].
+copy [H | T] [H | R] <- copy T R.
+tag_all [] [].
+tag_all [H | T] [t H H | R] <- tag_all T R.
+
+# Backtracking over bindings made in write mode.
+choose (one X) X.
+choose (two X Y) X <- Y = X.
+choose (three A B C) A <- B = C.
+
+> fresh_out (p 1 2) R?
+> fresh_out S R?
+> pair_out 1 Y R?
+> pair_out X Y (pr a b)?
+> list_out 1 [2, 3] R?
+> list_out H T R?
+> nested_out R?
+> self X X?
+> self X Y?
+> self (f Z) Y?
+> self2 1 2 R?
+> self2 X Y X?
+> self2 X Y Y?
+> self2 X Y R, R = g P Q?
+> deep X X?
+> deep X R?
+> deep (z Q) R, Q = 5?
+> twin R 3?
+> twin R X, X = 4?
+> twin T T?
+> escape R?
+> escape (w 1)?
+> late R X?
+> late R R?
+> once (d (add (mul x x) (pw x 3)) x D)?
+> once (d (mul (add x 1) (add x 2)) x D)?
+> d (add x x) x D?
+> copy [1, 2, 3] R?
+> copy [1, X, 3] R, X = 2?
+> copy [A, B] R, R = [B, A]?
+> tag_all [a, b] R?
+> tag_all [X, Y] R, X = 1?
+> findall X (choose R X) L?
+> findall R (choose R 1) L?
+> choose (two A B) 5, A == B?
+> choose R X, R = three P Q Q?

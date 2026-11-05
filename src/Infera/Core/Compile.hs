@@ -192,12 +192,15 @@ data Goal
 -- | One side-table entry of a clause stream: the values an instruction
 -- cannot carry as an unboxed word. Calls need the callee and the contract
 -- evidence of the call site, an escape needs the goals that stay on the tree
--- interpreter, and a structure that meets an unbound argument needs its
--- pattern to be built and occurs-checked.
+-- interpreter, and a structure that meets an unbound argument needs the
+-- slots it must occurs-check once it is built in write mode.
 data StreamRef
   = SRefCall !PredRef !(Maybe Trust)
   | SRefEscape ![Goal]
-  | SRefPattern !Pattern
+  | -- | the slots a structure built in write mode must occurs-check: the
+    -- repeated variables inside it. A first occurrence is a fresh variable and
+    -- a constant holds no variable, so neither can contain the target.
+    SRefOccurs ![Int]
 
 -- | A clause as a flat instruction stream over unboxed words, with the side
 -- table of boxed values its instructions index. See
@@ -810,10 +813,10 @@ encodeClause clause
       -- Two first occurrences are matched cell to cell, as the tree's matching
       -- does for a two-argument structure.
       PStruct f [PFirst h, PFirst t] -> do
-        entry <- side (SRefPattern pattern)
+        entry <- side (SRefOccurs [])
         emit [opGetListFirst, i, entry, f, h, t]
       PStruct f children -> do
-        entry <- side (SRefPattern pattern)
+        entry <- side (SRefOccurs (repeatedSlots pattern))
         start <- here
         emit [opGetStruct, i, entry, f, length children, 0]
         unifyOperands children
@@ -830,11 +833,11 @@ encodeClause clause
       PSlot off -> emit [opUV, off]
       PWord w -> emit [opUC, w]
       PStruct f [PFirst h, PFirst t] -> do
-        entry <- side (SRefPattern pattern)
+        entry <- side (SRefOccurs [])
         start <- here
         emit [opUSF, entry, f, h, t, start + 6]
       PStruct f children -> do
-        entry <- side (SRefPattern pattern)
+        entry <- side (SRefOccurs (repeatedSlots pattern))
         start <- here
         emit [opUS, entry, f, length children, 0]
         unifyOperands children
@@ -860,6 +863,18 @@ encodeClause clause
       PWord w -> emit [opPushConst, w]
       PStruct f children -> pushValues children >> emit [opPushStruct, f, length children]
       PArith {} -> emit [opFail]
+
+-- | The repeated variables inside a head structure, once each, in order of
+-- first appearance: the only parts of the structure that can already hold
+-- the variable it is bound to.
+repeatedSlots :: Pattern -> [Int]
+repeatedSlots pattern = nub (go pattern)
+  where
+    go p = case p of
+      PSlot off -> [off]
+      PStruct _ children -> concatMap go children
+      PArith _ _ children -> concatMap go children
+      _ -> []
 
 -- | Would the encoder emit an instruction for real work before reaching an
 -- escape? Trivial goals are skipped by the encoder, so they are skipped here.

@@ -89,6 +89,21 @@ the end for orientation.
    and without bangs every `is` and comparison boxed both operands and the
    result to call it.
 
+7. **Write mode on the clause stream** (`writeAndBind`, `writeOperands`,
+   `writeListFirst`; added after the first review). A head structure met by
+   an unbound argument used to leave the stream: `unifyPattern` built it by
+   walking the `Pattern` tree, then `occursPattern` walked the tree again.
+   Now the structure is built from the same operand instructions read mode
+   runs (`UF`, `UV`, `UC`, `US`, `USF`), WAM-style, and the occurs check
+   visits only the structure's repeated variables, listed per structure at
+   load time in its side entry (`SRefOccurs`, replacing `SRefPattern`). A
+   first occurrence is a fresh variable and a constant holds none, so a
+   structure of only those binds unconditionally. The occurs check is the
+   same check as before, on fewer places: a repeated variable whose value
+   contains the target still fails the binding (`self X (f X)` with `X`
+   aliased to the output fails, as in the reference engine). The tree
+   interpreter's write mode is unchanged.
+
 ## What did not help
 
 - **Arithmetic in the clause stream.** An `opGoal` instruction ran `is` and
@@ -134,6 +149,28 @@ Microbenchmarks, same measure (`INFERA_JIT=0`):
 
 zebra is now ahead of Scryer; all three remain 2-4.5x behind SWI-Prolog.
 
+### Write mode on the stream
+
+Instructions retired, millions, before and after change 7:
+
+| case | before | after | change |
+| --- | ---: | ---: | ---: |
+| deriv x30000 | 10928 | 9921 | -9% |
+| queens 9, all | 10053 | 8966 | -11% |
+| zebra x300 | 13496 | 13454 | 0% |
+| primes 20000 | 14842 | 14844 | 0% |
+| build + unify `h/5` (micro) | 5517 | 5102 | -8% |
+| build `s/1` via a call (micro) | 10264 | 9776 | -5% |
+
+queens gains because `perm`/`sel` build their `[H | R]` outputs on every
+call. primes is unchanged: `remove/3` starts with `is`, so its clauses run
+on the tree interpreter, whose write mode this does not touch. A single
+reservation for a nested template (one `reserveCells` instead of one per
+level) was not done; a reservation is a bump and a capacity test.
+
+Totals against `main` (`ae5fd44`), all changes: zebra -16%, deriv -19%,
+primes -8%, queens -15%, nrev -4%.
+
 ## Correctness
 
 - `test/core/parity-shallow.nprolog` (new, in the `core-engine` group): heads
@@ -142,6 +179,12 @@ zebra is now ahead of Scryer; all three remain 2-4.5x behind SWI-Prolog.
   head variables over structures, variables escaping into built structures
   across tail calls, membership under active constraints (the non-shallow
   path), and nested nondeterminism under `findall` and `not`.
+- `test/core/parity-write.nprolog` (new, in the `core-engine` group): output
+  structures of fresh variables and constants, repeated variables that make
+  the binding cyclic (must fail) or not, nested structures and lists, an
+  unbound local escaping into an output, write-mode lists built by tail
+  recursion, symbolic differentiation, and backtracking over write-mode
+  bindings.
 - `core-engine parity` over `test/core/*.nprolog` agrees normally, with
   collection at every call (`--gc-limit 1`), and with
   `INFERA_CORE_STREAM=0`.

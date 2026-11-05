@@ -1732,8 +1732,7 @@ streamHead m !stream !base !pc = case () of
         arg <- readArg s (unsafeAt code (pc + 1))
         streamIfUnify m stream base (pc + 3) arg (unsafeAt code (pc + 2))
     | op == opGetListFirst -> do
-        let !entry = unsafeAt code (pc + 2)
-            !functor = unsafeAt code (pc + 3)
+        let !functor = unsafeAt code (pc + 3)
             !h = unsafeAt code (pc + 4)
             !t = unsafeAt code (pc + 5)
         arg <- readArg s (unsafeAt code (pc + 1))
@@ -1750,8 +1749,11 @@ streamHead m !stream !base !pc = case () of
                 writeFirst s (base + t) tailWord
                 streamHead m stream base (pc + 6)
             | tag == tagRef -> do
-                ok <- unifyPattern m base (streamSidePattern stream entry) arg
-                if ok then streamHead m stream base (pc + 6) else pure streamFailed
+                -- Two fresh variables: the cons holds nothing the target can
+                -- occur in.
+                built <- writeListFirst s base functor h t
+                bind s (valOf d) built
+                streamHead m stream base (pc + 6)
             | otherwise -> pure streamFailed
     | op == opGetStruct -> do
         let !entry = unsafeAt code (pc + 2)
@@ -1769,10 +1771,10 @@ streamHead m !stream !base !pc = case () of
                 rest <- streamOperands m stream base (valOf d + 1) n (pc + 6)
                 if rest == streamFailed then pure streamFailed else streamHead m stream base rest
             | tag == tagRef -> do
-                -- Building the pattern, occurs-checking it and binding is the
-                -- tree's write mode; it needs the pattern, so take that path
-                -- whole and skip the operand instructions it replaced.
-                ok <- unifyPattern m base (streamSidePattern stream entry) arg
+                -- Write mode: the same operand instructions build the
+                -- structure, then only its repeated variables are
+                -- occurs-checked before the binding.
+                ok <- writeAndBind m stream base entry functor n (pc + 6) (valOf d)
                 if ok then streamHead m stream base after else pure streamFailed
             | otherwise -> pure streamFailed
     | otherwise -> pure pc
@@ -1811,8 +1813,7 @@ streamOperand m !stream !base !cell !pc = case () of
         ok <- unify s (unsafeAt code (pc + 1)) word
         pure (if ok then pc + 2 else streamFailed)
     | op == opUSF -> do
-        let !entry = unsafeAt code (pc + 1)
-            !functor = unsafeAt code (pc + 2)
+        let !functor = unsafeAt code (pc + 2)
             !h = unsafeAt code (pc + 3)
             !t = unsafeAt code (pc + 4)
             !after = unsafeAt code (pc + 5)
@@ -1830,8 +1831,9 @@ streamOperand m !stream !base !cell !pc = case () of
                 writeFirst s (base + t) tailWord
                 pure (pc + 6)
             | tag == tagRef -> do
-                ok <- unifyPattern m base (streamSidePattern stream entry) word
-                pure (if ok then after else streamFailed)
+                built <- writeListFirst s base functor h t
+                bind s (valOf d) built
+                pure after
             | otherwise -> pure streamFailed
     | op == opUS -> do
         let !entry = unsafeAt code (pc + 1)
@@ -1847,7 +1849,7 @@ streamOperand m !stream !base !cell !pc = case () of
               then pure streamFailed
               else streamOperands m stream base (valOf d + 1) n (pc + 5)
             | tag == tagRef -> do
-                ok <- unifyPattern m base (streamSidePattern stream entry) word
+                ok <- writeAndBind m stream base entry functor n (pc + 5) (valOf d)
                 pure (if ok then after else streamFailed)
             | otherwise -> pure streamFailed
     | otherwise -> pure streamFailed
@@ -1855,6 +1857,100 @@ streamOperand m !stream !base !cell !pc = case () of
     !s = mStore m
     !code = csCode stream
     !op = unsafeAt code pc
+
+-- ─── write mode ──────────────────────────────────────────────────────────────
+
+-- | A head structure met by an unbound cell, built from the operand
+-- instructions read mode would have matched (WAM write mode), then bound to
+-- that cell. Only the structure's repeated variables, listed in its side
+-- entry, can already hold the cell, so only they are occurs-checked; a
+-- structure of fresh variables and constants binds unconditionally.
+writeAndBind :: Machine -> ClauseStream -> Int -> Int -> Word' -> Int -> Int -> Int -> IO Bool
+writeAndBind m !stream !base !entry !functor !n !pc !target = do
+  let !s = mStore m
+  addr <- reserveCells s (n + 1)
+  packed <- writeOperands m stream base (addr + 1) n pc True
+  writeCell s addr (if odd packed then functor .|. groundBit else functor)
+  cyclic <- case unsafeAt (csRefs stream) entry of
+    SRefOccurs slots -> occursInSlots s base target slots
+    _ -> pure True
+  if cyclic
+    then pure False
+    else bind s target (strWord addr) >> pure True
+
+-- | Does the cell occur in any of these activation slots' values?
+occursInSlots :: Store -> Int -> Int -> [Int] -> IO Bool
+occursInSlots _ _ _ [] = pure False
+occursInSlots s !base !target (off : rest) = do
+  hit <- occursIn s target (refWord (base + off))
+  if hit then pure True else occursInSlots s base target rest
+
+-- | Fill @n@ argument cells from @cell@ upwards by running the unify
+-- operands at @pc@ in write mode. The result packs the offset after the
+-- operands with the cells' groundness: @2 * pc + 1@ when all are ground.
+--
+-- A fresh variable, or a repeated one still unbound in its slot, becomes
+-- the argument cell itself, and the slot refers to it, as 'fillArguments'
+-- does for the tree interpreter's constructors. A nested structure is
+-- reserved above its parent and built the same way.
+writeOperands :: Machine -> ClauseStream -> Int -> Int -> Int -> Int -> Bool -> IO Int
+writeOperands m !stream !base !cell !n !pc !ground
+  | n <= 0 = pure (2 * pc + (if ground then 1 else 0))
+  | op == opUF = do
+      let !slot = base + unsafeAt code (pc + 1)
+      writeCell s cell (refWord cell)
+      writeCell s slot (refWord cell)
+      writeOperands m stream base (cell + 1) (n - 1) (pc + 2) False
+  | op == opUV = do
+      let !slot = base + unsafeAt code (pc + 1)
+      value <- readCell s slot
+      if value == refWord slot
+        then do
+          -- An unbound local escapes into this argument: an ordinary,
+          -- trailed binding redirects the slot to it.
+          writeCell s cell (refWord cell)
+          bind s slot (refWord cell)
+          writeOperands m stream base (cell + 1) (n - 1) (pc + 2) False
+        else do
+          writeCell s cell value
+          g <- if ground then groundNowWord s value else pure False
+          writeOperands m stream base (cell + 1) (n - 1) (pc + 2) g
+  | op == opUC = do
+      let !w = unsafeAt code (pc + 1)
+      writeCell s cell w
+      g <- if ground then groundNowWord s w else pure False
+      writeOperands m stream base (cell + 1) (n - 1) (pc + 2) g
+  | op == opUSF = do
+      built <- writeListFirst s base (unsafeAt code (pc + 2)) (unsafeAt code (pc + 3)) (unsafeAt code (pc + 4))
+      writeCell s cell built
+      writeOperands m stream base (cell + 1) (n - 1) (unsafeAt code (pc + 5)) False
+  | op == opUS = do
+      let !functor = unsafeAt code (pc + 2)
+          !k = unsafeAt code (pc + 3)
+      addr <- reserveCells s (k + 1)
+      packed <- writeOperands m stream base (addr + 1) k (pc + 5) True
+      let !childGround = odd packed
+      writeCell s addr (if childGround then functor .|. groundBit else functor)
+      writeCell s cell (strWord addr)
+      writeOperands m stream base (cell + 1) (n - 1) (unsafeAt code (pc + 4)) (ground && childGround)
+  | otherwise = pure (2 * pc + (if ground then 1 else 0))
+  where
+    !s = mStore m
+    !code = csCode stream
+    !op = unsafeAt code pc
+
+-- | A two-argument constructor of two fresh variables (the head @[H | T]@
+-- met by an unbound cell): both live in its own cells, and the slots refer
+-- to them. It is never ground.
+writeListFirst :: Store -> Int -> Word' -> Int -> Int -> IO Word'
+writeListFirst s !base !functor !h !t = do
+  addr <- reserveCells s 3
+  writeCell s addr functor
+  writeCell s (addr + 1) (refWord (addr + 1))
+  writeCell s (addr + 2) (refWord (addr + 2))
+  writeCell s (base + h) (refWord (addr + 1))
+  writeCell s (base + t) (refWord (addr + 2))
+  pure (strWord addr)
 
 streamCallTarget :: ClauseStream -> Int -> IO Pred
 streamCallTarget stream entry = case unsafeAt (csRefs stream) entry of
@@ -1871,10 +1967,6 @@ streamEscapeGoals stream entry = case unsafeAt (csRefs stream) entry of
   SRefEscape goals -> goals
   _ -> error "core: stream escape entry is not an escape"
 
-streamSidePattern :: ClauseStream -> Int -> Pattern
-streamSidePattern stream entry = case unsafeAt (csRefs stream) entry of
-  SRefPattern pattern -> pattern
-  _ -> error "core: stream pattern entry is not a pattern"
 
 -- | Select and try the clauses of a predicate against the registers.
 callClauses :: Machine -> Pred -> Int -> Int -> Cont -> IO Step
