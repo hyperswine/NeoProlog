@@ -301,6 +301,25 @@ emitOp = \case
         f1 = appendFrag (bytes pre) (jccRel32 0x80 bailoutLbl)
         f2 = appendFrag f1 (checkFitsImmediate 0 bailoutLbl)
      in (appendFrag f2 (bytes (putReg dst 0)), Nothing)
+  JModChecked dst a b bailoutLbl ->
+    -- rax = a; divisor in a register other than rax/rdx (r11 if spilled).
+    -- idiv leaves the truncated remainder in rdx; when it is non-zero and
+    -- its sign differs from the divisor's, adding the divisor floors it.
+    let (ra, loadA) = getReg 0 a
+        (rb, loadB) = getReg 11 b
+        pre = loadA ++ movRR 0 ra ++ loadB ++ [rexW rb 0 rb, 0x85, modRM 3 rb rb]
+        post =
+          [0x48, 0x99] -- cqo
+            ++ [rexW 0 0 rb, 0xF7, modRM 3 7 rb] -- idiv rb
+            ++ [rexW 2 0 2, 0x85, modRM 3 2 2] -- test rdx, rdx
+            ++ [0x74, 11] -- jz done
+            ++ movRR 0 2 -- mov rax, rdx
+            ++ [rexW rb 0 0, 0x31, modRM 3 rb 0] -- xor rax, rb
+            ++ [0x79, 3] -- jns done
+            ++ [rexW rb 0 2, 0x01, modRM 3 rb 2] -- add rdx, rb
+            ++ putReg dst 2 -- done:
+        f1 = appendFrag (bytes pre) (jccRel32 0x84 bailoutLbl)
+     in (appendFrag f1 (bytes post), Nothing)
   JAddImm dst src imm ->
     let (s, loadS) = getReg 0 src
      in (bytes (loadS ++ movRR 0 s ++ addImm32 0 imm ++ putReg dst 0), Nothing)
