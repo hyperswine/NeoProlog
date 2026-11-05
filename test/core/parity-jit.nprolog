@@ -47,6 +47,19 @@ w4 [] 0.
 w4 [_ | T] N <- P is 9, P != 0, X is 1, X != 0, Y is 2, Z is 3, B is 4, C is 5, Y != Z, B != 5, C != 0, w4 T N.
 mk 0 [].
 mk N [N | T] <- N > 0, N1 is N - 1, mk N1 T.
+# Kernel calls that each bind a variable older than the choice point, so
+# every binding is trailed. After backtracking, every variable must be free
+# again. CoreTest runs these past the initial trail size on the core engine
+# alone (the reference engine is quadratic here).
+fresh_vars 0 [].
+fresh_vars N [_ | T] <- N > 0, N1 is N - 1, fresh_vars N1 T.
+bind_all [].
+bind_all [X | T] <- sum_to 3 0 X, bind_all T.
+count_free [] N N.
+count_free [X | T] A N <- var X, A1 is A + 1, count_free T A1 N.
+count_free [X | T] A N <- nonvar X, count_free T A N.
+bound_then_undone N F <- fresh_vars N L, (bind_all L, fail ; count_free L 0 F).
+bound_sum N S <- fresh_vars N L, bind_all L, list_sum L 0 S.
 > loop 50000?
 > loop 90000?
 > loop -1?
@@ -101,3 +114,5 @@ mk N [N | T] <- N > 0, N1 is N - 1, mk N1 T.
 > zz [1] 5 N?
 > w3 [1, 2] N?
 > w4 [1, 2] N?
+> bound_then_undone 300 F?
+> bound_sum 300 S?
