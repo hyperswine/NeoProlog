@@ -88,3 +88,4 @@ engine design notes, before 2026-10-24.
 | 2026-11-04 | [UNIFICATION-HEAVY](2026-11-04-UNIFICATION-HEAVY.md) | zebra, deriv and primes against SWI: profile, the Horizon 2 pruning removed, ranked remaining wins |
 | 2026-11-05 | [BENCHMARKS](2026-11-05-BENCHMARKS.md) | report: every benchmark by task type, JIT on and off, against SWI-Prolog and Scryer on an Apple M4 |
 | 2026-11-05 | [PER-CALL-WORK](2026-11-05-PER-CALL-WORK.md) | shallow backtracking, structures built in place, selection that only narrows; zebra -16%, deriv -11%, primes -8% instructions |
+| 2026-11-05 | [SCAN-KERNEL](2026-11-05-SCAN-KERNEL.md) | native list-search kernels for `mem`/`right_of`-shaped predicates, choice points through the step clause; zebra -69% instructions |

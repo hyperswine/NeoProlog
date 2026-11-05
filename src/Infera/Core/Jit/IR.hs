@@ -145,6 +145,10 @@ data JitOp
     JValOf Reg Reg
   | -- | @JMkWord dst val tag@: @dst = (val `shiftL` 3) .|. tag@
     JMkWord Reg Reg Int
+  | -- | @JAnd dst a b@: @dst = a .&. b@
+    JAnd Reg Reg Reg
+  | -- | @JShr dst src n@: @dst = src `shiftR` n@ (arithmetic, @0 < n < 64@)
+    JShr Reg Reg Int
   | -- | @JAddChecked dst a b bailoutLbl@: @dst = a + b@; jump to @bailoutLbl@ if outside 61-bit immediate range
     JAddChecked Reg Reg Reg Label
   | -- | @JSubChecked dst a b bailoutLbl@: @dst = a - b@; jump to @bailoutLbl@ if outside 61-bit immediate range
