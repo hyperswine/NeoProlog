@@ -5,10 +5,17 @@ module Main (main) where
 
 import Control.Exception (evaluate)
 import Control.Monad (unless)
+import Data.Bits (shiftR)
+import Data.Char (ord)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (intercalate, isPrefixOf)
 import Data.Version (showVersion)
 import GHC.Clock (getMonotonicTimeNSec)
-import GHC.Fingerprint (fingerprintString)
+import Foreign.Marshal.Alloc (free, mallocBytes, reallocBytes)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (pokeByteOff)
+import Data.Word (Word8)
+import GHC.Fingerprint (Fingerprint, fingerprintData)
 import GHC.Stats
 import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Machine.Control as Machine
@@ -200,6 +207,44 @@ metricFields metrics =
     ("builtin_wrappers_avoided", show (Machine.metricBuiltinWrappersAvoided metrics))
   ]
 
+-- | 'fingerprintString' of the concatenated pieces, with the same value:
+-- each character contributes its code point as four big-endian bytes. The
+-- bytes go into one malloc'd buffer as each piece is read, so neither the
+-- whole text nor a list of its bytes is ever live on the GHC heap.
+-- 'fingerprintString' itself builds that byte list (about 40 bytes of heap
+-- per byte of input), which put a transient of tens of megabytes into
+-- @max_live_bytes@ before the loop had started.
+fingerprintPieces :: [IO String] -> IO Fingerprint
+fingerprintPieces pieces = do
+  buffer <- mallocBytes initial >>= newIORef
+  capacity <- newIORef initial
+  used <- newIORef 0
+  let put c = do
+        n <- readIORef used
+        cap <- readIORef capacity
+        p <- if n + 4 <= cap
+          then readIORef buffer
+          else do
+            let cap' = 2 * cap
+            p' <- readIORef buffer >>= \old -> reallocBytes old cap'
+            writeIORef buffer p'
+            writeIORef capacity cap'
+            pure p'
+        let w = ord c
+        pokeByteOff p n (fromIntegral (w `shiftR` 24) :: Word8)
+        pokeByteOff p (n + 1) (fromIntegral (w `shiftR` 16) :: Word8)
+        pokeByteOff p (n + 2) (fromIntegral (w `shiftR` 8) :: Word8)
+        pokeByteOff p (n + 3) (fromIntegral w :: Word8)
+        modifyIORef' used (+ 4)
+  mapM_ (\piece -> piece >>= mapM_ put) pieces
+  p <- readIORef buffer :: IO (Ptr Word8)
+  n <- readIORef used
+  result <- fingerprintData p n
+  free p
+  pure result
+  where
+    initial = 1024 * 1024
+
 main :: IO ()
 main = do
   arguments <- getArgs
@@ -218,9 +263,9 @@ main = do
         "src/Infera/Engine.hs", "src/Infera/Engine/Contracts.hs", "src/Infera/Arith.hs",
         "src/Infera/CLP.hs", "src/Infera/Unify.hs", "src/Infera/Program.hs",
         "src/Infera/Syntax.hs", "src/Infera/Machine/Trace/Types.hs", "bench/machine-tail.hs"]
-  contents <- mapM (\path -> readFile path >>= \text -> pure (path ++ "\n" ++ text)) paths
-  let fingerprint = show (fingerprintString
-        (caseName ++ source ++ querySource ++ show expected ++ concat contents))
+  fingerprint <- show <$> fingerprintPieces
+    (pure (caseName ++ source ++ querySource ++ show expected)
+      : [(\text -> path ++ "\n" ++ text) <$> readFile path | path <- paths])
   _ <- evaluate (length fingerprint)
   performGC
   before <- getRTSStats

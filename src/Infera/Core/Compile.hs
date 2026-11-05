@@ -192,12 +192,15 @@ data Goal
 -- | One side-table entry of a clause stream: the values an instruction
 -- cannot carry as an unboxed word. Calls need the callee and the contract
 -- evidence of the call site, an escape needs the goals that stay on the tree
--- interpreter, and a structure that meets an unbound argument needs its
--- pattern to be built and occurs-checked.
+-- interpreter, and a structure that meets an unbound argument needs the
+-- slots it must occurs-check once it is built in write mode.
 data StreamRef
   = SRefCall !PredRef !(Maybe Trust)
   | SRefEscape ![Goal]
-  | SRefPattern !Pattern
+  | -- | the slots a structure built in write mode must occurs-check: the
+    -- repeated variables inside it. A first occurrence is a fresh variable and
+    -- a constant holds no variable, so neither can contain the target.
+    SRefOccurs ![Int]
 
 -- | A clause as a flat instruction stream over unboxed words, with the side
 -- table of boxed values its instructions index. See
@@ -249,7 +252,11 @@ data ArgIndex = ArgIndex
     aiBoxed :: !(Map.Map Key Candidates),
     aiOpen :: !Candidates,
     -- | some clause has a key at this position
-    aiSelective :: !Bool
+    aiSelective :: !Bool,
+    -- | an immediate key that keeps every clause (the cons of a list
+    -- predicate whose clauses all take a cons there), so meeting it needs no
+    -- lookup; 'minBound' when there is none, which no key word equals
+    aiAll :: !Int
   }
 
 -- | A bounded, compiled discriminator below an argument's principal
@@ -278,7 +285,13 @@ data Pred = Pred
     pClauses :: !(Array Int Clause),
     pClauseCount :: !Int,
     pIndex :: [ArgIndex],
+    -- | the selective principal indexes with their argument positions; a
+    -- non-selective index never narrows a selection, so it is not visited
+    pPrincipal :: [(Int, ArgIndex)],
     pDecisions :: [DecisionIndex],
+    -- | the same decisions grouped by argument position: an unbound argument
+    -- skips every path below it with one check
+    pDecisionGroups :: [(Int, [DecisionIndex])],
     -- | the leading immediate-integer guard of each clause, if any
     pIntGuards :: !(Array Int (Maybe IntGuard)),
     pHasGuards :: !Bool,
@@ -486,12 +499,23 @@ compilePred ctx p = do
         pClauses = listArray (0, max 0 (count - 1)) compiledClauses,
         pClauseCount = count,
         pIndex = index,
+        pPrincipal = [(i, idx) | (i, idx) <- zip [0 ..] index, aiSelective idx],
         pDecisions = [decision | decision@(DecisionIndex _ _ idx) <- decisions, aiSelective idx],
+        pDecisionGroups =
+          [ (i, group)
+            | i <- [0 .. arity - 1],
+              let group = [decision | decision@(DecisionIndex j _ idx) <- decisions, j == i, aiSelective idx],
+              not (null group)
+          ],
         pIntGuards = listArray (0, max 0 (count - 1)) (if null guards then [Nothing] else guards),
         pHasGuards = any isJust guards,
         pAll = shared [0 .. count - 1],
         pOne = ones,
-        pIndexed = P.predIsIndexed (ctxProgram ctx) p,
+        -- With no selective key, decision or guard, selection always
+        -- returns every clause: skip it.
+        pIndexed =
+          P.predIsIndexed (ctxProgram ctx) p
+            && (any aiSelective index || any (\(DecisionIndex _ _ idx) -> aiSelective idx) decisions || any isJust guards),
         pDecls = P.predDecls p,
         pInferred = P.predInferred p,
         pSwitch =
@@ -523,7 +547,9 @@ buildIndexAt syms shared position path clauses = do
       withOpen members = shared (IS.toAscList (IS.union members open))
       fast = IM.fromList [(w, withOpen members) | (key, members) <- Map.toList grouped, Just w <- [immediateKey key]]
       boxedKeys = Map.fromList [(key, withOpen members) | (key, members) <- Map.toList grouped, immediateKey key == Nothing]
-  pure (ArgIndex fast boxedKeys (shared (IS.toAscList open)) (not (Map.null grouped)))
+      everything = [w | (key, members) <- Map.toList grouped, Just w <- [immediateKey key],
+                        IS.size (IS.union members open) == length clauses]
+  pure (ArgIndex fast boxedKeys (shared (IS.toAscList open)) (not (Map.null grouped)) (case everything of { w : _ -> w; [] -> minBound }))
 
 patternAtPath :: [Int] -> [Pattern] -> Maybe Pattern
 patternAtPath [] _ = Nothing
@@ -787,10 +813,10 @@ encodeClause clause
       -- Two first occurrences are matched cell to cell, as the tree's matching
       -- does for a two-argument structure.
       PStruct f [PFirst h, PFirst t] -> do
-        entry <- side (SRefPattern pattern)
+        entry <- side (SRefOccurs [])
         emit [opGetListFirst, i, entry, f, h, t]
       PStruct f children -> do
-        entry <- side (SRefPattern pattern)
+        entry <- side (SRefOccurs (repeatedSlots pattern))
         start <- here
         emit [opGetStruct, i, entry, f, length children, 0]
         unifyOperands children
@@ -807,11 +833,11 @@ encodeClause clause
       PSlot off -> emit [opUV, off]
       PWord w -> emit [opUC, w]
       PStruct f [PFirst h, PFirst t] -> do
-        entry <- side (SRefPattern pattern)
+        entry <- side (SRefOccurs [])
         start <- here
         emit [opUSF, entry, f, h, t, start + 6]
       PStruct f children -> do
-        entry <- side (SRefPattern pattern)
+        entry <- side (SRefOccurs (repeatedSlots pattern))
         start <- here
         emit [opUS, entry, f, length children, 0]
         unifyOperands children
@@ -837,6 +863,18 @@ encodeClause clause
       PWord w -> emit [opPushConst, w]
       PStruct f children -> pushValues children >> emit [opPushStruct, f, length children]
       PArith {} -> emit [opFail]
+
+-- | The repeated variables inside a head structure, once each, in order of
+-- first appearance: the only parts of the structure that can already hold
+-- the variable it is bound to.
+repeatedSlots :: Pattern -> [Int]
+repeatedSlots pattern = nub (go pattern)
+  where
+    go p = case p of
+      PSlot off -> [off]
+      PStruct _ children -> concatMap go children
+      PArith _ _ children -> concatMap go children
+      _ -> []
 
 -- | Would the encoder emit an instruction for real work before reaching an
 -- escape? Trivial goals are skipped by the encoder, so they are skipped here.
@@ -886,7 +924,7 @@ candidateClauses !store p
   | otherwise = do
       constrained <- readReg store rCLP
       if constrained /= 0
-        then principalKeys store p False (pIndex p) 0 (pAll p)
+        then principalKeys store p False (pPrincipal p) (pAll p)
         else
           if pClauseCount p <= 1
             -- A pure single candidate is tried directly: its head performs
@@ -894,10 +932,10 @@ candidateClauses !store p
             -- that survives the failure.
             then pure (pAll p)
             else do
-              selected <- principalKeys store p True (pIndex p) 0 (pAll p)
+              selected <- principalKeys store p True (pPrincipal p) (pAll p)
               case selected of
                 Candidates _ -> do
-                  refined <- decisionKeys store p (pDecisions p) selected
+                  refined <- decisionGroups store p (pDecisionGroups p) selected
                   if pHasGuards p then keepGuards store p refined else pure refined
                 _ -> pure selected
 
@@ -908,29 +946,44 @@ candidateClauses !store p
 -- performs all remaining checks without allocating another alternative.
 -- Constraints retain every principal decision: skipped head bindings can
 -- otherwise change whether an error is exposed.
-principalKeys :: Store -> Pred -> Bool -> [ArgIndex] -> Int -> Candidates -> IO Candidates
-principalKeys _ _ _ [] !_ selected = pure selected
-principalKeys store p pureCall (index : rest) !i selected
-  | not (aiSelective index) = principalKeys store p pureCall rest (i + 1) selected
-  | otherwise = do
-      w <- readArg store i >>= deref store
-      if tagOf w == tagRef
-        then principalKeys store p pureCall rest (i + 1) selected
-        else
-          if tagOf w == tagBox
-            then do
-              restricted <- lookupBoxed store index w
-              case restricted of
-                Nothing -> principalKeys store p pureCall rest (i + 1) selected
-                Just candidates -> choose candidates
-            else lookupImmediate store index w >>= choose
+principalKeys :: Store -> Pred -> Bool -> [(Int, ArgIndex)] -> Candidates -> IO Candidates
+principalKeys _ _ _ [] selected = pure selected
+principalKeys store p pureCall ((i, index) : rest) selected = do
+  w <- readArg store i >>= deref store
+  if tagOf w == tagRef
+    then principalKeys store p pureCall rest selected
+    else
+      if tagOf w == tagBox
+        then do
+          restricted <- lookupBoxed store index w
+          case restricted of
+            Nothing -> principalKeys store p pureCall rest selected
+            Just candidates -> choose candidates
+        else do
+          key <- immediateKeyOf store w
+          if key == aiAll index
+            then principalKeys store p pureCall rest selected
+            else choose (IM.findWithDefault (aiOpen index) key (aiFast index))
   where
     choose !candidates = case intersectCandidates p selected candidates of
       NoCandidate -> pure NoCandidate
       narrowed@(OneCandidate _) | pureCall -> pure narrowed
-      narrowed -> principalKeys store p pureCall rest (i + 1) narrowed
+      narrowed -> principalKeys store p pureCall rest narrowed
 
 -- | Bounded constructor decisions below the principal functors.
+-- | Decisions argument by argument. Intersection is order-independent, so
+-- grouping changes no selection; an argument that is still unbound has no
+-- subterm to decide on, and its paths are skipped together.
+decisionGroups :: Store -> Pred -> [(Int, [DecisionIndex])] -> Candidates -> IO Candidates
+decisionGroups _ _ _ NoCandidate = pure NoCandidate
+decisionGroups _ _ _ only@(OneCandidate _) = pure only
+decisionGroups _ _ [] selected = pure selected
+decisionGroups store p ((i, group) : rest) selected = do
+  w <- readArg store i >>= deref store
+  if tagOf w /= tagStr
+    then decisionGroups store p rest selected
+    else decisionKeys store p group selected >>= decisionGroups store p rest
+
 decisionKeys :: Store -> Pred -> [DecisionIndex] -> Candidates -> IO Candidates
 decisionKeys _ _ _ NoCandidate = pure NoCandidate
 decisionKeys _ _ _ only@(OneCandidate _) = pure only
@@ -946,9 +999,12 @@ decisionKeys store p (DecisionIndex i path index : rest) selected = do
           let !narrowed = maybe selected (intersectCandidates p selected) restricted
           decisionKeys store p rest narrowed
         else do
-          restricted <- lookupImmediate store index found
-          let !narrowed = intersectCandidates p selected restricted
-          decisionKeys store p rest narrowed
+          key <- immediateKeyOf store found
+          if key == aiAll index
+            then decisionKeys store p rest selected
+            else do
+              let !narrowed = intersectCandidates p selected (IM.findWithDefault (aiOpen index) key (aiFast index))
+              decisionKeys store p rest narrowed
 
 -- | A boxed key's candidates. NaN has no lawful ordered-map key: preserve
 -- the ordinary unification path for it instead of making an index decision.
@@ -960,14 +1016,13 @@ lookupBoxed store index w = do
     Just k -> Just (Map.findWithDefault (aiOpen index) k (aiBoxed index))
     Nothing -> Nothing
 
--- | An immediate or functor key's candidates: a precomputed shared value.
-lookupImmediate :: Store -> ArgIndex -> Word' -> IO Candidates
-lookupImmediate store index w
-  | tagOf w == tagStr = do
-      f <- readCell store (valOf w)
-      pure $! IM.findWithDefault (aiOpen index) (funKey f) (aiFast index)
-  | otherwise = pure $! IM.findWithDefault (aiOpen index) w (aiFast index)
-{-# INLINE lookupImmediate #-}
+-- | The key of an immediate word or of a structure's functor, as the
+-- index's 'aiFast' table is keyed.
+immediateKeyOf :: Store -> Word' -> IO Int
+immediateKeyOf store w
+  | tagOf w == tagStr = funKey <$> readCell store (valOf w)
+  | otherwise = pure w
+{-# INLINE immediateKeyOf #-}
 
 -- | Drop the candidates whose leading integer guard is known to fail. A
 -- result equal to the input, empty or single is not rebuilt.
@@ -1042,7 +1097,7 @@ planMiss = minBound
 
 -- | 'evalFast''s binary operators and bounds over immediate integers.
 planApply :: ArithOp -> Int -> Int -> Int
-planApply op x y = case op of
+planApply !op !x !y = case op of
   OpPlus -> fits (x + y)
   OpMinus -> fits (x - y)
   OpMul
@@ -1055,6 +1110,7 @@ planApply op x y = case op of
   _ -> planMiss
   where
     fits r = if r >= -(2 ^ (60 :: Int)) && r < 2 ^ (60 :: Int) then r else planMiss
+{-# INLINE planApply #-}
 
 -- | The intersection of two ascending selections. An input equal to the
 -- result is returned itself, and a singleton is the shared one, so only a

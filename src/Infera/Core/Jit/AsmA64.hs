@@ -117,6 +117,14 @@ asr3 d n = 0x9343FC00 .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 and7 :: Int -> Int -> I
 and7 d n = 0x92400800 .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
 
+-- and xD, xN, xM
+andRR :: Int -> Int -> Int -> I
+andRR d n m = 0x8A000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
+
+-- asr xD, xN, #k  (sbfm xD, xN, #k, #63)
+asrImm :: Int -> Int -> Int -> I
+asrImm d n k = 0x9340FC00 .|. fromIntegral (k `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
+
 -- orr xD, xN, xM
 orrRR :: Int -> Int -> Int -> I
 orrRR d n m = 0xAA000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `shiftL` 5) .|. fromIntegral d
@@ -230,6 +238,8 @@ emitOp seqId = \case
   JStoreImm src base idx -> (ws [strImm (hwReg src) (hwReg base) idx], Nothing)
   JTagOf dst src -> (ws [and7 (hwReg dst) (hwReg src)], Nothing)
   JValOf dst src -> (ws [asr3 (hwReg dst) (hwReg src)], Nothing)
+  JAnd dst a b -> (ws [andRR (hwReg dst) (hwReg a) (hwReg b)], Nothing)
+  JShr dst src k -> (ws [asrImm (hwReg dst) (hwReg src) k], Nothing)
   JMkWord dst val tag ->
     let d = hwReg dst
         v = hwReg val

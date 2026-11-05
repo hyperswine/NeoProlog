@@ -254,6 +254,13 @@ emitOp = \case
   JValOf dst src ->
     let (s, loadS) = getReg 0 src
      in (bytes (loadS ++ movRR 0 s ++ sar3 0 ++ putReg dst 0), Nothing)
+  JAnd dst a b ->
+    let (ra, loadA) = getReg 0 a
+        (rb, loadB) = getReg 2 b
+     in (bytes (loadA ++ loadB ++ movRR 0 ra ++ [rexW rb 0 0, 0x21, modRM 3 rb 0] ++ putReg dst 0), Nothing)
+  JShr dst src k ->
+    let (s, loadS) = getReg 0 src
+     in (bytes (loadS ++ movRR 0 s ++ [rexW 0 0 0, 0xC1, modRM 3 7 0, fromIntegral k] ++ putReg dst 0), Nothing)
   JMkWord dst val tag ->
     let (v, loadV) = getReg 0 val
      in (bytes (loadV ++ movRR 0 v ++ shl3 0 ++ (if tag == 0 then [] else orImm8 0 tag) ++ putReg dst 0), Nothing)

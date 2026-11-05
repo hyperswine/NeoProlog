@@ -877,33 +877,38 @@ unify s a0 b0 = do
             if valOf a > valOf b
               then bind s (valOf a) b >> pure True
               else bind s (valOf b) a >> pure True
-        | ta == tagRef -> bindChecked (valOf a) b tb
-        | tb == tagRef -> bindChecked (valOf b) a ta
+        | ta == tagRef -> bindChecked s (valOf a) b tb
+        | tb == tagRef -> bindChecked s (valOf b) a ta
         | ta == tagStr && tb == tagStr -> do
             fa <- readCell s (valOf a)
             fb <- readCell s (valOf b)
             if funKey fa /= funKey fb
               then pure False
-              else args (valOf a + 1) (valOf b + 1) (funArity fa)
+              else unifyArgs s (valOf a + 1) (valOf b + 1) (funArity fa)
         | ta == tagBox && tb == tagBox -> do
             x <- boxed s a
             y <- boxed s b
             pure (sameBoxed x y)
         | otherwise -> pure False
-  where
-    -- Cyclic bindings fail: the language keeps the occurs check.
-    bindChecked addr value tag
-      | tag == tagStr = do
-          cyclic <- occursIn s addr value
-          if cyclic then pure False else bind s addr value >> pure True
-      | otherwise = bind s addr value >> pure True
-    args !i !j !n
-      | n == 0 = pure True
-      | otherwise = do
-          x <- readCell s i
-          y <- readCell s j
-          ok <- unify s x y
-          if ok then args (i + 1) (j + 1) (n - 1) else pure False
+
+-- | Bind an unbound cell to a non-variable word. Cyclic bindings fail: the
+-- language keeps the occurs check. (Top-level with strict arguments, so the
+-- address is not boxed on every bind.)
+bindChecked :: Store -> Int -> Word' -> Int -> IO Bool
+bindChecked s !addr !value !tag
+  | tag == tagStr = do
+      cyclic <- occursIn s addr value
+      if cyclic then pure False else bind s addr value >> pure True
+  | otherwise = bind s addr value >> pure True
+
+unifyArgs :: Store -> Int -> Int -> Int -> IO Bool
+unifyArgs s !i !j !n
+  | n == 0 = pure True
+  | otherwise = do
+      x <- readCell s i
+      y <- readCell s j
+      ok <- unify s x y
+      if ok then unifyArgs s (i + 1) (j + 1) (n - 1) else pure False
 
 -- Floats unify by value: signed zeros unify, NaN never unifies with itself.
 sameBoxed :: Boxed -> Boxed -> Bool
@@ -986,21 +991,22 @@ occursWalk s addr w0 = do
           if funGround f
             then pure OccGround
             else do
-              r <- args (valOf w + 1) (funArity f) True
+              r <- occursArgs s addr (valOf w + 1) (funArity f) True
               when (r == OccGround) $ do
                 writeCell s (valOf w) (f .|. groundBit)
                 trailValueIf s (valOf w) f
               pure r
       | otherwise -> pure OccGround
-  where
-    args !i !n !allGround
-      | n == 0 = pure (if allGround then OccGround else OccOpen)
-      | otherwise = do
-          r <- occursWalk s addr =<< readCell s i
-          case r of
-            OccHit -> pure OccHit
-            OccGround -> args (i + 1) (n - 1) allGround
-            OccOpen -> args (i + 1) (n - 1) False
+
+occursArgs :: Store -> Int -> Int -> Int -> Bool -> IO Occ
+occursArgs s !addr !i !n !allGround
+  | n == 0 = pure (if allGround then OccGround else OccOpen)
+  | otherwise = do
+      r <- occursWalk s addr =<< readCell s i
+      case r of
+        OccHit -> pure OccHit
+        OccGround -> occursArgs s addr (i + 1) (n - 1) allGround
+        OccOpen -> occursArgs s addr (i + 1) (n - 1) False
 
 -- | Build a term on the heap. Variables map through the supplied cell table;
 -- unknown variables get fresh cells and extend the table.
