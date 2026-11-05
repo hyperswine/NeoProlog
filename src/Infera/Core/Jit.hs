@@ -14,11 +14,13 @@ module Infera.Core.Jit
     compileJitKernel,
     compileGeneralTailJit,
     invokeJitKernel,
+    invokeScanKernel,
+    scanShape,
   )
 where
 
 import Control.Monad (foldM, forM_, when)
-import Data.Bits ((.|.))
+import Data.Bits (complement, (.|.))
 import qualified Data.IntMap.Strict as IM
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
@@ -86,7 +88,10 @@ data JitKernel = JitKernel
     jkFunPtr :: !(FunPtr NativeFn),
     jkAddr :: !Int64,
     jkCellsPerIter :: !Int,
-    jkScratch :: !(ForeignPtr Int64)
+    jkScratch :: !(ForeignPtr Int64),
+    -- | a list search ('scanShape'): the list argument's position; -1 for
+    -- a deterministic kernel
+    jkScan :: !Int
   }
 
 assembleHost :: JitUnit -> [Word8]
@@ -96,7 +101,10 @@ assembleHost unit = case arch of
   _ -> []
 
 installUnit :: PredKey -> Int -> Int -> JitUnit -> IO (Maybe JitKernel)
-installUnit key arity cellsPerIter unit
+installUnit key arity cellsPerIter = installUnitAs key arity cellsPerIter (-1)
+
+installUnitAs :: PredKey -> Int -> Int -> Int -> JitUnit -> IO (Maybe JitKernel)
+installUnitAs key arity cellsPerIter scanPos unit
   | not jitEnabled = pure Nothing
   | otherwise = do
       let bytes = assembleHost unit
@@ -116,7 +124,7 @@ installUnit key arity cellsPerIter unit
               let addr = fromIntegral (ptrToIntPtr ptr)
                   fnPtr = castPtrToFunPtr ptr
               jitDebug (show key ++ ": compiled (" ++ show (length bytes) ++ " bytes, " ++ arch ++ ")")
-              pure (Just (JitKernel key arity fnPtr addr cellsPerIter scratch))
+              pure (Just (JitKernel key arity fnPtr addr cellsPerIter scratch scanPos))
 
 -- | Attempt to compile a predicate into a native 'JitKernel' at program load
 -- time. Checks 2-level nested callers (@safe/1@, @nrev/2@) and then runs the
@@ -125,6 +133,13 @@ installUnit key arity cellsPerIter unit
 compileJitKernel :: Word' -> Word' -> P.Program -> PredKey -> [P.Signature] -> P.Signature -> [S.Clause] -> IO (Maybe JitKernel)
 compileJitKernel nilW consW prog key decls inferred clauses
   | not jitEnabled = pure Nothing
+  | null decls,
+    Just (pos, pattern) <- scanShape key clauses,
+    Just p <- P.lookupPred key prog,
+    not (P.predIsTabled prog p),
+    not (P.nameHasFlag prog (fst key) S.FlagDynamic) = do
+      jitDebug (show key ++ ": list search on argument " ++ show pos)
+      installUnitAs key (snd key) 0 pos (compileScanKernel consW (snd key) pos pattern)
   | not (null decls) && any (\sig -> P.sigDet sig `notElem` [S.Det, S.Semidet]) decls = do
       jitDebug (show key ++ ": declined (non-det declared contract)")
       pure Nothing
@@ -1489,3 +1504,358 @@ recordXcheck kernel arity argsPtr newH newTR depthAfter code =
         path = dir ++ "/" ++ name ++ "_" ++ show ar ++ "." ++ show seqNum ++ ".case"
     withBinaryFile path WriteMode $ \h ->
       withArrayLen header $ \cnt p -> hPutBuf h p (cnt * 8)
+
+-- ─── List-search kernels (nondeterministic) ──────────────────────────────────
+
+-- | A list search: two clauses, a base clause first whose list argument is a
+-- prefix of elements unified with other arguments, then a step clause that
+-- drops the head and recurses on the tail with the other arguments
+-- unchanged:
+--
+-- > mem X [X | _].                    right_of X Y [Y, X | _].
+-- > mem X [_ | T] <- mem X T.         right_of X Y [_ | T] <- right_of X Y T.
+--
+-- The kernel walks the list from the call's list argument, trying the base
+-- clause's head at each position and undoing a failed attempt from the
+-- trail itself. It returns at the first position where the head matches,
+-- leaving that position's cons in the list argument's slot, and the caller
+-- pushes a choice point that resumes with the step clause there; it returns
+-- 'jitFailure' when the list ends, and 'jitBailout' with the current
+-- position in the slot when the rest of the search needs the interpreter (an
+-- unbound tail, nested structures, boxed constants, a full trail). Every
+-- outcome is one the interpreter would reach: the step clause makes calls at
+-- later positions exactly calls on the remaining list.
+--
+-- The result is the list argument's position and the base clause's
+-- elements, each the argument it unifies with or 'Nothing' for @_@.
+scanShape :: PredKey -> [S.Clause] -> Maybe (Int, [Maybe Int])
+scanShape (name, arity) [cBase, cStep]
+  | arity >= 1 && arity <= 8,
+    S.Compound bName bArgs <- S.clauseHead cBase,
+    bName == name && length bArgs == arity && null (S.clauseBody cBase),
+    S.Compound sName sArgs <- S.clauseHead cStep,
+    sName == name && length sArgs == arity,
+    [S.Compound rName rArgs] <- S.clauseBody cStep,
+    rName == name && length rArgs == arity =
+      case [pos | pos <- [0 .. arity - 1], stepAt pos sArgs rArgs] of
+        pos : _ -> do
+          let others = [(i, a) | (i, a) <- zip [0 ..] bArgs, i /= pos]
+          vars <- mapM (\(i, a) -> case a of S.Var v | v >= 0 -> Just (v, i); S.Var _ -> Just (-1, i); _ -> Nothing) others
+          let named = [v | (v, _) <- vars, v >= 0]
+          if length (nub named) /= length named then Nothing else Just ()
+          elems <- prefix (bArgs !! pos)
+          pattern <- mapM (element vars) elems
+          if null pattern then Nothing else Just (pos, pattern)
+        [] -> Nothing
+  where
+    stepAt pos sArgs rArgs
+      | S.Compound "cons" [S.Var h, S.Var t] <- sArgs !! pos,
+        t >= 0 && isAnonOrSingleton h cStep,
+        rArgs !! pos == S.Var t =
+          let others = [(a, b) | (i, a, b) <- zip3 [0 ..] sArgs rArgs, i /= pos]
+              vs = [v | (S.Var v, S.Var v') <- others, v == v', v >= 0, v /= t]
+           in length vs == length others && length (nub vs) == length vs
+      | otherwise = False
+    prefix = \case
+      S.Compound "cons" [e, rest] -> (e :) <$> prefix rest
+      S.Var v | isAnonOrSingleton v cBase -> Just []
+      _ -> Nothing
+    element vars = \case
+      S.Var v
+        | isAnonOrSingleton v cBase -> Just Nothing
+        | Just i <- lookup v vars -> Just (Just i)
+      _ -> Nothing
+scanShape _ _ = Nothing
+
+-- | The native code of a list search ('scanShape'). Arguments stay in their
+-- slots; two slots past them hold the trail mark of the current attempt and
+-- the cons being matched.
+compileScanKernel :: Word' -> Int -> Int -> [Maybe Int] -> JitUnit
+compileScanKernel consW arity pos pattern =
+  JitUnit . concatMap roomFirst $
+    [ JLoadImm RT0 RState stateClpIdx,
+      JBranchImm JNe RT0 0 "decline",
+      JLoadImm RT0 RArgs pos,
+      JDeref RT0 RT0,
+      JTagOf RT1 RT0,
+      JBranchImm JEq RT1 (fromIntegral tagRef) "decline",
+      JLabel "scan",
+      JTagOf RT1 RT0,
+      JBranchImm JEq RT1 (fromIntegral tagRef) "bail_here"
+    ]
+      ++ consCheck RT0 RT1 RT2 "fail"
+      ++ [JStoreImm RTR RArgs spillTR, JStoreImm RT0 RArgs spillCons]
+      ++ concat (zipWith element [0 :: Int ..] pattern)
+      ++ [ JStoreImm RT0 RArgs pos,
+           JReturn jitSuccess,
+           JLabel "elem_fail"
+         ]
+      ++ unwind "uf"
+      ++ [ JValOf RT1 RT0,
+           JAddImm RT1 RT1 2,
+           JLoadIx RT0 RCells RT1,
+           JDeref RT0 RT0,
+           JJump "scan",
+           JLabel "elem_bail"
+         ]
+      ++ unwind "ub"
+      ++ [ JLabel "bail_here",
+           JStoreImm RT0 RArgs pos,
+           JReturn jitBailout,
+           JLabel "fail",
+           JReturn jitFailure,
+           JLabel "decline",
+           JReturn jitDeclined
+         ]
+  where
+    -- 'JBindRef' writes the cell before it checks the trail's capacity, so
+    -- a full trail would bail with an untrailed binding that no unwind
+    -- undoes. Check first; RT7 is free at every bind below.
+    roomFirst op = case op of
+      JBindRef _ _ "elem_bail" ->
+        [JLoadImm RT7 RState stateTrailCapIdx, JBranchCmp JGe RTR RT7 "elem_bail", op]
+      _ -> [op]
+    spillTR = arity
+    spillCons = arity + 1
+    consPlain = fromIntegral consW :: Int64
+    consGround = fromIntegral (consW .|. groundBit) :: Int64
+    gnd = fromIntegral groundBit :: Int64
+    arityMask = 0x7FFFF :: Int64
+    -- @w@ is a cons, else jump to @miss@ (an unbound @w@ is the
+    -- caller's to handle first).
+    consCheck w t1 t2 miss =
+      [ JTagOf t1 w,
+        JBranchImm JNe t1 (fromIntegral tagStr) miss,
+        JValOf t1 w,
+        JLoadIx t2 RCells t1,
+        JBranchImm JEq t2 consPlain (lbl "cons"),
+        JBranchImm JEq t2 consGround (lbl "cons"),
+        JJump miss,
+        JLabel (lbl "cons")
+      ]
+      where
+        lbl x = x ++ "_" ++ show w ++ "_" ++ miss
+    element j mp =
+      [ op
+        | j > 0,
+          op <-
+            [ JLoadImm RT1 RArgs spillCons,
+              JValOf RT1 RT1,
+              JAddImm RT1 RT1 2,
+              JLoadIx RT1 RCells RT1,
+              JDeref RT1 RT1,
+              JTagOf RT2 RT1,
+              JBranchImm JEq RT2 (fromIntegral tagRef) "elem_bail"
+            ]
+              ++ renameLabels ("e" ++ show j) (consCheck RT1 RT2 RT3 "elem_fail")
+              ++ [JStoreImm RT1 RArgs spillCons]
+      ]
+        ++ case mp of
+          Nothing -> []
+          Just p ->
+            [ JLoadImm RT2 RArgs spillCons,
+              JValOf RT2 RT2,
+              JAddImm RT2 RT2 1,
+              JLoadIx RT2 RCells RT2,
+              JLoadImm RT1 RArgs p
+            ]
+              ++ unifyShallow ("u" ++ show j)
+    renameLabels pfx = map $ \case
+      JLabel l | l /= "elem_fail" -> JLabel (pfx ++ l)
+      JBranchImm c r v l | isLocal l -> JBranchImm c r v (pfx ++ l)
+      JJump l | isLocal l -> JJump (pfx ++ l)
+      op -> op
+      where
+        isLocal l = take 5 l == "cons_"
+    unwind p =
+      [ JLoadImm RT1 RArgs spillTR,
+        JLabel (p ++ "_loop"),
+        JBranchCmp JLe RTR RT1 (p ++ "_done"),
+        JSubImm RTR RTR 1,
+        JLoadIx RT2 RTrail RTR,
+        JShr RT2 RT2 1,
+        JMkWord RT3 RT2 0,
+        JStoreIx RT3 RCells RT2,
+        JJump (p ++ "_loop"),
+        JLabel (p ++ "_done")
+      ]
+    -- Unify RT1 with RT2, one level deep: constants, unbound variables and
+    -- structures whose arguments are constants, variables or ground
+    -- structures. Anything deeper bails. Uses RT1-RT7.
+    unifyShallow u =
+      [ JDeref RT1 RT1,
+        JDeref RT2 RT2,
+        JBranchCmp JEq RT1 RT2 done,
+        JTagOf RT3 RT1,
+        JTagOf RT4 RT2,
+        JBranchImm JEq RT3 (fromIntegral tagRef) aref,
+        JBranchImm JEq RT4 (fromIntegral tagRef) bref,
+        JBranchImm JNe RT3 (fromIntegral tagStr) atomic,
+        JBranchImm JNe RT4 (fromIntegral tagStr) "elem_fail",
+        JValOf RT1 RT1,
+        JValOf RT2 RT2,
+        JLoadIx RT3 RCells RT1,
+        JLoadIx RT4 RCells RT2,
+        JMovImm RT5 (fromIntegral (complement groundBit)),
+        JAnd RT3 RT3 RT5,
+        JAnd RT4 RT4 RT5,
+        JBranchCmp JNe RT3 RT4 "elem_fail",
+        JValOf RT3 RT3,
+        JMovImm RT5 arityMask,
+        JAnd RT3 RT3 RT5,
+        JLabel loop,
+        JBranchImm JEq RT3 0 done,
+        JAddImm RT1 RT1 1,
+        JAddImm RT2 RT2 1,
+        JLoadIx RT4 RCells RT1,
+        JLoadIx RT5 RCells RT2,
+        JDeref RT4 RT4,
+        JDeref RT5 RT5,
+        JBranchCmp JEq RT4 RT5 next,
+        JTagOf RT6 RT4,
+        JBranchImm JEq RT6 (fromIntegral tagRef) xref,
+        JTagOf RT7 RT5,
+        JBranchImm JEq RT7 (fromIntegral tagRef) yref,
+        -- Two different non-variables: two structures or two boxed
+        -- constants need the interpreter; anything else is a mismatch.
+        JBranchCmp JNe RT6 RT7 "elem_fail",
+        JBranchImm JEq RT6 (fromIntegral tagStr) "elem_bail",
+        JBranchImm JEq RT6 (fromIntegral tagBox) "elem_bail",
+        JJump "elem_fail",
+        JLabel xref
+      ]
+        ++ bindArg (u ++ "_x") RT4 RT5
+        ++ [JLabel yref]
+        ++ bindArg (u ++ "_y") RT5 RT4
+        ++ [ JLabel next,
+             JSubImm RT3 RT3 1,
+             JJump loop,
+             JLabel atomic,
+             JBranchCmp JNe RT3 RT4 "elem_fail",
+             JBranchImm JEq RT3 (fromIntegral tagBox) "elem_bail",
+             JJump "elem_fail",
+             JLabel aref
+           ]
+        ++ bindTop (u ++ "_a") RT1 RT2
+        ++ [JLabel bref]
+        ++ bindTop (u ++ "_b") RT2 RT1
+        ++ [JLabel done]
+      where
+        done = u ++ "_done"
+        loop = u ++ "_loop"
+        next = u ++ "_next"
+        xref = u ++ "_xref"
+        yref = u ++ "_yref"
+        aref = u ++ "_aref"
+        bref = u ++ "_bref"
+        atomic = u ++ "_atomic"
+        -- An argument variable @v@ against a different word @o@: two
+        -- variables bind the younger to the older, as 'unify' does; a
+        -- structure needs the occurs check unless it is marked ground.
+        bindArg p v o =
+          [ JTagOf RT7 o,
+            JBranchImm JNe RT7 (fromIntegral tagRef) (p ++ "_nonref"),
+            JBranchCmp JGt v o (p ++ "_young"),
+            JValOf RT6 o,
+            JBindRef RT6 v "elem_bail",
+            JJump next,
+            JLabel (p ++ "_young"),
+            JValOf RT6 v,
+            JBindRef RT6 o "elem_bail",
+            JJump next,
+            JLabel (p ++ "_nonref"),
+            JBranchImm JNe RT7 (fromIntegral tagStr) (p ++ "_bind"),
+            JValOf RT6 o,
+            JLoadIx RT6 RCells RT6,
+            JMovImm RT7 gnd,
+            JAnd RT6 RT6 RT7,
+            JBranchImm JEq RT6 0 "elem_bail",
+            JLabel (p ++ "_bind"),
+            JValOf RT6 v,
+            JBindRef RT6 o "elem_bail",
+            JJump next
+          ]
+        -- The top-level variable @a@ against a different word @b@. A
+        -- structure that is not marked ground gets the occurs check over its
+        -- arguments: @a@ among them fails, a nested structure that is not
+        -- marked ground bails.
+        bindTop p a b =
+          [ JTagOf RT3 b,
+            JBranchImm JNe RT3 (fromIntegral tagRef) (p ++ "_nonref"),
+            JBranchCmp JGt a b (p ++ "_young"),
+            JValOf RT3 b,
+            JBindRef RT3 a "elem_bail",
+            JJump done,
+            JLabel (p ++ "_young"),
+            JValOf RT3 a,
+            JBindRef RT3 b "elem_bail",
+            JJump done,
+            JLabel (p ++ "_nonref"),
+            JBranchImm JNe RT3 (fromIntegral tagStr) (p ++ "_bind"),
+            JValOf RT4 b,
+            JLoadIx RT5 RCells RT4,
+            JMovImm RT6 gnd,
+            JAnd RT6 RT5 RT6,
+            JBranchImm JNe RT6 0 (p ++ "_bind"),
+            JValOf RT5 RT5,
+            JMovImm RT6 arityMask,
+            JAnd RT5 RT5 RT6,
+            JLabel (p ++ "_occurs"),
+            JBranchImm JEq RT5 0 (p ++ "_bind"),
+            JAddImm RT4 RT4 1,
+            JLoadIx RT6 RCells RT4,
+            JDeref RT6 RT6,
+            JBranchCmp JEq RT6 a "elem_fail",
+            JTagOf RT7 RT6,
+            JBranchImm JNe RT7 (fromIntegral tagStr) (p ++ "_onext"),
+            JValOf RT7 RT6,
+            JLoadIx RT7 RCells RT7,
+            JMovImm RT6 gnd,
+            JAnd RT7 RT7 RT6,
+            JBranchImm JEq RT7 0 "elem_bail",
+            JLabel (p ++ "_onext"),
+            JSubImm RT5 RT5 1,
+            JJump (p ++ "_occurs"),
+            JLabel (p ++ "_bind"),
+            JValOf RT3 a,
+            JBindRef RT3 b "elem_bail",
+            JJump done
+          ]
+
+-- | Run a list-search kernel on the argument registers. The result is the
+-- kernel's code and the word it left in the list argument's slot: the
+-- matched cons after 'jitSuccess', the position to continue from after
+-- 'jitBailout'. On success the bindings of the matched head stay, trailed
+-- against the entry heap top so that a choice point with the entry marks
+-- undoes them; every other outcome leaves the trail as it was.
+invokeScanKernel :: Store -> JitKernel -> IO (Int64, Word')
+invokeScanKernel s kernel =
+  withForeignPtr (jkScratch kernel) $ \basePtr -> do
+    let statePtr = basePtr
+        argsPtr = basePtr `plusInt64` 10
+        arity = jkArity kernel
+    entryH <- heapTop s
+    entryTR <- trailTop s
+    entryHB <- hb s
+    cPtr <- cellsPtr s
+    tPtr <- trailPtr s
+    tCap <- readReg s rTRAILCAP
+    clp <- readReg s rCLP
+    pokeElemOff statePtr stateCellsIdx (fromIntegral (ptrToIntPtr cPtr))
+    pokeElemOff statePtr stateTrailIdx (fromIntegral (ptrToIntPtr tPtr))
+    pokeElemOff statePtr stateHIdx (fromIntegral entryH)
+    pokeElemOff statePtr stateTRIdx (fromIntegral entryTR)
+    pokeElemOff statePtr stateHBIdx (fromIntegral (max entryHB entryH))
+    pokeElemOff statePtr stateTrailCapIdx (fromIntegral tCap)
+    pokeElemOff statePtr stateClpIdx (fromIntegral clp)
+    forM_ [0 .. arity - 1] $ \i -> do
+      w <- readArg s i
+      pokeElemOff argsPtr i (fromIntegral w)
+    code <- callNativeFn (jkFunPtr kernel) statePtr argsPtr (basePtr `plusInt64` 8)
+    newTR <- fromIntegral <$> peekElemOff statePtr stateTRIdx
+    setTrailTop s newTR
+    w <- fromIntegral <$> peekElemOff argsPtr (jkScan kernel)
+    pure (code, w)
+  where
+    plusInt64 :: Ptr Int64 -> Int -> Ptr Int64
+    plusInt64 p n = intPtrToPtr (ptrToIntPtr p + fromIntegral (n * 8))

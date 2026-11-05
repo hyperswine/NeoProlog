@@ -34,7 +34,8 @@ import qualified Infera.CLP as CLP
 import qualified Infera.CLP.Mutable as Mutable
 import qualified Infera.Core.Constraint as NativeConstraint
 import Infera.Core.Compile
-import Infera.Core.Jit (invokeJitKernel, jitEnabled)
+import Infera.Core.Jit (JitKernel (..), invokeJitKernel, invokeScanKernel, jitEnabled)
+import Infera.Core.Jit.IR (jitBailout, jitFailure, jitSuccess)
 import Infera.Core.Ops
 import qualified Infera.Core.Liveness as Liveness
 import qualified Infera.Core.Delta as Delta
@@ -418,6 +419,9 @@ pushChoiceMarked m h tr next alt = do
   setChoiceTop m (top + 1)
   setHb s h
   pure top
+-- Inlined into 'shallowCandidates', its hot caller (a second caller made
+-- GHC call it out of line, about 1% on deriv).
+{-# INLINE pushChoiceMarked #-}
 
 newChoices :: Int -> IO Choices
 newChoices n =
@@ -1452,7 +1456,7 @@ callPlain m frame predicate cont0 = do
       if depth > maxResolutionDepth
         then raiseItems m [BranchExhausted] (backtrack m)
         else case (pJit predicate, mSlotStats m) of
-          (Just kernel, Nothing) | jitEnabled -> do
+          (Just kernel, Nothing) | jitEnabled -> if jkScan kernel >= 0 then scanPlain frame' kernel depth cont else do
             outcome <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
             case outcome of
               Just (1, _) -> run m cont
@@ -1460,6 +1464,16 @@ callPlain m frame predicate cont0 = do
               Just (3, _) -> raiseItems m [BranchExhausted] (backtrack m)
               _ -> enterPlainInterpreted frame' cont depth
           _ -> enterPlainInterpreted frame' cont depth
+    scanPlain frame' kernel depth cont = do
+      entry <- choiceTop m
+      returnCont <- scanCommit m predicate entry cont
+      outcome <- scanRun m predicate kernel depth returnCont
+      if outcome == scanMatched
+        then run m returnCont
+        else
+          if outcome == scanNoMatch
+            then backtrack m
+            else callClausesInterpreted m frame' predicate entry depth returnCont
     enterPlainInterpreted frame' cont depth = do
       let !s = mStore m
       entry <- choiceTop m
@@ -2063,7 +2077,7 @@ tryReclaimFrame s !base = do
 callClausesWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
 callClausesWithFrame m frame predicate barrier depth returnCont =
   case (pJit predicate, mSlotStats m) of
-    (Just kernel, Nothing) | jitEnabled -> do
+    (Just kernel, Nothing) | jitEnabled -> if jkScan kernel >= 0 then scanClauses kernel else do
       outcome <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
       case outcome of
         Just (1, _) -> run m returnCont
@@ -2071,6 +2085,74 @@ callClausesWithFrame m frame predicate barrier depth returnCont =
         Just (3, _) -> raiseItems m [BranchExhausted] (backtrack m)
         _ -> callClausesInterpreted m frame predicate barrier depth returnCont
     _ -> callClausesInterpreted m frame predicate barrier depth returnCont
+  where
+    scanClauses kernel = do
+      outcome <- scanRun m predicate kernel depth returnCont
+      if outcome == scanMatched
+        then run m returnCont
+        else
+          if outcome == scanNoMatch
+            then backtrack m
+            else callClausesInterpreted m frame predicate barrier depth returnCont
+
+-- | The continuation of a list search called from 'callPlain': the commit
+-- an inferred switch asks for, as for interpreted candidates.
+scanCommit :: Machine -> Pred -> Int -> Cont -> IO Cont
+scanCommit m predicate entry cont = case cont of
+  CReturn h _ Nothing _ | h >= 0 -> pure cont
+  _ -> do
+    commits <- case pSwitch predicate of
+      Nothing -> pure False
+      Just positions -> switchGround (mStore m) positions
+    if not commits
+      then pure cont
+      else do
+        guardBase <- guardTop m
+        pure (CReturn entry guardBase Nothing cont)
+{-# NOINLINE scanCommit #-}
+
+-- | Run a list search's native kernel ('scanShape') on the argument
+-- registers. A match at a cons with more list after it pushes a choice point
+-- that retries the step clause (the predicate's second) on that cons, with
+-- the marks from before the kernel ran, so backtracking undoes the match and
+-- continues the search exactly as the interpreter would. The saved
+-- arguments sit below the choice's heap mark. After a bailout the list
+-- argument's register holds the position the kernel reached, and the caller
+-- runs the clauses from there. (Not part of the interpreter's recursive
+-- group, so adding it changes nothing GHC inlines there.)
+scanRun :: Machine -> Pred -> JitKernel -> Int -> Cont -> IO Int
+scanRun m predicate kernel depth returnCont = do
+  let !s = mStore m
+      !pos = jkScan kernel
+  tr0 <- trailTop s
+  (code, w) <- invokeScanKernel s kernel
+  if code == jitSuccess
+    then do
+      rest <- readCell s (valOf w + 2) >>= deref s
+      let !t = tagOf rest
+      when (t == tagRef || t == tagStr) $ do
+        writeArg s pos w
+        saved <- saveArgs s (pArity predicate)
+        h0 <- heapTop s
+        () <$ pushChoiceMarked m h0 tr0 1 (AltClauses predicate scanOrdinals saved depth returnCont)
+      pure scanMatched
+    else
+      if code == jitFailure
+        then pure scanNoMatch
+        else do
+          when (code == jitBailout) (writeArg s pos w)
+          pure scanInterpret
+{-# NOINLINE scanRun #-}
+
+scanMatched, scanNoMatch, scanInterpret :: Int
+scanMatched = 1
+scanNoMatch = 0
+scanInterpret = 2
+
+-- | A list search's two clauses, as the candidates its choice points retry.
+scanOrdinals :: UArray Int Int
+scanOrdinals = IA.listArray (0, 1) [0, 1]
+{-# NOINLINE scanOrdinals #-}
 
 callClausesInterpreted :: Machine -> Int -> Pred -> Int -> Int -> Cont -> IO Step
 callClausesInterpreted m frame predicate barrier depth returnCont = do
