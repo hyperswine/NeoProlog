@@ -353,23 +353,24 @@ emitOp seqId = \case
       Nothing
     )
   JBindRef addrReg valReg bailoutLbl ->
+    -- The cell is written last: a bailout on a full trail must leave it
+    -- untouched, since the caller's unwind only undoes trailed bindings.
     let a = hwReg addrReg
         v = hwReg valReg
         bCondRel :: I -> Int -> I
         bCondRel c offsetWords = 0x54000000 .|. (fromIntegral (offsetWords .&. 0x7FFFF) `shiftL` 5) .|. c
      in ( Frag
-            [ strIx v (hwReg RCells) a, -- 0: RCells[addr] = val
-              cmpRR a (hwReg RHB), -- 1: cmp addr, RHB
-              bCondRel condGE 7, -- 2: if addr >= RHB, skip trailing (to word 9)
-              ldrImm rScratch0 (hwReg RState) stateTrailCapIdx, -- 3: trailCap
-              cmpRR (hwReg RTR) rScratch0, -- 4: cmp RTR, trailCap
-              bCondPlaceholder condGE, -- 5: if RTR >= trailCap -> bailoutLbl
-              addImm rScratch1 31 0, -- 6: nop/placeholder replaced below by lsl #1
-              strIx rScratch1 (hwReg RTrail) (hwReg RTR), -- 7: RTrail[RTR] = 2 * addr
-              addImm (hwReg RTR) (hwReg RTR) 1 -- 8: RTR += 1
+            [ cmpRR a (hwReg RHB), -- 0: cmp addr, RHB
+              bCondRel condGE 7, -- 1: if addr >= RHB, skip trailing (to word 8)
+              ldrImm rScratch0 (hwReg RState) stateTrailCapIdx, -- 2: trailCap
+              cmpRR (hwReg RTR) rScratch0, -- 3: cmp RTR, trailCap
+              bCondPlaceholder condGE, -- 4: if RTR >= trailCap -> bailoutLbl
+              0xD37FF800 .|. fromIntegral (a `shiftL` 5) .|. fromIntegral rScratch1, -- 5: lsl scratch1, addr, #1
+              strIx rScratch1 (hwReg RTrail) (hwReg RTR), -- 6: RTrail[RTR] = 2 * addr
+              addImm (hwReg RTR) (hwReg RTR) 1, -- 7: RTR += 1
+              strIx v (hwReg RCells) a -- 8: RCells[addr] = val
             ]
-            [(5, bailoutLbl, True)]
-            `replaceWord6` (0xD37FF800 .|. fromIntegral (a `shiftL` 5) .|. fromIntegral rScratch1),
+            [(4, bailoutLbl, True)],
           Nothing
         )
   JJump lbl -> (Frag [bUncondPlaceholder] [(0, lbl, False)], Nothing)
@@ -384,7 +385,6 @@ emitOp seqId = \case
          in (Frag (ld ++ [cmpRR (hwReg a) rScratch0, bCondPlaceholder (a64Cond c)]) [(n + 1, lbl, True)], Nothing)
   JReturn code -> (ws (epilogueWords code), Nothing)
   where
-    replaceWord6 (Frag is fx) w6 = Frag (take 6 is ++ [w6] ++ drop 7 is) fx
     _ = seqId
 
 assembleA64 :: JitUnit -> [Word8]
