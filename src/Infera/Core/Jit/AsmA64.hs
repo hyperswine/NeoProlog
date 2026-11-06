@@ -24,6 +24,9 @@
 --   x14 = RT5       (caller-saved working register)
 --   x6  = RT6       (caller-saved working register)
 --   x7  = RT7       (caller-saved working register)
+--   x28 = RE        (callee-saved; native environment frame)
+--   x8  = RSP       (native stack top; native code calls no C, so a
+--                    caller-saved register is safe)
 --   x15, x16, x17 = internal assembler scratch registers
 module Infera.Core.Jit.AsmA64
   ( assembleA64,
@@ -59,6 +62,8 @@ hwReg = \case
   RT5 -> 14
   RT6 -> 6
   RT7 -> 7
+  RE -> 28
+  RSP -> 8
 
 rDepth, rScratch0, rScratch1, rScratch2 :: Int
 rDepth = 27
@@ -383,6 +388,11 @@ emitOp seqId = \case
         let ld = movImm64 rScratch0 imm
             n = length ld
          in (Frag (ld ++ [cmpRR (hwReg a) rScratch0, bCondPlaceholder (a64Cond c)]) [(n + 1, lbl, True)], Nothing)
+  -- adr xD, label: the byte offset is a word delta, so immlo is zero and
+  -- immhi takes the same 19-bit field position as a conditional branch.
+  JLoadLabel dst lbl -> (Frag [0x10000000 .|. fromIntegral (hwReg dst)] [(0, lbl, True)], Nothing)
+  -- br xN
+  JJumpReg r -> (ws [0xD61F0000 .|. fromIntegral (hwReg r `shiftL` 5)], Nothing)
   JReturn code -> (ws (epilogueWords code), Nothing)
   where
     _ = seqId

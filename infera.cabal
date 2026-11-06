@@ -91,6 +91,8 @@ library
         Infera.Core.Jit
         Infera.Core.Jit.AsmA64
         Infera.Core.Jit.AsmX64
+        Infera.Core.Jit.Clause
+        Infera.Core.Jit.Exclusive
         Infera.Core.Jit.IR
         Infera.Core.Run
         Infera.Core.Constraint

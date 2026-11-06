@@ -1,0 +1,167 @@
+<- notable.
+# The clause compiler (docs/2026-11-06-CLAUSE-COMPILER.md, increment 1):
+# whole predicates in native code, with calls between them, frames on a
+# native stack, structures built and matched, and clause selection that
+# commits only where no later clause could match.
+
+# Non-tail double recursion with arithmetic around the calls.
+fib 0 0.
+fib 1 1.
+fib N F <- N > 1, N1 is N - 1, N2 is N - 2, fib N1 F1, fib N2 F2, F is F1 + F2.
+
+# A non-tail call, then arithmetic on its result.
+len [] 0.
+len [_ | T] N <- len T M, N is M + 1.
+
+# A call to another predicate of the unit, then a last call.
+remove _ [] [].
+remove P [I | Is] Nis <- 0 is I % P, remove P Is Nis.
+remove P [I | Is] [I | Nis] <- X is I % P, X != 0, remove P Is Nis.
+sieve [] [].
+sieve [P | Xs] [P | Ys] <- remove P Xs Zs, sieve Zs Ys.
+upto N N [N].
+upto I N [I | T] <- I < N, I1 is I + 1, upto I1 N T.
+
+# Mutual recursion.
+even 0.
+even N <- N > 0, M is N - 1, odd M.
+odd N <- N > 0, M is N - 1, even M.
+
+# Building and matching nested structures.
+expr E <- E = add (add (pw x 3) (times 4 (pw x 2))) (sub (times 7 x) 9).
+deep E <- E = t (t (t (t (t (t (t (t (t x x) x) x) x) x) x) x) x) x.
+wrap X (f X (g X)).
+unwrap (f A (g B)) A B.
+pair X Y (p X Y).
+swap (p X Y) (p Y X).
+swapall [] [].
+swapall [P | Ps] [Q | Qs] <- swap P Q, swapall Ps Qs.
+
+# A repeated head variable: unification without a walk where possible.
+same X X.
+twice X [X, X].
+
+# Atoms and characters in heads, and a structure selected by functor.
+kind red warm.
+kind blue cool.
+kind 'c' letter.
+area (sq S) A <- A is S * S.
+area (rect W H) A <- A is W * H.
+area (tri B H) A <- A is B * H % 1000.
+areas [] 0.
+areas [S | Ss] T <- area S A, areas Ss T0, T is T0 + A.
+
+# Overlapping clauses: the interpreter commits on the first answer only
+# when the switch argument is ground, and native code must match it.
+cls 0 zero.
+cls N small <- N < 10.
+cls N big <- N >= 10.
+
+# Guards on an argument that an alias can bind.
+sgn X 1 <- X > 0.
+sgn X -1 <- X <= 0.
+
+# Structural != decided natively only on constants.
+diff X Y <- X != Y.
+
+# A long list for len/2, whose non-tail recursion grows the native stack
+# (3000 frames of about 7 words against 4096 initial words). count/2 itself
+# is a tail loop kernel. Open-ended queries are under once: parity
+# enumerates every answer.
+count 0 [].
+count N [N | T] <- N > 0, M is N - 1, count M T.
+
+> fib 0 F?
+> fib 1 F?
+> fib 15 F?
+> fib 23 F?
+> fib 10 55?
+> fib 10 54?
+> fib 0 1?
+> fib N 1?
+> fib -1 F?
+> fib a F?
+> len [] N?
+> len [a, b, c] N?
+> once (len [a, b | T] N)?
+> once (len L 2)?
+> len [a, b] 3?
+> upto 2 30 L, sieve L P?
+> sieve [2, 3, 4, 5, 6, 7, 8, 9, 10] P?
+> sieve [] P?
+> sieve [0, 3] P?
+> sieve [3, 0, 6] P?
+> remove 0 [1, 2] L?
+> remove 3 [3, 4, 9, 1] [4, 1]?
+> remove 3 [3, 4, 9, 1] [4]?
+> even 10?
+> even 7?
+> odd 7?
+> even -2?
+> expr E?
+> deep E?
+> expr (add A B)?
+> expr (add (add (pw x 3) (times 4 (pw x 2))) (sub (times 7 x) 9))?
+> expr (add (add (pw x 3) (times 4 (pw x 2))) (sub (times 7 y) 9))?
+> wrap a W?
+> wrap Y W?
+> wrap X (f a (g a))?
+> wrap X (f a (g b))?
+> wrap X (f X Y)?
+> wrap X X?
+> wrap X (f Y (g Y))?
+> unwrap (f 1 (g 2)) A B?
+> unwrap W A B?
+> unwrap (f 1 2) A B?
+> pair a b P?
+> pair X Y P, X = 1?
+> swap (p 1 2) Q?
+> swap Q (p 1 2)?
+> swapall [p 1 2, p a b, p (f x) [y]] Qs?
+> once (swapall [p 1 2 | T] Qs)?
+> same a a?
+> same a b?
+> same 1 1?
+> same 'a' 'a'?
+> same X a?
+> same a X?
+> same X Y?
+> same X Y, X = 3?
+> same (f a) (f a)?
+> same (f X) (f a)?
+> same X (f X)?
+> same [1, 2] [1, 2]?
+> twice a L?
+> twice X [1, 1]?
+> twice X [1, 2]?
+> twice X [A, B]?
+> twice 2.5 L?
+> kind red K?
+> kind X cool?
+> kind 'c' K?
+> kind green K?
+> area (sq 3) A?
+> area (rect 2 5) A?
+> area (tri 4 5) A?
+> area (circle 2) A?
+> area (sq x) A?
+> area S 9?
+> areas [sq 2, rect 3 4, tri 2 2] T?
+> areas [sq 2, oval] T?
+> cls 0 C?
+> cls 5 C?
+> cls 50 C?
+> findall C (cls 0 C) Cs?
+> findall C (cls 7 C) Cs?
+> diff 1 2?
+> diff 1 1?
+> diff a b?
+> diff X 1?
+> count 3 L?
+> count 3000 L, len L N?
+> fib 18 F?
+# An argument a guard reads is bound by another argument's head through an
+# alias: both clauses answer, so the guards cannot prove a commit.
+> sgn U U?
+> sgn 5 S?
+> sgn -3 S?
