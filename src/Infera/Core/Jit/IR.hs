@@ -17,6 +17,8 @@
 -- * @state[5]@ = @rCAP@ (effective cells capacity / GC limit)
 -- * @state[6]@ = @rTRAILCAP@ (trail capacity)
 -- * @state[7]@ = @rCLP@ (active constraint store flag; non-zero declines)
+-- * @state[8]@ = native stack base (clause units only)
+-- * @state[9]@ = native stack limit (clause units only)
 --
 -- * @args[0 .. arity-1]@ = call argument words
 --
@@ -33,6 +35,8 @@
 -- * @3@ = resolution depth exhausted (@jitExhausted@)
 -- * @4@ = mid-span bailout (@jitBailout@; driver unwinds to entry marks)
 -- * @5@ = error pending (@jitError@)
+-- * @6@ = native stack full (@jitStackFull@; driver unwinds, grows the
+--   native stack and calls again)
 module Infera.Core.Jit.IR
   ( Label,
     Reg (..),
@@ -45,6 +49,7 @@ module Infera.Core.Jit.IR
     jitExhausted,
     jitBailout,
     jitError,
+    jitStackFull,
     stateCellsIdx,
     stateTrailIdx,
     stateHIdx,
@@ -53,6 +58,8 @@ module Infera.Core.Jit.IR
     stateCapIdx,
     stateTrailCapIdx,
     stateClpIdx,
+    stateNStackBaseIdx,
+    stateNStackLimIdx,
     budgetDepthIdx,
     budgetAllocIdx,
   )
@@ -62,13 +69,14 @@ import Data.Int (Int64)
 
 type Label = String
 
-jitFailure, jitSuccess, jitDeclined, jitExhausted, jitBailout, jitError :: Int64
+jitFailure, jitSuccess, jitDeclined, jitExhausted, jitBailout, jitError, jitStackFull :: Int64
 jitFailure = 0
 jitSuccess = 1
 jitDeclined = 2
 jitExhausted = 3
 jitBailout = 4
 jitError = 5
+jitStackFull = 6
 
 stateCellsIdx, stateTrailIdx, stateHIdx, stateTRIdx, stateHBIdx, stateCapIdx, stateTrailCapIdx, stateClpIdx :: Int
 stateCellsIdx = 0
@@ -79,6 +87,10 @@ stateHBIdx = 4
 stateCapIdx = 5
 stateTrailCapIdx = 6
 stateClpIdx = 7
+
+stateNStackBaseIdx, stateNStackLimIdx :: Int
+stateNStackBaseIdx = 8
+stateNStackLimIdx = 9
 
 budgetDepthIdx, budgetAllocIdx :: Int
 budgetDepthIdx = 0
@@ -96,6 +108,8 @@ budgetAllocIdx = 1
 -- * 'RTR'      : cached trail top @rTR@
 -- * 'RHB'      : cached choice boundary @rHB@
 -- * 'RT0'..'RT7': general 64-bit working registers for loop variables and scratch
+-- * 'RE'       : current native environment frame (a byte address)
+-- * 'RSP'      : native stack top (a byte address)
 data Reg
   = RState
   | RArgs
@@ -113,6 +127,8 @@ data Reg
   | RT5
   | RT6
   | RT7
+  | RE
+  | RSP
   deriving (Eq, Ord, Show)
 
 data Cond
@@ -175,6 +191,10 @@ data JitOp
     JBranchCmp Cond Reg Reg Label
   | -- | @JBranchImm cond a imm label@: signed 64-bit comparison of @a@ with @imm@
     JBranchImm Cond Reg Int64 Label
+  | -- | @JLoadLabel dst label@: @dst@ = the code address of @label@
+    JLoadLabel Reg Label
+  | -- | @JJumpReg r@: jump to the code address in @r@
+    JJumpReg Reg
   | -- | @JReturn code@: write back @RH@, @RTR@, and @RDepth@ to @RState@/@RBudgets@ and return @code@
     JReturn Int64
   deriving (Eq, Show)

@@ -21,6 +21,7 @@
 --   rbp-8 .. rbp-40  = saved rbx, r12, r13, r14, r15 (pushed in the prologue)
 --   rbp-48           = RBudgets pointer spill slot
 --   rbp-56 .. rbp-88 = spilled slots for RT3..RT7 when needed
+--   rbp-96, rbp-104  = spilled RE and RSP (clause units)
 --   The spill area must stay below the callee-saved pushes: an earlier layout
 --   put RBudgets at rbp-40, overwriting the saved r15 that GHC relies on.
 --   rax, rdx, r11    = assembler scratch registers
@@ -65,6 +66,8 @@ hwLoc = \case
   RT5 -> Right (-72)
   RT6 -> Right (-80)
   RT7 -> Right (-88)
+  RE -> Right (-96)
+  RSP -> Right (-104)
 
 rexW :: Int -> Int -> Int -> Word8
 rexW r x b =
@@ -109,17 +112,19 @@ loadImmIx :: Int -> Int -> Int -> B
 loadImmIx dst base idx =
   let disp = idx * 8
       needSib = (base .&. 7) == 4
-   in [rexW dst 0 base, 0x8B, modRM 1 dst base]
+      wide = disp > 127
+   in [rexW dst 0 base, 0x8B, modRM (if wide then 2 else 1) dst base]
         ++ [sib 0 4 base | needSib]
-        ++ [fromIntegral (disp .&. 0xFF)]
+        ++ (if wide then imm32 disp else [fromIntegral (disp .&. 0xFF)])
 
 storeImmIx :: Int -> Int -> Int -> B
 storeImmIx src base idx =
   let disp = idx * 8
       needSib = (base .&. 7) == 4
-   in [rexW src 0 base, 0x89, modRM 1 src base]
+      wide = disp > 127
+   in [rexW src 0 base, 0x89, modRM (if wide then 2 else 1) src base]
         ++ [sib 0 4 base | needSib]
-        ++ [fromIntegral (disp .&. 0xFF)]
+        ++ (if wide then imm32 disp else [fromIntegral (disp .&. 0xFF)])
 
 loadRegIx :: Int -> Int -> Int -> B
 loadRegIx dst base idx =
@@ -189,7 +194,7 @@ prologueBytes =
     0x41, 0x55, -- push r13
     0x41, 0x56, -- push r14
     0x41, 0x57, -- push r15
-    0x48, 0x83, 0xEC, 0x30 -- sub rsp, 48 (spill area for RBudgets, RT3..RT7)
+    0x48, 0x83, 0xEC, 0x40 -- sub rsp, 64 (spill area for RBudgets, RT3..RT7, RE, RSP)
   ]
     ++ movRR 3 7 -- rbx (RState)   = rdi
     ++ movRR 12 6 -- r12 (RArgs)    = rsi
@@ -208,7 +213,7 @@ epilogueBytes code =
     ++ loadRbp8 2 (-48) -- rdx = RBudgets*
     ++ storeImmIx 13 2 budgetDepthIdx -- budgets[0] = r13 (RDepth)
     ++ movImm 0 code
-    ++ [ 0x48, 0x83, 0xC4, 0x30, -- add rsp, 48
+    ++ [ 0x48, 0x83, 0xC4, 0x40, -- add rsp, 64
          0x41, 0x5F, -- pop r15
          0x41, 0x5E, -- pop r14
          0x41, 0x5D, -- pop r13
@@ -364,6 +369,16 @@ emitOp = \case
   JBranchImm c a imm lbl ->
     let (ra, loadA) = getReg 0 a
      in (appendFrag (bytes (loadA ++ movImm 11 imm ++ cmpRR ra 11)) (jccRel32 (jccByte c) lbl), Nothing)
+  -- lea r, [rip + rel32]; the rel32 is the frag's last four bytes, so
+  -- the usual fixup (relative to the end of the field) applies.
+  JLoadLabel dst lbl ->
+    let hw = either id (const 0) (hwLoc dst)
+        lea = Frag [rexW hw 0 0, 0x8D, modRM 0 hw 5, 0, 0, 0, 0] [(3, lbl)]
+     in (appendFrag lea (bytes (either (const []) (storeRbp8 0) (hwLoc dst))), Nothing)
+  -- jmp r64
+  JJumpReg r ->
+    let (hw, load) = getReg 0 r
+     in (bytes (load ++ [0x41 | hw >= 8] ++ [0xFF, modRM 3 4 hw]), Nothing)
   JReturn code -> (bytes (epilogueBytes code), Nothing)
 
 assembleX64 :: JitUnit -> [Word8]

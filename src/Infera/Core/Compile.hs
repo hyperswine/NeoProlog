@@ -474,6 +474,8 @@ compilePred ctx p = do
   compiledClauses <- mapM (compileClause ctx (P.predDecls p)) clauses
   jitKernel <-
     compileJitKernel
+      (ctxSymbols ctx)
+      coreBuiltinGoal
       (ctxNil ctx)
       (ctxCons ctx)
       (ctxProgram ctx)
@@ -1501,6 +1503,22 @@ compileGoal ctx term = case term of
       Nothing
         | P.nameHasFlag (ctxProgram ctx) f S.FlagDynamic -> GCallFacts (f, length as) <$> mapM arg as
         | otherwise -> pure (GError (UnknownPredicate (f, length as)))
+
+-- | Whether 'compileGoal' treats a goal of this name and arity as anything
+-- other than a call to a program predicate.
+coreBuiltinGoal :: String -> Int -> Bool
+coreBuiltinGoal f n =
+  (f, n) `elem` special || (f, n) `elem` leafBuiltins || f `elem` constraintBuiltins
+  where
+    special =
+      [ ("true", 0), ("fail", 0), ("false", 0), ("!", 0), ("nl", 0), ("$cut", 1), (",", 2), (";", 2), ("->", 2),
+        ("not", 1), ("once", 1), ("forall", 2), ("findall", 3), ("unify", 2), ("equiv", 2), ("neq", 2), ("is", 2),
+        ("gt", 2), ("lt", 2), ("gte", 2), ("lte", 2), ("var", 1), ("nonvar", 1), ("ground", 1), ("is_int", 1),
+        ("is_float", 1), ("is_num", 1), ("is_str", 1), ("is_atom", 1), ("is_char", 1), ("is_list", 1),
+        ("write", 1), ("print", 1), ("writeln", 1), ("emit", 1), ("minimize", 2), ("assert", 1), ("retract", 1),
+        ("retractall", 1), ("phrase", 2), ("phrase", 3), ("phrase_from_file", 2), ("phrase_from_file", 3)
+      ]
+        ++ [("call", k) | k <- [1 .. 9]]
 
 -- | Builtins whose reference implementation is a pure function of their
 -- arguments (and the preloaded files): run through 'GLeaf'.
