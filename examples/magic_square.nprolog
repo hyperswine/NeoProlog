@@ -1,0 +1,72 @@
+# Magic Squares (3x3 normal magic square over 1..9 with magic sum 15, and
+# symmetric 4x4 magic square over 1..16 with magic sum 34).
+# Exercises both CLP(Z) propagation and native whole-clause backtracking search.
+# Run: infera examples/magic_square.nprolog
+<- notable.
+
+# 1. CLP(Z) model for the 3x3 magic square.
+magic3_clp [A, B, C, D, E, F, G, H, I] <-
+  Square = [A, B, C, D, E, F, G, H, I],
+  Square in 1..9,
+  all_different Square,
+  A + B + C #= 15,
+  D + E + F #= 15,
+  G + H + I #= 15,
+  A + D + G #= 15,
+  B + E + H #= 15,
+  C + F + I #= 15,
+  A + E + I #= 15,
+  C + E + G #= 15,
+  label Square.
+
+# Canonical symmetry-broken 3x3 magic square (unique up to dihedral D4 symmetry).
+magic3_canonical [A, B, C, D, E, F, G, H, I] <-
+  Square = [A, B, C, D, E, F, G, H, I],
+  magic3_clp Square,
+  A #< C, A #< G, A #< I, C #< G.
+
+# 2. Pure backtracking search for 3x3 magic squares (compiled by Clause.hs).
+num9 1.
+num9 2.
+num9 3.
+num9 4.
+num9 5.
+num9 6.
+num9 7.
+num9 8.
+num9 9.
+
+absent _ [].
+absent X [H | T] <- X != H, absent X T.
+
+magic3_search [A, B, C, D, E, F, G, H, I] <-
+  E = 5,
+  num9 A, A != 5,
+  I is 10 - A, I >= 1, I <= 9, I != A, I != 5,
+  num9 C, absent C [A, E, I],
+  G is 10 - C, G >= 1, G <= 9, absent G [C, A, E, I],
+  B is 15 - A - C, B >= 1, B <= 9, absent B [G, C, A, E, I],
+  H is 10 - B, H >= 1, H <= 9, absent H [B, G, C, A, E, I],
+  D is 15 - A - G, D >= 1, D <= 9, absent D [H, B, G, C, A, E, I],
+  F is 10 - D, F >= 1, F <= 9, absent F [D, H, B, G, C, A, E, I],
+  15 is D + E + F,
+  15 is G + H + I,
+  15 is B + E + H,
+  15 is C + F + I.
+
+magic3_count N <-
+  findall Sq (magic3_search Sq) Sqs,
+  list_len Sqs 0 N.
+
+list_len [] N N.
+list_len [_ | T] Acc N <- Next is Acc + 1, list_len T Next N.
+
+report ->
+  { magic3_canonical Sq, magic3_count Count },
+  "Canonical 3x3 magic square: ", wr Sq, nl,
+  "Total 3x3 magic squares:    ", wr Count, nl.
+
+> emit report?
+> magic3_canonical Result?
+> magic3_count Result?
+> findall Sq (magic3_clp Sq) Result?

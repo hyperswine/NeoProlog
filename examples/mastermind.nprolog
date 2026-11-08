@@ -1,0 +1,91 @@
+# Mastermind Codebreaker: 4-peg codes over 6 colors (1..6).
+# Given a history of guesses and (ExactBulls, ColorCows) feedback clues,
+# finds all consistent secret codes and verifies unique deduction.
+# Run: infera examples/mastermind.nprolog
+<- notable.
+
+color 1.
+color 2.
+color 3.
+color 4.
+color 5.
+color 6.
+
+code [A, B, C, D] <-
+  color A, color B, color C, color D.
+
+# Count exact positional matches (bulls) and return the unmatched residuals.
+bulls [] [] B B [] [].
+bulls [G | Gs] [S | Ss] Acc B Ug Us <-
+  G == S,
+  Acc1 is Acc + 1,
+  bulls Gs Ss Acc1 B Ug Us.
+bulls [G | Gs] [S | Ss] Acc B [G | Ug] [S | Us] <-
+  G != S,
+  bulls Gs Ss Acc B Ug Us.
+
+# Remove one matching color from the secret residual if present.
+del_one X [X | T] T.
+del_one X [H | T] [H | R] <- X != H, del_one X T R.
+
+# Count color matches in the wrong position (cows).
+cows [] _ C C.
+cows [G | Gs] Us Acc C <-
+  del_one G Us RestUs,
+  Acc1 is Acc + 1,
+  cows Gs RestUs Acc1 C.
+cows [G | Gs] Us Acc C <-
+  not (del_one G Us _),
+  cows Gs Us Acc C.
+
+score Guess Secret Bulls Cows <-
+  bulls Guess Secret 0 Bulls Ug Us,
+  cows Ug Us 0 Cows.
+
+consistent _ [].
+consistent Secret [clue Guess B C | Rest] <-
+  score Guess Secret B C,
+  consistent Secret Rest.
+
+solve_clues Clues Secret <-
+  code Secret,
+  consistent Secret Clues.
+
+# A classic 4-clue Mastermind game that uniquely identifies [3, 6, 3, 2].
+sample_clues [
+  clue [1, 1, 2, 2] 1 0,
+  clue [3, 4, 4, 5] 1 0,
+  clue [3, 5, 2, 6] 1 2,
+  clue [3, 3, 6, 1] 1 2
+].
+
+# Count how many codes survive after the first 2 clues (narrowing 1296 -> 30).
+partial_clues [
+  clue [1, 1, 2, 2] 1 0,
+  clue [3, 4, 4, 5] 1 0
+].
+
+count_codes [] N N.
+count_codes [_ | T] Acc N <- Next is Acc + 1, count_codes T Next N.
+
+surviving_count Clues N <-
+  findall S (solve_clues Clues S) Codes,
+  count_codes Codes 0 N.
+
+sample_secret Secret <-
+  sample_clues Clues,
+  solve_clues Clues Secret.
+
+partial_count N <-
+  partial_clues Clues,
+  surviving_count Clues N.
+
+report ->
+  { sample_secret Secret, partial_count Count2 },
+  "Candidates after 2 clues: ", wr Count2, nl,
+  "Deduced secret code:      ", wr Secret, nl.
+
+> emit report?
+> findall S (sample_secret S) Result?
+> partial_count Result?
+> score [3, 5, 2, 6] [3, 6, 3, 2] Bulls Cows?

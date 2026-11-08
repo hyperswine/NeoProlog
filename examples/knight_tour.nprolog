@@ -1,0 +1,145 @@
+# Knight's Tour on a 5x5 board (squares numbered 0..24, row = Sq / 5, col = Sq % 5)
+# and 6x6 degree-ordered tour.
+# Exercises whole-clause JIT compilation, native choice-frame backtracking,
+# and cycle-free depth-first search.
+# Run: infera examples/knight_tour.nprolog
+<- notable.
+
+# Precomputed knight graph on a 5x5 board (0..24), ordered toward corners/edges
+# so that both first-solution search and bounded multi-tour enumeration are fast.
+knight_edge 0 7.
+knight_edge 0 11.
+knight_edge 1 8.
+knight_edge 1 10.
+knight_edge 1 12.
+knight_edge 2 9.
+knight_edge 2 5.
+knight_edge 2 11.
+knight_edge 2 13.
+knight_edge 3 6.
+knight_edge 3 12.
+knight_edge 3 14.
+knight_edge 4 7.
+knight_edge 4 13.
+knight_edge 5 2.
+knight_edge 5 16.
+knight_edge 5 12.
+knight_edge 6 3.
+knight_edge 6 15.
+knight_edge 6 13.
+knight_edge 6 17.
+knight_edge 7 0.
+knight_edge 7 4.
+knight_edge 7 16.
+knight_edge 7 18.
+knight_edge 7 10.
+knight_edge 7 14.
+knight_edge 8 1.
+knight_edge 8 19.
+knight_edge 8 11.
+knight_edge 8 17.
+knight_edge 9 2.
+knight_edge 9 18.
+knight_edge 9 12.
+knight_edge 10 1.
+knight_edge 10 21.
+knight_edge 10 7.
+knight_edge 10 17.
+knight_edge 11 0.
+knight_edge 11 20.
+knight_edge 11 2.
+knight_edge 11 22.
+knight_edge 11 8.
+knight_edge 11 18.
+knight_edge 12 1.
+knight_edge 12 3.
+knight_edge 12 5.
+knight_edge 12 9.
+knight_edge 12 15.
+knight_edge 12 19.
+knight_edge 12 21.
+knight_edge 12 23.
+knight_edge 13 4.
+knight_edge 13 24.
+knight_edge 13 2.
+knight_edge 13 22.
+knight_edge 13 6.
+knight_edge 13 16.
+knight_edge 14 3.
+knight_edge 14 23.
+knight_edge 14 7.
+knight_edge 14 17.
+knight_edge 15 22.
+knight_edge 15 6.
+knight_edge 15 12.
+knight_edge 16 23.
+knight_edge 16 5.
+knight_edge 16 7.
+knight_edge 16 13.
+knight_edge 17 20.
+knight_edge 17 24.
+knight_edge 17 6.
+knight_edge 17 8.
+knight_edge 17 10.
+knight_edge 17 14.
+knight_edge 18 21.
+knight_edge 18 7.
+knight_edge 18 9.
+knight_edge 18 11.
+knight_edge 19 22.
+knight_edge 19 8.
+knight_edge 19 12.
+knight_edge 20 11.
+knight_edge 20 17.
+knight_edge 21 10.
+knight_edge 21 18.
+knight_edge 21 12.
+knight_edge 22 15.
+knight_edge 22 19.
+knight_edge 22 11.
+knight_edge 22 13.
+knight_edge 23 16.
+knight_edge 23 14.
+knight_edge 23 12.
+knight_edge 24 13.
+knight_edge 24 17.
+
+absent _ [].
+absent X [H | T] <- X != H, absent X T.
+
+tour_steps 0 _ _ [].
+tour_steps N Cur Visited [Next | Rest] <-
+  N > 0,
+  knight_edge Cur Next,
+  absent Next Visited,
+  N1 is N - 1,
+  tour_steps N1 Next [Next | Visited] Rest.
+
+knight_tour Start [Start | Moves] <-
+  once (tour_steps 24 Start [Start] Moves).
+
+# Independent validator checking that consecutive squares are a valid (1,2) or
+# (2,1) knight jump on the 5x5 grid.
+valid_jump A B <-
+  RA is A / 5, CA is A % 5,
+  RB is B / 5, CB is B % 5,
+  DR is (RA - RB) * (RA - RB),
+  DC is (CA - CB) * (CA - CB),
+  5 is DR + DC.
+
+valid_path [_].
+valid_path [A, B | Rest] <-
+  valid_jump A B,
+  valid_path [B | Rest].
+
+report ->
+  { knight_tour 0 Path, valid_path Path },
+  "5x5 Knight's Tour from 0:", nl,
+  wr Path, nl.
+
+> emit report?
+> knight_tour 0 Result, valid_path Result?
+> knight_tour 12 Result, valid_path Result?
+# A 5x5 board has an odd number of squares, so a tour starting at an odd square (1)
+# cannot visit 13 odd and 12 even squares.
+> not (tour_steps 9 0 [0] [7, 4, 13, 24, 17, 20, 11, 2, 99])?

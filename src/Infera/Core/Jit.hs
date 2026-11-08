@@ -230,10 +230,11 @@ installClauseUnit key up = do
         then jitDebug (show key ++ ": infera_jit_alloc failed") >> pure Nothing
         else do
           let slots = upArgSlots up
-          scratch <- mallocForeignPtrArray (cuArgsAt + slots + 2)
+          scratch <- mallocForeignPtrArray (cuArgsAt + slots + 3)
           withForeignPtr scratch $ \sp -> do
             pokeElemOff sp (cuArgsAt + slots) (-1)
             pokeElemOff sp (cuArgsAt + slots + 1) (-1)
+            pokeElemOff sp (cuArgsAt + slots + 2) 0
           stack <- mallocForeignPtrArray cuInitialStack
           stackRef <- newIORef (stack, cuInitialStack)
           jitDebug (show key ++ ": clause unit of " ++ show (upPreds up) ++ " (" ++ show (length bytes) ++ " bytes, " ++ arch ++ ")")
@@ -1509,7 +1510,8 @@ invokeClauseUnit allowChoices s currentDepth maxDepth kernel stackRef =
         bailIdx = cuStateWords + 2 + argSlotsOf kernel
     bailCap <- peekElemOff basePtr bailIdx
     bailH <- peekElemOff basePtr (bailIdx + 1)
-    let backoff = (bailH == 0 && bailCap > 0) || (bailCap == fromIntegral effectiveCap && fromIntegral entryH >= bailH)
+    needsChoices <- if allowChoices then pure 0 else peekElemOff basePtr (bailIdx + 2)
+    let backoff = needsChoices /= 0 || (bailH == 0 && bailCap > 0) || (bailCap == fromIntegral effectiveCap && fromIntegral entryH >= bailH)
     if backoff || depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + 8 > effectiveCap || entryTR + 8 > tCap
       then pure Nothing
       else do
@@ -1561,6 +1563,10 @@ invokeClauseUnit allowChoices s currentDepth maxDepth kernel stackRef =
                       pokeElemOff basePtr bailIdx (fromIntegral effectiveCap)
                       pokeElemOff basePtr (bailIdx + 1) (if effectiveCap - entryH > 65536 then 0 else fromIntegral entryH)
                       jitDebug (show (jkKey kernel) ++ ": heap limit -> interpreter")
+                      pure Nothing
+                  | c == 7 -> do
+                      unwind
+                      pokeElemOff basePtr (bailIdx + 2) 1
                       pure Nothing
                   | otherwise -> do
                       unwind

@@ -86,9 +86,11 @@ planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry 
               JLoadImm RT0 RState stateBIdx,
               JBranchImm JEq RT0 0 "unit_ok",
               JLoadImm RT1 RState stateAllowChoicesIdx,
-              JBranchImm JEq RT1 0 "rerun",
+              JBranchImm JEq RT1 0 "need_choices",
               JLabel "unit_ok",
               JReturn jitSuccess,
+              JLabel "need_choices",
+              JReturn 7,
               JLabel "fail",
               JLoadImm RT0 RState stateBIdx,
               JBranchImm JEq RT0 0 "fail_exit",
@@ -108,6 +110,8 @@ planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry 
               JLabel "stackfull",
               JReturn jitStackFull
             ]
+              ++ unifySlowOps
+              ++ gndClearOps
       pure (UnitPlan (JitUnit (preflight ++ concat bodies ++ exits)) maxArity (map fst preds))
 
 -- | Whether a predicate may root a unit: everything it reaches is in the
@@ -361,6 +365,7 @@ selection p clauses = do
     key = P.predKey p
     arity = snd key
     inferred = P.predInferred p
+    isDet = P.sigDet inferred == S.Det
     isDetOrSemidet = P.sigDet inferred `elem` [S.Det, S.Semidet]
     modes = map S.argMode (P.sigArgs inferred)
     isInput i = length modes /= arity || modes !! i /= S.ModeOut
@@ -371,7 +376,7 @@ selection p clauses = do
        in S.Clause hd (guardPrefix cl) (S.clauseNVars cl)
     masked = map mask clauses
     switch = P.sigSwitch inferred
-    commitsOnSuccess = P.sigDet inferred == S.Semidet && not (null switch)
+    commitsOnSuccess = P.sigDet inferred == S.Semidet && not (null switch) && all isInput switch
     extraIntArgs c1 c2 = case (evaluatedPaths c1, evaluatedPaths c2) of
       (Just ei, Just ej) ->
         let missing = Set.toList (ej `Set.difference` (ei `Set.union` intLitPaths c1))
@@ -383,8 +388,8 @@ selection p clauses = do
       let hvs = concatMap termVarIds (headArgs cl)
        in length hvs == length (nub hvs) && readOnlyPaths cl `Set.isSubsetOf` roSet
     pair (i, j)
-      | (if isDetOrSemidet then headsExclusive arity ci cj else headsExclusive 1 ci cj) =
-          Right ([], [], [(i, disjointPaths (if isDetOrSemidet then arity else 1) ci cj)])
+      | (if isDet then headsExclusive arity ci cj else headsExclusive 1 ci cj) =
+          Right ([], [], [(i, disjointPaths (if isDet then arity else 1) ci cj)])
       | laterRaisesNothingNew arity ci cj, Just ints <- extraIntArgs ci cj, clausesExclusive arity ci cj =
           let roSet = guardRoPaths ci
               gnd = if headCannotBind (clauses !! i) roSet then [] else guarded
@@ -814,8 +819,16 @@ matchTermWith env ro path t w failL mDirectNext = case t of
       else do
         occurs <- filter (`Set.member` gsSeen before) . nub <$> pure (termVarIds t)
         b <- buildTerm env t
-        occursChecks occurs w failL
-        emit [JValOf w w, JBindRef w b "rerun", JJump doneL]
+        let isComp = \case S.Compound _ _ -> True; _ -> False
+        if null occurs
+          then emit [JValOf w w, JBindRef w b "rerun", JJump doneL]
+          else if not (any isComp as)
+            then do
+              unifyWords w b failL
+              emit [JJump doneL]
+            else do
+              occursChecks occurs w failL
+              emit [JValOf w w, JBindRef w b "rerun", JJump doneL]
         freeReg b
     afterWrite <- get
     put afterWrite {gsSeen = gsSeen before, gsFree = gsFree before}
@@ -864,212 +877,214 @@ matchTermWith env ro path t w failL mDirectNext = case t of
   where
     readOnly = maybe False (Set.member path) ro
 
--- | Unify two words (both clobbered): equal words, an unbound cell with a
--- constant or structure (with a 1-level occurs check when the structure is
--- not marked ground), two different constants (which fail), and two
--- structures (with 1-level child unification). Deeper nested structures or
--- boxed values rerun on the interpreter.
+-- | Unify two words (both clobbered): equal words finish inline in 3 ops;
+-- unequal words spill RT0..RT5 to RSP[0..5], store fail/done return labels in
+-- RSP[6..7], and jump to the per-unit @unify_slow@ subroutine.
 unifyWords :: Reg -> Reg -> Label -> G ()
 unifyWords a b failL = do
   done <- lbl' "u_done"
-  aRef <- lbl' "u_aref"
-  bRef <- lbl' "u_bref"
-  bothRef <- lbl' "u_both"
-  bindB <- lbl' "u_bindb"
-  aRefBStr <- lbl' "u_aref_bstr"
-  bRefAStr <- lbl' "u_bref_astr"
-  bindRefStr <- lbl' "u_bind_ref_str"
-  bindRefStrOk <- lbl' "u_bind_ref_str_ok"
-  occLoop <- lbl' "u_occ_loop"
-  occChild <- lbl' "u_occ_child"
-  occChildLoop <- lbl' "u_occ_cloop"
-  occNext <- lbl' "u_occ_next"
-  aStr <- lbl' "u_astr"
-  strLoop <- lbl' "u_str_loop"
-  strNext <- lbl' "u_str_next"
-  strARef <- lbl' "u_str_aref"
-  strANonRef <- lbl' "u_str_anonref"
-  strABind <- lbl' "u_str_abind"
-  strBindB <- lbl' "u_str_bindb"
-  strBRef <- lbl' "u_str_bref"
-  strBBind <- lbl' "u_str_bbind"
-  spillDone <- lbl' "u_spill_done"
-  spillFail <- lbl' "u_spill_fail"
-  spillRerun <- lbl' "u_spill_rerun"
-  let (r0, r1, r2, r3) = case filter (\r -> r /= a && r /= b) workRegs of
-        x0 : x1 : x2 : x3 : _ -> (x0, x1, x2, x3)
-        _ -> (RT0, RT1, RT2, RT3)
-      spill = [JStoreImm r0 RSP 0, JStoreImm r1 RSP 1, JStoreImm r2 RSP 2, JStoreImm r3 RSP 3]
-      unspill = [JLoadImm r0 RSP 0, JLoadImm r1 RSP 1, JLoadImm r2 RSP 2, JLoadImm r3 RSP 3]
-  emit $
+  emit
     [ JDeref a a,
       JDeref b b,
       JBranchCmp JEq a b done,
-      JTagOf RT7 a,
-      JBranchImm JEq RT7 (fromIntegral tagRef) aRef,
-      JTagOf RT7 b,
-      JBranchImm JEq RT7 (fromIntegral tagRef) bRef,
-      JTagOf RT7 a,
-      JBranchImm JEq RT7 (fromIntegral tagStr) aStr,
-      JBranchImm JEq RT7 (fromIntegral tagBox) "rerun",
-      JJump failL,
-      JLabel aRef,
-      JTagOf RT7 b,
-      JBranchImm JEq RT7 (fromIntegral tagRef) bothRef,
-      JBranchImm JEq RT7 (fromIntegral tagStr) aRefBStr,
-      JValOf a a,
-      JBindRef a b "rerun",
-      JJump done,
-      JLabel bRef,
-      JTagOf RT7 a,
-      JBranchImm JEq RT7 (fromIntegral tagStr) bRefAStr,
-      JValOf b b,
-      JBindRef b a "rerun",
-      JJump done,
-      JLabel bothRef,
-      JBranchCmp JLt a b bindB,
-      JValOf a a,
-      JBindRef a b "rerun",
-      JJump done,
-      JLabel bindB,
-      JValOf b b,
-      JBindRef b a "rerun",
-      JJump done,
-      JLabel bRefAStr,
+      JStoreImm RT0 RSP 0,
+      JStoreImm RT1 RSP 1,
+      JStoreImm RT2 RSP 2,
+      JStoreImm RT3 RSP 3,
+      JStoreImm RT4 RSP 4,
+      JStoreImm RT5 RSP 5,
+      JLoadLabel RT7 failL,
+      JStoreImm RT7 RSP 6,
+      JLoadLabel RT7 done,
+      JStoreImm RT7 RSP 7,
       JMov RT7 a,
-      JMov a b,
-      JMov b RT7,
-      JLabel aRefBStr,
-      JLabel bindRefStr
+      JMov RT1 b,
+      JMov RT0 RT7,
+      JJump "unify_slow",
+      JLabel done
     ]
-      ++ spill
-      ++ [ JValOf r0 b,
-           JLoadIx r1 RCells r0,
-           JMovImm RT7 (fromIntegral groundBit),
-           JAnd RT7 r1 RT7,
-           JBranchImm JNe RT7 0 bindRefStrOk,
-           JValOf r1 r1,
-           JMovImm RT7 0x7FFFF,
-           JAnd r1 r1 RT7,
-           JLabel occLoop,
-           JBranchImm JEq r1 0 bindRefStrOk,
-           JAddImm r0 r0 1,
-           JLoadIx r2 RCells r0,
-           JDeref r2 r2,
-           JBranchCmp JEq r2 a spillFail,
-           JTagOf RT7 r2,
-           JBranchImm JNe RT7 (fromIntegral tagStr) occNext,
-           JValOf r3 r2,
-           JLoadIx r2 RCells r3,
-           JMovImm RT7 (fromIntegral groundBit),
-           JAnd RT7 r2 RT7,
-           JBranchImm JNe RT7 0 occNext,
-           JBranchImm JNe r1 1 occChild,
-           JMov r0 r3,
-           JValOf r1 r2,
-           JMovImm RT7 0x7FFFF,
-           JAnd r1 r1 RT7,
-           JJump occLoop,
-           JLabel occChild,
-           JValOf r2 r2,
-           JMovImm RT7 0x7FFFF,
-           JAnd r2 r2 RT7,
-           JLabel occChildLoop,
-           JBranchImm JEq r2 0 occNext,
-           JAddImm r3 r3 1,
-           JLoadIx RT7 RCells r3,
-           JDeref RT7 RT7,
-           JBranchCmp JEq RT7 a spillFail,
-           JTagOf RT7 RT7,
-           JBranchImm JEq RT7 (fromIntegral tagStr) spillRerun,
-           JSubImm r2 r2 1,
-           JJump occChildLoop,
-           JLabel occNext,
-           JSubImm r1 r1 1,
-           JJump occLoop,
-           JLabel bindRefStrOk,
-           JValOf a a,
-           JBindRef a b spillRerun,
-           JJump spillDone,
-           JLabel aStr,
-           JTagOf RT7 b,
-           JBranchImm JNe RT7 (fromIntegral tagStr) failL
-         ]
-      ++ spill
-      ++ [ JValOf a a,
-           JValOf b b,
-           JLoadIx r0 RCells a,
-           JLoadIx r1 RCells b,
-           JMovImm RT7 (complement (fromIntegral groundBit)),
-           JAnd r0 r0 RT7,
-           JAnd r1 r1 RT7,
-           JBranchCmp JNe r0 r1 spillFail,
-           JValOf r0 r0,
-           JMovImm RT7 0x7FFFF,
-           JAnd r0 r0 RT7,
-           JLabel strLoop,
-           JBranchImm JEq r0 0 spillDone,
-           JAddImm a a 1,
-           JAddImm b b 1,
-           JLoadIx r1 RCells a,
-           JDeref r1 r1,
-           JLoadIx r2 RCells b,
-           JDeref r2 r2,
-           JBranchCmp JEq r1 r2 strNext,
-           JTagOf r3 r1,
-           JTagOf RT7 r2,
-           JBranchImm JEq r3 (fromIntegral tagRef) strARef,
-           JBranchImm JEq RT7 (fromIntegral tagRef) strBRef,
-           JBranchCmp JNe r3 RT7 spillFail,
-           JBranchImm JEq r3 (fromIntegral tagStr) spillRerun,
-           JBranchImm JEq r3 (fromIntegral tagBox) spillRerun,
-           JJump spillFail,
-           JLabel strARef,
-           JBranchImm JNe RT7 (fromIntegral tagRef) strANonRef,
-           JBranchCmp JLt r1 r2 strBindB,
-           JValOf r1 r1,
-           JBindRef r1 r2 spillRerun,
-           JJump strNext,
-           JLabel strBindB,
-           JValOf r2 r2,
-           JBindRef r2 r1 spillRerun,
-           JJump strNext,
-           JLabel strANonRef,
-           JBranchImm JNe RT7 (fromIntegral tagStr) strABind,
-           JValOf r3 r2,
-           JLoadIx r3 RCells r3,
-           JMovImm RT7 (fromIntegral groundBit),
-           JAnd r3 r3 RT7,
-           JBranchImm JEq r3 0 spillRerun,
-           JLabel strABind,
-           JValOf r1 r1,
-           JBindRef r1 r2 spillRerun,
-           JJump strNext,
-           JLabel strBRef,
-           JBranchImm JNe r3 (fromIntegral tagStr) strBBind,
-           JValOf r3 r1,
-           JLoadIx r3 RCells r3,
-           JMovImm RT7 (fromIntegral groundBit),
-           JAnd r3 r3 RT7,
-           JBranchImm JEq r3 0 spillRerun,
-           JLabel strBBind,
-           JValOf r2 r2,
-           JBindRef r2 r1 spillRerun,
-           JLabel strNext,
-           JSubImm r0 r0 1,
-           JJump strLoop,
-           JLabel spillFail
-         ]
-      ++ unspill
-      ++ [ JJump failL,
-           JLabel spillRerun
-         ]
-      ++ unspill
-      ++ [ JJump "rerun",
-           JLabel spillDone
-         ]
-      ++ unspill
-      ++ [JLabel done]
+
+-- | Per-unit shared slow path for 'unifyWords': handles unbound cells,
+-- constants, 1-level occurs checks, and 1-level structure unification.
+-- Expects dereferenced operands in @RT0@ and @RT1@ (@RT0 /= RT1@), saved
+-- @RT0..RT5@ in @RSP[0..5]@, failure target in @RSP[6]@, and success target
+-- in @RSP[7]@. Leaves @RT6@ untouched.
+unifySlowOps :: [JitOp]
+unifySlowOps =
+  let a = RT0
+      b = RT1
+      r0 = RT2
+      r1 = RT3
+      r2 = RT4
+      r3 = RT5
+      unspill =
+        [ JLoadImm RT0 RSP 0,
+          JLoadImm RT1 RSP 1,
+          JLoadImm RT2 RSP 2,
+          JLoadImm RT3 RSP 3,
+          JLoadImm RT4 RSP 4,
+          JLoadImm RT5 RSP 5
+        ]
+   in [ JLabel "unify_slow",
+        JTagOf RT7 a,
+        JBranchImm JEq RT7 (fromIntegral tagRef) "us_aref",
+        JTagOf RT7 b,
+        JBranchImm JEq RT7 (fromIntegral tagRef) "us_bref",
+        JTagOf RT7 a,
+        JBranchImm JEq RT7 (fromIntegral tagStr) "us_astr",
+        JBranchImm JEq RT7 (fromIntegral tagBox) "rerun",
+        JJump "us_fail",
+        JLabel "us_aref",
+        JTagOf RT7 b,
+        JBranchImm JEq RT7 (fromIntegral tagRef) "us_both",
+        JBranchImm JEq RT7 (fromIntegral tagStr) "us_aref_bstr",
+        JValOf a a,
+        JBindRef a b "rerun",
+        JJump "us_done",
+        JLabel "us_bref",
+        JTagOf RT7 a,
+        JBranchImm JEq RT7 (fromIntegral tagStr) "us_bref_astr",
+        JValOf b b,
+        JBindRef b a "rerun",
+        JJump "us_done",
+        JLabel "us_both",
+        JBranchCmp JLt a b "us_bindb",
+        JValOf a a,
+        JBindRef a b "rerun",
+        JJump "us_done",
+        JLabel "us_bindb",
+        JValOf b b,
+        JBindRef b a "rerun",
+        JJump "us_done",
+        JLabel "us_bref_astr",
+        JMov RT7 a,
+        JMov a b,
+        JMov b RT7,
+        JLabel "us_aref_bstr",
+        JValOf r0 b,
+        JLoadIx r1 RCells r0,
+        JMovImm RT7 (fromIntegral groundBit),
+        JAnd RT7 r1 RT7,
+        JBranchImm JNe RT7 0 "us_bind_ref_str_ok",
+        JValOf r1 r1,
+        JMovImm RT7 0x7FFFF,
+        JAnd r1 r1 RT7,
+        JLabel "us_occ_loop",
+        JBranchImm JEq r1 0 "us_bind_ref_str_ok",
+        JAddImm r0 r0 1,
+        JLoadIx r2 RCells r0,
+        JDeref r2 r2,
+        JBranchCmp JEq r2 a "us_fail",
+        JTagOf RT7 r2,
+        JBranchImm JNe RT7 (fromIntegral tagStr) "us_occ_next",
+        JValOf r3 r2,
+        JLoadIx r2 RCells r3,
+        JMovImm RT7 (fromIntegral groundBit),
+        JAnd RT7 r2 RT7,
+        JBranchImm JNe RT7 0 "us_occ_next",
+        JBranchImm JNe r1 1 "us_occ_child",
+        JMov r0 r3,
+        JValOf r1 r2,
+        JMovImm RT7 0x7FFFF,
+        JAnd r1 r1 RT7,
+        JJump "us_occ_loop",
+        JLabel "us_occ_child",
+        JValOf r2 r2,
+        JMovImm RT7 0x7FFFF,
+        JAnd r2 r2 RT7,
+        JLabel "us_occ_cloop",
+        JBranchImm JEq r2 0 "us_occ_next",
+        JAddImm r3 r3 1,
+        JLoadIx RT7 RCells r3,
+        JDeref RT7 RT7,
+        JBranchCmp JEq RT7 a "us_fail",
+        JTagOf RT7 RT7,
+        JBranchImm JEq RT7 (fromIntegral tagStr) "rerun",
+        JSubImm r2 r2 1,
+        JJump "us_occ_cloop",
+        JLabel "us_occ_next",
+        JSubImm r1 r1 1,
+        JJump "us_occ_loop",
+        JLabel "us_bind_ref_str_ok",
+        JValOf a a,
+        JBindRef a b "rerun",
+        JJump "us_done",
+        JLabel "us_astr",
+        JTagOf RT7 b,
+        JBranchImm JNe RT7 (fromIntegral tagStr) "us_fail",
+        JValOf a a,
+        JValOf b b,
+        JLoadIx r0 RCells a,
+        JLoadIx r1 RCells b,
+        JMovImm RT7 (complement (fromIntegral groundBit)),
+        JAnd r0 r0 RT7,
+        JAnd r1 r1 RT7,
+        JBranchCmp JNe r0 r1 "us_fail",
+        JValOf r0 r0,
+        JMovImm RT7 0x7FFFF,
+        JAnd r0 r0 RT7,
+        JLabel "us_str_loop",
+        JBranchImm JEq r0 0 "us_done",
+        JAddImm a a 1,
+        JAddImm b b 1,
+        JLoadIx r1 RCells a,
+        JDeref r1 r1,
+        JLoadIx r2 RCells b,
+        JDeref r2 r2,
+        JBranchCmp JEq r1 r2 "us_str_next",
+        JTagOf r3 r1,
+        JTagOf RT7 r2,
+        JBranchImm JEq r3 (fromIntegral tagRef) "us_str_aref",
+        JBranchImm JEq RT7 (fromIntegral tagRef) "us_str_bref",
+        JBranchCmp JNe r3 RT7 "us_fail",
+        JBranchImm JEq r3 (fromIntegral tagStr) "rerun",
+        JBranchImm JEq r3 (fromIntegral tagBox) "rerun",
+        JJump "us_fail",
+        JLabel "us_str_aref",
+        JBranchImm JNe RT7 (fromIntegral tagRef) "us_str_anonref",
+        JBranchCmp JLt r1 r2 "us_str_bindb",
+        JValOf r1 r1,
+        JBindRef r1 r2 "rerun",
+        JJump "us_str_next",
+        JLabel "us_str_bindb",
+        JValOf r2 r2,
+        JBindRef r2 r1 "rerun",
+        JJump "us_str_next",
+        JLabel "us_str_anonref",
+        JBranchImm JNe RT7 (fromIntegral tagStr) "us_str_abind",
+        JValOf r3 r2,
+        JLoadIx r3 RCells r3,
+        JMovImm RT7 (fromIntegral groundBit),
+        JAnd r3 r3 RT7,
+        JBranchImm JEq r3 0 "rerun",
+        JLabel "us_str_abind",
+        JValOf r1 r1,
+        JBindRef r1 r2 "rerun",
+        JJump "us_str_next",
+        JLabel "us_str_bref",
+        JBranchImm JNe r3 (fromIntegral tagStr) "us_str_bbind",
+        JValOf r3 r1,
+        JLoadIx r3 RCells r3,
+        JMovImm RT7 (fromIntegral groundBit),
+        JAnd r3 r3 RT7,
+        JBranchImm JEq r3 0 "rerun",
+        JLabel "us_str_bbind",
+        JValOf r2 r2,
+        JBindRef r2 r1 "rerun",
+        JLabel "us_str_next",
+        JSubImm r0 r0 1,
+        JJump "us_str_loop",
+        JLabel "us_fail"
+      ]
+        ++ unspill
+        ++ [ JLoadImm RT7 RSP 6,
+             JJumpReg RT7,
+             JLabel "us_done"
+           ]
+        ++ unspill
+        ++ [ JLoadImm RT7 RSP 7,
+             JJumpReg RT7
+           ]
 
 -- | Before binding the unbound cell in @w@ to a new structure holding the
 -- values of earlier variables: a variable that is the cell itself fails
@@ -1214,29 +1229,45 @@ buildTerm env t = do
       S.Compound _ bs -> all constant bs
       _ -> True
     groundOrClear w off fw = do
-      g <- allocReg
-      u <- allocReg
-      okL <- lbl' "gnd"
-      nonL <- lbl' "non"
+      retL <- lbl' "gnd"
       emit
-        [ JMov g w,
-          JDeref g g,
-          JTagOf u g,
-          JBranchImm JEq u (fromIntegral tagRef) nonL,
-          JBranchImm JNe u (fromIntegral tagStr) okL,
-          JValOf g g,
-          JLoadIx g RCells g,
-          JMovImm u (fromIntegral groundBit),
-          JAnd g g u,
-          JBranchImm JNe g 0 okL,
-          JLabel nonL,
-          JSubImm u RH off,
-          JMovImm g fw,
-          JStoreIx g RCells u,
-          JLabel okL
+        [ JStoreImm w RSP 0,
+          JSubImm RT7 RH off,
+          JStoreImm RT7 RSP 1,
+          JMovImm RT7 fw,
+          JStoreImm RT7 RSP 2,
+          JLoadLabel RT7 retL,
+          JJump "gnd_clear",
+          JLabel retL
         ]
-      freeReg u
-      freeReg g
+
+-- | Per-unit shared helper for 'groundOrClear': tests whether the word in
+-- @RSP[0]@ is ground, and if not, clears the structure header at @RSP[1]@
+-- using the un-grounded functor word in @RSP[2]@. Returns to @RT7@.
+gndClearOps :: [JitOp]
+gndClearOps =
+  [ JLabel "gnd_clear",
+    JStoreImm RT0 RSP 3,
+    JStoreImm RT1 RSP 4,
+    JLoadImm RT0 RSP 0,
+    JDeref RT0 RT0,
+    JTagOf RT1 RT0,
+    JBranchImm JEq RT1 (fromIntegral tagRef) "gc_clear",
+    JBranchImm JNe RT1 (fromIntegral tagStr) "gc_ret",
+    JValOf RT0 RT0,
+    JLoadIx RT0 RCells RT0,
+    JMovImm RT1 (fromIntegral groundBit),
+    JAnd RT0 RT0 RT1,
+    JBranchImm JNe RT0 0 "gc_ret",
+    JLabel "gc_clear",
+    JLoadImm RT0 RSP 1,
+    JLoadImm RT1 RSP 2,
+    JStoreIx RT1 RCells RT0,
+    JLabel "gc_ret",
+    JLoadImm RT0 RSP 3,
+    JLoadImm RT1 RSP 4,
+    JJumpReg RT7
+  ]
 
 -- | An integer expression into a register, untagged. A value that is not an
 -- immediate integer, or a result outside one, goes to the interpreter.

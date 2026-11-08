@@ -1,0 +1,72 @@
+# Triangle Peg Solitaire on the 4-row, 10-hole triangular board.
+# Jump one peg over an adjacent peg into an empty hole, removing the jumped
+# peg, until only a single peg remains on the board (8 jumps from 9 pegs).
+# Run: infera examples/peg_solitaire.nprolog
+<- notable.
+
+# Directed jump lines (From, Over, To) on the 4-row, 10-hole triangle:
+#         0
+#       1   2
+#     3   4   5
+#   6   7   8   9
+# Split into downward/rightward and upward/leftward jumps (9 clauses each,
+# within the 16-clause native unit threshold).
+jump_a (b 1 1 C 0 E F G H I J) (jump 0 1 3) (b 0 0 C 1 E F G H I J).
+jump_a (b 1 B 1 D E 0 G H I J) (jump 0 2 5) (b 0 B 0 D E 1 G H I J).
+jump_a (b A 1 C 1 E F 0 H I J) (jump 1 3 6) (b A 0 C 0 E F 1 H I J).
+jump_a (b A 1 C D 1 F G H 0 J) (jump 1 4 8) (b A 0 C D 0 F G H 1 J).
+jump_a (b A B 1 D 1 F G 0 I J) (jump 2 4 7) (b A B 0 D 0 F G 1 I J).
+jump_a (b A B 1 D E 1 G H I 0) (jump 2 5 9) (b A B 0 D E 0 G H I 1).
+jump_a (b A B C 1 1 0 G H I J) (jump 3 4 5) (b A B C 0 0 1 G H I J).
+jump_a (b A B C D E F 1 1 0 J) (jump 6 7 8) (b A B C D E F 0 0 1 J).
+jump_a (b A B C D E F G 1 1 0) (jump 7 8 9) (b A B C D E F G 0 0 1).
+
+jump_b (b 0 1 C 1 E F G H I J) (jump 3 1 0) (b 1 0 C 0 E F G H I J).
+jump_b (b 0 B 1 D E 1 G H I J) (jump 5 2 0) (b 1 B 0 D E 0 G H I J).
+jump_b (b A 0 C 1 E F 1 H I J) (jump 6 3 1) (b A 1 C 0 E F 0 H I J).
+jump_b (b A 0 C D 1 F G H 1 J) (jump 8 4 1) (b A 1 C D 0 F G H 0 J).
+jump_b (b A B 0 D 1 F G 1 I J) (jump 7 4 2) (b A B 1 D 0 F G 0 I J).
+jump_b (b A B 0 D E 1 G H I 1) (jump 9 5 2) (b A B 1 D E 0 G H I 0).
+jump_b (b A B C 0 1 1 G H I J) (jump 5 4 3) (b A B C 1 0 0 G H I J).
+jump_b (b A B C D E F 0 1 1 J) (jump 8 7 6) (b A B C D E F 1 0 0 J).
+jump_b (b A B C D E F G 0 1 1) (jump 9 8 7) (b A B C D E F G 1 0 0).
+
+apply_jump Board Move NextBoard <- jump_a Board Move NextBoard.
+apply_jump Board Move NextBoard <- jump_b Board Move NextBoard.
+
+solve_pegs 0 Board [] Board.
+solve_pegs N Board [Move | Moves] Final <-
+  N > 0,
+  apply_jump Board Move NextBoard,
+  N1 is N - 1,
+  solve_pegs N1 NextBoard Moves Final.
+
+# Starting with hole 1 empty (9 pegs), 8 jumps leave 1 peg at hole 2.
+initial_board (b 1 0 1 1 1 1 1 1 1 1).
+goal_board    (b 0 0 1 0 0 0 0 0 0 0).
+
+peg_solution : semidet (list any: =>).
+peg_solution Moves <-
+  initial_board Start,
+  goal_board Goal,
+  once (solve_pegs 8 Start Moves Goal).
+
+peg_solution_count : det (int: =>).
+peg_solution_count Count <-
+  initial_board Start,
+  goal_board Goal,
+  findall Moves (solve_pegs 8 Start Moves Goal) All,
+  count_list All 0 Count.
+
+count_list [] N N.
+count_list [_ | T] Acc N <- Next is Acc + 1, count_list T Next N.
+
+report ->
+  { peg_solution Moves, peg_solution_count Count },
+  "Triangle Peg Solitaire winning sequence (8 jumps):", nl,
+  wr Moves, nl,
+  "Total 8-jump winning sequences to hole 2: ", wr Count, nl.
+
+> emit report?
+> peg_solution Result?
+> peg_solution_count Result?

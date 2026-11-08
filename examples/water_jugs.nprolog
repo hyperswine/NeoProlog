@@ -1,0 +1,85 @@
+# Missionaries and Cannibals & Water Jugs state-space puzzles.
+# Three missionaries and three cannibals must cross a river using a boat that
+# holds one or two people, never leaving missionaries outnumbered on either bank.
+# Run: infera examples/water_jugs.nprolog
+<- notable.
+
+# 1. Missionaries and Cannibals: state [MLeft, CLeft, BoatBank] (0=left, 1=right).
+bank_ok 0 _.
+bank_ok 3 _.
+bank_ok M M <- M > 0, M < 3.
+
+safe_mc MLeft CLeft <-
+  MLeft >= 0, MLeft <= 3,
+  CLeft >= 0, CLeft <= 3,
+  MRight is 3 - MLeft,
+  CRight is 3 - CLeft,
+  bank_ok MLeft CLeft,
+  bank_ok MRight CRight.
+
+boat 2 0.
+boat 0 2.
+boat 1 1.
+boat 1 0.
+boat 0 1.
+
+step_mc [M, C, 0] [DM, DC] [M1, C1, 1] <-
+  boat DM DC,
+  M1 is M - DM,
+  C1 is C - DC,
+  safe_mc M1 C1.
+step_mc [M, C, 1] [DM, DC] [M1, C1, 0] <-
+  boat DM DC,
+  M1 is M + DM,
+  C1 is C + DC,
+  safe_mc M1 C1.
+
+absent _ [].
+absent X [H | T] <- X != H, absent X T.
+
+mc_walk 0 [0, 0, 1] _ [].
+mc_walk N State Seen [Move | Moves] <-
+  N > 0,
+  step_mc State Move Next,
+  absent Next Seen,
+  N1 is N - 1,
+  mc_walk N1 Next [Next | Seen] Moves.
+
+# Minimum crossing is 11 boat trips, with 4 distinct optimal plans.
+mc_plans Plans <-
+  findall Moves (mc_walk 11 [3, 3, 0] [[3, 3, 0]] Moves) Plans.
+
+# 2. Classic Die Hard 5L / 3L Water Jugs puzzle (measure exactly 4L in the 5L jug).
+jug_step [_, B] fill5 [5, B].
+jug_step [A, _] fill3 [A, 3].
+jug_step [_, B] empty5 [0, B].
+jug_step [A, _] empty3 [A, 0].
+jug_step [A, B] pour5to3 [A1, B1] <-
+  A > 0, Room is 3 - B, Room > 0,
+  Pour is min A Room,
+  A1 is A - Pour, B1 is B + Pour.
+jug_step [A, B] pour3to5 [A1, B1] <-
+  B > 0, Room is 5 - A, Room > 0,
+  Pour is min B Room,
+  A1 is A + Pour, B1 is B - Pour.
+
+jug_walk 0 [4, _] _ [].
+jug_walk N State Seen [Act | Acts] <-
+  N > 0,
+  jug_step State Act Next,
+  absent Next Seen,
+  N1 is N - 1,
+  jug_walk N1 Next [Next | Seen] Acts.
+
+shortest_jugs Acts <-
+  once (jug_walk 6 [0, 0] [[0, 0]] Acts).
+
+report ->
+  { mc_plans [FirstMC | _], shortest_jugs JugActs },
+  "Missionaries & Cannibals (11 trips): ", wr FirstMC, nl,
+  "Water Jugs (5L/3L -> 4L in 6 steps): ", wr JugActs, nl.
+
+> emit report?
+> mc_plans Result?
+> shortest_jugs Result?
+> not (mc_walk 10 [3, 3, 0] [[3, 3, 0]] _)?

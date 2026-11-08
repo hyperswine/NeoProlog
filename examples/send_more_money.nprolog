@@ -1,0 +1,102 @@
+# Cryptarithmetic puzzles: SEND + MORE = MONEY and DONALD + GERALD = ROBERT.
+# Demonstrates both finite-domain CLP(Z) propagation and carry-column native
+# backtracking search (compiled by the whole-clause JIT).
+# Run: infera examples/send_more_money.nprolog
+<- notable.
+
+# 1. CLP(Z) finite-domain model for SEND + MORE = MONEY.
+send_more_money_clp [S, E, N, D, M, O, R, Y] <-
+  Vars = [S, E, N, D, M, O, R, Y],
+  Vars in 0..9,
+  S #>= 1,
+  M #>= 1,
+  all_different Vars,
+  1000 * S + 100 * E + 10 * N + D +
+  1000 * M + 100 * O + 10 * R + E #=
+  10000 * M + 1000 * O + 100 * N + 10 * E + Y,
+  label Vars.
+
+# 2. Pure carry-column search (compiled to native code by Clause.hs).
+digit 0.
+digit 1.
+digit 2.
+digit 3.
+digit 4.
+digit 5.
+digit 6.
+digit 7.
+digit 8.
+digit 9.
+
+pos_digit 1.
+pos_digit 2.
+pos_digit 3.
+pos_digit 4.
+pos_digit 5.
+pos_digit 6.
+pos_digit 7.
+pos_digit 8.
+pos_digit 9.
+
+carry 0.
+carry 1.
+
+absent _ [].
+absent X [H | T] <- X != H, absent X T.
+
+# Column-by-column addition from units to ten-thousands cuts the search tree
+# from 10^8 down to a few hundred nodes.
+send_more_money_search [S, E, N, D, M, O, R, Y] <-
+  M = 1,
+  pos_digit S, absent S [M],
+  digit O, absent O [S, M],
+  carry C3,
+  O is (S + M + C3) % 10,
+  M is (S + M + C3) / 10,
+  digit E, absent E [O, S, M],
+  digit N, absent N [E, O, S, M],
+  carry C2,
+  N is (E + O + C2) % 10,
+  C3 is (E + O + C2) / 10,
+  digit R, absent R [N, E, O, S, M],
+  carry C1,
+  E is (N + R + C1) % 10,
+  C2 is (N + R + C1) / 10,
+  digit D, absent D [R, N, E, O, S, M],
+  digit Y, absent Y [D, R, N, E, O, S, M],
+  Y is (D + E) % 10,
+  C1 is (D + E) / 10.
+
+# DONALD + GERALD = ROBERT via carry-column search.
+donald_gerald_robert [D, O, N, A, L, G, E, R, B, T] <-
+  pos_digit D,
+  digit T, absent T [D],
+  T is (D + D) % 10,
+  C1 is (D + D) / 10,
+  digit L, absent L [T, D],
+  digit R, absent R [L, T, D], R >= 1,
+  R is (L + L + C1) % 10,
+  C2 is (L + L + C1) / 10,
+  digit A, absent A [R, L, T, D],
+  digit E, absent E [A, R, L, T, D],
+  E is (A + A + C2) % 10,
+  C3 is (A + A + C2) / 10,
+  digit N, absent N [E, A, R, L, T, D],
+  digit B, absent B [N, E, A, R, L, T, D],
+  B is (N + R + C3) % 10,
+  C4 is (N + R + C3) / 10,
+  digit O, absent O [B, N, E, A, R, L, T, D],
+  O is (O + E + C4) % 10,
+  C5 is (O + E + C4) / 10,
+  pos_digit G, absent G [O, B, N, E, A, R, L, T, D],
+  R is D + G + C5.
+
+report ->
+  { send_more_money_clp Send, donald_gerald_robert Donald },
+  "SEND+MORE=MONEY:      ", wr Send, nl,
+  "DONALD+GERALD=ROBERT: ", wr Donald, nl.
+
+> emit report?
+> send_more_money_clp Result?
+> send_more_money_search Result?
+> donald_gerald_robert Result?

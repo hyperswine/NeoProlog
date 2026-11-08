@@ -21,7 +21,10 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-EXAMPLES = ("sudoku4", "river_crossing", "job_shop", "route_planning", "supply_packing")
+EXAMPLES = (
+    "sudoku4", "river_crossing", "job_shop", "route_planning", "supply_packing",
+    "send_more_money", "magic_square", "knight_tour", "peg_solitaire", "mastermind", "water_jugs",
+)
 
 
 def require(condition, message):
@@ -60,7 +63,7 @@ class Runner:
         value = matches[0]
         require(re.fullmatch(r"[\[\], 0-9a-z_\-]+", value) is not None,
                 "unexpected result syntax: " + value)
-        quoted = re.sub(r"\b[a-z][a-z_]*\b", lambda m: repr(m.group()), value)
+        quoted = re.sub(r"\b[a-z][a-z_0-9]*\b", lambda m: repr(m.group()), value)
         self.queries += 1
         return ast.literal_eval(quoted)
 
@@ -259,6 +262,65 @@ def check_packing(runner):
             "overweight required radio accepted")
 
 
+def check_cryptarithmetic(runner):
+    expected_send = [[9, 5, 6, 7, 1, 0, 8, 2]]
+    same_set(runner.query("send_more_money", "findall R (send_more_money_clp R) Result"),
+             expected_send, "SEND+MORE=MONEY CLP")
+    same_set(runner.query("send_more_money", "findall R (send_more_money_search R) Result"),
+             expected_send, "SEND+MORE=MONEY search")
+    same_set(runner.query("send_more_money", "findall R (donald_gerald_robert R) Result"),
+             [[5, 2, 6, 4, 8, 1, 9, 7, 3, 0]], "DONALD+GERALD=ROBERT")
+
+
+def check_magic_square(runner):
+    base = [[2, 9, 4], [7, 5, 3], [6, 1, 8]]
+    rot = lambda g: [list(r) for r in zip(*g[::-1])]
+    flip = lambda g: [r[::-1] for r in g]
+    symmetries = []
+    cur = base
+    for _ in range(4):
+        symmetries.append([x for r in cur for x in r])
+        symmetries.append([x for r in flip(cur) for x in r])
+        cur = rot(cur)
+    same_set(runner.query("magic_square", "findall Sq (magic3_search Sq) Result"),
+             symmetries, "3x3 magic squares search")
+    same_set(runner.query("magic_square", "findall Sq (magic3_clp Sq) Result"),
+             symmetries, "3x3 magic squares CLP")
+    require(runner.query("magic_square", "magic3_canonical Result") == [2, 9, 4, 7, 5, 3, 6, 1, 8],
+            "canonical 3x3 magic square mismatch")
+
+
+def check_knight_tour(runner):
+    for start in (0, 12):
+        path = runner.query("knight_tour", f"knight_tour {start} Result")
+        require(len(path) == 25 and path[0] == start and sorted(path) == list(range(25)),
+                "invalid knight tour permutation")
+        for a, b in zip(path, path[1:]):
+            ra, ca = divmod(a, 5)
+            rb, cb = divmod(b, 5)
+            require((ra - rb) ** 2 + (ca - cb) ** 2 == 5, "invalid knight step")
+
+
+def check_peg_solitaire(runner):
+    require(runner.query("peg_solitaire", "peg_solution_count Result") == 14,
+            "triangle peg solitaire count mismatch")
+
+
+def check_mastermind(runner):
+    require(runner.query("mastermind", "findall S (sample_secret S) Result")
+            == [[3, 6, 3, 2]], "mastermind unique secret mismatch")
+    require(runner.query("mastermind", "partial_count Result") == 30,
+            "mastermind partial count mismatch")
+
+
+def check_water_jugs(runner):
+    plans = runner.query("water_jugs", "mc_plans Result")
+    require(len(plans) == 4 and all(len(p) == 11 for p in plans), "missionaries & cannibals optimal count mismatch")
+    acts = runner.query("water_jugs", "shortest_jugs Result")
+    require(acts == ["fill5", "pour5to3", "empty3", "pour5to3", "fill5", "pour5to3"],
+            "water jugs shortest sequence mismatch")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -279,7 +341,9 @@ def main():
             for name in EXAMPLES:
                 output = runner.run(ROOT / "examples" / (name + ".nprolog"))
                 require("\nfalse." not in output, "demonstration failed: " + name)
-            for check in (check_sudoku, check_river, check_jobs, check_routes, check_packing):
+            for check in (check_sudoku, check_river, check_jobs, check_routes, check_packing,
+                          check_cryptarithmetic, check_magic_square, check_knight_tour,
+                          check_peg_solitaire, check_mastermind, check_water_jugs):
                 check(runner)
             print(json.dumps({"status": "ok", "jit": jit, "stream": stream,
                               "independent_queries": runner.queries, "demo_programs": len(EXAMPLES),
