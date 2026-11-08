@@ -77,15 +77,11 @@ lightswitch careless.
 lightswitch turnstile.
 
 act P (r enter) (g X N 1 R T) (take mutex) (r count) (g X N 0 R T) <- lightswitch P.
-act P (r count) (g X N M R T) (readers N1) (r Next) (g X N1 M R T) <-
-  lightswitch P, N1 is N + 1,
-  ( N1 == 1 -> Next = first ; Next = admitted ).
+act P (r count) (g X N M R T) (readers N1) (r Next) (g X N1 M R T) <- lightswitch P, N1 is N + 1, ( N1 == 1 -> Next = first ; Next = admitted ).
 act P (r first) (g X N M 1 T) (take room) (r admitted) (g X N M 0 T) <- lightswitch P.
 act P (r admitted) (g X N _ R T) (release mutex) (r reading) (g X N 1 R T) <- lightswitch P.
 act P (r reading) (g X N 1 R T) (take mutex) (r uncount) (g X N 0 R T) <- lightswitch P.
-act P (r uncount) (g X N M R T) (readers N1) (r Next) (g X N1 M R T) <-
-  lightswitch P, N1 is N - 1,
-  ( N1 == 0 -> Next = last ; Next = finished ).
+act P (r uncount) (g X N M R T) (readers N1) (r Next) (g X N1 M R T) <- lightswitch P, N1 is N - 1, ( N1 == 0 -> Next = last ; Next = finished ).
 act P (r last) (g X N M _ T) (release room) (r finished) (g X N M 1 T) <- lightswitch P.
 act P (r finished) (g X N _ R T) (release mutex) (r idle) (g X N 1 R T) <- lightswitch P.
 
@@ -134,9 +130,7 @@ writing (w written _).
 conflict (s Ps _) <- select W Ps Others, writing W, member O Others, inside_db O.
 
 # Both writers are done, but x does not show both updates.
-lost_update (s Ps (g X _ _ _ _)) <-
-  forall (member (w Step _) Ps) (Step == done),
-  X != 2.
+lost_update (s Ps (g X _ _ _ _)) <- forall (member (w Step _) Ps) (Step == done), X != 2.
 
 # Nobody can move.
 stuck_state P S <- not (next P S _ _).
@@ -170,9 +164,7 @@ fair_step P (at S Left) A (at S1 Left1) <- passing P S A S1, unmet S1 Left Left1
 home S (at S1 []) <- S1 == S.
 
 unmet _ [] [].
-unmet S [C | Cs] Left <-
-  ( holds C S -> Left = Rest ; Left = [C | Rest] ),
-  unmet S Cs Rest.
+unmet S [C | Cs] Left <- ( holds C S -> Left = Rest ; Left = [C | Rest] ), unmet S Cs Rest.
 
 holds (reading I) (s Ps _) <- nth I Ps (r reading).
 holds (idle I) (s Ps _) <- nth I Ps (r idle).
@@ -195,30 +187,23 @@ bfs Step Goal [node S Path | Queue] Seen Steps <-
     bfs Step Goal Queue1 Seen1 Steps ).
 
 unseen [] Seen Seen [].
-unseen [node S P | Ns] Seen Seen1 Fresh <-
-  ( member S Seen -> unseen Ns Seen Seen1 Fresh
-  ; Fresh = [node S P | Rest], unseen Ns [S | Seen] Seen1 Rest ).
+unseen [node S P | Ns] Seen Seen1 Fresh <- ( member S Seen -> unseen Ns Seen Seen1 Fresh ; Fresh = [node S P | Rest], unseen Ns [S | Seen] Seen1 Rest ).
 
 counterexample P Goal Steps <- start S, run (next P) S Goal Steps.
 
 same S T <- S == T.
 
 # A run into an overtaken state, then a fair loop back to it.
-lasso P Prefix Loop <-
-  once (overtaken P S Loop),
-  counterexample P (same S) Prefix.
+lasso P Prefix Loop <- once (overtaken P S Loop), counterexample P (same S) Prefix.
 
 # ── Report ───────────────────────────────────────────────────────────────────
 
-report P ->
-  { states P N }, wr P, ": ", wr N, " reachable states", nl,
-  exclusion P, updates P, deadlock P, overtaking P.
+report P -> { states P N }, wr P, ": ", wr N, " reachable states", nl, exclusion P, updates P, deadlock P, overtaking P.
 
 exclusion P ->
   ( { once (reachable P S, conflict S) } ->
-      { counterexample P conflict Steps },
-      "  exclusion fails:", nl, steps Steps
-  ; "  exclusion holds", nl ).
+      { counterexample P conflict Steps }, "  exclusion fails:", nl, steps Steps
+    ; "  exclusion holds", nl ).
 
 updates P ->
   ( { once (reachable P S, lost_update S) } ->
