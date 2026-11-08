@@ -99,7 +99,19 @@ clausesExclusive inCount ci cj =
       | x1 == x2 && y1 == y2 = clash op1 op2
       | x1 == y2 && y1 == x2 = clash op1 (flipCmp op2)
       | otherwise = False
-    clash a b = (a, b) `elem` [("gt", "lt"), ("gt", "lte"), ("lt", "gt"), ("lt", "gte"), ("gte", "lt"), ("lte", "gt")]
+    clash a b =
+      (a, b)
+        `elem` [ ("gt", "lt"),
+                 ("gt", "lte"),
+                 ("lt", "gt"),
+                 ("lt", "gte"),
+                 ("gte", "lt"),
+                 ("lte", "gt"),
+                 ("eq", "lt"),
+                 ("eq", "gt"),
+                 ("lt", "eq"),
+                 ("gt", "eq")
+               ]
 
 flipCmp :: String -> String
 flipCmp = \case
@@ -122,6 +134,8 @@ clauseConstraints headArgs body = (foldl refineRange litRanges guards, relations
     second' f (a, b) = (a, f b)
     occurrences = concat [walk (i, []) a | (i, a) <- zip [0 ..] headArgs]
     varPaths = M.fromListWith (\_ first -> first) [(v, path) | (Left v, path) <- occurrences]
+    varAllPaths = M.fromListWith (flip (++)) [(v, [path]) | (Left v, path) <- occurrences]
+    headEqRels = [(p1, "eq", p2) | (p1 : p2 : _) <- M.elems varAllPaths]
     litRanges = M.fromList [(path, IntRange (Just k) (Just k) []) | (Right k, path) <- occurrences]
     operand = \case
       S.Var v | Just path <- M.lookup v varPaths -> Just (Left path)
@@ -129,7 +143,7 @@ clauseConstraints headArgs body = (foldl refineRange litRanges guards, relations
       _ -> Nothing
     cmps = [(op, a, b) | S.Compound op [l, r] <- body, isCmpOp op, Just a <- [operand l], Just b <- [operand r]]
     guards = [(x, op, k) | (op, Left x, Right k) <- cmps] ++ [(x, flipCmp op, k) | (op, Right k, Left x) <- cmps]
-    relations = [(x, op, y) | (op, Left x, Left y) <- cmps, op /= "neq"]
+    relations = headEqRels ++ [(x, op, y) | (op, Left x, Left y) <- cmps, op /= "neq"]
 
 -- | Integer ranges on arithmetic expressions over head paths, from guards
 -- that evaluate them: @k is E@ (E equals k), @X is E@ followed by a

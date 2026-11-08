@@ -14,6 +14,8 @@ module Infera.Core.Jit
     compileJitKernel,
     compileGeneralTailJit,
     invokeJitKernel,
+    invokeJitKernelWith,
+    resumeClauseUnit,
     invokeScanKernel,
     scanShape,
     runNativeUnit,
@@ -167,12 +169,11 @@ compileJitKernel syms isBuiltin nilW consW prog key decls inferred clauses
   | not (null decls) && any (\sig -> P.sigDet sig `notElem` [S.Det, S.Semidet]) decls = do
       jitDebug (show key ++ ": declined (non-det declared contract)")
       pure Nothing
-  | P.sigDet inferred `notElem` [S.Det, S.Semidet] = do
-      jitDebug (show key ++ ": declined (inferred " ++ show (P.sigDet inferred) ++ ")")
-      pure Nothing
-  | Just (unit, cellsPerIter) <- matchSafeLoop nilW consW prog key clauses =
+  | P.sigDet inferred `elem` [S.Det, S.Semidet],
+    Just (unit, cellsPerIter) <- matchSafeLoop nilW consW prog key clauses =
       installUnit key (snd key) cellsPerIter unit
-  | Just (unit, cellsPerIter) <- matchNrevLoop nilW consW prog key clauses =
+  | P.sigDet inferred `elem` [S.Det, S.Semidet],
+    Just (unit, cellsPerIter) <- matchNrevLoop nilW consW prog key clauses =
       installUnit key (snd key) cellsPerIter unit
   | Just (unit, cellsPerIter) <- compileGeneralTailJit nilW consW key inferred clauses =
       installUnit key (snd key) cellsPerIter unit
@@ -207,12 +208,12 @@ clauseUnitsOn :: Bool
 clauseUnitsOn = unsafePerformIO (maybe True (/= "0") <$> lookupEnv "INFERA_JIT_CLAUSES")
 {-# NOINLINE clauseUnitsOn #-}
 
--- Clause unit scratch: state (10 words), budgets (2), argument slots, then
+-- Clause unit scratch: state (12 words), budgets (2), argument slots, then
 -- the heap limit and entry heap top of the last capacity bailout.
 cuStateWords, cuBudgetsAt, cuArgsAt :: Int
-cuStateWords = 10
-cuBudgetsAt = 10
-cuArgsAt = 12
+cuStateWords = 12
+cuBudgetsAt = 12
+cuArgsAt = 14
 
 cuInitialStack, cuMaxStack :: Int
 cuInitialStack = 4096
@@ -1398,11 +1399,15 @@ scratchBailCapIdx = 22
 scratchBailHIdx = 23
 
 invokeJitKernel :: Store -> Int -> Int -> JitKernel -> IO (Maybe (Int64, Int))
-invokeJitKernel s currentDepth maxDepth kernel
+invokeJitKernel s currentDepth maxDepth kernel =
+  fmap (\(c, d, _) -> (c, d)) <$> invokeJitKernelWith False s currentDepth maxDepth kernel
+
+invokeJitKernelWith :: Bool -> Store -> Int -> Int -> JitKernel -> IO (Maybe (Int64, Int, Bool))
+invokeJitKernelWith allowChoices s currentDepth maxDepth kernel
   | jkScan kernel == -3 = case jkLazy kernel of
       Nothing -> pure Nothing
-      Just unit -> invokeJitKernel s currentDepth maxDepth unit
-  | Just stackRef <- jkStack kernel = invokeClauseUnit s currentDepth maxDepth kernel stackRef
+      Just unit -> invokeJitKernelWith allowChoices s currentDepth maxDepth unit
+  | Just stackRef <- jkStack kernel = invokeClauseUnit allowChoices s currentDepth maxDepth kernel stackRef
   | otherwise = withForeignPtr (jkScratch kernel) $ \basePtr -> do
     let statePtr = basePtr
         budgetsPtr = basePtr `plusInt64` 8
@@ -1419,35 +1424,20 @@ invokeJitKernel s currentDepth maxDepth kernel
     clp <- readReg s rCLP
     let cBase = fromIntegral (ptrToIntPtr cPtr) :: Int64
         tBase = fromIntegral (ptrToIntPtr tPtr) :: Int64
-        effectiveCap = min cap gcLim
+        entryCap = min cap gcLim
+        effectiveCap = min cap (gcLim + 131072)
         depthRem = maxDepth - currentDepth
         allocRem = max 0 (effectiveCap - entryH - 16)
-    -- Depth is continuation depth, as in the interpreter ('contDepth'): a
-    -- last call does not deepen it, so kernels tick only for nested
-    -- (non-last) calls. The deepest nested call any kernel makes before
-    -- its first tick is one level (noatt inside safe), so decline when
-    -- there is no headroom at all and let the interpreter decide.
-    -- Allocation-budget backoff: after a mid-span bailout the kernel would
-    -- bail again on every re-entry under the same heap limit from at least
-    -- as high a heap top, redoing (and unwinding) the whole remaining span
-    -- each time, which made long list builds quadratic. Decline until a
-    -- collection or growth moves the limit, or the heap top drops below the
-    -- bailout's entry.
     bailCap <- peekElemOff basePtr scratchBailCapIdx
     bailH <- peekElemOff basePtr scratchBailHIdx
     let backoff = bailCap == fromIntegral effectiveCap && fromIntegral entryH >= bailH
-    if backoff || depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > effectiveCap || entryTR + 8 > tCap
+    if backoff || depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + jkCellsPerIter kernel + 8 > entryCap || entryTR + 8 > tCap
       then pure Nothing
       else do
         pokeElemOff statePtr stateCellsIdx cBase
         pokeElemOff statePtr stateTrailIdx tBase
         pokeElemOff statePtr stateHIdx (fromIntegral entryH)
         pokeElemOff statePtr stateTRIdx (fromIntegral entryTR)
-        -- Kernels see every cell that existed at entry as older than the
-        -- choice boundary, so each binding of such a cell is trailed and a
-        -- bailout's unwind to entryTR undoes it before the interpreter
-        -- re-runs the call. Cells the kernel allocates sit above entryH and
-        -- are dropped with the heap top.
         pokeElemOff statePtr stateHBIdx (fromIntegral (max entryHB entryH))
         pokeElemOff statePtr stateCapIdx (fromIntegral effectiveCap)
         pokeElemOff statePtr stateTrailCapIdx (fromIntegral tCap)
@@ -1466,19 +1456,19 @@ invokeJitKernel s currentDepth maxDepth kernel
                 setHeapTop s newH
                 setTrailTop s newTR
                 recordXcheck kernel arity argsPtr newH newTR depthAfter code
-                pure (Just (jitSuccess, maxDepth - depthAfter))
+                pure (Just (jitSuccess, maxDepth - depthAfter, False))
             | c == jitFailure -> do
                 newTR <- fromIntegral <$> peekElemOff statePtr stateTRIdx
                 setTrailTop s newTR
                 unwindTrail s entryTR
                 setHeapTop s entryH
-                pure (Just (jitFailure, currentDepth))
+                pure (Just (jitFailure, currentDepth, False))
             | c == jitExhausted -> do
                 newTR <- fromIntegral <$> peekElemOff statePtr stateTRIdx
                 setTrailTop s newTR
                 unwindTrail s entryTR
                 setHeapTop s entryH
-                pure (Just (jitExhausted, maxDepth + 1))
+                pure (Just (jitExhausted, maxDepth + 1, False))
             | c == jitDeclined ->
                 pure Nothing
             | otherwise -> do
@@ -1500,8 +1490,8 @@ invokeJitKernel s currentDepth maxDepth kernel
 -- does not handle (a type, an unbound input it must test, a structure an
 -- occurs check would walk): the call reruns on the interpreter, without the
 -- capacity backoff, which is for a heap limit that would stop it again.
-invokeClauseUnit :: Store -> Int -> Int -> JitKernel -> IORef (ForeignPtr Int64, Int) -> IO (Maybe (Int64, Int))
-invokeClauseUnit s currentDepth maxDepth kernel stackRef =
+invokeClauseUnit :: Bool -> Store -> Int -> Int -> JitKernel -> IORef (ForeignPtr Int64, Int) -> IO (Maybe (Int64, Int, Bool))
+invokeClauseUnit allowChoices s currentDepth maxDepth kernel stackRef =
   withForeignPtr (jkScratch kernel) $ \basePtr -> do
     let statePtr = basePtr
         budgetsPtr = basePtr `plusInt64` cuBudgetsAt
@@ -1519,7 +1509,7 @@ invokeClauseUnit s currentDepth maxDepth kernel stackRef =
         bailIdx = cuStateWords + 2 + argSlotsOf kernel
     bailCap <- peekElemOff basePtr bailIdx
     bailH <- peekElemOff basePtr (bailIdx + 1)
-    let backoff = bailCap == fromIntegral effectiveCap && fromIntegral entryH >= bailH
+    let backoff = (bailH == 0 && bailCap > 0) || (bailCap == fromIntegral effectiveCap && fromIntegral entryH >= bailH)
     if backoff || depthRem < 1 || clp /= 0 || gcLim < initialCollectLimit || entryH + 8 > effectiveCap || entryTR + 8 > tCap
       then pure Nothing
       else do
@@ -1542,6 +1532,8 @@ invokeClauseUnit s currentDepth maxDepth kernel stackRef =
                 pokeElemOff statePtr stateClpIdx (fromIntegral clp)
                 pokeElemOff statePtr stateNStackBaseIdx stackBase
                 pokeElemOff statePtr stateNStackLimIdx (stackBase + fromIntegral (8 * size))
+                pokeElemOff statePtr stateBIdx 0
+                pokeElemOff statePtr stateAllowChoicesIdx (if allowChoices then 1 else 0)
                 pokeElemOff budgetsPtr budgetDepthIdx (fromIntegral depthRem)
                 pokeElemOff budgetsPtr budgetAllocIdx 0
                 callNativeFn (jkFunPtr kernel) statePtr argsPtr budgetsPtr
@@ -1551,11 +1543,12 @@ invokeClauseUnit s currentDepth maxDepth kernel stackRef =
                 c
                   | c == jitSuccess -> do
                       newH <- fromIntegral <$> peekElemOff statePtr stateHIdx
+                      newB <- peekElemOff statePtr stateBIdx
                       setHeapTop s newH
                       setTrailTop s newTR
-                      pure (Just (jitSuccess, currentDepth))
-                  | c == jitFailure -> unwind >> pure (Just (jitFailure, currentDepth))
-                  | c == jitExhausted -> unwind >> pure (Just (jitExhausted, maxDepth + 1))
+                      pure (Just (jitSuccess, currentDepth, newB /= 0))
+                  | c == jitFailure -> unwind >> pure (Just (jitFailure, currentDepth, False))
+                  | c == jitExhausted -> unwind >> pure (Just (jitExhausted, maxDepth + 1, False))
                   | c == jitDeclined -> pure Nothing
                   | c == jitStackFull, size < cuMaxStack -> do
                       unwind
@@ -1566,7 +1559,7 @@ invokeClauseUnit s currentDepth maxDepth kernel stackRef =
                   | c == jitBailout -> do
                       unwind
                       pokeElemOff basePtr bailIdx (fromIntegral effectiveCap)
-                      pokeElemOff basePtr (bailIdx + 1) (fromIntegral entryH)
+                      pokeElemOff basePtr (bailIdx + 1) (if effectiveCap - entryH > 65536 then 0 else fromIntegral entryH)
                       jitDebug (show (jkKey kernel) ++ ": heap limit -> interpreter")
                       pure Nothing
                   | otherwise -> do
@@ -1574,6 +1567,52 @@ invokeClauseUnit s currentDepth maxDepth kernel stackRef =
                       jitDebug (show (jkKey kernel) ++ ": rerun on the interpreter (code " ++ show c ++ ")")
                       pure Nothing
         attempt
+  where
+    plusInt64 :: Ptr Int64 -> Int -> Ptr Int64
+    plusInt64 p n = intPtrToPtr (ptrToIntPtr p + fromIntegral (n * 8))
+
+-- | Resume a clause unit at its topmost native choice frame (@stateBIdx@).
+resumeClauseUnit :: Store -> Int -> Int -> Int -> Int -> JitKernel -> IO (Maybe (Int64, Int, Bool))
+resumeClauseUnit s entryH entryTR currentDepth maxDepth kernel
+  | jkScan kernel == -3 = case jkLazy kernel of
+      Nothing -> pure Nothing
+      Just unit -> resumeClauseUnit s entryH entryTR currentDepth maxDepth unit
+  | Just stackRef <- jkStack kernel =
+      withForeignPtr (jkScratch kernel) $ \basePtr -> do
+        let statePtr = basePtr
+            budgetsPtr = basePtr `plusInt64` cuBudgetsAt
+            argsPtr = basePtr `plusInt64` cuArgsAt
+        curH <- heapTop s
+        curTR <- trailTop s
+        cap <- readReg s rCAP
+        gcLim <- readReg s rGCLIM
+        tCap <- readReg s rTRAILCAP
+        cPtr <- cellsPtr s
+        tPtr <- trailPtr s
+        (stack, _) <- readIORef stackRef
+        code <- withForeignPtr stack $ \_ -> do
+          pokeElemOff statePtr stateCellsIdx (fromIntegral (ptrToIntPtr cPtr))
+          pokeElemOff statePtr stateTrailIdx (fromIntegral (ptrToIntPtr tPtr))
+          pokeElemOff statePtr stateHIdx (fromIntegral curH)
+          pokeElemOff statePtr stateTRIdx (fromIntegral curTR)
+          pokeElemOff statePtr stateCapIdx (fromIntegral (min cap gcLim))
+          pokeElemOff statePtr stateTrailCapIdx (fromIntegral tCap)
+          pokeElemOff statePtr stateAllowChoicesIdx 1
+          callNativeFn (jkFunPtr kernel) statePtr argsPtr budgetsPtr
+        newTR <- fromIntegral <$> peekElemOff statePtr stateTRIdx
+        let unwind = setTrailTop s newTR >> unwindTrail s entryTR >> setHeapTop s entryH
+        case code of
+          c
+            | c == jitSuccess -> do
+                newH <- fromIntegral <$> peekElemOff statePtr stateHIdx
+                newB <- peekElemOff statePtr stateBIdx
+                setHeapTop s newH
+                setTrailTop s newTR
+                pure (Just (jitSuccess, currentDepth, newB /= 0))
+            | c == jitFailure -> unwind >> pure (Just (jitFailure, currentDepth, False))
+            | c == jitExhausted -> unwind >> pure (Just (jitExhausted, maxDepth + 1, False))
+            | otherwise -> unwind >> pure Nothing
+  | otherwise = pure Nothing
   where
     plusInt64 :: Ptr Int64 -> Int -> Ptr Int64
     plusInt64 p n = intPtrToPtr (ptrToIntPtr p + fromIntegral (n * 8))

@@ -24,6 +24,7 @@ module Infera.Core.Compile
     Clause (..),
     ArgIndex (..),
     DecisionIndex (..),
+    DecisionTree (..),
     Candidates (..),
     candidateList,
     Key (..),
@@ -56,6 +57,7 @@ import Data.Maybe (isJust)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as Map
+import Foreign.Ptr (Ptr)
 import Infera.Core.Jit (JitKernel, compileJitKernel)
 import Infera.Core.Ops
 import Infera.Core.Store
@@ -264,9 +266,9 @@ data ArgIndex = ArgIndex
 -- head variables remain candidates at every descendant position.
 data DecisionIndex = DecisionIndex !Int [Int] !ArgIndex
 
--- Only a leading comparison between immediate integers can reject a
--- clause here. Unknown values remain on the ordinary execution path,
--- including its instantiation and type errors.
+-- Only a leading comparison between immediate integers (or compatibility of
+-- repeated head variables) can reject a clause here. Unknown values remain
+-- on the ordinary execution path, including its instantiation and type errors.
 -- | An operand of a selection guard: an integer literal, an argument
 -- register (or a sub-term of one at a short path), or an arithmetic
 -- operation over operands, evaluated like the interpreter's plans.
@@ -274,10 +276,26 @@ data GuardValue = GuardInt !Int | GuardArg !Int [Int] | GuardOp !ArithOp GuardVa
 
 data GuardRel = RelGt | RelLt | RelGte | RelLte | RelEq | RelNe deriving (Eq, Show)
 
--- | A clause's leading test, decidable from the argument registers alone
--- when every operand is an immediate integer: the clause is skipped when
--- the test fails, and tried as usual when it cannot be decided.
-data IntGuard = IntGuard !GuardRel !GuardValue !GuardValue
+-- | A clause's leading test, decidable from the argument registers alone:
+-- the clause is skipped when the test fails, and tried as usual when it
+-- cannot be decided.
+data IntGuard
+  = IntGuard !GuardRel !GuardValue !GuardValue
+  | -- | Repeated head variable at two paths: can only match when the two
+    -- positions are unifiable (same tag and key when both are bound).
+    GuardSameTerm !Int [Int] !Int [Int]
+  | -- | Leading structural disequality (@!=@ or @not (A == B)@) between two
+    -- head paths: fails when both are identical immediate constants.
+    GuardDiffTerm !Int [Int] !Int [Int]
+
+-- | Load-time compiled single-pass decision tree for pure clause selection.
+data DecisionTree
+  = DTLeaf !Candidates
+  | DTSwitchArg !Int !Int !(IM.IntMap DecisionTree) !(Map.Map Key DecisionTree) !DecisionTree !DecisionTree
+  | DTGroupArg !Int !DecisionTree !DecisionTree
+  | DTSwitchPath !Int [Int] !Int !(IM.IntMap DecisionTree) !(Map.Map Key DecisionTree) !DecisionTree !DecisionTree
+  | DTGuard !IntGuard !DecisionTree !DecisionTree
+  | DTFallback
 
 data Pred = Pred
   { pKey :: !PredKey,
@@ -295,6 +313,8 @@ data Pred = Pred
     -- | the leading immediate-integer guard of each clause, if any
     pIntGuards :: !(Array Int (Maybe IntGuard)),
     pHasGuards :: !Bool,
+    -- | compiled single-pass decision tree for pure calls
+    pDecisionTree :: !DecisionTree,
     -- | every clause, and each ordinal alone
     pAll :: !Candidates,
     pOne :: !(Array Int Candidates),
@@ -494,6 +514,22 @@ compilePred ctx p = do
     decision <- buildIndexAt (ctxSymbols ctx) shared i path compiledClauses
     pure (DecisionIndex i path decision)
   let guards = map leadingIntGuard compiledClauses
+      principal = [(i, idx) | (i, idx) <- zip [0 ..] index, aiSelective idx]
+      selDecisions = [decision | decision@(DecisionIndex _ _ idx) <- decisions, aiSelective idx]
+      decisionGroups' =
+        [ (i, group)
+          | i <- [0 .. arity - 1],
+            let group = [decision | decision@(DecisionIndex j _ idx) <- decisions, j == i, aiSelective idx],
+            not (null group)
+        ]
+      hasGuards = any isJust guards
+      indexed =
+        P.predIsIndexed (ctxProgram ctx) p
+          && (any aiSelective index || not (null selDecisions) || hasGuards)
+      dtree =
+        if not indexed || count <= 1
+          then DTLeaf (shared [0 .. count - 1])
+          else buildPredDecisionTree shared count principal decisionGroups' guards
   pure
     Pred
       { pKey = P.predKey p,
@@ -501,23 +537,15 @@ compilePred ctx p = do
         pClauses = listArray (0, max 0 (count - 1)) compiledClauses,
         pClauseCount = count,
         pIndex = index,
-        pPrincipal = [(i, idx) | (i, idx) <- zip [0 ..] index, aiSelective idx],
-        pDecisions = [decision | decision@(DecisionIndex _ _ idx) <- decisions, aiSelective idx],
-        pDecisionGroups =
-          [ (i, group)
-            | i <- [0 .. arity - 1],
-              let group = [decision | decision@(DecisionIndex j _ idx) <- decisions, j == i, aiSelective idx],
-              not (null group)
-          ],
+        pPrincipal = principal,
+        pDecisions = selDecisions,
+        pDecisionGroups = decisionGroups',
         pIntGuards = listArray (0, max 0 (count - 1)) (if null guards then [Nothing] else guards),
-        pHasGuards = any isJust guards,
+        pHasGuards = hasGuards,
+        pDecisionTree = dtree,
         pAll = shared [0 .. count - 1],
         pOne = ones,
-        -- With no selective key, decision or guard, selection always
-        -- returns every clause: skip it.
-        pIndexed =
-          P.predIsIndexed (ctxProgram ctx) p
-            && (any aiSelective index || any (\(DecisionIndex _ _ idx) -> aiSelective idx) decisions || any isJust guards),
+        pIndexed = indexed,
         pDecls = P.predDecls p,
         pInferred = P.predInferred p,
         pSwitch =
@@ -527,6 +555,89 @@ compilePred ctx p = do
         pTrustReturn = not (null (P.predDecls p)) && all clTrustReturn compiledClauses,
         pJit = jitKernel
       }
+
+-- | Build a single-pass 'DecisionTree' when the branching factor is bounded,
+-- or 'DTFallback' for predicates with large multi-argument cross products.
+buildPredDecisionTree ::
+  ([Int] -> Candidates) ->
+  Int ->
+  [(Int, ArgIndex)] ->
+  [(Int, [DecisionIndex])] ->
+  [Maybe IntGuard] ->
+  DecisionTree
+buildPredDecisionTree shared count principal groups guards
+  | length principal == 1 && null groups && not (any isJust guards),
+    [(i, idx)] <- principal =
+      DTSwitchArg
+        i
+        (aiAll idx)
+        (IM.map DTLeaf (aiFast idx))
+        (Map.map DTLeaf (aiBoxed idx))
+        (DTLeaf (aiOpen idx))
+        (DTLeaf (shared [0 .. count - 1]))
+  | count > 32 || length principal > 2 || sum (map (length . snd) groups) > 8 =
+      DTFallback
+  | otherwise =
+      buildPrincipal principal allSet
+  where
+    allSet = IS.fromDistinctAscList [0 .. count - 1]
+    candsToSet NoCandidate = IS.empty
+    candsToSet (OneCandidate x) = IS.singleton x
+    candsToSet (Candidates xs) = IS.fromDistinctAscList [unsafeAt xs k | k <- [0 .. numElements xs - 1]]
+    guardMap = IM.fromList [(i, g) | (i, Just g) <- zip [0 ..] guards]
+
+    buildPrincipal [] s
+      | IS.size s <= 1 = DTLeaf (shared (IS.toAscList s))
+      | otherwise = buildGroups groups s
+    buildPrincipal ((i, idx) : rest) s
+      | IS.size s <= 1 = DTLeaf (shared (IS.toAscList s))
+      | otherwise =
+          let stepCands c =
+                let s' = IS.intersection s (candsToSet c)
+                 in if IS.size s' <= 1
+                      then DTLeaf (shared (IS.toAscList s'))
+                      else buildPrincipal rest s'
+              missTree = stepCands (aiOpen idx)
+              varTree = buildPrincipal rest s
+              fastMap = IM.map stepCands (aiFast idx)
+              boxedMap = Map.map stepCands (aiBoxed idx)
+           in DTSwitchArg i (aiAll idx) fastMap boxedMap missTree varTree
+
+    buildGroups [] s = buildGuards s
+    buildGroups ((i, grp) : rest) s
+      | IS.size s <= 1 = DTLeaf (shared (IS.toAscList s))
+      | otherwise =
+          let strTree = buildPaths grp rest s
+              nonStrTree = buildGroups rest s
+           in DTGroupArg i strTree nonStrTree
+
+    buildPaths [] restGroups s = buildGroups restGroups s
+    buildPaths (DecisionIndex i path idx : morePaths) restGroups s
+      | IS.size s <= 1 = DTLeaf (shared (IS.toAscList s))
+      | otherwise =
+          let next s'
+                | IS.size s' <= 1 = DTLeaf (shared (IS.toAscList s'))
+                | otherwise = buildPaths morePaths restGroups s'
+              missTree = next (IS.intersection s (candsToSet (aiOpen idx)))
+              varTree = next s
+              fastMap = IM.map (next . IS.intersection s . candsToSet) (aiFast idx)
+              boxedMap = Map.map (next . IS.intersection s . candsToSet) (aiBoxed idx)
+           in DTSwitchPath i path (aiAll idx) fastMap boxedMap missTree varTree
+
+    buildGuards s
+      | IS.size s == 0 = DTLeaf NoCandidate
+      | otherwise =
+          let active = [(ord, g) | ord <- IS.toAscList s, Just g <- [IM.lookup ord guardMap]]
+           in if null active
+                then DTLeaf (shared (IS.toAscList s))
+                else
+                  if length active > 5
+                    then DTFallback
+                    else expandGuards active s
+
+    expandGuards [] s = DTLeaf (shared (IS.toAscList s))
+    expandGuards ((ord, g) : rest) s =
+      DTGuard g (expandGuards rest s) (expandGuards rest (IS.delete ord s))
 
 -- | Ascending ordinals as a selection result, sharing the singletons.
 toCandidates :: Array Int Candidates -> [Int] -> Candidates
@@ -581,14 +692,14 @@ nestedPaths depth pattern
     discriminates _ = False
 
 -- | The guard a clause's leading goals give: a comparison, an @is@ whose
--- target is an integer literal or a head variable, or an @is@ into a fresh
+-- target is an integer literal or a head variable, an @is@ into a fresh
 -- body variable followed by a test of that variable against an integer
--- literal (@X is I % P, X != 0@). Expressions use the plan operators, so
--- 'guardHolds' computes exactly what the interpreter would.
+-- literal (@X is I % P, X != 0@), or a leading structural disequality
+-- (@!=@ or @not (A == B)@) between two head variables.
 leadingIntGuard :: Clause -> Maybe IntGuard
 leadingIntGuard clause = case bodyGuard of
+  found@(Just _) -> found
   Nothing -> repeatedHeadGuard clause
-  found -> found
   where
     bodyGuard = case clBody clause of
       GCmp op a b _ _ : _ -> IntGuard (relOf op) <$> value a <*> value b
@@ -603,7 +714,17 @@ leadingIntGuard clause = case bodyGuard of
             GCmp op (EPat (PSlot v')) (EImm k) _ _ : _ | v' == v -> IntGuard (relOf op) <$> value e <*> pure (GuardInt k)
             GCmp op (EImm k) (EPat (PSlot v')) _ _ : _ | v' == v -> IntGuard (relOf op) (GuardInt k) <$> value e
             _ -> Nothing
+      GNeq (PSlot u) (PSlot v) : _ -> diffGuard u v
+      GNot [GEquiv (PSlot u) (PSlot v)] : _ -> diffGuard u v
+      GCheck CkGround _ : GNot [GEquiv (PSlot u) (PSlot v)] : _ -> diffGuard u v
+      GCheck CkGround _ : GNeq (PSlot u) (PSlot v) : _ -> diffGuard u v
       _ -> Nothing
+    diffGuard u v = do
+      (i, p) <- IM.lookup u slots
+      (j, q) <- IM.lookup v slots
+      if length p <= 3 && length q <= 3
+        then Just (GuardDiffTerm i p j q)
+        else Nothing
     against rel e w = IntGuard rel <$> value e <*> pure (GuardInt (valOf w))
     relOf op = case op of
       CmpGt -> RelGt
@@ -627,15 +748,13 @@ leadingIntGuard clause = case bodyGuard of
       PArith _ _ children -> concat [slotPaths (path ++ [i]) child | (i, child) <- zip [0 ..] children]
       PWord _ -> []
 
--- | A clause with no leading test whose head repeats a variable, as in
--- @look K (t K V _ _) V@, can still be skipped at selection: the two
--- occurrences must be identical, and two immediate integers are identical
--- exactly when they are equal. Any other value misses the plan and keeps
--- the clause. A path whose structure has a different functor reads a cell
--- the head would not match anyway.
+-- | A clause whose head repeats a variable, as in @look K (t K V _ _) V@ or
+-- @d X X 1@, can be skipped at selection whenever the two occurrences hold
+-- bound values that cannot unify (different tags, different immediate
+-- constants, or structures with different functors).
 repeatedHeadGuard :: Clause -> Maybe IntGuard
 repeatedHeadGuard clause = case repeated of
-  ((i, p) : (j, q) : _) : _ -> Just (IntGuard RelEq (GuardArg i p) (GuardArg j q))
+  ((i, p) : (j, q) : _) : _ -> Just (GuardSameTerm i p j q)
   _ -> Nothing
   where
     occurrences = IM.fromListWith (flip (++))
@@ -697,15 +816,6 @@ keyOfWord store w = case tagOf w of
           BStr s -> Just (KStr s)
     | otherwise -> pure Nothing
 
--- | Intersect the useful principal keys in clause order, then refine with
--- bounded constructor decisions and a leading immediate-integer guard.
--- Refinement makes no bindings and never evaluates an expression. It is
--- disabled while a constraint store is active: head bindings may wake a
--- constraint before a later head mismatch or failed guard is reached.
---
--- Index results are precomputed and shared; only an intersection or guard
--- filter leaving two or more clauses, neither of its inputs, builds a new
--- result, and a boxed key allocates its lookup key.
 -- ─── the clause stream ───────────────────────────────────────────────────────
 
 -- | Encoding state: instructions and side entries. Instructions are kept in
@@ -929,17 +1039,65 @@ candidateClauses !store p
         then principalKeys store p False (pPrincipal p) (pAll p)
         else
           if pClauseCount p <= 1
-            -- A pure single candidate is tried directly: its head performs
-            -- every check an index could, and a mismatch binds nothing
-            -- that survives the failure.
             then pure (pAll p)
             else do
-              selected <- principalKeys store p True (pPrincipal p) (pAll p)
-              case selected of
-                Candidates _ -> do
-                  refined <- decisionGroups store p (pDecisionGroups p) selected
-                  if pHasGuards p then keepGuards store p refined else pure refined
-                _ -> pure selected
+              pCells <- cellsPtr store
+              evalDecisionTree store pCells p (pDecisionTree p)
+
+evalDecisionTree :: Store -> Ptr Int -> Pred -> DecisionTree -> IO Candidates
+evalDecisionTree !store !pCells p = go
+  where
+    go tree = case tree of
+      DTLeaf !cands -> pure cands
+      DTSwitchArg !i !allKey !fastMap !boxedMap !missTree !varTree -> do
+        w <- readArg store i >>= derefPtr pCells
+        let !t = tagOf w
+        if t == tagRef
+          then go varTree
+          else
+            if t == tagBox
+              then do
+                key <- keyOfWord store w
+                case key of
+                  Just (KFlt d) | isNaN d -> go varTree
+                  Just k -> go (Map.findWithDefault missTree k boxedMap)
+                  Nothing -> go varTree
+              else do
+                key <- if t == tagStr then funKey <$> peekAt pCells (valOf w) else pure w
+                if key == allKey
+                  then go varTree
+                  else go (IM.findWithDefault missTree key fastMap)
+      DTGroupArg !i !strTree !nonStrTree -> do
+        w <- readArg store i >>= derefPtr pCells
+        if tagOf w == tagStr then go strTree else go nonStrTree
+      DTSwitchPath !i path !allKey !fastMap !boxedMap !missTree !varTree -> do
+        found <- argumentAtPathPtr store pCells i path
+        let !t = tagOf found
+        if t == tagRef
+          then go varTree
+          else
+            if t == tagBox
+              then do
+                key <- keyOfWord store found
+                case key of
+                  Just (KFlt d) | isNaN d -> go varTree
+                  Just k -> go (Map.findWithDefault missTree k boxedMap)
+                  Nothing -> go varTree
+              else do
+                key <- if t == tagStr then funKey <$> peekAt pCells (valOf found) else pure found
+                if key == allKey
+                  then go varTree
+                  else go (IM.findWithDefault missTree key fastMap)
+      DTGuard !g !passTree !failTree -> do
+        ok <- evalGuardPtr store pCells g
+        if ok then go passTree else go failTree
+      DTFallback -> do
+        selected <- principalKeys store p True (pPrincipal p) (pAll p)
+        case selected of
+          Candidates _ -> do
+            refined <- decisionGroups store p (pDecisionGroups p) selected
+            if pHasGuards p then keepGuards store p refined else pure refined
+          _ -> pure selected
 
 -- The selection steps are top-level functions: local ones closing over the
 -- store and predicate would be allocated on every call.
@@ -1031,16 +1189,18 @@ immediateKeyOf store w
 keepGuards :: Store -> Pred -> Candidates -> IO Candidates
 keepGuards _ _ NoCandidate = pure NoCandidate
 keepGuards store p only@(OneCandidate ordinal) = do
-  ok <- guardHolds store p ordinal
+  pCells <- cellsPtr store
+  ok <- guardHoldsPtr store pCells p ordinal
   pure $! if ok then only else NoCandidate
 keepGuards store p selected@(Candidates ordinals) = do
+  pCells <- cellsPtr store
   let n = numElements ordinals
       -- survivors, and the first one
       count !k !kept !first
         | k >= n = finish kept first
         | otherwise = do
             let ordinal = ordinals `unsafeAt` k
-            ok <- guardHolds store p ordinal
+            ok <- guardHoldsPtr store pCells p ordinal
             if ok
               then count (k + 1) (kept + 1) (if kept == 0 then ordinal else first)
               else count (k + 1) kept first
@@ -1049,26 +1209,30 @@ keepGuards store p selected@(Candidates ordinals) = do
         | kept == 0 = pure NoCandidate
         | kept == 1 = pure $! pOne p `unsafeAt` first
         | otherwise = do
-            survivors <- filterOrdinals [unsafeAt ordinals k | k <- [0 .. n - 1]]
+            survivors <- filterOrdinals pCells [unsafeAt ordinals k | k <- [0 .. n - 1]]
             pure (Candidates (IA.listArray (0, kept - 1) survivors))
   count 0 (0 :: Int) (0 :: Int)
   where
-    filterOrdinals [] = pure []
-    filterOrdinals (ordinal : rest) = do
-      ok <- guardHolds store p ordinal
-      if ok then (ordinal :) <$> filterOrdinals rest else filterOrdinals rest
+    filterOrdinals _ [] = pure []
+    filterOrdinals pCells (ordinal : rest) = do
+      ok <- guardHoldsPtr store pCells p ordinal
+      if ok then (ordinal :) <$> filterOrdinals pCells rest else filterOrdinals pCells rest
 
--- | A guard holds unless every operand is an immediate integer, every
--- operation stays within the plan bounds, and the test then fails.
-guardHolds :: Store -> Pred -> Int -> IO Bool
-guardHolds store p ordinal = case pIntGuards p `unsafeAt` ordinal of
+guardHoldsPtr :: Store -> Ptr Int -> Pred -> Int -> IO Bool
+guardHoldsPtr store !pCells p ordinal = case pIntGuards p `unsafeAt` ordinal of
   Nothing -> pure True
-  Just (IntGuard rel a b) -> do
-    x <- guardInt store a
+  Just g -> evalGuardPtr store pCells g
+{-# INLINE guardHoldsPtr #-}
+
+-- | Evaluate one guard with a pre-loaded cells pointer.
+evalGuardPtr :: Store -> Ptr Int -> IntGuard -> IO Bool
+evalGuardPtr store !pCells g = case g of
+  IntGuard rel a b -> do
+    x <- guardIntPtr store pCells a
     if x == planMiss
       then pure True
       else do
-        y <- guardInt store b
+        y <- guardIntPtr store pCells b
         pure $!
           y == planMiss || case rel of
             RelGt -> x > y
@@ -1077,20 +1241,48 @@ guardHolds store p ordinal = case pIntGuards p `unsafeAt` ordinal of
             RelLte -> x <= y
             RelEq -> x == y
             RelNe -> x /= y
+  GuardSameTerm i p j q -> do
+    w1 <- argumentAtPathPtr store pCells i p
+    w2 <- argumentAtPathPtr store pCells j q
+    if w1 == w2
+      then pure True
+      else do
+        let !t1 = tagOf w1
+            !t2 = tagOf w2
+        if t1 == tagRef || t2 == tagRef
+          then pure True
+          else
+            if t1 /= t2
+              then pure False
+              else
+                if t1 == tagStr
+                  then do
+                    f1 <- peekAt pCells (valOf w1)
+                    f2 <- peekAt pCells (valOf w2)
+                    pure $! funKey f1 == funKey f2
+                  else pure $! t1 == tagBox
+  GuardDiffTerm i p j q -> do
+    w1 <- argumentAtPathPtr store pCells i p
+    w2 <- argumentAtPathPtr store pCells j q
+    let !t1 = tagOf w1
+    if w1 == w2 && (t1 == tagInt || t1 == tagAtm || t1 == tagChr)
+      then pure False
+      else pure True
+{-# INLINE evalGuardPtr #-}
 
 -- | A guard operand as an immediate integer, or 'planMiss'.
-guardInt :: Store -> GuardValue -> IO Int
-guardInt store v = case v of
+guardIntPtr :: Store -> Ptr Int -> GuardValue -> IO Int
+guardIntPtr store !pCells v = case v of
   GuardInt n -> pure n
   GuardArg i path -> do
-    w <- argumentAtPath store i path
+    w <- argumentAtPathPtr store pCells i path
     pure $! if tagOf w == tagInt then valOf w else planMiss
   GuardOp op a b -> do
-    x <- guardInt store a
+    x <- guardIntPtr store pCells a
     if x == planMiss
       then pure planMiss
       else do
-        y <- guardInt store b
+        y <- guardIntPtr store pCells b
         pure $! if y == planMiss then planMiss else planApply op x y
 
 -- | No immediate integer is 'minBound', so it marks a plan that missed.
@@ -1173,18 +1365,25 @@ memberCandidates x (Candidates ys) = go 0
 -- such a path reads as an unbound word, which no index or guard decides.
 -- No recursive walk of runtime data occurs, including for cyclic data.
 argumentAtPath :: Store -> Int -> [Int] -> IO Word'
-argumentAtPath store position path = readArg store position >>= descend path
+argumentAtPath store position path = do
+  pCells <- cellsPtr store
+  argumentAtPathPtr store pCells position path
+{-# INLINE argumentAtPath #-}
+
+argumentAtPathPtr :: Store -> Ptr Int -> Int -> [Int] -> IO Word'
+argumentAtPathPtr store !pCells position path = readArg store position >>= descend path
   where
-    descend [] word = deref store word
+    descend [] word = derefPtr pCells word
     descend (i : rest) word = do
-      current <- deref store word
+      current <- derefPtr pCells word
       if tagOf current /= tagStr
         then pure (refWord 0)
         else do
-          functor <- readCell store (valOf current)
+          functor <- peekAt pCells (valOf current)
           if i >= funArity functor
             then pure (refWord 0)
-            else readCell store (valOf current + i + 1) >>= descend rest
+            else peekAt pCells (valOf current + i + 1) >>= descend rest
+{-# INLINE argumentAtPathPtr #-}
 
 compileClause :: Ctx -> [P.Signature] -> S.Clause -> IO Clause
 compileClause ctx sigs clause = do

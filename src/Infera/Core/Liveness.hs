@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+
 -- | The heap references used by suspended goal plans. Compilation keeps
 -- slot offsets for cheap execution; collection can detach the surviving
 -- plans from their activation block by turning those offsets into words.
@@ -6,12 +8,15 @@
 module Infera.Core.Liveness
   ( visitPattern,
     visitGoals,
+    visitStream,
     relocatePattern,
     relocateGoals,
   )
 where
 
+import Data.Array.Base (numElements, unsafeAt)
 import Infera.Core.Compile
+import Infera.Core.Ops
 import Infera.Core.Store (Word', refWord)
 
 visitPattern :: (Word' -> IO ()) -> Int -> Pattern -> IO ()
@@ -132,3 +137,58 @@ relocateGoals relocate base = mapM goal
       GEmit p -> GEmit <$> pattern p
       GEmitText p -> GEmitText <$> pattern p
       GUnsupported term -> pure (GUnsupported term)
+
+-- | Visit the activation slots of @base@ that can still be read by @stream@
+-- at or after @pc0@. A 'ClauseStream' body has no backward jumps, so only
+-- instructions at @pc >= pc0@ (and any escape goal list they reach) can
+-- read from @base@.
+visitStream :: (Word' -> IO ()) -> Int -> ClauseStream -> Int -> IO ()
+visitStream visit !base !stream !pc0
+  | base <= 0 = pure ()
+  | otherwise = go pc0
+  where
+    !code = csCode stream
+    !refs = csRefs stream
+    !len = numElements code
+    slot off = visit (refWord (base + off))
+    go !pc
+      | pc >= len = pure ()
+      | op == opProceed || op == opCheckBound || op == opCut || op == opFail || op == opDoUnify =
+          go (pc + 1)
+      | op == opCall || op == opExecute =
+          go (pc + 3)
+      | op == opEscape = do
+          case unsafeAt refs (unsafeAt code (pc + 1)) of
+            SRefEscape gs -> visitGoals visit base gs
+            _ -> pure ()
+          go (pc + 2)
+      | op == opArgPrep || op == opPushConst =
+          go (pc + 2)
+      | op == opPutConst || op == opPushStruct =
+          go (pc + 3)
+      | op == opPutStruct =
+          go (pc + 4)
+      | op == opPutFirst || op == opPutVar =
+          slot (unsafeAt code (pc + 2)) >> go (pc + 3)
+      | op == opPushFirst || op == opPushVar =
+          slot (unsafeAt code (pc + 1)) >> go (pc + 2)
+      | op == opGetFirst || op == opGetVar =
+          slot (unsafeAt code (pc + 2)) >> go (pc + 3)
+      | op == opGetConst =
+          go (pc + 3)
+      | op == opGetListFirst =
+          slot (unsafeAt code (pc + 4)) >> slot (unsafeAt code (pc + 5)) >> go (pc + 6)
+      | op == opGetStruct =
+          go (pc + 6)
+      | op == opUF || op == opUV =
+          slot (unsafeAt code (pc + 1)) >> go (pc + 2)
+      | op == opUC =
+          go (pc + 2)
+      | op == opUSF =
+          slot (unsafeAt code (pc + 3)) >> slot (unsafeAt code (pc + 4)) >> go (pc + 6)
+      | op == opUS =
+          go (pc + 5)
+      | otherwise = pure ()
+      where
+        !op = unsafeAt code pc
+

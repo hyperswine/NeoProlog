@@ -29,12 +29,13 @@ import Data.Array.Unboxed (UArray)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
+import Foreign.Ptr (Ptr)
 import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble, numericTerm)
 import qualified Infera.CLP as CLP
 import qualified Infera.CLP.Mutable as Mutable
 import qualified Infera.Core.Constraint as NativeConstraint
 import Infera.Core.Compile
-import Infera.Core.Jit (JitKernel (..), invokeJitKernel, invokeScanKernel, jitEnabled)
+import Infera.Core.Jit (JitKernel (..), invokeJitKernel, invokeJitKernelWith, invokeScanKernel, jitEnabled, resumeClauseUnit)
 import Infera.Core.Jit.IR (jitBailout, jitFailure, jitSuccess)
 import Infera.Core.Ops
 import qualified Infera.Core.Liveness as Liveness
@@ -97,8 +98,8 @@ data Cont
   | -- | a candidate of a minimize scope: cost pattern, base, state ref
     CExitMinimize Pattern !Int !(IORef Minimum)
   | -- | a suspended clause instruction stream: code, pc, activation base,
-    -- cut barrier, depth
-    CStream !ClauseStream !Int !Int !Int !Int Cont
+    -- cut barrier, depth, fused commit height (-1 none), fused guard base (-1 none)
+    CStream !ClauseStream !Int !Int !Int !Int !Int !Int Cont
 
 -- | One choice point, as a value. The stack itself is stored in 'Choices';
 -- this record is built only on cold paths (collection, invariant checks).
@@ -142,6 +143,8 @@ data Alt
     AltRetract [(Int, Term, Int)] !PredKey !Int Cont
   | -- | sentinel of a minimize scope
     AltMinimize !(IORef Minimum) !(IORef [SearchItem]) Cont
+  | -- | remaining native choice frames on a clause unit's stack
+    AltNative !Pred !JitKernel !Int !Int !Int !Int Cont
 
 -- | The state of a minimize scope: entry marks and the best candidate so
 -- far as the bindings it made to older cells, its output, tables and facts.
@@ -664,7 +667,12 @@ run' m cont = case cont of
     state <- exportState m
     pure (Yield (Found state) (backtrack m))
   CGoals goals base barrier depth next -> runGoals m goals base barrier depth next
-  CStream stream pc base barrier depth next -> runStream m stream pc base barrier depth next
+  CStream stream pc base barrier depth commitHeight guardBase next -> do
+    when (guardBase >= 0) (markGuardsFrom m guardBase)
+    when (commitHeight >= 0) $ do
+      cutTo m commitHeight
+      when (guardBase >= 0) (removeGuardsFrom m guardBase)
+    runStream m stream pc base barrier depth next
   CReturn commitHeight guardBase check next -> do
     problem <- case check of
       Nothing -> pure Nothing
@@ -766,7 +774,7 @@ contDepth cont = case cont of
   CExitFindAll _ _ _ _ _ _ depth -> depth
   CExitTable _ -> 0
   CExitMinimize _ _ _ -> 0
-  CStream _ _ _ _ depth _ -> depth
+  CStream _ _ _ _ depth _ _ _ -> depth
 
 -- Skip exhausted goal lists so that a tail call sees its caller's return.
 dropEmpty :: Cont -> Cont
@@ -917,8 +925,9 @@ step' m goal goals base barrier depth next = case goal of
     buildArgs m base patterns 0
     pending <- arithData (mStore m)
     when (pending > 0) (normalizeArgs m (pArity predicate))
-    let cont = if null goals then next else CGoals goals base barrier depth next
-    callPredicate m (if null goals then base else 0) predicate trust cont
+    let !cont = if null goals then next else CGoals goals base barrier depth next
+        !callDepth = if null goals then contDepth next + 1 else depth + 1
+    callPredicate m (if null goals then base else 0) callDepth predicate trust cont
   GTabled ref patterns -> do
     predicate <- readIORef ref
     buildArgs m base patterns 0
@@ -1432,18 +1441,79 @@ leafItems m items previous cont = case items of
 
 -- ─── calls ───────────────────────────────────────────────────────────────────
 
+-- | Does the continuation immediately cut any choice points created by the
+-- current call as soon as the call returns?
+commitsImmediately :: Cont -> Bool
+commitsImmediately cont = case cont of
+  CExitIf {} -> True
+  CExitNot {} -> True
+  CReturn h _ Nothing _ | h >= 0 -> True
+  CReturn (-1) _ Nothing next -> commitsImmediately next
+  CGoals [] _ _ _ next -> commitsImmediately next
+  CGoals (GTrue : gs) b bar d next -> commitsImmediately (CGoals gs b bar d next)
+  CGoals (GCut : _) _ _ _ _ -> True
+  CStream stream pc _ _ _ h _ next
+    | h >= 0 -> True
+    | otherwise ->
+        let !code = csCode stream
+            !op = unsafeAt code pc
+         in op == opCut || (op == opProceed && commitsImmediately next)
+  _ -> False
+
+-- | Is the continuation guaranteed not to invoke another native clauseUnit
+-- (which would overwrite the store's single native choice stack) before
+-- cutting this call's choices?
+commitsWithoutCall :: Cont -> Bool
+commitsWithoutCall cont = case cont of
+  CExitIf {} -> True
+  CExitNot {} -> True
+  CReturn h _ Nothing _ | h >= 0 -> True
+  CReturn (-1) _ Nothing next -> commitsWithoutCall next
+  CGoals gs _ _ _ next -> goalsWithoutCall gs && commitsWithoutCall next
+  CStream stream pc _ _ _ h _ next
+    | h >= 0 -> True
+    | otherwise -> streamWithoutCall (csCode stream) pc next
+  _ -> False
+  where
+    goalsWithoutCall [] = True
+    goalsWithoutCall (g : gs) = case g of
+      GTrue -> goalsWithoutCall gs
+      GFail -> True
+      GCut -> True
+      GUnify {} -> goalsWithoutCall gs
+      GEquiv {} -> goalsWithoutCall gs
+      GNeq {} -> goalsWithoutCall gs
+      GIs {} -> goalsWithoutCall gs
+      GCmp {} -> goalsWithoutCall gs
+      GCheck {} -> goalsWithoutCall gs
+      GWrite {} -> goalsWithoutCall gs
+      GNl -> goalsWithoutCall gs
+      _ -> False
+    streamWithoutCall code !pc next = case unsafeAt code pc of
+      op | op == opProceed -> commitsWithoutCall next
+         | op == opCut -> True
+         | op == opFail -> True
+         | op == opCheckBound -> streamWithoutCall code (pc + 1) next
+         | op == opDoUnify -> streamWithoutCall code (pc + 1) next
+         | op == opArgPrep -> streamWithoutCall code (pc + 2) next
+         | op == opPutFirst || op == opPutVar || op == opPutConst -> streamWithoutCall code (pc + 3) next
+         | op == opPutStruct -> streamWithoutCall code (pc + 4) next
+         | op == opPushFirst || op == opPushVar || op == opPushConst -> streamWithoutCall code (pc + 2) next
+         | op == opPushStruct -> streamWithoutCall code (pc + 3) next
+         | otherwise -> False
+
 -- | Call with the arguments in the registers.
-callPredicate :: Machine -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
-callPredicate m frame predicate trust cont0 = case pDecls predicate of
-  [] -> callPlain m frame predicate cont0
-  _ -> callDeclared m frame predicate trust cont0
+callPredicate :: Machine -> Int -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
+callPredicate m frame !depth predicate trust cont0 = case pDecls predicate of
+  [] -> callPlain m frame depth predicate cont0
+  _ -> callDeclared m frame depth predicate trust cont0
 {-# INLINE callPredicate #-}
 
 -- | A call to a predicate without declared contracts: there is no
 -- signature to select, no guard to push and no return to check. Only an
 -- inferred switch can make it commit after its first solution.
-callPlain :: Machine -> Int -> Pred -> Cont -> IO Step
-callPlain m frame predicate cont0 = do
+callPlain :: Machine -> Int -> Int -> Pred -> Cont -> IO Step
+callPlain m frame !depth predicate cont0 = do
   let s = mStore m
   top <- heapTop s
   limit <- readReg s rGCLIM
@@ -1452,29 +1522,52 @@ callPlain m frame predicate cont0 = do
     else enter frame cont0
   where
     enter frame' cont = do
-      let depth = contDepth cont + 1
       if depth > maxResolutionDepth
         then raiseItems m [BranchExhausted] (backtrack m)
         else case (pJit predicate, mSlotStats m) of
           (Just kernel, Nothing) | jitEnabled -> if jkScan kernel >= 0 then scanPlain frame' kernel depth cont else do
-            outcome <- invokeJitKernel (mStore m) depth maxResolutionDepth kernel
+            let !s = mStore m
+                !immCommit = commitsImmediately cont
+                !noCallCommit = immCommit || commitsWithoutCall cont
+            switchCommit <-
+              if noCallCommit
+                then pure False
+                else case pSwitch predicate of
+                  Nothing -> pure False
+                  Just positions -> switchGround s positions
+            let !allowChoices = noCallCommit || switchCommit
+                !needSaved = noCallCommit && not immCommit
+            saved <- if needSaved then saveArgs s (pArity predicate) else pure 0
+            entryH <- heapTop s
+            entryTR <- trailTop s
+            outcome <- invokeJitKernelWith allowChoices s depth maxResolutionDepth kernel
             case outcome of
-              Just (1, _) -> run m cont
-              Just (0, _) -> backtrack m
-              Just (3, _) -> raiseItems m [BranchExhausted] (backtrack m)
-              _ -> enterPlainInterpreted frame' cont depth
+              Just (1, _, hasMore) -> do
+                when (hasMore && needSaved) $ do
+                  _ <- pushChoice m (AltNative predicate kernel saved entryH entryTR depth cont)
+                  pure ()
+                run m cont
+              Just (0, _, _) -> do
+                when needSaved (setHeapTop s saved)
+                backtrack m
+              Just (3, _, _) -> do
+                when needSaved (setHeapTop s saved)
+                raiseItems m [BranchExhausted] (backtrack m)
+              _ -> do
+                when needSaved (setHeapTop s saved)
+                enterPlainInterpreted frame' cont depth
           _ -> enterPlainInterpreted frame' cont depth
-    scanPlain frame' kernel depth cont = do
+    scanPlain frame' kernel d cont = do
       entry <- choiceTop m
       returnCont <- scanCommit m predicate entry cont
-      outcome <- scanRun m predicate kernel depth returnCont
+      outcome <- scanRun m predicate kernel d returnCont
       if outcome == scanMatched
         then run m returnCont
         else
           if outcome == scanNoMatch
             then backtrack m
-            else callClausesInterpreted m frame' predicate entry depth returnCont
-    enterPlainInterpreted frame' cont depth = do
+            else callClausesInterpreted m frame' predicate entry d returnCont
+    enterPlainInterpreted frame' cont d = do
       let !s = mStore m
       entry <- choiceTop m
       cands <- candidateClauses s predicate
@@ -1482,13 +1575,14 @@ callPlain m frame predicate cont0 = do
         NoCandidate -> backtrack m
         OneCandidate ordinal
           | null (clBody (pClauses predicate ! ordinal)) ->
-              tryClauseWithFrame m frame' predicate ordinal entry depth cont
+              tryClauseWithFrame m frame' predicate ordinal entry d cont
         _ -> do
           -- A continuation that already commits at an older height covers
           -- this call's choice points as well: the call keeps it whether or
           -- not it would commit, so the groundness test is skipped.
           returnCont <- case cont of
             CReturn h _ Nothing _ | h >= 0 -> pure cont
+            CStream _ _ _ _ _ h _ _ | h >= 0 -> pure cont
             _ -> do
               commits <- case pSwitch predicate of
                 Nothing -> pure False
@@ -1497,12 +1591,15 @@ callPlain m frame predicate cont0 = do
                 then pure cont
                 else do
                   guardBase <- guardTop m
-                  pure (CReturn entry guardBase Nothing cont)
-          dispatchCandidates m frame' predicate entry depth returnCont cands
+                  pure $ case cont of
+                    CStream s' pc' base' bar' d' (-1) (-1) next' ->
+                      CStream s' pc' base' bar' d' entry guardBase next'
+                    _ -> CReturn entry guardBase Nothing cont
+          dispatchCandidates m frame' predicate entry d returnCont cands
 
 -- | A call to a predicate with declared contracts.
-callDeclared :: Machine -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
-callDeclared m frame predicate trust cont0 = do
+callDeclared :: Machine -> Int -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
+callDeclared m frame !depth predicate trust cont0 = do
   let s = mStore m
       key = pKey predicate
       n = pArity predicate
@@ -1523,7 +1620,6 @@ callDeclared m frame predicate trust cont0 = do
           args <- mapM (readArg s) [0 .. n - 1]
           pure (Just (key, sig, args))
         _ -> pure Nothing
-      let depth = contDepth cont + 1
       if depth > maxResolutionDepth
         then raiseItems m [BranchExhausted] (backtrack m)
         else do
@@ -1537,6 +1633,9 @@ callDeclared m frame predicate trust cont0 = do
               returnCont = case (commits || hasGuard, checked, cont) of
                 (False, Nothing, _) -> cont
                 (True, Nothing, CReturn h _ Nothing _) | h >= 0 -> cont
+                (True, Nothing, CStream _ _ _ _ _ h _ _) | h >= 0 -> cont
+                (True, Nothing, CStream s' pc' base' bar' d' (-1) (-1) next') ->
+                  CStream s' pc' base' bar' d' (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) next'
                 _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
           barrier <- choiceTop m
           callClausesWithFrame m (if top > limit then 0 else frame) predicate barrier depth returnCont
@@ -1570,7 +1669,7 @@ frameDead base = dead
       | other == base = False
       | other < base = True
       | otherwise = dead next
-    dead (CStream _ _ other _ _ next) = if other == base then False else other < base || dead next
+    dead (CStream _ _ other _ _ _ _ next) = if other == base then False else other < base || dead next
     dead (CReturn _ _ _ next) = dead next
     dead (CExitIf _ _ other _ _ next) = other /= base && dead next
     dead (CExitNot _ _ _) = True
@@ -1623,15 +1722,15 @@ streamCode m !stream !pc !sp !base !barrier !depth !next = case () of
         predicate <- streamCallTarget stream entry
         pending <- arithData s
         when (pending > 0) (normalizeArgs m arity)
-        callPredicate m 0 predicate (streamCallTrust stream entry)
-          (CStream stream (pc + 3) base barrier depth next)
+        callPredicate m 0 (depth + 1) predicate (streamCallTrust stream entry)
+          (CStream stream (pc + 3) base barrier depth (-1) (-1) next)
     | op == opExecute -> do
         let !entry = unsafeAt code (pc + 1)
             !arity = unsafeAt code (pc + 2)
         predicate <- streamCallTarget stream entry
         pending <- arithData s
         when (pending > 0) (normalizeArgs m arity)
-        callPredicate m base predicate (streamCallTrust stream entry) next
+        callPredicate m base depth predicate (streamCallTrust stream entry) next
     | op == opEscape ->
         runGoals m (streamEscapeGoals stream (unsafeAt code (pc + 1))) base barrier depth next
     | op == opArgPrep -> streamCode m stream (pc + 2) (unsafeAt code (pc + 1)) base barrier depth next
@@ -1734,40 +1833,52 @@ copyPushed s !from !to !n !ground
 -- | Match every consecutive head-argument instruction, returning the offset of
 -- the first instruction after them or 'streamFailed'.
 streamHead :: Machine -> ClauseStream -> Int -> Int -> IO Int
-streamHead m !stream !base !pc = case () of
+streamHead m !stream !base !pc = do
+  p <- cellsPtr (mStore m)
+  streamHeadPtr m p stream base pc
+{-# INLINE streamHead #-}
+
+streamHeadPtr :: Machine -> Ptr Int -> ClauseStream -> Int -> Int -> IO Int
+streamHeadPtr m !p !stream !base !pc = case () of
   _ | op == opGetFirst -> do
-        writeFirst s (base + unsafeAt code (pc + 2)) =<< readArg s (unsafeAt code (pc + 1))
-        streamHead m stream base (pc + 3)
+        arg <- readArg s (unsafeAt code (pc + 1))
+        d <- derefPtr p arg
+        pokeAt p (base + unsafeAt code (pc + 2)) d
+        streamHeadPtr m p stream base (pc + 3)
     | op == opGetVar -> do
         arg <- readArg s (unsafeAt code (pc + 1))
         word <- slotWord s base (unsafeAt code (pc + 2))
-        streamIfUnify m stream base (pc + 3) arg word
+        p' <- cellsPtr s
+        ok <- unifyPtr s p' word arg
+        if ok then streamHeadPtr m p' stream base (pc + 3) else pure streamFailed
     | op == opGetConst -> do
         arg <- readArg s (unsafeAt code (pc + 1))
-        streamIfUnify m stream base (pc + 3) arg (unsafeAt code (pc + 2))
+        ok <- unifyPtr s p (unsafeAt code (pc + 2)) arg
+        if ok then streamHeadPtr m p stream base (pc + 3) else pure streamFailed
     | op == opGetListFirst -> do
         let !functor = unsafeAt code (pc + 3)
             !h = unsafeAt code (pc + 4)
             !t = unsafeAt code (pc + 5)
         arg <- readArg s (unsafeAt code (pc + 1))
-        d <- deref s arg
+        d <- derefPtr p arg
         case tagOf d of
           tag | tag == tagStr -> do
-            f <- readCell s (valOf d)
+            f <- peekAt p (valOf d)
             if funKey f /= functor
               then pure streamFailed
               else do
-                headWord <- readCell s (valOf d + 1)
-                tailWord <- readCell s (valOf d + 2)
-                writeFirst s (base + h) headWord
-                writeFirst s (base + t) tailWord
-                streamHead m stream base (pc + 6)
+                headWord <- peekAt p (valOf d + 1) >>= derefPtr p
+                tailWord <- peekAt p (valOf d + 2) >>= derefPtr p
+                pokeAt p (base + h) headWord
+                pokeAt p (base + t) tailWord
+                streamHeadPtr m p stream base (pc + 6)
             | tag == tagRef -> do
                 -- Two fresh variables: the cons holds nothing the target can
                 -- occur in.
                 built <- writeListFirst s base functor h t
                 bind s (valOf d) built
-                streamHead m stream base (pc + 6)
+                p' <- cellsPtr s
+                streamHeadPtr m p' stream base (pc + 6)
             | otherwise -> pure streamFailed
     | op == opGetStruct -> do
         let !entry = unsafeAt code (pc + 2)
@@ -1775,21 +1886,29 @@ streamHead m !stream !base !pc = case () of
             !n = unsafeAt code (pc + 4)
             !after = unsafeAt code (pc + 5)
         arg <- readArg s (unsafeAt code (pc + 1))
-        d <- deref s arg
+        d <- derefPtr p arg
         case tagOf d of
           tag | tag == tagStr -> do
-            f <- readCell s (valOf d)
+            f <- peekAt p (valOf d)
             if funKey f /= functor
               then pure streamFailed
               else do
-                rest <- streamOperands m stream base (valOf d + 1) n (pc + 6)
-                if rest == streamFailed then pure streamFailed else streamHead m stream base rest
+                rest <- streamOperandsPtr m p stream base (valOf d + 1) n (pc + 6)
+                if rest == streamFailed
+                  then pure streamFailed
+                  else do
+                    p' <- cellsPtr s
+                    streamHeadPtr m p' stream base rest
             | tag == tagRef -> do
                 -- Write mode: the same operand instructions build the
                 -- structure, then only its repeated variables are
                 -- occurs-checked before the binding.
                 ok <- writeAndBind m stream base entry functor n (pc + 6) (valOf d)
-                if ok then streamHead m stream base after else pure streamFailed
+                if ok
+                  then do
+                    p' <- cellsPtr s
+                    streamHeadPtr m p' stream base after
+                  else pure streamFailed
             | otherwise -> pure streamFailed
     | otherwise -> pure pc
   where
@@ -1797,76 +1916,76 @@ streamHead m !stream !base !pc = case () of
     !code = csCode stream
     !op = unsafeAt code pc
 
-streamIfUnify :: Machine -> ClauseStream -> Int -> Int -> Word' -> Word' -> IO Int
-streamIfUnify m stream base after arg word = do
-  ok <- unify (mStore m) word arg
-  if ok then streamHead m stream base after else pure streamFailed
-{-# INLINE streamIfUnify #-}
-
 -- | The @n@ unify operands for the argument cells from @cell@ upwards.
-streamOperands :: Machine -> ClauseStream -> Int -> Int -> Int -> Int -> IO Int
-streamOperands m !stream !base !cell !n !pc
+streamOperandsPtr :: Machine -> Ptr Int -> ClauseStream -> Int -> Int -> Int -> Int -> IO Int
+streamOperandsPtr m !p !stream !base !cell !n !pc
   | n <= 0 = pure pc
-  | otherwise = do
-      next <- streamOperand m stream base cell pc
-      if next == streamFailed then pure streamFailed else streamOperands m stream base (cell + 1) (n - 1) next
-
--- | One unify operand: the word to match is the contents of @cell@.
-streamOperand :: Machine -> ClauseStream -> Int -> Int -> Int -> IO Int
-streamOperand m !stream !base !cell !pc = case () of
-  _ | op == opUF -> do
-        writeFirst s (base + unsafeAt code (pc + 1)) =<< readCell s cell
-        pure (pc + 2)
-    | op == opUV -> do
-        word <- readCell s cell
-        value <- slotWord s base (unsafeAt code (pc + 1))
-        ok <- unify s value word
-        pure (if ok then pc + 2 else streamFailed)
-    | op == opUC -> do
-        word <- readCell s cell
-        ok <- unify s (unsafeAt code (pc + 1)) word
-        pure (if ok then pc + 2 else streamFailed)
-    | op == opUSF -> do
-        let !functor = unsafeAt code (pc + 2)
-            !h = unsafeAt code (pc + 3)
-            !t = unsafeAt code (pc + 4)
-            !after = unsafeAt code (pc + 5)
-        word <- readCell s cell
-        d <- deref s word
-        case tagOf d of
-          tag | tag == tagStr -> do
-            f <- readCell s (valOf d)
-            if funKey f /= functor
-              then pure streamFailed
-              else do
-                headWord <- readCell s (valOf d + 1)
-                tailWord <- readCell s (valOf d + 2)
-                writeFirst s (base + h) headWord
-                writeFirst s (base + t) tailWord
-                pure (pc + 6)
-            | tag == tagRef -> do
-                built <- writeListFirst s base functor h t
-                bind s (valOf d) built
-                pure after
-            | otherwise -> pure streamFailed
-    | op == opUS -> do
-        let !entry = unsafeAt code (pc + 1)
-            !functor = unsafeAt code (pc + 2)
-            !n = unsafeAt code (pc + 3)
-            !after = unsafeAt code (pc + 4)
-        word <- readCell s cell
-        d <- deref s word
-        case tagOf d of
-          tag | tag == tagStr -> do
-            f <- readCell s (valOf d)
-            if funKey f /= functor
-              then pure streamFailed
-              else streamOperands m stream base (valOf d + 1) n (pc + 5)
-            | tag == tagRef -> do
-                ok <- writeAndBind m stream base entry functor n (pc + 5) (valOf d)
-                pure (if ok then after else streamFailed)
-            | otherwise -> pure streamFailed
-    | otherwise -> pure streamFailed
+  | op == opUF = do
+      w <- peekAt p cell >>= derefPtr p
+      pokeAt p (base + unsafeAt code (pc + 1)) w
+      streamOperandsPtr m p stream base (cell + 1) (n - 1) (pc + 2)
+  | op == opUV = do
+      word <- peekAt p cell
+      value <- slotWord s base (unsafeAt code (pc + 1))
+      p' <- cellsPtr s
+      ok <- unifyPtr s p' value word
+      if ok then streamOperandsPtr m p' stream base (cell + 1) (n - 1) (pc + 2) else pure streamFailed
+  | op == opUC = do
+      word <- peekAt p cell
+      ok <- unifyPtr s p (unsafeAt code (pc + 1)) word
+      if ok then streamOperandsPtr m p stream base (cell + 1) (n - 1) (pc + 2) else pure streamFailed
+  | op == opUSF = do
+      let !functor = unsafeAt code (pc + 2)
+          !h = unsafeAt code (pc + 3)
+          !t = unsafeAt code (pc + 4)
+          !after = unsafeAt code (pc + 5)
+      word <- peekAt p cell
+      d <- derefPtr p word
+      case tagOf d of
+        tag | tag == tagStr -> do
+          f <- peekAt p (valOf d)
+          if funKey f /= functor
+            then pure streamFailed
+            else do
+              headWord <- peekAt p (valOf d + 1) >>= derefPtr p
+              tailWord <- peekAt p (valOf d + 2) >>= derefPtr p
+              pokeAt p (base + h) headWord
+              pokeAt p (base + t) tailWord
+              streamOperandsPtr m p stream base (cell + 1) (n - 1) (pc + 6)
+          | tag == tagRef -> do
+              built <- writeListFirst s base functor h t
+              bind s (valOf d) built
+              p' <- cellsPtr s
+              streamOperandsPtr m p' stream base (cell + 1) (n - 1) after
+          | otherwise -> pure streamFailed
+  | op == opUS = do
+      let !entry = unsafeAt code (pc + 1)
+          !functor = unsafeAt code (pc + 2)
+          !k = unsafeAt code (pc + 3)
+          !after = unsafeAt code (pc + 4)
+      word <- peekAt p cell
+      d <- derefPtr p word
+      case tagOf d of
+        tag | tag == tagStr -> do
+          f <- peekAt p (valOf d)
+          if funKey f /= functor
+            then pure streamFailed
+            else do
+              next <- streamOperandsPtr m p stream base (valOf d + 1) k (pc + 5)
+              if next == streamFailed
+                then pure streamFailed
+                else do
+                  p' <- cellsPtr s
+                  streamOperandsPtr m p' stream base (cell + 1) (n - 1) next
+          | tag == tagRef -> do
+              ok <- writeAndBind m stream base entry functor k (pc + 5) (valOf d)
+              if ok
+                then do
+                  p' <- cellsPtr s
+                  streamOperandsPtr m p' stream base (cell + 1) (n - 1) after
+                else pure streamFailed
+          | otherwise -> pure streamFailed
+  | otherwise = pure streamFailed
   where
     !s = mStore m
     !code = csCode stream
@@ -2100,6 +2219,7 @@ callClausesWithFrame m frame predicate barrier depth returnCont =
 scanCommit :: Machine -> Pred -> Int -> Cont -> IO Cont
 scanCommit m predicate entry cont = case cont of
   CReturn h _ Nothing _ | h >= 0 -> pure cont
+  CStream _ _ _ _ _ h _ _ | h >= 0 -> pure cont
   _ -> do
     commits <- case pSwitch predicate of
       Nothing -> pure False
@@ -2108,7 +2228,10 @@ scanCommit m predicate entry cont = case cont of
       then pure cont
       else do
         guardBase <- guardTop m
-        pure (CReturn entry guardBase Nothing cont)
+        pure $ case cont of
+          CStream s' pc' base' bar' d' (-1) (-1) next' ->
+            CStream s' pc' base' bar' d' entry guardBase next'
+          _ -> CReturn entry guardBase Nothing cont
 {-# NOINLINE scanCommit #-}
 
 -- | Run a list search's native kernel ('scanShape') on the argument
@@ -2167,15 +2290,18 @@ dispatchCandidates m frame predicate barrier depth returnCont candidates = do
     OneCandidate ordinal -> tryClauseWithFrame m frame predicate ordinal barrier depth returnCont
     Candidates ordinals -> do
       clp <- readReg s rCLP
-      saved <- saveArgs s (pArity predicate)
       if clp == 0
         then do
+          -- Reserve the saved-argument slots below h0 without copying argRegs;
+          -- writeSavedArgs copies them only if a non-final candidate succeeds.
+          saved <- reserveCells s (pArity predicate)
           h0 <- heapTop s
           tr0 <- trailTop s
           older <- hb s
           setHb s h0
           shallowCandidates m frame predicate ordinals saved h0 tr0 older 0 barrier depth returnCont
         else do
+          saved <- saveArgs s (pArity predicate)
           let !alt = AltClauses predicate ordinals saved depth returnCont
           choice <- pushChoice m alt
           let !barrier' = min barrier choice
@@ -2197,8 +2323,8 @@ dispatchCandidates m frame predicate barrier depth returnCont candidates = do
 shallowCandidates :: Machine -> Int -> Pred -> UArray Int Int -> Int -> Int -> Int -> Int -> Int -> Int -> Int -> Cont -> IO Step
 shallowCandidates m !frame predicate ordinals !saved !h0 !tr0 !older !k !barrier !depth returnCont
   | k + 1 >= numElements ordinals = do
-      -- Nothing would remain to retry: drop the saved arguments and run the
-      -- last candidate exactly as a single one.
+      -- Nothing would remain to retry: drop the reserved argument slots and
+      -- run the last candidate exactly as a single one.
       setHeapTop s saved
       setHb s older
       tryClauseWithFrame m frame predicate (ordinals `unsafeAt` k) barrier depth returnCont
@@ -2217,6 +2343,7 @@ shallowCandidates m !frame predicate ordinals !saved !h0 !tr0 !older !k !barrier
           setHeapTop s h0
           shallowCandidates m frame predicate ordinals saved h0 tr0 older (k + 1) barrier depth returnCont
         else do
+          writeSavedArgs s saved (pArity predicate)
           choice <- pushChoiceMarked m h0 tr0 (k + 1) (AltClauses predicate ordinals saved depth returnCont)
           let !barrier' = min barrier choice
           case clStream clause of
@@ -2690,6 +2817,26 @@ backtrackChoice m top =
                 -- The winner's store already holds these bindings.
                 writeReg s rBOUND 0
                 run m cont
+        AltNative predicate kernel saved entryH entryTR d cont -> do
+          pop
+          outcome <- resumeClauseUnit s entryH entryTR d maxResolutionDepth kernel
+          case outcome of
+            Just (1, _, hasMore) -> do
+              when hasMore $ do
+                _ <- pushChoice m (AltNative predicate kernel saved entryH entryTR d cont)
+                pure ()
+              run m cont
+            Just (0, _, _) -> do
+              setHeapTop s saved
+              backtrack m
+            Just (3, _, _) -> do
+              setHeapTop s saved
+              raiseItems m [BranchExhausted] (backtrack m)
+            _ -> do
+              loadArgs s saved (pArity predicate)
+              setHeapTop s saved
+              entry <- choiceTop m
+              callClausesInterpreted m 0 predicate entry d cont
   where
     pop = do
       top <- choiceTop m
@@ -3467,7 +3614,7 @@ checkInvariants m cont = do
         CExitIf _ _ base _ _ next -> checkBase base >> checkCont next
         CExitFindAll _ _ _ base _ _ _ -> checkBase base
         CExitMinimize _ base _ -> checkBase base
-        CStream _ _ base _ _ next -> checkBase base >> checkCont next
+        CStream _ _ base _ _ _ _ next -> checkBase base >> checkCont next
         _ -> pure ()
       checkBase base = when (base > 0) $ do
         marker <- peekAt arr (base - 1)
@@ -3529,6 +3676,7 @@ collect m cont nargs = do
   -- The bitmaps are small and newArray clears them in bulk. Reusing them
   -- would require a slower bit-by-bit clear; reuse the word-sized arrays.
   marks <- newArray (0, top) False :: IO (IOUArray Int Bool)
+  streamBasesRef <- newIORef IS.empty
   -- Slot zero is the stack height, kept unboxed just like the addresses.
   stackRef <- newIORef =<< (newArray (0, 4095) 0 :: IO (IOUArray Int Int))
   let push a = do
@@ -3588,16 +3736,16 @@ collect m cont nargs = do
           markCont (fxCont fx)
         CExitMinimize cost base _ -> Liveness.visitPattern markWord base cost
         -- Code is immutable words and cannot be rewritten, so a suspended
-        -- stream keeps its whole activation block live: every slot the
-        -- remaining instructions could still name, plus the marker cell that
-        -- makes the block contiguous and readable. Mark-compact preserves
-        -- address order, so the block stays contiguous and every operand
-        -- offset in the code stays valid; relocating it is then one address.
-        CStream _ _ base _ _ next -> markBlock base >> markCont next
-      markBlock base = do
+        -- stream keeps its activation block contiguous in address order,
+        -- while only tracing the slots that remaining instructions at or
+        -- after pc can still read. Dead slots are reset to self-references
+        -- after drain so their unreachable structures can be collected.
+        CStream stream pc base _ _ _ _ next -> markStream stream pc base >> markCont next
+      markStream stream pc base = do
         when (base > 0 && base <= top) $ do
-          marker <- peekAt arr (base - 1)
-          forM_ [base - 1 .. min top (base - 1 + markerVars marker)] markCell
+          markCell (base - 1)
+          modifyIORef' streamBasesRef (IS.insert base)
+          Liveness.visitStream markWord base stream pc
       markResults ref = do
         collected <- readIORef ref
         forM_ collected (markCopy . fst)
@@ -3630,6 +3778,7 @@ collect m cont nargs = do
           markCont c
         AltLabel _ _ _ c -> markCont c
         AltOptimize _ _ _ _ _ c -> markCont c
+        AltNative predicate _ saved _ _ _ c -> forM_ [saved .. saved + pArity predicate - 1] markCell >> markCont c
       -- Constraint stores retain logical variables independently of the
       -- suspended syntax. Their watched cells, and pending reconciliation
       -- cells, must survive even when a local has no remaining goal use.
@@ -3653,6 +3802,14 @@ collect m cont nargs = do
     markAlt (chAlt choice)
     markWatched (chWatched choice)
   drain
+  streamBases <- readIORef streamBasesRef
+  forM_ (IS.toList streamBases) $ \base -> do
+    marker <- peekAt arr (base - 1)
+    forM_ [base .. min (top - 1) (base - 1 + markerVars marker)] $ \a -> do
+      live <- unsafeRead marks a
+      unless live $ do
+        pokeAt arr a (refWord a)
+        unsafeWrite marks a True
   -- Forwarding: fwd a = live cells below a.
   let fwd = gcForward workspace
   let count !a !n
@@ -3703,10 +3860,17 @@ collect m cont nargs = do
             old <- if len == 2 then peekAt trailArr start else pure 0
             unsafeWrite keptBelow start k
             when (len == 2) (unsafeWrite keptBelow (start + 1) k)
-            live <- liveCell (entry `div` 2)
-            if live
+            let !addr = entry `div` 2
+            live <- liveCell addr
+            stillBound <-
+              if live && len == 1
+                then do
+                  w <- peekAt arr addr
+                  pure (w /= refWord addr)
+                else pure live
+            if stillBound
               then do
-                addr' <- forward (entry `div` 2)
+                addr' <- forward addr
                 if len == 1
                   then pokeAt trailArr k (addr' * 2)
                   else do
@@ -3740,8 +3904,8 @@ collect m cont nargs = do
         CExitMinimize cost base ref -> (\p -> CExitMinimize p 0 ref) <$> Liveness.relocatePattern reloc base cost
         -- The code names slots by offset, so the block must not be detached:
         -- forward the base and keep it.
-        CStream stream pc base barrier depth next ->
-          CStream stream pc <$> forward base <*> pure barrier <*> pure depth <*> relocCont next
+        CStream stream pc base barrier depth commitHeight guardBase next ->
+          CStream stream pc <$> forward base <*> pure barrier <*> pure depth <*> pure commitHeight <*> pure guardBase <*> relocCont next
       relocResults ref = do
         collected <- readIORef ref
         relocated <- forM collected $ \(copy, produced) -> (\c -> (c, produced)) <$> relocCopy copy
@@ -3793,6 +3957,8 @@ collect m cont nargs = do
           AltMinimize ref buffer <$> relocCont c
         AltLabel variables selected values c -> AltLabel variables selected values <$> relocCont c
         AltOptimize variables selected value goal minimum c -> AltOptimize variables selected value goal minimum <$> relocCont c
+        AltNative predicate kernel saved entryH entryTR d c ->
+          AltNative predicate kernel <$> forward saved <*> forward entryH <*> unsafeRead keptBelow entryTR <*> pure d <*> relocCont c
   cont' <- relocCont cont
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
   varCells <- readIORef (mVarCells m)

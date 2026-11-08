@@ -58,6 +58,7 @@ hwLoc = \case
   RH -> Left 8 -- r8
   RTR -> Left 9 -- r9
   RHB -> Left 10 -- r10
+  RDepth -> Left 13 -- r13
   RT0 -> Left 1 -- rcx
   RT1 -> Left 6 -- rsi
   RT2 -> Left 7 -- rdi

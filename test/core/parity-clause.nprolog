@@ -64,6 +64,45 @@ sgn X -1 <- X <= 0.
 # Structural != decided natively only on constants.
 diff X Y <- X != Y.
 
+# Increment 2: inline type/groundness tests, structural equality, cuts,
+# once, negation-as-failure, and native choice-frame backtracking.
+classify X int <- is_int X.
+classify X atom <- is_atom X.
+classify X char <- is_char X.
+classify X open <- var X.
+classify X comp <- nonvar X, not (is_int X), not (is_atom X), not (is_char X).
+
+check_ground X ok <- ground X, nonvar X.
+check_ground X open <- not (ground X).
+
+eq_test A B same <- A == B.
+eq_test A B diff <- not (A == B).
+
+match_target X hit <- X == p a (g 3).
+match_target X miss <- not (X == p a (g 3)).
+
+first_pos : unsafe.
+first_pos [X | _] X <- X > 0, !.
+first_pos [_ | T] R <- first_pos T R.
+
+sel X [X | T] T.
+sel X [H | T] [H | R] <- sel X T R.
+perm [] [].
+perm L [H | T] <- sel H L R, perm R T.
+
+once_pick L X <- once (sel X L _), X > 1.
+has_even L <- sel X L _, 0 is X % 2.
+no_even L <- not (has_even L).
+
+d (add U V) X (add DU DV) <- d U X DU, d V X DV.
+d (sub U V) X (sub DU DV) <- d U X DU, d V X DV.
+d (times U V) X (add (times DU V) (times U DV)) <- d U X DU, d V X DV.
+d (quo U V) X (quo (sub (times DU V) (times U DV)) (pw V 2)) <- d U X DU, d V X DV.
+d (pw U N) X (times DU (times N (pw U N1))) <- is_int N, N1 is N - 1, d U X DU.
+d (neg U) X (neg DU) <- d U X DU.
+d X X 1.
+d C X 0 <- ground C, not (C == X).
+
 # A long list for len/2, whose non-tail recursion grows the native stack
 # (3000 frames of about 7 words against 4096 initial words). count/2 itself
 # is a tail loop kernel. Open-ended queries are under once: parity
@@ -131,6 +170,10 @@ count N [N | T] <- N > 0, M is N - 1, count M T.
 > same (f X) (f a)?
 > same X (f X)?
 > same [1, 2] [1, 2]?
+> same (p X 2) (p 1 Y)?
+> same (p X X) (p a b)?
+> same (p X (f a)) (p (f a) Y)?
+> same (p X Y) (p Y (f X))?
 > twice a L?
 > twice X [1, 1]?
 > twice X [1, 2]?
@@ -165,3 +208,29 @@ count N [N | T] <- N > 0, M is N - 1, count M T.
 > sgn U U?
 > sgn 5 S?
 > sgn -3 S?
+# Increment 2 parity queries.
+> classify 42 K?
+> classify hello K?
+> classify 'z' K?
+> classify U K?
+> classify (p 1 2) K?
+> check_ground (p 1 [a, b]) R?
+> check_ground (p 1 [a, W]) R?
+> eq_test 7 7 R?
+> eq_test 7 8 R?
+> eq_test X X R?
+> eq_test X Y R?
+> match_target (p a (g 3)) R?
+> match_target (p a (g 4)) R?
+> match_target X R?
+> first_pos [-3, 0, 4, 9] R?
+> first_pos [-3, -1] R?
+> sel X [1, 2, 3] R?
+> perm [1, 2, 3] P?
+> once_pick [1, 2, 3] X?
+> once_pick [3, 1, 4] X?
+> has_even [1, 3, 4, 5]?
+> no_even [1, 3, 5]?
+> no_even [1, 2, 5]?
+> d (add (pw x 3) (neg (times 4 x))) x D?
+> once (d (quo (times x x) (sub x 1)) x D)?

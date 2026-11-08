@@ -60,6 +60,8 @@ module Infera.Core.Jit.IR
     stateClpIdx,
     stateNStackBaseIdx,
     stateNStackLimIdx,
+    stateBIdx,
+    stateAllowChoicesIdx,
     budgetDepthIdx,
     budgetAllocIdx,
   )
@@ -88,9 +90,11 @@ stateCapIdx = 5
 stateTrailCapIdx = 6
 stateClpIdx = 7
 
-stateNStackBaseIdx, stateNStackLimIdx :: Int
+stateNStackBaseIdx, stateNStackLimIdx, stateBIdx, stateAllowChoicesIdx :: Int
 stateNStackBaseIdx = 8
 stateNStackLimIdx = 9
+stateBIdx = 10
+stateAllowChoicesIdx = 11
 
 budgetDepthIdx, budgetAllocIdx :: Int
 budgetDepthIdx = 0
@@ -107,6 +111,7 @@ budgetAllocIdx = 1
 -- * 'RH'       : cached heap top @rH@
 -- * 'RTR'      : cached trail top @rTR@
 -- * 'RHB'      : cached choice boundary @rHB@
+-- * 'RDepth'   : cached resolution depth budget
 -- * 'RT0'..'RT7': general 64-bit working registers for loop variables and scratch
 -- * 'RE'       : current native environment frame (a byte address)
 -- * 'RSP'      : native stack top (a byte address)
@@ -119,6 +124,7 @@ data Reg
   | RH
   | RTR
   | RHB
+  | RDepth
   | RT0
   | RT1
   | RT2

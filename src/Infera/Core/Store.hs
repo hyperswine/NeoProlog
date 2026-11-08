@@ -45,16 +45,16 @@ module Infera.Core.Store
     readCell, writeCell, pushCell, allocCells, allocSlots, allocFrame, operandWord, operandAt,
     resetSlots, resetFrame, markerWord, logicalId, nameCell, nameCellAs,
     replaceLogicalIds, collectionStats, recordCollection,
-    readArg, writeArg, saveArgs, loadArgs, reserveCells, groundNowWord,
+    readArg, writeArg, saveArgs, writeSavedArgs, loadArgs, reserveCells, groundNowWord,
     readReg, writeReg, rVAL, rGCLIM, rCLP, rBOUND, rCAP, rTRAILCAP, initialCollectLimit, markerVars,
     drainBound, recordBoundCell,
     -- * Pinned block pointers (invalidated by growth)
     cellsPtr, trailPtr, boundPtr, peekAt, pokeAt,
-    deref, bind, unwindTrail, trailIf, trailValueIf,
+    deref, derefPtr, bind, unwindTrail, trailIf, trailValueIf,
     structureWord, structure2, structure2WithGround,
     box, boxed, boxIn, boxedIn,
     -- * Unification and equality
-    unify, equiv, isGroundWord, occursIn,
+    unify, unifyPtr, equiv, isGroundWord, occursIn,
     -- * Term exchange
     importTerm, importTermWords, exportTerm, exportTermWith,
   )
@@ -350,18 +350,22 @@ writeArg :: Store -> Int -> Word' -> IO ()
 writeArg s = unsafeWrite (argRegs s)
 {-# INLINE writeArg #-}
 
--- | Copy the first @n@ argument registers to the heap for a choice point;
--- returns the address of the copy.
-saveArgs :: Store -> Int -> IO Int
-saveArgs s n = do
-  top <- heapTop s
-  ensureCells s (top + n)
+-- | Copy the first @n@ argument registers into cells already reserved at @top@.
+writeSavedArgs :: Store -> Int -> Int -> IO ()
+writeSavedArgs s !top !n = do
   cells <- cellsPtr s
   let go !i
         | i >= n = pure ()
         | otherwise = unsafeRead (argRegs s) i >>= pokeAt cells (top + i) >> go (i + 1)
   go 0
-  unsafeWrite (regs s) rH (top + n)
+{-# INLINE writeSavedArgs #-}
+
+-- | Copy the first @n@ argument registers to the heap for a choice point;
+-- returns the address of the copy.
+saveArgs :: Store -> Int -> IO Int
+saveArgs s n = do
+  top <- reserveCells s n
+  writeSavedArgs s top n
   pure top
 
 loadArgs :: Store -> Int -> Int -> IO ()
@@ -705,16 +709,24 @@ structure2WithGround s functor ground a b = do
   pokeAt p (addr + 2) b
   pure (strWord addr)
 
+-- | Follow reference chains using a pre-loaded cells base pointer.
+derefPtr :: Ptr Int -> Word' -> IO Word'
+derefPtr !p !w
+  | tagOf w == tagRef = go w
+  | otherwise = pure w
+  where
+    go !v = do
+      v' <- peekAt p (valOf v)
+      if v' == v || tagOf v' /= tagRef then pure v' else go v'
+{-# INLINE derefPtr #-}
+
 -- | Follow reference chains. The result is either a non-REF word or the
 -- REF of an unbound cell.
 deref :: Store -> Word' -> IO Word'
 deref s !w
   | tagOf w == tagRef = do
       p <- cellsPtr s
-      let go !v = do
-            v' <- peekAt p (valOf v)
-            if v' == v || tagOf v' /= tagRef then pure v' else go v'
-      go w
+      derefPtr p w
   | otherwise = pure w
 {-# INLINE deref #-}
 
@@ -864,45 +876,59 @@ boxedIn syms w = do
 -- are undone by the caller's backtracking, exactly as in a WAM.
 unify :: Store -> Word' -> Word' -> IO Bool
 unify s a0 b0 = do
-  a <- deref s a0
-  b <- deref s b0
-  if a == b
-    then pure True
-    else case (tagOf a, tagOf b) of
-      (ta, tb)
-        | ta == tagRef && tb == tagRef -> do
-            -- Bind the younger cell to the older one, as a WAM does: the
-            -- older cell outlives it on backtracking and collection keeps
-            -- address order, so no reference can outlive its target.
-            if valOf a > valOf b
-              then bind s (valOf a) b >> pure True
-              else bind s (valOf b) a >> pure True
-        | ta == tagRef -> bindChecked (valOf a) b tb
-        | tb == tagRef -> bindChecked (valOf b) a ta
-        | ta == tagStr && tb == tagStr -> do
-            fa <- readCell s (valOf a)
-            fb <- readCell s (valOf b)
-            if funKey fa /= funKey fb
-              then pure False
-              else args (valOf a + 1) (valOf b + 1) (funArity fa)
-        | ta == tagBox && tb == tagBox -> do
-            x <- boxed s a
-            y <- boxed s b
-            pure (sameBoxed x y)
-        | otherwise -> pure False
+  p <- cellsPtr s
+  unifyPtr s p a0 b0
+{-# INLINE unify #-}
+
+-- | 'unify' with a pre-loaded cells base pointer. No cell allocation takes
+-- place during unification, so @p@ remains valid throughout.
+unifyPtr :: Store -> Ptr Int -> Word' -> Word' -> IO Bool
+unifyPtr s !p = go
   where
+    go a0 b0 = do
+      a <- derefPtr p a0
+      b <- derefPtr p b0
+      if a == b
+        then pure True
+        else case (tagOf a, tagOf b) of
+          (ta, tb)
+            | ta == tagRef && tb == tagRef -> do
+                -- Bind the younger cell to the older one, as a WAM does: the
+                -- older cell outlives it on backtracking and collection keeps
+                -- address order, so no reference can outlive its target.
+                if valOf a > valOf b
+                  then bindAt (valOf a) b >> pure True
+                  else bindAt (valOf b) a >> pure True
+            | ta == tagRef -> bindChecked (valOf a) b tb
+            | tb == tagRef -> bindChecked (valOf b) a ta
+            | ta == tagStr && tb == tagStr -> do
+                fa <- peekAt p (valOf a)
+                fb <- peekAt p (valOf b)
+                if funKey fa /= funKey fb
+                  then pure False
+                  else args (valOf a + 1) (valOf b + 1) (funArity fa)
+            | ta == tagBox && tb == tagBox -> do
+                x <- boxed s a
+                y <- boxed s b
+                pure (sameBoxed x y)
+            | otherwise -> pure False
+    bindAt addr value = do
+      pokeAt p addr value
+      trailIf s addr
+      flag <- unsafeRead (regs s) rCLP
+      when (flag /= 0) (recordBound s addr)
     -- Cyclic bindings fail: the language keeps the occurs check.
     bindChecked addr value tag
       | tag == tagStr = do
-          cyclic <- occursIn s addr value
-          if cyclic then pure False else bind s addr value >> pure True
-      | otherwise = bind s addr value >> pure True
+          cyclic <- occursInPtr s p addr value
+          if cyclic then pure False else bindAt addr value >> pure True
+      | otherwise = bindAt addr value >> pure True
     args !i !j !n
       | n == 0 = pure True
       | otherwise = do
-          x <- readCell s i
-          y <- readCell s j
-          ok <- unify s x y
+          x <- peekAt p i
+          y <- peekAt p j
+          ok <- go x y
           if ok then args (i + 1) (j + 1) (n - 1) else pure False
 
 -- Floats unify by value: signed zeros unify, NaN never unifies with itself.
@@ -916,52 +942,56 @@ sameBoxed _ _ = False
 -- unbound variables are different.
 equiv :: Store -> Word' -> Word' -> IO Bool
 equiv s a0 b0 = do
-  a <- deref s a0
-  b <- deref s b0
-  if a == b
-    then pure True
-    else case (tagOf a, tagOf b) of
-      (ta, tb)
-        | ta == tagStr && tb == tagStr -> do
-            fa <- readCell s (valOf a)
-            fb <- readCell s (valOf b)
-            if funKey fa /= funKey fb then pure False else args (valOf a + 1) (valOf b + 1) (funArity fa)
-        | ta == tagBox && tb == tagBox -> sameBoxed <$> boxed s a <*> boxed s b
-        | otherwise -> pure False
-  where
-    args !i !j !n
-      | n == 0 = pure True
-      | otherwise = do
-          x <- readCell s i
-          y <- readCell s j
-          ok <- equiv s x y
-          if ok then args (i + 1) (j + 1) (n - 1) else pure False
+  p <- cellsPtr s
+  let go x0 y0 = do
+        a <- derefPtr p x0
+        b <- derefPtr p y0
+        if a == b
+          then pure True
+          else case (tagOf a, tagOf b) of
+            (ta, tb)
+              | ta == tagStr && tb == tagStr -> do
+                  fa <- peekAt p (valOf a)
+                  fb <- peekAt p (valOf b)
+                  if funKey fa /= funKey fb then pure False else args (valOf a + 1) (valOf b + 1) (funArity fa)
+              | ta == tagBox && tb == tagBox -> sameBoxed <$> boxed s a <*> boxed s b
+              | otherwise -> pure False
+      args !i !j !n
+        | n == 0 = pure True
+        | otherwise = do
+            x <- peekAt p i
+            y <- peekAt p j
+            ok <- go x y
+            if ok then args (i + 1) (j + 1) (n - 1) else pure False
+  go a0 b0
 
 -- | Groundness, memoised in the functor cell: a structure found ground is
 -- marked, and the mark is trailed when a choice point could undo a binding
 -- inside it.
 isGroundWord :: Store -> Word' -> IO Bool
 isGroundWord s w0 = do
-  w <- deref s w0
-  case tagOf w of
-    t | t == tagRef -> pure False
-      | t == tagStr -> do
-          f <- readCell s (valOf w)
-          if funGround f
-            then pure True
-            else do
-              ok <- args (valOf w + 1) (funArity f)
-              when ok $ do
-                writeCell s (valOf w) (f .|. groundBit)
-                trailValueIf s (valOf w) f
-              pure ok
-      | otherwise -> pure True
-  where
-    args !i !n
-      | n == 0 = pure True
-      | otherwise = do
-          ok <- isGroundWord s =<< readCell s i
-          if ok then args (i + 1) (n - 1) else pure False
+  p <- cellsPtr s
+  let go u0 = do
+        w <- derefPtr p u0
+        case tagOf w of
+          t | t == tagRef -> pure False
+            | t == tagStr -> do
+                f <- peekAt p (valOf w)
+                if funGround f
+                  then pure True
+                  else do
+                    ok <- args (valOf w + 1) (funArity f)
+                    when ok $ do
+                      pokeAt p (valOf w) (f .|. groundBit)
+                      trailValueIf s (valOf w) f
+                    pure ok
+            | otherwise -> pure True
+      args !i !n
+        | n == 0 = pure True
+        | otherwise = do
+            ok <- go =<< peekAt p i
+            if ok then args (i + 1) (n - 1) else pure False
+  go w0
 
 -- | Does the unbound cell @addr@ occur in @w@?
 --
@@ -971,32 +1001,40 @@ isGroundWord s w0 = do
 -- existing one (a tree insert, an accumulator) re-walked the old term on
 -- every binding and made such loops quadratic.
 occursIn :: Store -> Int -> Word' -> IO Bool
-occursIn s addr w0 = (== OccHit) <$> occursWalk s addr w0
+occursIn s addr w0 = do
+  p <- cellsPtr s
+  occursInPtr s p addr w0
+{-# INLINE occursIn #-}
+
+occursInPtr :: Store -> Ptr Int -> Int -> Word' -> IO Bool
+occursInPtr s !p addr w0 = (== OccHit) <$> occursWalk s p addr w0
+{-# INLINE occursInPtr #-}
 
 data Occ = OccHit | OccGround | OccOpen
   deriving (Eq)
 
-occursWalk :: Store -> Int -> Word' -> IO Occ
-occursWalk s addr w0 = do
-  w <- deref s w0
-  case tagOf w of
-    t | t == tagRef -> pure (if valOf w == addr then OccHit else OccOpen)
-      | t == tagStr -> do
-          f <- readCell s (valOf w)
-          if funGround f
-            then pure OccGround
-            else do
-              r <- args (valOf w + 1) (funArity f) True
-              when (r == OccGround) $ do
-                writeCell s (valOf w) (f .|. groundBit)
-                trailValueIf s (valOf w) f
-              pure r
-      | otherwise -> pure OccGround
+occursWalk :: Store -> Ptr Int -> Int -> Word' -> IO Occ
+occursWalk s !p addr = go
   where
+    go w0 = do
+      w <- derefPtr p w0
+      case tagOf w of
+        t | t == tagRef -> pure (if valOf w == addr then OccHit else OccOpen)
+          | t == tagStr -> do
+              f <- peekAt p (valOf w)
+              if funGround f
+                then pure OccGround
+                else do
+                  r <- args (valOf w + 1) (funArity f) True
+                  when (r == OccGround) $ do
+                    pokeAt p (valOf w) (f .|. groundBit)
+                    trailValueIf s (valOf w) f
+                  pure r
+          | otherwise -> pure OccGround
     args !i !n !allGround
       | n == 0 = pure (if allGround then OccGround else OccOpen)
       | otherwise = do
-          r <- occursWalk s addr =<< readCell s i
+          r <- go =<< peekAt p i
           case r of
             OccHit -> pure OccHit
             OccGround -> args (i + 1) (n - 1) allGround

@@ -54,6 +54,7 @@ hwReg = \case
   RH -> 24
   RTR -> 25
   RHB -> 26
+  RDepth -> 27
   RT0 -> 9
   RT1 -> 10
   RT2 -> 11
