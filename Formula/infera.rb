@@ -2,7 +2,7 @@ class Infera < Formula
   desc "Prolog-inspired logic language with sorts, modes, tabling and CLP(Z)"
   homepage "https://github.com/hyperswine/NeoProlog"
   url "https://github.com/hyperswine/NeoProlog.git",
-      tag: "v2.0.0"
+      tag: "v2.5.0"
   license "GPL-3.0-only"
   head "https://github.com/hyperswine/NeoProlog.git", branch: "main"
 
