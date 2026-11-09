@@ -2,7 +2,7 @@
 
 Kind: measurement report. Whole-process timings of Infera at `9a93cfe` (2.5.0 + 2) against SWI-Prolog, GNU Prolog, Trealla and Scryer on one shared, noisy Linux x86-64 VM. No engine change. Jack's macOS arm64 machine was **not** measured.
 
-**Short answer: mixed, not reliable.** Current Infera (main `9a93cfe`, 2.5.0 + 2 commits) wins clearly on the shapes its JIT kernels cover: startup, nrev, primes, zebra, and the repo's `bench_deriv`, where the derivative is thrown away. It also beats SWI (but not gprolog) on untabled tak and fib. It is still 2–4.5× behind SWI on findall, assert, first-argument indexing, and symbolic term work when the result is actually used. It also gives a wrong answer on `deriv` with `plus`/`minus` constructors. Infera wins 5 of 12 suite rows outright and beats SWI on 7 of 12. The "big wins" depend on kernels that apply only to specific clause shapes.
+**Short answer: mixed, not reliable.** Current Infera (main `9a93cfe`, 2.5.0 + 2 commits) wins clearly on the shapes its JIT kernels cover: startup, nrev, primes, zebra, and the repo's `bench_deriv`, where the derivative is thrown away. It also beats SWI (but not gprolog) on untabled tak and fib. It is still about 2–3× behind SWI on findall, assert, first-argument indexing, and symbolic term work when the result is actually used (the findall row's 4.5× is overstated by a harness artifact; see the correction below). It also gives a wrong answer on `deriv` with `plus`/`minus` constructors. Infera wins 5 of 12 suite rows outright and beats SWI on 7 of 12. The "big wins" depend on kernels that apply only to specific clause shapes.
 
 ## What was measured
 
@@ -77,7 +77,7 @@ Primary rows (one per workload: hello, nrev, tak, fib, queens, primes, zebra, de
   - queens 1.15× SWI (level with gprolog)
   - first-argument indexing 2.0× SWI
   - assertz 2.8×
-  - findall 4.5×
+  - findall 4.5× as measured, about 2.1× once the harness artifact is removed (see correction)
   - deriv with `plus`/`minus` 4.3×, **and the answer is wrong**
 - **Symbolic terms when the result is used:** derivrkeep 1.76× SWI, derivracc 1.75×, derivracc2 3.0×. The repo's `bench_deriv` binds every derivative to `_`. Its JIT win (0.11 s vs JIT-off 0.56 s) disappears once the derivative is returned and inspected (0.26 s), and completely once it is walked (JIT on = JIT off = 3.6 s). So the headline deriv win measures a case where no output term is consumed, not general structure building.
 - **vs Scryer and Trealla:** Infera is faster than both on every row except index (Trealla 0.052 vs 0.056, a tie), findall (Scryer tie) and the plus/minus deriv rows.
@@ -130,7 +130,7 @@ Primary rows (one per workload: hello, nrev, tak, fib, queens, primes, zebra, de
 **Trend:**
 - Large real gains since Nov 4: the list-search/filter kernels took primes and zebra from about 3.6× behind SWI to ahead of it, and nrev roughly 4.5× faster.
 - Indexing improved a lot in absolute terms (1.13 s → 0.056 s).
-- Unchanged: queens, tak and fib ratios; assert and findall still 3–4.5× behind; general symbolic term building still about 1.75–3× behind when the output is used.
+- Unchanged: queens, tak and fib ratios; assert still about 3× behind and findall about 2× (4.5× as first measured, see correction); general symbolic term building still about 1.75–3× behind when the output is used.
 
 ## Repo performance claims vs measured here
 
@@ -166,3 +166,8 @@ Primary rows (one per workload: hello, nrev, tak, fib, queens, primes, zebra, de
    - `infera F.nprolog +RTS -N1 -RTS` with `:q` on stdin; `INFERA_JIT=0` for the JIT-off column
 4. Run 1 warm-up and 5 timed rounds, interleaved across systems. Check every printed answer and take the median.
 5. Probes: `INFERA_JIT_DEBUG=1` shows the clause-unit fallback; `INFERA_JIT_CLAUSES=0` turns clause units off.
+
+## Correction (2026-11-09, later the same day): findall harness artifact
+
+The `findall` query in the rebuilt harness was not wrapped in `once`, so Infera's REPL also printed the whole 50k-element list `L` (about 339 KB of stdout) while SWI and gprolog printed only the sum. That inflated Infera's findall time. With the same query wrapped in `once` (prints only the sum), interleaved median of 5 at `9a93cfe`: Infera 0.040 s vs SWI 0.019 s, about **2.1×**, not 4.5×. The assertz and index queries were already `once`-wrapped and are unaffected. The table rows above are left as originally measured.
+
