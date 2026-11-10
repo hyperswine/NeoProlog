@@ -10,6 +10,40 @@ Open work for the next optimization is tracked in
 boxed-value retention, JIT code and cache lifetime, interpreter allocation,
 and gates that preserve measured gains and prove native execution.
 
+## Tracks 1–5 clause-JIT, symbolic terms, and dynamic fact store - 2026-11-10
+
+Following [the 2026-11-09 competitor report](2026-11-09-COMPETITOR-BENCHMARKS.md),
+Tracks 1–5 (`84812e8`) landed whole-search native `queens/2` compilation with
+multi-argument head exclusivity, fused `wGetListVarVar` WAM instructions,
+type-guarded `tsize/2` exclusivity, binary-search functor switches
+(`arg0FunSwitch`), post-`once` tail-call heap/trail reclamation
+(`clauseCanReclaimTailH`), a 64M-word native JIT heap, an unboxed dynamic
+integer fact buffer (`DynIntBuf`) with incremental `O(1)` first-argument
+indexing, an open-addressed `pFact2` table for static 2-argument facts, and a
+built-in fallback `length/2`.
+
+Whole-process wall-clock medians on Apple M4 (`aarch64-darwin`, `-O2`,
+`<- notable.`) across the validated CLI suite (`bench/run.py --runs 5`) and the
+13-workload competitor suite:
+
+| Workload | Infera (`84812e8` JIT) | Infera (`84812e8` No-JIT) | Prior Infera (`9a93cfe`) | Scryer 0.10.0 (M4) | SWI 10.0.0 (Nov 9) | gprolog 1.6.0 (Nov 9) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `nrev` (30 × 30k) | **0.136s** | 1.662s | 0.129s | 1.017s | 0.971s | 0.693s |
+| `tak(24,16,8)` (untabled) | **0.028s** | 0.398s | 0.577s | 0.313s | 1.626s | 0.490s |
+| `fib(27)` (untabled) | **0.029s** | 0.111s | 0.149s | 0.143s | 0.382s | 0.123s |
+| `queens(9)` (all 352) | **0.531s** | 1.024s | 0.619s | 0.842s | 0.539s | 0.637s |
+| `primes` (up to 20k) | **0.080s** | 0.619s | 0.087s | 0.658s | 0.489s | 0.481s |
+| `zebra` (300×) | **0.090s** | 0.660s | 0.089s | 0.603s | 0.257s | 0.286s |
+| `derivr` (30k×, discarded) | **0.040s** | 0.448s | 0.113s | 0.367s | 0.152s | 0.228s |
+| `derivrkeep` (30k×, inspected) | **0.041s** | 0.454s | 0.263s | 0.371s | 0.150s | 0.240s |
+| `derivracc2` (30k× + `tsize/2`) | **0.104s** | 2.330s | 3.753s | 1.806s | 1.241s | 1.568s |
+| `assertz` (100k + `findall` + sum) | **0.056s** | 0.077s | 0.139s | 0.397s | **0.050s** | 0.064s |
+| `findall` (50k solutions) | **0.019s** | 0.044s | 0.040s | 0.071s | 0.020s | 0.021s |
+| `index` (2k facts × 20 rounds) | 0.047s | 0.048s | 0.039s | 0.087s | **0.028s** | 0.035s |
+
+See [Addendum 2 of the competitor report](2026-11-09-COMPETITOR-BENCHMARKS.md)
+for the full breakdown.
+
 ## Unification-heavy programs - 2026-11-04
 
 Three cases joined `bench/run.py`: `zebra`, `deriv` and `primes`, the

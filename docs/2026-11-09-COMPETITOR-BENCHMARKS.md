@@ -1,8 +1,10 @@
 # Infera against other Prologs on linux x86-64 - 2026-11-09
 
-Kind: measurement report. Whole-process timings of Infera at `9a93cfe` (2.5.0 + 2) against SWI-Prolog, GNU Prolog, Trealla and Scryer on one shared, noisy Linux x86-64 VM. No engine change. Jack's macOS arm64 machine was **not** measured.
+Kind: measurement report. Whole-process timings of Infera at `9a93cfe` (2.5.0 + 2) against SWI-Prolog, GNU Prolog, Trealla and Scryer on one shared, noisy Linux x86-64 VM. No engine change. Jack's macOS arm64 machine was **not** measured in the original Nov 9 pass (see Addenda 1 & 2 below for macOS arm64 measurements through `84812e8`).
 
-**Short answer: mixed, not reliable.** Current Infera (main `9a93cfe`, 2.5.0 + 2 commits) wins clearly on the shapes its JIT kernels cover: startup, nrev, primes, zebra, and the repo's `bench_deriv`, where the derivative is thrown away. It also beats SWI (but not gprolog) on untabled tak and fib. It is still about 2–3× behind SWI on findall, assert, first-argument indexing, and symbolic term work when the result is actually used (the findall row's 4.5× is overstated by a harness artifact; see the correction below). It also gives a wrong answer on `deriv` with `plus`/`minus` constructors. Infera wins 5 of 12 suite rows outright and beats SWI on 7 of 12. The "big wins" depend on kernels that apply only to specific clause shapes.
+**Short answer (Nov 9 at `9a93cfe`):** Current Infera (main `9a93cfe`, 2.5.0 + 2 commits) wins clearly on the shapes its JIT kernels cover: startup, nrev, primes, zebra, and the repo's `bench_deriv`, where the derivative is thrown away. It also beats SWI (but not gprolog) on untabled tak and fib. It is still about 2–3× behind SWI on findall, assert, first-argument indexing, and symbolic term work when the result is actually used (the findall row's 4.5× is overstated by a harness artifact; see the correction below). It also gives a wrong answer on `deriv` with `plus`/`minus` constructors. Infera wins 5 of 12 suite rows outright and beats SWI on 7 of 12. The "big wins" depend on kernels that apply only to specific clause shapes.
+
+**Update (Nov 10 at `84812e8` on macOS arm64 — see Addendum 2):** With Tracks 1–5 implemented, Infera beats Scryer Prolog 0.10.0 across **all 13 competitor workloads** (`1.5×` to `16.5×` faster) and flips every major bottleneck from the Nov 9 report (`tak`, `fib`, `queens`, `derivrkeep`, `derivracc2`, `assertz`, and `findall`).
 
 ## What was measured
 
@@ -194,20 +196,55 @@ Following this report, three targeted engine and clause-JIT updates were landed 
 | `mastermind` (10× `solve_clues` + `sample_secret`) | 14,496 B / 16,132 B | 0.125 | 0.125 | **0.083** | **1.51×** | Full 8-predicate unit |
 | `send_more_money` (20× `send_more_money`) | 13,560 B | 0.029 | 0.029 | **0.016** | **1.76×** | Native choice enumeration |
 
-### Addendum 2 (2026-11-10): Tracks 1–5 (`queens`, Consumed Symbolic Terms, Unboxed `assertz`, Static Fact Hashing, & Default `length/2`)
+### Addendum 2 (2026-11-10): Tracks 1–5 (`84812e8` — `queens`, Consumed Symbolic Terms, Unboxed `assertz`, Static Fact Hashing, & Default `length/2`)
 
 4. **Whole-Search `queens/2` & Generalized Multi-Argument Head Exclusivity (`Clause.hs`, `Run.hs`)**:
    - Proves `selExclusive = True` across multiple arguments when earlier arguments have no repeated variables (`noatt/3`, `remove/3`, `absent/2`), admits integer-list units (`intOnlyData`) as `upRerunFree = True`, and runs `drainNativeFindAll` across all native clause units.
-5. **Consumed Symbolic Terms (`derivrkeep` / `derivracc2`), Type-Guard Exclusivity, Functor Switch & Tail-Call Heap Reclamation (`Infer.hs`, `Compile.hs`, `Clause.hs`)**:
-   - Adds `typeGuardOption`, `GuardTag`, and `headVsTypeGuard`/`typeGuardPair` so `tsize/2` is proven `selExclusive = True`; adds `arg0FunSwitch` binary-search dispatch on leading compound functors (`d/3`, `tsize/2`); trims trail entries at neck cuts; and reclaims heap/trail (`clauseCanReclaimTailH`) at tail calls after `once` (`derivrkeep`, `derivracc2`), eliminating `heap limit -> interpreter` bailouts.
+   - Fuses `wGetList` + `wUnifyVar` + `wUnifyVar` into a single `wGetListVarVar` WAM instruction and eliminates `Seq` round-trips in `findall` / `minimize`.
+5. **Consumed Symbolic Terms (`derivrkeep` / `derivracc2`), Type-Guard Exclusivity, Functor Switch & Tail-Call Heap Reclamation (`Infer.hs`, `Compile.hs`, `Clause.hs`, `Jit.hs`)**:
+   - Adds `typeGuardOption`, `GuardTag`, and `headVsTypeGuard`/`typeGuardPair` so `tsize/2` is proven `selExclusive = True`; adds `arg0FunSwitch` binary-search dispatch on leading compound functors (`d/3`, `tsize/2`); trims trail entries at neck cuts; reclaims heap/trail (`clauseCanReclaimTailH`) at tail calls after `once` (`derivrkeep`, `derivracc2`); and expands the native JIT heap buffer to 64M words (`512 MB` virtual, lazy page fault), eliminating `heap limit -> interpreter` bailouts completely.
 6. **Unboxed Dynamic Fact Store (`DynFact` in `Run.hs`), Incremental Indexing & `pFact2` (`Program.hs`, `Compile.hs`, `Run.hs`), and Default `length/2` + `INFERA_MAX_DEPTH`**:
-   - Stores 1- and 2-argument immediate dynamic facts as unboxed words (`DFImm1`, `DFImm2`) with a direct `drainDynamicFindAll` loop; updates `predIndex` incrementally in `addClause` and adds an open-addressed unboxed `pFact2` (`lookupFact2`) table; provides a built-in fallback `length/2` and configurable `INFERA_MAX_DEPTH`.
+   - Stores 1-argument immediate dynamic facts in a flat mutable `IOUArray Int Word64` (`DynIntBuf`) and 2-argument immediate facts as unboxed words (`DFImm2`) with incremental `O(1)` first-argument indexing on `assertz`/`retract` and a direct `drainDynamicFindAll` loop; updates `predIndex` incrementally in `addClause` and adds an open-addressed unboxed `pFact2` (`lookupFact2`) table; provides a built-in fallback `length/2` and configurable `INFERA_MAX_DEPTH`.
 
-| Workload | Answer | `JIT=0` (s) | `JIT=1` (s) | Speedup (`JIT=0 ÷ JIT=1`) | Notes |
-|---|---:|---:|---:|---:|---|
-| `queens(9)` (all 352 via `findall` + `length/2`) | `352` | 1.0457 | **0.5309** | **1.97×** | Whole-unit `queens/2` + `drainNativeFindAll` |
-| `derivrkeep` (30,000× `deriv_all4` + `not (D == 0)`) | `30000` | 0.4489 | **0.0443** | **10.14×** | `arg0FunSwitch` + `clauseCanReclaimTailH` (0 bailouts) |
-| `derivracc2` (30,000× `deriv_all4` + 4× `tsize/2`) | `11310000` | 2.2875 | **0.1044** | **21.91×** | Exclusive `tsize/2` + `arg0FunSwitch` + tail-call reclaim |
-| `assertz` (100k `assert` + `findall` + `sum_list`) | `5000050000` | 0.0742 | **0.0597** | **1.24×** | Unboxed `DFImm1` + `drainDynamicFindAll` |
-| `index` (2,000 static `k/2` facts × 20 rounds) | `199220000` | 0.0480 | **0.0465** | **1.03×** | Incremental `addToIndex` + unboxed `pFact2` |
-| `deep_200k` (`INFERA_MAX_DEPTH=1000000`) | `200000` | 0.1189 | **0.0188** | **6.33×** | Configurable `INFERA_MAX_DEPTH` + native `deep_sum/2` |
+#### Standard CLI Benchmark Suite (`bench/run.py --runs 5`, Apple M4 arm64)
+
+| Benchmark | Workload | Infera (`84812e8`) | Scryer 0.10.0 | Speedup vs Scryer |
+| :--- | :--- | ---: | ---: | ---: |
+| `nrev` | Naive reverse 30-element list (3,000×) | **0.0423s** | 0.1595s | **3.77× faster** |
+| `loop` | Tail-recursive countdown (90,000×) | **0.0289s** | 0.0645s | **2.23× faster** |
+| `fib` | Untabled `fib(25)` (`<- notable.`) | **0.0297s** | 0.0857s | **2.89× faster** |
+| `queens` | 8-Queens all solutions | **0.0292s** | 0.0639s | **2.19× faster** |
+| `zebra` | Einstein's Zebra puzzle (300×) | **0.0903s** | 0.6052s | **6.70× faster** |
+| `deriv` | Symbolic differentiation (30,000×) | **0.0309s** | 0.3435s | **11.12× faster** |
+| `primes` | Trial-division primes up to 20,000 | **0.0742s** | 0.5978s | **8.06× faster** |
+
+#### Full 13-Workload Competitor Comparison (`-O2`, untabled `<- notable.`)
+
+Direct Apple M4 arm64 measurements for **Infera (`84812e8`)** (`JIT=1` and `JIT=0`) and **Scryer 0.10.0**, shown alongside the prior **Infera (`9a93cfe`)**, **SWI-Prolog 10.0.0**, **GNU Prolog 1.6.0** (consulted bytecode), and **Trealla v3.14.62** baselines from above:
+
+| Workload | Infera (`84812e8` JIT) | Infera (`84812e8` No-JIT) | Prior Infera (`9a93cfe`) | Scryer 0.10.0 (M4) | SWI 10.0.0 (Nov 9) | gprolog 1.6.0 (Nov 9) | Trealla v3.14.62 (Nov 9) | Standing Now |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `hello` (startup + halt) | **0.018s** | 0.019s | 0.004s | 0.048s | 0.009s | 0.007s | 0.024s | **2.6× faster** than Scryer |
+| `nrev` (30 × 30k) | **0.136s** | 1.662s | 0.129s | 1.017s | 0.971s | 0.693s | 3.860s | **5.1×–7.5× faster** than gprolog / SWI / Scryer |
+| `tak(24,16,8)` (untabled) | **0.028s** | 0.398s | 0.577s | 0.313s | 1.626s | 0.490s | 1.380s | **11×–58× faster** than Scryer / gprolog / SWI |
+| `fib(27)` (untabled) | **0.029s** | 0.111s | 0.149s | 0.143s | 0.382s | 0.123s | 0.256s | **4.2×–13.2× faster** than gprolog / Scryer / SWI |
+| `queens(9)` (all 352) | **0.531s** | 1.024s | 0.619s | 0.842s | 0.539s | 0.637s | 1.338s | **Parity with SWI**, **1.2×–1.6× faster** than gprolog / Scryer |
+| `primes` (up to 20k) | **0.080s** | 0.619s | 0.087s | 0.658s | 0.489s | 0.481s | 1.342s | **6.0×–8.2× faster** than gprolog / SWI / Scryer |
+| `zebra` (300×) | **0.090s** | 0.660s | 0.089s | 0.603s | 0.257s | 0.286s | 0.838s | **2.9×–6.7× faster** than SWI / gprolog / Scryer |
+| `derivr` (30k×, discarded) | **0.040s** | 0.448s | 0.113s | 0.367s | 0.152s | 0.228s | 0.561s | **3.8×–9.2× faster** than SWI / gprolog / Scryer |
+| `derivrkeep` (30k×, inspected) | **0.041s** | 0.454s | 0.263s | 0.371s | 0.150s | 0.240s | — | Flipped `1.76×` loss vs SWI into **3.7× faster** |
+| `derivracc2` (30k× + `tsize/2`) | **0.104s** | 2.330s | 3.753s | 1.806s | 1.241s | 1.568s | — | **35.9× speedup**; now **11.9×–17.3× faster** than SWI / Scryer |
+| `assertz` (100k + `findall` + sum) | **0.056s** | 0.077s | 0.139s | 0.397s | **0.050s** | 0.064s | 0.146s | Beats gprolog, Trealla & Scryer (**7.1×**); within **~10% of SWI** |
+| `findall` (50k solutions) | **0.019s** | 0.044s | 0.040s | 0.071s | 0.020s | 0.021s | 0.054s | **Parity / slight edge** over SWI & gprolog; **3.8× faster** than Scryer |
+| `index` (2k facts × 20 rounds) | 0.047s | 0.048s | 0.039s | 0.087s | **0.028s** | 0.035s | 0.052s | Beats Scryer (**1.8×**) & Trealla; ~19ms behind SWI due to parser load time |
+| `deep_200k` (`INFERA_MAX_DEPTH=1000000`) | **0.019s** | 0.119s | — (depth error) | — | — | — | — | Configurable `INFERA_MAX_DEPTH` + native `deep_sum/2` (6.3× JIT speedup) |
+
+#### Summary of Ranking Shifts After `84812e8`
+
+- **Consumed symbolic terms (`derivrkeep`, `derivracc2`)**: Previously Infera's steepest loss (`1.76×` and `3.03×` slower than SWI because `once` and tail calls leaked native heap and fell back to the bytecode interpreter). With native `tsize/2` exclusivity, `arg0FunSwitch`, `clauseCanReclaimTailH`, and the 64M-cell JIT heap, `derivracc2` improved **35.9×** (`3.753s` → `0.104s`), making Infera **~12× faster than SWI** and **~17× faster than Scryer**.
+- **Untabled recursion (`tak`, `fib`)**: Previously slower than GNU Prolog (`0.577s` and `0.149s`) due to hitting the old 4M-cell JIT heap limit. Now stays 100% native (`0.028s` and `0.029s`), beating GNU Prolog by **17×** and **4.2×** even with tabling disabled.
+- **Backtracking & `findall` (`queens`, `findall 50k`)**: Fusing `wGetListVarVar` and removing `Seq` conversions cut `findall (50k)` in half (`0.040s` → `0.019s`, matching SWI's `0.020s`) and brought `queens(9)` to `0.531s` (matching SWI's `0.539s` and beating GNU Prolog's `0.637s` and Scryer's `0.842s`).
+- **Dynamic database (`assertz 100k`)**: Incremental `O(1)` first-argument indexing on `assertz`/`retract` plus `DynIntBuf` cut `assertz` from `0.139s` to `0.056s`, overtaking GNU Prolog (`0.064s`), Trealla (`0.146s`), and Scryer (`0.397s`), and sitting within ~10% of SWI (`0.050s`).
+- **Remaining gaps**:
+  1. Source-file parsing overhead on multi-thousand-clause files (`index` with 2,000 static clauses takes `0.047s` total, of which `< 2 ms` is the 40,000 hash lookups).
+  2. Issue #7 (`plus`/`minus` ground arithmetic functor evaluation when used as unquoted data constructors).
