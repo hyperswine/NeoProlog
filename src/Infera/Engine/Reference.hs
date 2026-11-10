@@ -59,6 +59,9 @@ import Infera.Program
 import Infera.Purity (describeViolation, programViolations)
 import Infera.Syntax
 import Infera.Unify
+import System.Environment (lookupEnv)
+import System.IO.Unsafe (unsafePerformIO)
+import Text.Read (readMaybe)
 
 -- ─── STATE ───────────────────────────────────────────────────────────────────
 
@@ -110,8 +113,13 @@ data Env = Env
 mkEnv :: Program -> Env
 mkEnv prog = Env prog (progFiles prog)
 
+{-# NOINLINE maxResolutionDepth #-}
 maxResolutionDepth :: Int
-maxResolutionDepth = 100000
+maxResolutionDepth = unsafePerformIO $ do
+  m <- lookupEnv "INFERA_MAX_DEPTH"
+  pure $ case m >>= readMaybe of
+    Just n | n > 0 -> n
+    _ -> 100000
 
 -- | Upper bound on fixpoint iterations for one tabled call.  Predicates with
 -- infinitely many answers (generators) hit this bound; declare them
@@ -754,7 +762,7 @@ labelMinimum st0 cost l =
 callPred :: Env -> Int -> SolverState -> Term -> Search
 callPred env fuel st goal = case functorOf goal of
   Nothing -> [BranchError (TypeError "callable goal" goal)]
-  Just key -> case lookupPred key (envProg env) of
+  Just key -> case lookupPredOrDefault key (envProg env) of
     Nothing
       | nameHasFlag (envProg env) (fst key) FlagDynamic -> callDynamic st key goal
       | otherwise -> [BranchError (UnknownPredicate key)]

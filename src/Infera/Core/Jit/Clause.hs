@@ -28,6 +28,7 @@ import Control.Monad.State.Strict
 import Data.Bits (complement, (.|.))
 import Data.Int (Int64)
 import Data.List (group, nub, sortOn)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as M
 import qualified Data.Set as Set
@@ -56,7 +57,7 @@ planClauseUnit :: Symbols -> (String -> Int -> Bool) -> P.Program -> PredKey -> 
 planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry of
   Left why -> pure (Left why)
   Right preds -> do
-    let clausesOf k = maybe [] (IM.elems . P.predClauses) (P.lookupPred k prog)
+    let clausesOf k = maybe [] (IM.elems . P.predClauses) (P.lookupPredOrDefault k prog)
         allClauses = [cl | (k, _) <- preds, cl <- clausesOf k]
         terms = concat [S.clauseHead c : concatMap flatten (S.clauseBody c) | c <- allClauses]
         dataTerms = concat [headArgs c ++ concatMap goalDataTerms (concatMap flatten (S.clauseBody c)) | c <- allClauses]
@@ -67,6 +68,9 @@ planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry 
           g
             | isInlineGuard g || g == S.Atom "!" -> []
             | otherwise -> callArgs g
+        intOnlyData =
+          all (== "nil") (concatMap atomsIn dataTerms)
+            && all (== ("cons", 2)) (concatMap funsIn dataTerms)
     atoms <- forM (nub (concatMap atomsIn terms)) $ \a -> (,) a . fromIntegral . atmWord <$> internAtom syms a
     funs <- forM (nub (concatMap funsIn terms)) $ \(f, n) -> do
       fid <- internFunctor syms f n
@@ -81,7 +85,7 @@ planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry 
               && all (selExclusive . snd) sels
               && not (any (\cl -> countControlTemps cl > 0) allClauses)
           freshOutMap = inferFreshOutArgs preds clausesOf
-          (choiceSafe, needIntMap, needGndMap) = inferChoiceNeeds env preds clausesOf selMap
+          (choiceSafe, needIntMap, needGndMap) = inferChoiceNeeds env intOnlyData preds clausesOf selMap
       bodies <- forM (zip [0 :: Int ..] sels) $ \(i, (k, sel)) ->
         compilePred env idx unitCanReclaimH (M.findWithDefault Set.empty k freshOutMap) i k (clausesOf k) sel
       let entrySel = case sels of
@@ -189,21 +193,48 @@ arg0ConstGroups env arity clauses
            in Just (sortOn fst (zip heads starts), Set.fromList ends)
         else Nothing
 
+-- | Check whether a predicate with @arity >= 1@ starts with @m >= 4@ compound
+-- patterns at argument 0 whose functors are pairwise distinct, followed by
+-- @n - m@ non-compound suffix clauses. Returns @(sortedFunPairs, mSuffixTarget)@.
+arg0FunSwitch :: CEnv -> Int -> [S.Clause] -> Maybe ([(Int64, Int)], Maybe Int)
+arg0FunSwitch env arity clauses
+  | arity < 1 = Nothing
+  | otherwise =
+      let m = length prefix
+          fws = [funW env f (length as) | cl <- prefix, S.Compound f as : _ <- [headArgs cl]]
+          suffix = drop m clauses
+          canMatchStr cl = case headArgs cl of
+            S.Var _ : _ -> True
+            S.Compound _ _ : _ -> True
+            _ -> False
+          mSuffixTarget = if any canMatchStr suffix then Just m else Nothing
+       in if m >= 4 && length (nub fws) == m
+            then Just (sortOn fst (zip fws [0 .. m - 1]), mSuffixTarget)
+            else Nothing
+  where
+    isComp0 cl = case headArgs cl of
+      S.Compound _ _ : _ -> True
+      _ -> False
+    prefix = takeWhile isComp0 clauses
+
 -- | Infer which arguments of each predicate in the unit must be integers or
 -- ground at entry so that no clause can evaluate an unbound variable or trigger
 -- a read-only / non-ground bailout during native choice enumeration.
 inferChoiceNeeds ::
   CEnv ->
+  Bool ->
   [(PredKey, P.Pred)] ->
   (PredKey -> [S.Clause]) ->
   M.Map PredKey Selection ->
   (Bool, M.Map PredKey (Set.Set Int), M.Map PredKey (Set.Set Int))
-inferChoiceNeeds env preds clausesOf selMap = go True initInt initGnd
+inferChoiceNeeds env intOnlyData preds clausesOf selMap = go True initInt initGnd
   where
     keys = map fst preds
     hasArg0Switch k = case arg0ConstGroups env (snd k) (clausesOf k) of
       Just _ -> True
-      Nothing -> False
+      Nothing -> case arg0FunSwitch env (snd k) (clausesOf k) of
+        Just _ -> True
+        Nothing -> False
     initInt = M.fromList [(k, Set.fromList (maybe [] selInt (M.lookup k selMap))) | k <- keys]
     initGnd =
       M.fromList
@@ -244,7 +275,7 @@ inferChoiceNeeds env preds clausesOf selMap = go True initInt initGnd
           needIntVar bound v (!ok, accI, accG)
             | Set.member v bound = (ok, accI, accG)
             | Just (i, True) <- M.lookup v varOwner = (ok, Set.insert i accI, accG)
-            | Just (i, False) <- M.lookup v varOwner = (False, accI, Set.insert i accG)
+            | Just (i, False) <- M.lookup v varOwner = (ok && intOnlyData, accI, Set.insert i accG)
             | otherwise = (False, accI, accG)
           needGndVar bound v (!ok, accI, accG)
             | Set.member v bound = (ok, accI, accG)
@@ -386,7 +417,7 @@ gatherUnit isBuiltin prog entry = gather [entry] []
     gather (k : queue) done
       | k `elem` map fst done = gather queue done
       | otherwise = do
-          p <- maybe (Left (show k ++ " undefined")) Right (P.lookupPred k prog)
+          p <- maybe (Left (show k ++ " undefined")) Right (P.lookupPredOrDefault k prog)
           admissible k p
           let callees = [c | cl <- IM.elems (P.predClauses p), g <- concatMap goalsIn (S.clauseBody cl), Just c <- [callKey g]]
           gather (queue ++ callees) ((k, p) : done)
@@ -436,7 +467,7 @@ gatherUnit isBuiltin prog entry = gather [entry] []
       S.Atom f | not (isBuiltin f 0), userPred (f, 0) -> Just (f, 0)
       S.Compound f as | not (isBuiltin f (length as)), userPred (f, length as) -> Just (f, length as)
       _ -> Nothing
-    userPred k = case P.lookupPred k prog of
+    userPred k = case P.lookupPredOrDefault k prog of
       Just _ -> not (P.nameHasFlag prog (fst k) S.FlagDynamic)
       Nothing -> False
 
@@ -574,6 +605,7 @@ isEarlyGuard = \case
   S.Atom "true" -> True
   S.Compound "is" _ -> True
   S.Compound op [_, _] -> op `elem` ["gt", "lt", "gte", "lte", "neq"]
+  S.Compound op [_] -> op `elem` ["is_int", "is_atom", "is_char"]
   _ -> False
 
 -- | Leading inline tests that bind no external variables and have at most
@@ -611,13 +643,21 @@ selectOrNondet p clauses = case selection p clauses of
 -- every later clause @j@ cannot match then, and could not raise an error
 -- the interpreter would raise before failing it.
 selection :: P.Pred -> [S.Clause] -> Either String Selection
-selection p clauses = do
-  pairs <- forM [(i, j) | i <- [0 .. n - 1], j <- [i + 1 .. n - 1]] pair
-  let ints = nub [x | (xs, _, _) <- pairs, x <- xs]
-      grounds = nub [x | (_, xs, _) <- pairs, x <- xs]
-      roMap = M.fromListWith Set.union [(i, paths) | (_, _, ros) <- pairs, (i, paths) <- ros]
-      ro = [if i == n - 1 then Set.empty else M.findWithDefault Set.empty i roMap | i <- [0 .. n - 1]]
-  pure (Selection True ints grounds ro)
+selection p clauses
+  | arity >= 1,
+    isInput 0,
+    Just ks <- mapM arg0ConstKey clauses,
+    let sorted = sortOn fst ks,
+    and (zipWith (/=) (map fst sorted) (drop 1 (map fst sorted))) =
+      let ro = [if i == n - 1 then Set.empty else Set.singleton (0, []) | i <- [0 .. n - 1]]
+       in Right (Selection True [] [] ro)
+  | otherwise = do
+      pairs <- forM [(i, j) | i <- [0 .. n - 1], j <- [i + 1 .. n - 1]] pair
+      let ints = nub [x | (xs, _, _) <- pairs, x <- xs]
+          grounds = nub [x | (_, xs, _) <- pairs, x <- xs]
+          roMap = M.fromListWith Set.union [(i, paths) | (_, _, ros) <- pairs, (i, paths) <- ros]
+          ro = [if i == n - 1 then Set.empty else M.findWithDefault Set.empty i roMap | i <- [0 .. n - 1]]
+      pure (Selection True ints grounds ro)
   where
     n = length clauses
     key = P.predKey p
@@ -627,6 +667,11 @@ selection p clauses = do
     isDetOrSemidet = P.sigDet inferred `elem` [S.Det, S.Semidet]
     modes = map S.argMode (P.sigArgs inferred)
     isInput i = length modes /= arity || modes !! i /= S.ModeOut
+    arg0ConstKey cl = case headArgs cl of
+      S.IntLit k : _ | fits k -> Just (0 :: Int, show k)
+      S.Atom a : _ -> Just (1, a)
+      S.CharLit c : _ -> Just (2, [c])
+      _ -> Nothing
     mask cl =
       let hd = case S.clauseHead cl of
             S.Compound f as -> S.Compound f [if isInput i then a else S.Var (-1) | (i, a) <- zip [0 ..] as]
@@ -645,9 +690,58 @@ selection p clauses = do
     headCannotBind cl roSet =
       let hvs = concatMap termVarIds (headArgs cl)
        in length hvs == length (nub hvs) && readOnlyPaths cl `Set.isSubsetOf` roSet
+    firstDisjointArg c1 c2 =
+      case [pos | pos <- [0 .. arity - 1], not (Set.null (disjointPaths (pos + 1) c1 c2))] of
+        pos : _ -> Just pos
+        [] -> Nothing
+    noPriorBind cl pos =
+      let priorVars = concatMap termVarIds (take pos (headArgs cl))
+       in length priorVars == length (nub priorVars)
+    priorRoPaths cl pos = Set.filter (\(p', _) -> p' < pos) (readOnlyPaths cl)
+    headShapeIncompatible term gOp = case (term, gOp) of
+      (S.Compound _ _, op) -> op `elem` ["is_int", "is_atom", "is_char"]
+      (S.IntLit _, op) -> op `elem` ["is_atom", "is_char"]
+      (S.Atom _, op) -> op `elem` ["is_int", "is_char"]
+      (S.CharLit _, op) -> op `elem` ["is_int", "is_atom"]
+      _ -> False
+    headVsTypeGuard rawI c1 c2 =
+      case [ Set.insert (pos, []) (priorRoPaths c1 pos)
+             | (pos, a1, S.Var v2) <- zip3 [0 .. arity - 1] (headArgs c1) (headArgs c2),
+               v2 >= 0,
+               isInput pos,
+               isDet || noPriorBind rawI pos,
+               S.Compound gOp [S.Var gv] <- S.clauseBody c2,
+               gv == v2,
+               headShapeIncompatible a1 gOp
+           ] of
+        roSet : _ -> Just roSet
+        [] -> Nothing
+    typeGuardPair rawI c1 c2 =
+      case [ priorRoPaths c1 (pos + 1)
+             | (pos, S.Var v1, S.Var v2) <- zip3 [0 .. arity - 1] (headArgs c1) (headArgs c2),
+               v1 >= 0,
+               v2 >= 0,
+               isInput pos,
+               isDet || noPriorBind rawI (pos + 1),
+               S.Compound gOp1 [S.Var gv1] <- S.clauseBody c1,
+               gv1 == v1,
+               gOp1 `elem` ["is_int", "is_atom", "is_char"],
+               S.Compound gOp2 [S.Var gv2] <- S.clauseBody c2,
+               gv2 == v2,
+               gOp2 `elem` ["is_int", "is_atom", "is_char"],
+               gOp1 /= gOp2
+           ] of
+        roSet : _ -> Just roSet
+        [] -> Nothing
     pair (i, j)
-      | (if isDet then headsExclusive arity ci cj else headsExclusive 1 ci cj) =
-          Right ([], [], [(i, disjointPaths (if isDet then arity else 1) ci cj)])
+      | headsExclusive arity ci cj,
+        Just pos <- firstDisjointArg ci cj,
+        isDet || noPriorBind (clauses !! i) pos =
+          Right ([], [], [(i, priorRoPaths ci pos `Set.union` disjointPaths arity ci cj)])
+      | Just roSet <- headVsTypeGuard (clauses !! i) ci cj =
+          Right ([], [], [(i, roSet)])
+      | Just roSet <- typeGuardPair (clauses !! i) ci cj =
+          Right ([], [], [(i, roSet)])
       | laterRaisesNothingNew arity ci cj, Just ints <- extraIntArgs ci cj, clausesExclusive arity ci cj =
           let roSet = guardRoPaths ci
               gnd = if headCannotBind (clauses !! i) roSet then [] else guarded
@@ -737,6 +831,7 @@ evaluatedPaths cl = go Set.empty Set.empty (S.clauseBody cl)
           _ -> Just acc'
         go defs' acc'' gs
       S.Compound _ [a, b] -> uses defs acc (termVarIds a ++ termVarIds b) >>= \acc' -> go defs acc' gs
+      S.Compound op [a] | op `elem` ["is_int", "is_atom", "is_char"] -> uses defs acc (termVarIds a) >>= \acc' -> go defs acc' gs
       _ -> go defs acc gs
     uses defs acc vs = foldl (\m v -> m >>= use defs v) (Just acc) vs
     use defs v acc
@@ -904,201 +999,294 @@ compilePred env idx unitCanReclaimH freshOutArgs pIx key clauses sel = do
       retryLbl k = lbl ++ "_r" ++ show k
       sharedUndoFailLbl = lbl ++ "_ufail"
       arg0SwitchInfo = arg0ConstGroups env arity clauses
-      isArg0Switch = case arg0SwitchInfo of
-        Just _ -> True
-        Nothing -> False
+      isArg0Switch = isJust arg0SwitchInfo
+      arg0FunSwitchInfo = case arg0SwitchInfo of
+        Just _ -> Nothing
+        Nothing -> arg0FunSwitch env arity clauses
       groupLastSet = case arg0SwitchInfo of
         Just (_, ends) -> ends
         Nothing -> Set.singleton (n - 1)
-      saveArgsOps =
-        concat
-          [ [JLoadImm RT0 RArgs i, JStoreImm RT0 RE (frameHeader + i)]
-            | i <- [if isArg0Switch then 1 else 0 .. savedArgWords - 1]
-          ]
-      loadArgsOps =
-        concat
-          [ [JLoadImm RT0 RE (frameHeader + i), JStoreImm RT0 RArgs i]
-            | i <- [if isArg0Switch then 1 else 0 .. savedArgWords - 1]
-          ]
-      entry =
-        [ JLabel lbl,
-          -- RT7 holds the return address. Reserve 10 extra words above RSP for
-          -- temporary register spills in unifyWords/not.
-          JAddImm RT6 RSP (8 * (frameSize + 10)),
-          JLoadImm RT5 RState stateNStackLimIdx,
-          JBranchCmp JGt RT6 RT5 "stackfull",
-          JAddImm RT6 RSP (8 * frameSize),
-          JStoreImm RE RSP frameLink,
-          JStoreImm RT7 RSP frameRet,
-          JLoadImm RT0 RState stateBIdx,
-          JStoreImm RT0 RSP framePrevB,
-          JStoreImm RHB RSP frameHB,
-          JMov RE RSP,
-          JMov RSP RT6
-        ]
-          ++ concat [intCheck p "rerun" | p <- selInt sel]
-          ++ concat [groundCheck (lbl ++ "_g" ++ show p) p "rerun" | p <- selGround sel]
-          ++ ( if n > 1
-                 then
-                   [ JStoreImm RTR RE frameTR,
-                     JStoreImm RH RE frameH,
-                     JStoreImm RDepth RE frameDepth,
-                     JMov RHB RH
-                   ]
-                     ++ saveArgsOps
-                 else [JStoreImm RH RE frameH | unitCanReclaimH]
-             )
-          ++ ( case arg0SwitchInfo of
-                 Just (sortedPairs, _) ->
-                   [ JLoadImm RT0 RArgs 0,
+      isFact2Unique =
+        arity == 2
+          && exclusive
+          && isArg0Switch
+          && Set.size groupLastSet == n
+          && all (\cl -> null (S.clauseBody cl) && length (headArgs cl) == 2 && all isJust (map (constWord env) (headArgs cl))) clauses
+  if isFact2Unique
+    then case arg0SwitchInfo of
+      Just (sortedPairs, _) ->
+        let f2TailLbl = lbl ++ "_f2tail"
+            f2RetLbl = lbl ++ "_f2ret"
+            f2Clauses =
+              concat
+                [ [ JLabel (clauseLbl k),
+                    JMovImm RT2 cw1
+                  ]
+                    ++ [JJump f2TailLbl | k < n - 1]
+                  | (k, cl) <- zip [0 ..] clauses,
+                    let cw1 = fromMaybe 0 (constWord env (headArgs cl !! 1))
+                ]
+         in Right $
+              [ JLabel lbl,
+                JLoadImm RT0 RArgs 0,
+                JDeref RT0 RT0,
+                JTagOf RT1 RT0,
+                JBranchImm JEq RT1 (fromIntegral tagRef) "rerun"
+              ]
+                ++ emitConstBinSearch (lbl ++ "_bs") sortedPairs clauseLbl "fail"
+                ++ f2Clauses
+                ++ [ JLabel f2TailLbl,
+                     JLoadImm RT0 RArgs 1,
                      JDeref RT0 RT0,
+                     JBranchCmp JEq RT0 RT2 f2RetLbl,
                      JTagOf RT1 RT0,
-                     JBranchImm JEq RT1 (fromIntegral tagRef) "rerun"
+                     JBranchImm JNe RT1 (fromIntegral tagRef) "fail",
+                     JBindRef RT0 RT2 f2RetLbl,
+                     JLabel f2RetLbl,
+                     JJumpReg RT7
                    ]
-                     ++ emitConstBinSearch (lbl ++ "_bs") sortedPairs clauseLbl "fail"
-                 Nothing -> []
-             )
-  blocks <- forM (zip [0 ..] clauses) $ \(k, cl) -> do
-    let isLast = Set.member k groupLastSet
-        goals = concatMap flatten (S.clauseBody cl)
-        guardPred = if exclusive then isEarlyGuard else isInlineGuard
-        (prefix, rest) = span guardPred goals
-        remArgs = drop 1 (headArgs cl)
-        -- When an arg0Switch clause has no guards and at most one remaining
-        -- ground argument (or distinct first-time variables), matching remArgs
-        -- cannot fail after binding, so no trail undo is needed on failure.
-        remVars = concatMap termVarIds remArgs
-        remNoUndoOnFail =
-          isArg0Switch
-            && null prefix
-            && (all groundTermOk remArgs && length remArgs <= 1 || all isVarTerm remArgs && length remVars == length (nub remVars))
-        arg0DirectCommit = remNoUndoOnFail && isLast
-        headFailL
-          | remNoUndoOnFail = if isLast then "fail" else clauseLbl (k + 1)
-          | isArg0Switch && isLast = sharedUndoFailLbl
-          | isLast = "fail"
-          | otherwise = undoLbl k
-        ro = selReadOnly sel !! k
-        gndArgs = Set.fromList (selGround sel)
-        tempBase = varBase + S.clauseNVars cl
-    (ops, _) <- runGen 0 varBase tempBase frameSize $ do
-      emit [JLabel (clauseLbl k)]
-      when ((isLast && n > 1) || arg0DirectCommit) (emit [JLoadImm RHB RE frameHB])
-      if isArg0Switch
-        then
-          zipWithM_
-            (\i a -> matchArg env (Set.member i gndArgs) (Set.member i freshOutArgs) ro (i, []) a i headFailL Nothing)
-            [1 ..]
-            remArgs
-        else
-          zipWithM_
-            ( \i a ->
-                matchArg
-                  env
-                  (Set.member i gndArgs)
-                  (Set.member i freshOutArgs)
-                  ro
-                  (i, [])
-                  a
-                  i
-                  headFailL
-                  (if i == 0 && not isLast then Just (clauseLbl (k + 1)) else Nothing)
-            )
-            [0 ..]
-            (headArgs cl)
-      mapM_ (compileGuard env headFailL) prefix
-      unless (isLast || arg0DirectCommit) $
-        if exclusive
-          then do
-            -- Commit: drop trail entries for cells >= the caller's RHB.
-            loopL <- lbl' "keep"
-            nextL <- lbl' "keep_next"
-            doneL <- lbl' "keep_done"
-            emit
-              [ JLoadImm RHB RE frameHB,
-                JLoadImm RT0 RE frameTR,
-                JMov RT1 RT0,
-                JLabel loopL,
-                JBranchCmp JGe RT0 RTR doneL,
-                JLoadIx RT2 RTrail RT0,
-                JShr RT3 RT2 1,
-                JBranchCmp JGe RT3 RHB nextL,
-                JStoreIx RT2 RTrail RT1,
-                JAddImm RT1 RT1 1,
-                JLabel nextL,
-                JAddImm RT0 RT0 1,
-                JJump loopL,
-                JLabel doneL,
-                JMov RTR RT1
+      Nothing -> Left "unreachable"
+    else do
+      let nextCandOf k = case arg0FunSwitchInfo of
+            Just (sortedFunPairs, mSuffix)
+              | k < length sortedFunPairs -> mSuffix
+            _ ->
+              if Set.member k groupLastSet
+                then Nothing
+                else Just (k + 1)
+          retryTargets = Set.fromList [nk | k0 <- [0 .. n - 1], Just nk <- [nextCandOf k0]]
+          clauseCanReclaimTailH cl =
+            let goals = concatMap flatten (S.clauseBody cl)
+                guardPred = if exclusive then isEarlyGuard else isInlineGuard
+                (_, rest0) = span guardPred goals
+                rest1 = case rest0 of
+                  S.Atom "!" : rs -> rs
+                  S.Compound "$cut" [S.IntLit _] : rs -> rs
+                  _ -> rest0
+             in length rest1 >= 2
+                  && case reverse rest1 of
+                    lastG : _ ->
+                      not (isInlineGuard lastG)
+                        && lastG /= S.Atom "!"
+                        && case lastG of
+                          S.Compound "once" _ -> False
+                          S.Compound "not" _ -> False
+                          S.Compound "unify" _ -> False
+                          _ -> all (\a -> isVarTerm a || atomicOk a) (callArgs lastG)
+                    [] -> False
+          anyReclaimTail = any clauseCanReclaimTailH clauses
+          saveArgsOps =
+            concat
+              [ [JLoadImm RT0 RArgs i, JStoreImm RT0 RE (frameHeader + i)]
+                | i <- [if isArg0Switch then 1 else 0 .. savedArgWords - 1]
               ]
-          else
-            -- Link RE into the native choice-point chain for clause k + 1.
-            emit
-              [ JLoadLabel RT0 (retryLbl (k + 1)),
-                JStoreImm RT0 RE frameNextAlt,
-                JStoreImm RE RState stateBIdx,
-                JMov RHB RH
+          loadArgsOps =
+            concat
+              [ [JLoadImm RT0 RE (frameHeader + i), JStoreImm RT0 RArgs i]
+                | i <- [if isArg0Switch then 1 else 0 .. savedArgWords - 1]
               ]
-      compileBody env idx unitCanReclaimH cl (lbl ++ "_c" ++ show k) True rest
-    let undo
-          | isLast || remNoUndoOnFail = []
-          | otherwise =
-              [ JLabel (undoLbl k),
-                JLoadImm RT0 RE frameTR,
-                JLabel (undoLbl k ++ "_loop"),
-                JBranchCmp JLe RTR RT0 (undoLbl k ++ "_done"),
-                JSubImm RTR RTR 1,
-                JLoadIx RT1 RTrail RTR,
-                JShr RT1 RT1 1,
-                JMkWord RT2 RT1 tagRef,
-                JStoreIx RT2 RCells RT1,
-                JJump (undoLbl k ++ "_loop"),
-                JLabel (undoLbl k ++ "_done"),
-                JLoadImm RH RE frameH,
-                JJump (clauseLbl (k + 1))
-              ]
-        retry
-          | isLast || exclusive = []
-          | otherwise =
-              [ JLabel (retryLbl (k + 1)),
-                JLoadImm RT0 RE frameTR,
-                JLabel (retryLbl (k + 1) ++ "_loop"),
-                JBranchCmp JLe RTR RT0 (retryLbl (k + 1) ++ "_done"),
-                JSubImm RTR RTR 1,
-                JLoadIx RT1 RTrail RTR,
-                JShr RT1 RT1 1,
-                JMkWord RT2 RT1 tagRef,
-                JStoreIx RT2 RCells RT1,
-                JJump (retryLbl (k + 1) ++ "_loop"),
-                JLabel (retryLbl (k + 1) ++ "_done"),
-                JLoadImm RH RE frameH,
-                JLoadImm RDepth RE frameDepth,
-                JAddImm RSP RE (8 * frameSize),
-                JLoadImm RT0 RE framePrevB,
-                JStoreImm RT0 RState stateBIdx
-              ]
-                ++ loadArgsOps
-                ++ [JMov RHB RH | not (Set.member (k + 1) groupLastSet)]
-                ++ [JJump (clauseLbl (k + 1))]
-    pure (relabel (lbl ++ "_c" ++ show k ++ "_") ops ++ undo ++ retry)
-  let sharedUndo
-        | not isArg0Switch = []
-        | otherwise =
-            [ JLabel sharedUndoFailLbl,
-              JLoadImm RT0 RE frameTR,
-              JLabel (sharedUndoFailLbl ++ "_loop"),
-              JBranchCmp JLe RTR RT0 (sharedUndoFailLbl ++ "_done"),
-              JSubImm RTR RTR 1,
-              JLoadIx RT1 RTrail RTR,
-              JShr RT1 RT1 1,
-              JMkWord RT2 RT1 tagRef,
-              JStoreIx RT2 RCells RT1,
-              JJump (sharedUndoFailLbl ++ "_loop"),
-              JLabel (sharedUndoFailLbl ++ "_done"),
-              JLoadImm RH RE frameH,
-              JJump "fail"
+          entry =
+            [ JLabel lbl,
+              -- RT7 holds the return address. Reserve 10 extra words above RSP for
+              -- temporary register spills in unifyWords/not.
+              JAddImm RT6 RSP (8 * (frameSize + 10)),
+              JLoadImm RT5 RState stateNStackLimIdx,
+              JBranchCmp JGt RT6 RT5 "stackfull",
+              JAddImm RT6 RSP (8 * frameSize),
+              JStoreImm RE RSP frameLink,
+              JStoreImm RT7 RSP frameRet,
+              JLoadImm RT0 RState stateBIdx,
+              JStoreImm RT0 RSP framePrevB,
+              JStoreImm RHB RSP frameHB,
+              JMov RE RSP,
+              JMov RSP RT6
             ]
-  pure (entry ++ concat blocks ++ sharedUndo)
+              ++ concat [intCheck p "rerun" | p <- selInt sel]
+              ++ concat [groundCheck (lbl ++ "_g" ++ show p) p "rerun" | p <- selGround sel]
+              ++ ( if n > 1 || anyReclaimTail
+                     then
+                       [ JStoreImm RTR RE frameTR,
+                         JStoreImm RH RE frameH,
+                         JStoreImm RDepth RE frameDepth,
+                         JMov RHB RH
+                       ]
+                         ++ saveArgsOps
+                     else [JStoreImm RH RE frameH | unitCanReclaimH]
+                 )
+              ++ ( case arg0SwitchInfo of
+                     Just (sortedPairs, _) ->
+                       [ JLoadImm RT0 RArgs 0,
+                         JDeref RT0 RT0,
+                         JTagOf RT1 RT0,
+                         JBranchImm JEq RT1 (fromIntegral tagRef) "rerun"
+                       ]
+                         ++ emitConstBinSearch (lbl ++ "_bs") sortedPairs clauseLbl "fail"
+                     Nothing -> case arg0FunSwitchInfo of
+                       Just (sortedFunPairs, _) ->
+                         let m = length sortedFunPairs
+                             nonStrLbl = if m < n then clauseLbl m else "fail"
+                          in [ JLoadImm RT0 RArgs 0,
+                               JDeref RT0 RT0,
+                               JTagOf RT1 RT0,
+                               JBranchImm JEq RT1 (fromIntegral tagRef) "rerun",
+                               JBranchImm JNe RT1 (fromIntegral tagStr) nonStrLbl,
+                               JValOf RT1 RT0,
+                               JLoadIx RT0 RCells RT1,
+                               JMovImm RT1 (complement (fromIntegral groundBit)),
+                               JAnd RT0 RT0 RT1
+                             ]
+                               ++ emitConstBinSearch (lbl ++ "_fbs") sortedFunPairs clauseLbl nonStrLbl
+                       Nothing -> []
+                 )
+      blocks <- forM (zip [0 ..] clauses) $ \(k, cl) -> do
+        let nextCand = nextCandOf k
+            isLast = isNothing nextCand
+            nextK = fromMaybe (k + 1) nextCand
+            canReclaimTail = clauseCanReclaimTailH cl
+            goals = concatMap flatten (S.clauseBody cl)
+            guardPred = if exclusive then isEarlyGuard else isInlineGuard
+            (prefix, rest) = span guardPred goals
+            (hasNeckCut, restAfterCut) = case rest of
+              S.Atom "!" : rs -> (True, rs)
+              S.Compound "$cut" [S.IntLit _] : rs -> (True, rs)
+              _ -> (False, rest)
+            remArgs = drop 1 (headArgs cl)
+            -- When an arg0Switch clause has no guards and at most one remaining
+            -- ground argument (or distinct first-time variables), matching remArgs
+            -- cannot fail after binding, so no trail undo is needed on failure.
+            remVars = concatMap termVarIds remArgs
+            remNoUndoOnFail =
+              isArg0Switch
+                && null prefix
+                && (all groundTermOk remArgs && length remArgs <= 1 || all isVarTerm remArgs && length remVars == length (nub remVars))
+            arg0DirectCommit = remNoUndoOnFail && isLast
+            headFailL
+              | remNoUndoOnFail = if isLast then "fail" else clauseLbl nextK
+              | isArg0Switch && isLast = sharedUndoFailLbl
+              | isLast = "fail"
+              | otherwise = undoLbl k
+            ro = selReadOnly sel !! k
+            gndArgs = Set.fromList (selGround sel)
+            tempBase = varBase + S.clauseNVars cl
+        (ops, _) <- runGen 0 varBase tempBase frameSize $ do
+          emit [JLabel (clauseLbl k)]
+          when (((isLast && n > 1) || arg0DirectCommit) && not canReclaimTail) (emit [JLoadImm RHB RE frameHB])
+          if isArg0Switch
+            then
+              zipWithM_
+                (\i a -> matchArg env (Set.member i gndArgs) (Set.member i freshOutArgs) ro (i, []) a i headFailL Nothing)
+                [1 ..]
+                remArgs
+            else
+              zipWithM_
+                ( \i a ->
+                    matchArg
+                      env
+                      (Set.member i gndArgs)
+                      (Set.member i freshOutArgs)
+                      ro
+                      (i, [])
+                      a
+                      i
+                      headFailL
+                      (if i == 0 then fmap clauseLbl nextCand else Nothing)
+                )
+                [0 ..]
+                (headArgs cl)
+          mapM_ (compileGuard env headFailL) prefix
+          unless (isLast || arg0DirectCommit) $
+            if exclusive || hasNeckCut
+              then do
+                -- Commit: drop trail entries for cells >= the caller's RHB.
+                loopL <- lbl' "keep"
+                nextL <- lbl' "keep_next"
+                doneL <- lbl' "keep_done"
+                emit $
+                  [ JLoadImm RT4 RE frameHB,
+                    JLoadImm RT0 RE frameTR,
+                    JMov RT1 RT0,
+                    JLabel loopL,
+                    JBranchCmp JGe RT0 RTR doneL,
+                    JLoadIx RT2 RTrail RT0,
+                    JShr RT3 RT2 1,
+                    JBranchCmp JGe RT3 RT4 nextL,
+                    JStoreIx RT2 RTrail RT1,
+                    JAddImm RT1 RT1 1,
+                    JLabel nextL,
+                    JAddImm RT0 RT0 1,
+                    JJump loopL,
+                    JLabel doneL,
+                    JMov RTR RT1
+                  ]
+                    ++ [JMov RHB RT4 | not canReclaimTail]
+              else
+                -- Link RE into the native choice-point chain for nextK.
+                emit
+                  [ JLoadLabel RT0 (retryLbl nextK),
+                    JStoreImm RT0 RE frameNextAlt,
+                    JStoreImm RE RState stateBIdx,
+                    JMov RHB RH
+                  ]
+          compileBody env idx unitCanReclaimH canReclaimTail cl (lbl ++ "_c" ++ show k) True restAfterCut
+        let retry
+              | exclusive || Set.notMember k retryTargets = []
+              | otherwise =
+                  [ JLabel (retryLbl k),
+                    JLoadImm RT0 RE frameTR,
+                    JLabel (retryLbl k ++ "_loop"),
+                    JBranchCmp JLe RTR RT0 (retryLbl k ++ "_done"),
+                    JSubImm RTR RTR 1,
+                    JLoadIx RT1 RTrail RTR,
+                    JShr RT1 RT1 1,
+                    JMkWord RT2 RT1 tagRef,
+                    JStoreIx RT2 RCells RT1,
+                    JJump (retryLbl k ++ "_loop"),
+                    JLabel (retryLbl k ++ "_done"),
+                    JLoadImm RH RE frameH,
+                    JLoadImm RDepth RE frameDepth,
+                    JAddImm RSP RE (8 * frameSize),
+                    JLoadImm RT0 RE framePrevB,
+                    JStoreImm RT0 RState stateBIdx
+                  ]
+                    ++ loadArgsOps
+                    ++ [JMov RHB RH | not isLast || canReclaimTail]
+                    ++ [JJump (clauseLbl k)]
+            undo
+              | isLast || remNoUndoOnFail = []
+              | otherwise =
+                  [ JLabel (undoLbl k),
+                    JLoadImm RT0 RE frameTR,
+                    JLabel (undoLbl k ++ "_loop"),
+                    JBranchCmp JLe RTR RT0 (undoLbl k ++ "_done"),
+                    JSubImm RTR RTR 1,
+                    JLoadIx RT1 RTrail RTR,
+                    JShr RT1 RT1 1,
+                    JMkWord RT2 RT1 tagRef,
+                    JStoreIx RT2 RCells RT1,
+                    JJump (undoLbl k ++ "_loop"),
+                    JLabel (undoLbl k ++ "_done"),
+                    JLoadImm RH RE frameH,
+                    JJump (clauseLbl nextK)
+                  ]
+        pure (retry ++ relabel (lbl ++ "_c" ++ show k ++ "_") ops ++ undo)
+      let sharedUndo
+            | not isArg0Switch = []
+            | otherwise =
+                [ JLabel sharedUndoFailLbl,
+                  JLoadImm RT0 RE frameTR,
+                  JLabel (sharedUndoFailLbl ++ "_loop"),
+                  JBranchCmp JLe RTR RT0 (sharedUndoFailLbl ++ "_done"),
+                  JSubImm RTR RTR 1,
+                  JLoadIx RT1 RTrail RTR,
+                  JShr RT1 RT1 1,
+                  JMkWord RT2 RT1 tagRef,
+                  JStoreIx RT2 RCells RT1,
+                  JJump (sharedUndoFailLbl ++ "_loop"),
+                  JLabel (sharedUndoFailLbl ++ "_done"),
+                  JLoadImm RH RE frameH,
+                  JJump "fail"
+                ]
+      pure (entry ++ concat blocks ++ sharedUndo)
   where
     relabel pre = map $ \case
       JLabel l | local l -> JLabel (pre ++ l)
@@ -2086,8 +2274,8 @@ compileGroundTest x failL = case x of
 -- final goal of the sequence returns or tail-calls directly; when False
 -- (inside @once@ or @not@), execution falls through so the enclosing control
 -- construct can clean up.
-compileBody :: CEnv -> M.Map PredKey Int -> Bool -> S.Clause -> String -> Bool -> [S.Term] -> G ()
-compileBody env idx unitCanReclaimH cl base allowTail = go
+compileBody :: CEnv -> M.Map PredKey Int -> Bool -> Bool -> S.Clause -> String -> Bool -> [S.Term] -> G ()
+compileBody env idx unitCanReclaimH canReclaimTail cl base allowTail = go
   where
     headVarSet = Set.fromList (termVarIds (S.clauseHead cl))
     allClauseVars = allVarsIn (S.clauseHead cl) ++ concatMap allVarsIn (concatMap flatten (S.clauseBody cl))
@@ -2101,6 +2289,7 @@ compileBody env idx unitCanReclaimH cl base allowTail = go
           JMov RSP RE
         ]
           ++ [JLoadImm RH RE frameH | unitCanReclaimH]
+          ++ [JLoadImm RHB RE frameHB | canReclaimTail]
           ++ [ JLabel skipL,
                JLoadImm RE RE frameLink,
                JJumpReg RT7
@@ -2132,7 +2321,7 @@ compileBody env idx unitCanReclaimH cl base allowTail = go
             JStoreImm RH RE slotH
           ]
         seenBefore <- gets gsSeen
-        compileBody env idx unitCanReclaimH cl (base ++ "_once") False innerGoals
+        compileBody env idx unitCanReclaimH False cl (base ++ "_once") False innerGoals
         when deadHeap $ modify' (\st -> st {gsSeen = seenBefore})
         emit
           ( [ JLoadImm RT0 RE slotB,
@@ -2172,7 +2361,7 @@ compileBody env idx unitCanReclaimH cl base allowTail = go
               JMov RHB RH
             ]
           seenBefore <- gets gsSeen
-          compileBody env idx unitCanReclaimH cl (base ++ "_not") False innerGoals
+          compileBody env idx unitCanReclaimH False cl (base ++ "_not") False innerGoals
           modify' (\st -> st {gsSeen = seenBefore})
           -- Inner succeeded -> unwind to B_not and fail!
           emit
@@ -2238,24 +2427,64 @@ compileBody env idx unitCanReclaimH cl base allowTail = go
                       any
                         (\a -> case a of S.Var v -> v < 0 || Set.notMember v seenBeforeCall; _ -> False)
                         (callArgs g)
+                reclaimOps <-
+                  if unitCanReclaimH && not anyFreshInTail
+                    then
+                      pure $
+                        concat
+                          [ [ JLoadImm RT0 RArgs i,
+                              JTagOf RT1 RT0,
+                              JBranchImm JEq RT1 (fromIntegral tagRef) skipL
+                            ]
+                            | i <- localArgIndices
+                          ]
+                          ++ [JLoadImm RH RE frameH]
+                          ++ [JLoadImm RHB RE frameHB | canReclaimTail]
+                    else if canReclaimTail && not anyFreshInTail
+                      then do
+                        noRecL <- lbl' "tail_norec"
+                        trLoopL <- lbl' "tail_trloop"
+                        trOkL <- lbl' "tail_trok"
+                        argChecks <- forM [0 .. length (callArgs g) - 1] $ \i -> do
+                          okL <- lbl' ("tail_aok" ++ show i)
+                          pure
+                            [ JLoadImm RT0 RArgs i,
+                              JDeref RT0 RT0,
+                              JStoreImm RT0 RArgs i,
+                              JTagOf RT1 RT0,
+                              JBranchImm JEq RT1 (fromIntegral tagInt) okL,
+                              JBranchImm JEq RT1 (fromIntegral tagAtm) okL,
+                              JBranchImm JEq RT1 (fromIntegral tagChr) okL,
+                              JBranchImm JEq RT1 (fromIntegral tagBox) okL,
+                              JValOf RT1 RT0,
+                              JBranchCmp JGe RT1 RT2 noRecL,
+                              JLabel okL
+                            ]
+                        pure $
+                          [JLoadImm RT2 RE frameH]
+                            ++ concat argChecks
+                            ++ [ JLoadImm RT0 RE frameTR,
+                                 JLabel trLoopL,
+                                 JBranchCmp JGe RT0 RTR trOkL,
+                                 JLoadIx RT1 RTrail RT0,
+                                 JShr RT1 RT1 1,
+                                 JBranchCmp JLt RT1 RT2 noRecL,
+                                 JAddImm RT0 RT0 1,
+                                 JJump trLoopL,
+                                 JLabel trOkL,
+                                 JLoadImm RTR RE frameTR,
+                                 JMov RH RT2,
+                                 JLabel noRecL,
+                                 JLoadImm RHB RE frameHB
+                               ]
+                      else pure [JLoadImm RHB RE frameHB | canReclaimTail]
                 emit $
                   [ JLoadImm RT7 RE frameRet,
                     JLoadImm RT0 RState stateBIdx,
                     JBranchCmp JLe RE RT0 skipL,
                     JMov RSP RE
                   ]
-                    ++ ( if unitCanReclaimH && not anyFreshInTail
-                           then
-                             concat
-                               [ [ JLoadImm RT0 RArgs i,
-                                   JTagOf RT1 RT0,
-                                   JBranchImm JEq RT1 (fromIntegral tagRef) skipL
-                                 ]
-                                 | i <- localArgIndices
-                               ]
-                               ++ [JLoadImm RH RE frameH]
-                           else []
-                       )
+                    ++ reclaimOps
                     ++ [ JLabel skipL,
                          JLoadImm RE RE frameLink,
                          JJump (predLabel target)
@@ -2276,7 +2505,7 @@ compileBody env idx unitCanReclaimH cl base allowTail = go
       emit
         [ JLoadImm RT0 RE framePrevB,
           JStoreImm RT0 RState stateBIdx,
-          JLoadImm RHB RE frameHB,
+          JLoadImm RHB RE (if canReclaimTail then frameH else frameHB),
           JAddImm RSP RE (8 * fs)
         ]
     calleeName = \case

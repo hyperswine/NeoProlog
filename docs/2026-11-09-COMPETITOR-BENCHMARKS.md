@@ -193,3 +193,21 @@ Following this report, three targeted engine and clause-JIT updates were landed 
 | `peg_solitaire` (20× `peg_solution_count`) | 35,400 B | 0.032 | 0.032 | **0.016** | **1.97×** | Code size −48.5% (from 68,780 B) |
 | `mastermind` (10× `solve_clues` + `sample_secret`) | 14,496 B / 16,132 B | 0.125 | 0.125 | **0.083** | **1.51×** | Full 8-predicate unit |
 | `send_more_money` (20× `send_more_money`) | 13,560 B | 0.029 | 0.029 | **0.016** | **1.76×** | Native choice enumeration |
+
+### Addendum 2 (2026-11-10): Tracks 1–5 (`queens`, Consumed Symbolic Terms, Unboxed `assertz`, Static Fact Hashing, & Default `length/2`)
+
+4. **Whole-Search `queens/2` & Generalized Multi-Argument Head Exclusivity (`Clause.hs`, `Run.hs`)**:
+   - Proves `selExclusive = True` across multiple arguments when earlier arguments have no repeated variables (`noatt/3`, `remove/3`, `absent/2`), admits integer-list units (`intOnlyData`) as `upRerunFree = True`, and runs `drainNativeFindAll` across all native clause units.
+5. **Consumed Symbolic Terms (`derivrkeep` / `derivracc2`), Type-Guard Exclusivity, Functor Switch & Tail-Call Heap Reclamation (`Infer.hs`, `Compile.hs`, `Clause.hs`)**:
+   - Adds `typeGuardOption`, `GuardTag`, and `headVsTypeGuard`/`typeGuardPair` so `tsize/2` is proven `selExclusive = True`; adds `arg0FunSwitch` binary-search dispatch on leading compound functors (`d/3`, `tsize/2`); trims trail entries at neck cuts; and reclaims heap/trail (`clauseCanReclaimTailH`) at tail calls after `once` (`derivrkeep`, `derivracc2`), eliminating `heap limit -> interpreter` bailouts.
+6. **Unboxed Dynamic Fact Store (`DynFact` in `Run.hs`), Incremental Indexing & `pFact2` (`Program.hs`, `Compile.hs`, `Run.hs`), and Default `length/2` + `INFERA_MAX_DEPTH`**:
+   - Stores 1- and 2-argument immediate dynamic facts as unboxed words (`DFImm1`, `DFImm2`) with a direct `drainDynamicFindAll` loop; updates `predIndex` incrementally in `addClause` and adds an open-addressed unboxed `pFact2` (`lookupFact2`) table; provides a built-in fallback `length/2` and configurable `INFERA_MAX_DEPTH`.
+
+| Workload | Answer | `JIT=0` (s) | `JIT=1` (s) | Speedup (`JIT=0 ÷ JIT=1`) | Notes |
+|---|---:|---:|---:|---:|---|
+| `queens(9)` (all 352 via `findall` + `length/2`) | `352` | 1.0457 | **0.5309** | **1.97×** | Whole-unit `queens/2` + `drainNativeFindAll` |
+| `derivrkeep` (30,000× `deriv_all4` + `not (D == 0)`) | `30000` | 0.4489 | **0.0443** | **10.14×** | `arg0FunSwitch` + `clauseCanReclaimTailH` (0 bailouts) |
+| `derivracc2` (30,000× `deriv_all4` + 4× `tsize/2`) | `11310000` | 2.2875 | **0.1044** | **21.91×** | Exclusive `tsize/2` + `arg0FunSwitch` + tail-call reclaim |
+| `assertz` (100k `assert` + `findall` + `sum_list`) | `5000050000` | 0.0742 | **0.0597** | **1.24×** | Unboxed `DFImm1` + `drainDynamicFindAll` |
+| `index` (2,000 static `k/2` facts × 20 rounds) | `199220000` | 0.0480 | **0.0465** | **1.03×** | Incremental `addToIndex` + unboxed `pFact2` |
+| `deep_200k` (`INFERA_MAX_DEPTH=1000000`) | `200000` | 0.1189 | **0.0188** | **6.33×** | Configurable `INFERA_MAX_DEPTH` + native `deep_sum/2` |

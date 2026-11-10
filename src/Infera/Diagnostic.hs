@@ -169,7 +169,7 @@ diagnose items = concatMap inspect items
       _ -> case functorOf t of
         Nothing -> [emit item Error "not-callable" ("goal is not callable: " ++ show t)]
         Just key@(name, arity)
-          | isBuiltin key -> []
+          | isBuiltin key || key == ("length", 2) -> []
           | nameHasFlag prog name FlagDynamic -> []
           | key `elem` defined -> case lookupPred key prog of
               Just p | not (null (predDecls p)), all (incompatible (arguments t)) (predDecls p) ->
@@ -177,6 +177,7 @@ diagnose items = concatMap inspect items
               _ -> []
           | otherwise ->
               let alternatives = nub ([k | k@(n, _) <- defined, n == name]
+                    ++ [("length", 2) | name == "length"]
                     ++ [(name, a) | a <- [0 .. max 6 arity], isBuiltin (name, a)])
                in [if null alternatives
                     then emit item Error "undefined-predicate" ("undefined predicate: " ++ showPredKey key)

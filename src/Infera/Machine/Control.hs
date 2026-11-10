@@ -311,10 +311,14 @@ startWithRoots backend dense tailReuse measured scopes environment fuel state go
         ([name | (name, flags) <- Map.toList (progNameFlags program), FlagDynamic `elem` flags]
           ++ [fst (predKey definition) | definition <- programPreds program,
             FlagDynamic `elem` predFlags definition])
+      basePreds =
+        if Map.notMember ("length", 2) (progPreds program) && Set.notMember "length" dynamic
+          then Map.insert ("length", 2) defaultLengthPred (progPreds program)
+          else progPreds program
       routes = Map.mapWithKey (\(name, arity) definition ->
         PredicateRoute definition (builtinDet name arity == Nothing && Set.notMember name dynamic)
           (predIsTabled program definition) (predIsIndexed program definition)
-          (Tail.eligiblePredicate program definition) (Tail.eligibleFuelReuse program definition)) (progPreds program)
+          (Tail.eligiblePredicate program definition) (Tail.eligibleFuelReuse program definition)) basePreds
       running = Running branch [] 0 0 Seeking Nothing tailReuse routes dynamic protected measured emptyMetrics 1024 False [] Nothing Nothing [] backend Map.empty 0
   sampled <- sample heap running
   pure (Checkpoint environment frozen sampled)

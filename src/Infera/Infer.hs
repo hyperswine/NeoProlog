@@ -884,6 +884,7 @@ exclusive c1 c2 = case options of
     options =
       [[i] | i <- switchPositions]
         ++ guardOption
+        ++ typeGuardOption
         ++ literalVsGuard c1 c2
         ++ literalVsGuard c2 c1
     -- Any guard of one clause against any guard of the other, in every
@@ -897,6 +898,73 @@ exclusive c1 c2 = case options of
           b <- [g2, swapGuard g2],
           o <- maybe [] pure (contradiction a b)
       ]
+    -- Type guards (is_int, is_atom, is_char, is_float, is_str) and negated
+    -- type guards on head variables against head constructors/literals or
+    -- another clause's type guards at the same path.
+    typeGuardOption =
+      let (hf1, pos1, neg1) = clauseTypeFacts c1
+          (hf2, pos2, neg2) = clauseTypeFacts c2
+       in [ [i]
+          | (p@(i : _), t1) <- pos1,
+            any (\(q, t2) -> p == q && t1 /= t2) (hf2 ++ pos2)
+              || (p, t1) `elem` neg2
+          ]
+            ++ [ [i]
+               | (p@(i : _), t2) <- pos2,
+                 any (\(q, t1) -> p == q && t1 /= t2) hf1
+                   || (p, t2) `elem` neg1
+               ]
+            ++ [ [i]
+               | (p@(i : _), t1) <- hf1,
+                 (p, t1) `elem` neg2
+               ]
+            ++ [ [i]
+               | (p@(i : _), t2) <- hf2,
+                 (p, t2) `elem` neg1
+               ]
+    clauseTypeFacts cl =
+      let hps = headPaths cl
+          headFacts = concat [walkHead [i] a | (i, a) <- zip [0 ..] (args cl)]
+          walkHead path t = case t of
+            Var _ -> []
+            IntLit _ -> [(reverse path, "int")]
+            FloatLit _ -> [(reverse path, "float")]
+            Atom _ -> [(reverse path, "atom")]
+            CharLit _ -> [(reverse path, "char")]
+            StrLit _ -> [(reverse path, "str")]
+            Compound f xs ->
+              (reverse path, "struct")
+                : [ fact
+                  | f `notElem` arithOps,
+                    (j, x) <- zip [0 ..] xs,
+                    fact <- walkHead (j : path) x
+                  ]
+          leadTypeGuards [] = ([], [])
+          leadTypeGuards (g : gs) = case g of
+            Compound op [Var v]
+              | Just tag <- typeGuardTag op,
+                Just ps <- Map.lookup v hps ->
+                  let (pRest, nRest) = leadTypeGuards gs
+                   in ([(p, tag) | p <- ps] ++ pRest, nRest)
+            Compound "not" [Compound op [Var v]]
+              | Just tag <- typeGuardTag op,
+                Just ps <- Map.lookup v hps ->
+                  let (pRest, nRest) = leadTypeGuards gs
+                   in (pRest, [(p, tag) | p <- ps] ++ nRest)
+            Compound op _
+              | op `elem` ["is", "gt", "lt", "gte", "lte", "equiv", "neq", "ground", "nonvar", "var"] ->
+                  leadTypeGuards gs
+            Atom "true" -> leadTypeGuards gs
+            _ -> ([], [])
+          typeGuardTag op = case op of
+            "is_int" -> Just "int"
+            "is_float" -> Just "float"
+            "is_atom" -> Just "atom"
+            "is_char" -> Just "char"
+            "is_str" -> Just "str"
+            _ -> Nothing
+          (posG, negG) = leadTypeGuards (clauseBody cl)
+       in (headFacts, posG, negG)
     args (Clause (Compound _ as) _ _) = as
     args _ = []
     switchPositions =

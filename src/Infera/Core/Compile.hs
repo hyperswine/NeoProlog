@@ -41,6 +41,7 @@ module Infera.Core.Compile
     compileQueryGoals,
     compileGoalTerm,
     candidateClauses,
+    lookupFact2,
     keyOfWord,
   )
 where
@@ -48,12 +49,14 @@ where
 import Control.Monad (forM, forM_)
 import Data.Array (Array, listArray)
 import qualified Data.Array.IArray as IA
-import Data.Array.Base (numElements, unsafeAt)
+import Data.Array.Base (numElements, unsafeAt, unsafeFreeze, unsafeRead, unsafeWrite)
+import Data.Array.IO (IOUArray, newArray)
 import Data.Array.Unboxed (UArray)
+import Data.Bits (shiftR, (.&.))
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.IORef
 import Data.List (nub)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as Map
@@ -287,6 +290,9 @@ data IntGuard
   | -- | Leading structural disequality (@!=@ or @not (A == B)@) between two
     -- head paths: fails when both are identical immediate constants.
     GuardDiffTerm !Int [Int] !Int [Int]
+  | -- | Leading type check (@is_int@, @is_atom@, @is_char@) on a head path:
+    -- fails when the argument is bound to a non-boxed value with a different tag.
+    GuardTag !Int [Int] !Int
 
 -- | Load-time compiled single-pass decision tree for pure clause selection.
 data DecisionTree
@@ -326,7 +332,10 @@ data Pred = Pred
     pSwitch :: !(Maybe [Int]),
     -- | every clause's return is trusted: calls push no return check
     pTrustReturn :: !Bool,
-    pJit :: !(Maybe JitKernel)
+    pJit :: !(Maybe JitKernel),
+    -- | Open-addressed unboxed (key0, val1) hash table for 2-argument
+    -- immediate ground fact tables with distinct first-argument keys.
+    pFact2 :: !(Maybe (UArray Int Int))
   }
 
 data CoreProgram = CoreProgram
@@ -419,7 +428,12 @@ programScope program = do
 
 compileImage :: Symbols -> P.Program -> IO ProgramImage
 compileImage syms program = do
-  let preds = P.programPreds program
+  let preds =
+        P.programPreds program
+          ++ [ P.defaultLengthPred
+               | isNothing (P.lookupPred ("length", 2) program)
+                   && not (P.nameHasFlag program "length" S.FlagDynamic)
+             ]
   problems <- newIORef []
   nilW <- atmWord <$> internAtom syms "nil"
   consW <- (\f -> funWord f 2) <$> internFunctor syms "cons" 2
@@ -491,18 +505,33 @@ compilePred :: Ctx -> P.Pred -> IO Pred
 compilePred ctx p = do
   let clauses = IM.elems (P.predClauses p)
       arity = snd (P.predKey p)
+      isUnreferencedDefaultLength =
+        P.predKey p == ("length", 2)
+          && isNothing (P.lookupPred ("length", 2) (ctxProgram ctx))
+          && not
+            ( any
+                (hasLengthCall . S.clauseBody)
+                [cl | pr <- P.programPreds (ctxProgram ctx), cl <- IM.elems (P.predClauses pr)]
+            )
+      hasLengthCall = any termMentionsLength
+      termMentionsLength (S.Compound "length" [_, _]) = True
+      termMentionsLength (S.Compound _ as) = any termMentionsLength as
+      termMentionsLength _ = False
   compiledClauses <- mapM (compileClause ctx (P.predDecls p)) clauses
   jitKernel <-
-    compileJitKernel
-      (ctxSymbols ctx)
-      coreBuiltinGoal
-      (ctxNil ctx)
-      (ctxCons ctx)
-      (ctxProgram ctx)
-      (P.predKey p)
-      (P.predDecls p)
-      (P.predInferred p)
-      clauses
+    if isUnreferencedDefaultLength
+      then pure Nothing
+      else
+        compileJitKernel
+          (ctxSymbols ctx)
+          coreBuiltinGoal
+          (ctxNil ctx)
+          (ctxCons ctx)
+          (ctxProgram ctx)
+          (P.predKey p)
+          (P.predDecls p)
+          (P.predInferred p)
+          clauses
   let count = length compiledClauses
   let ones = listArray (0, max 0 (count - 1)) (map OneCandidate [0 .. count - 1])
       shared = toCandidates ones
@@ -530,6 +559,10 @@ compilePred ctx p = do
         if not indexed || count <= 1
           then DTLeaf (shared [0 .. count - 1])
           else buildPredDecisionTree shared count principal decisionGroups' guards
+  fact2 <-
+    if arity == 2 && P.predIsIndexed (ctxProgram ctx) p && null (P.predDecls p) && count >= 8
+      then buildFact2Table compiledClauses
+      else pure Nothing
   pure
     Pred
       { pKey = P.predKey p,
@@ -553,8 +586,56 @@ compilePred ctx p = do
             then Just (filter (< arity) (P.sigSwitch (P.predInferred p)))
             else Nothing,
         pTrustReturn = not (null (P.predDecls p)) && all clTrustReturn compiledClauses,
-        pJit = jitKernel
+        pJit = jitKernel,
+        pFact2 = fact2
       }
+
+buildFact2Table :: [Clause] -> IO (Maybe (UArray Int Int))
+buildFact2Table clauses =
+  case mapM extractPair clauses of
+    Nothing -> pure Nothing
+    Just pairs ->
+      let keys = IS.fromList (map fst pairs)
+       in if IS.size keys /= length pairs
+            then pure Nothing
+            else do
+              let nextPow2 !c = if c >= 2 * length pairs then c else nextPow2 (c * 2)
+                  !cap = nextPow2 16
+                  !mask = cap - 1
+              arr <- newArray (0, 2 * cap - 1) 0 :: IO (IOUArray Int Int)
+              let insertOne :: (Int, Int) -> IO ()
+                  insertOne (!k0, !v1) = go ((k0 * 0x9E3779B9) .&. mask)
+                    where
+                      go :: Int -> IO ()
+                      go !s = do
+                        cur <- unsafeRead arr (s * 2)
+                        if cur == 0
+                          then do
+                            unsafeWrite arr (s * 2) k0
+                            unsafeWrite arr (s * 2 + 1) v1
+                          else go ((s + 1) .&. mask)
+              mapM_ insertOne pairs
+              Just <$> unsafeFreeze arr
+  where
+    isImm !w = let !t = tagOf w in t == tagInt || t == tagAtm || t == tagChr
+    extractPair cl
+      | null (clBody cl),
+        [PWord w0, PWord w1] <- clHead cl,
+        isImm w0 && isImm w1 =
+          Just (w0, w1)
+      | otherwise = Nothing
+
+lookupFact2 :: UArray Int Int -> Word' -> Word'
+lookupFact2 !tbl !k0 =
+  let !mask = (numElements tbl `shiftR` 1) - 1
+      !s0 = (k0 * 0x9E3779B9) .&. mask
+      probe !s =
+        let !k = unsafeAt tbl (s * 2)
+         in if k == k0
+              then unsafeAt tbl (s * 2 + 1)
+              else if k == 0 then 0 else probe ((s + 1) .&. mask)
+   in probe s0
+{-# INLINE lookupFact2 #-}
 
 -- | Build a single-pass 'DecisionTree' when the branching factor is bounded,
 -- or 'DTFallback' for predicates with large multi-argument cross products.
@@ -718,6 +799,9 @@ leadingIntGuard clause = case bodyGuard of
       GNot [GEquiv (PSlot u) (PSlot v)] : _ -> diffGuard u v
       GCheck CkGround _ : GNot [GEquiv (PSlot u) (PSlot v)] : _ -> diffGuard u v
       GCheck CkGround _ : GNeq (PSlot u) (PSlot v) : _ -> diffGuard u v
+      GCheck CkInt (PSlot v) : _ | Just (i, p) <- IM.lookup v slots, length p <= 3 -> Just (GuardTag i p tagInt)
+      GCheck CkAtom (PSlot v) : _ | Just (i, p) <- IM.lookup v slots, length p <= 3 -> Just (GuardTag i p tagAtm)
+      GCheck CkChar (PSlot v) : _ | Just (i, p) <- IM.lookup v slots, length p <= 3 -> Just (GuardTag i p tagChr)
       _ -> Nothing
     diffGuard u v = do
       (i, p) <- IM.lookup u slots
@@ -1268,6 +1352,10 @@ evalGuardPtr store !pCells g = case g of
     if w1 == w2 && (t1 == tagInt || t1 == tagAtm || t1 == tagChr)
       then pure False
       else pure True
+  GuardTag i p wantTag -> do
+    w <- argumentAtPathPtr store pCells i p
+    let !t = tagOf w
+    pure $! t == tagRef || t == wantTag || (wantTag == tagInt && t == tagBox)
 {-# INLINE evalGuardPtr #-}
 
 -- | A guard operand as an immediate integer, or 'planMiss'.
@@ -1678,10 +1766,10 @@ compileGoal ctx term = case term of
       pure (GUnsupported term)
     userCall f as = case Map.lookup (f, length as) (ctxPreds ctx) of
       Just ref
-        | Just p <- P.lookupPred (f, length as) (ctxProgram ctx), P.predIsTabled (ctxProgram ctx) p ->
+        | Just p <- P.lookupPredOrDefault (f, length as) (ctxProgram ctx), P.predIsTabled (ctxProgram ctx) p ->
             GTabled ref <$> mapM arg as
         | otherwise -> do
-            let sigs = maybe [] P.predDecls (P.lookupPred (f, length as) (ctxProgram ctx))
+            let sigs = maybe [] P.predDecls (P.lookupPredOrDefault (f, length as) (ctxProgram ctx))
             seenBefore <- readIORef (ctxSeen ctx)
             patterns <- mapM arg as
             facts <- readIORef (ctxFacts ctx)

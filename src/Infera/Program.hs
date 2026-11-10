@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+
 -- | The predicate table: clauses grouped by name/arity, per-argument indexes,
 -- declared and inferred signatures, and per-predicate flags.
 module Infera.Program
@@ -15,6 +17,8 @@ module Infera.Program
     addDirective,
     buildProgram,
     lookupPred,
+    lookupPredOrDefault,
+    defaultLengthPred,
     programPreds,
     candidateClauses,
     predIsTabled,
@@ -77,16 +81,20 @@ buildIndex :: Int -> IntMap Clause -> [ArgIndex]
 buildIndex arity clauses = [indexFor i | i <- [0 .. arity - 1]]
   where
     indexFor i =
-      foldl' (addTo i) (ArgIndex Map.empty IS.empty) (IM.toList clauses)
-    addTo i (ArgIndex keyed open) (ci, cl) =
-      case headArg i cl of
-        Nothing -> ArgIndex keyed (IS.insert ci open)
-        Just t -> case indexKey t of
-          Nothing -> ArgIndex keyed (IS.insert ci open)
-          Just k -> ArgIndex (Map.insertWith IS.union k (IS.singleton ci) keyed) open
-    headArg i cl = case clauseHead cl of
-      Compound _ as | i < length as -> Just (as !! i)
+      foldl' (addToIndex i) (ArgIndex Map.empty IS.empty) (IM.toList clauses)
+
+addToIndex :: Int -> ArgIndex -> (Int, Clause) -> ArgIndex
+addToIndex i (ArgIndex keyed open) (ci, cl) =
+  case headArg i cl of
+    Nothing -> ArgIndex keyed (IS.insert ci open)
+    Just t -> case indexKey t of
+      Nothing -> ArgIndex keyed (IS.insert ci open)
+      Just k -> ArgIndex (Map.insertWith IS.union k (IS.singleton ci) keyed) open
+  where
+    headArg j clause = case clauseHead clause of
+      Compound _ as | j < length as -> Just (as !! j)
       _ -> Nothing
+{-# INLINE addToIndex #-}
 
 -- | Candidate clause numbers (in clause order) for a call whose arguments
 -- have the given principal functors (Nothing = unbound).
@@ -194,6 +202,35 @@ emptyProgram = Program Map.empty [] Map.empty Map.empty True True emptySourceMap
 lookupPred :: PredKey -> Program -> Maybe Pred
 lookupPred k = Map.lookup k . progPreds
 
+-- | Built-in fallback definition for @length/2@ when the user program does not
+-- define @length/2@ or declare @length@ dynamic.
+defaultLengthPred :: Pred
+defaultLengthPred =
+  let c0 = Clause (Compound "length" [Atom "nil", IntLit 0]) [] 0
+      c1 =
+        Clause
+          (Compound "length" [Compound "cons" [Var (-1), Var 0], Var 1])
+          [ Compound "length" [Var 0, Var 2],
+            Compound "is" [Var 1, Compound "plus" [Var 2, IntLit 1]]
+          ]
+          3
+      p0 = lookupPred ("length", 2) (addClause c1 (addClause c0 emptyProgram))
+      base = maybe (newPred ("length", 2)) id p0
+   in base
+        { predFlags = [FlagNoTable],
+          predInferred = Signature Semidet [ArgSpec (SList SAny) ModeIn, ArgSpec SInt ModeOut] [0],
+          predRecursive = True,
+          predPure = True,
+          predStructural = True
+        }
+
+lookupPredOrDefault :: PredKey -> Program -> Maybe Pred
+lookupPredOrDefault k prog = case lookupPred k prog of
+  Just p -> Just p
+  Nothing
+    | k == ("length", 2) && not (nameHasFlag prog "length" FlagDynamic) -> Just defaultLengthPred
+    | otherwise -> Nothing
+
 programPreds :: Program -> [Pred]
 programPreds prog = [p | k <- progOrder prog, Just p <- [Map.lookup k (progPreds prog)]]
 
@@ -209,19 +246,20 @@ withPred k f prog =
           progOrder = if existing then progOrder prog else progOrder prog ++ [k]
         }
 
--- | Append a clause to its predicate and refresh the index.
+-- | Append a clause to its predicate and refresh the index incrementally.
 addClause :: Clause -> Program -> Program
 addClause c prog = case clauseKey c of
   Nothing -> prog
   Just k@(_, arity) -> withPred k add prog
     where
       add p =
-        let n = IM.size (predClauses p)
-            clauses' = IM.insert n c (predClauses p)
+        let !n = IM.size (predClauses p)
+            !clauses' = IM.insert n c (predClauses p)
+            !idx' = [addToIndex i ai (n, c) | (i, ai) <- zip [0 .. arity - 1] (predIndex p)]
          in p
               { predClauses = clauses',
                 predClauseCache = ClauseCache.insertClause n c (predClauseCache p),
-                predIndex = buildIndex arity clauses'
+                predIndex = idx'
               }
 
 addDecl :: Decl -> Program -> Program

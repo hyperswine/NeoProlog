@@ -29,7 +29,7 @@ import Data.Array.Unboxed (UArray)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
-import Data.Maybe (isNothing)
+import Data.Maybe (isJust, isNothing)
 import Foreign.Ptr (Ptr)
 import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble, numericTerm)
 import qualified Infera.CLP as CLP
@@ -67,10 +67,14 @@ traceMsg :: String -> IO ()
 traceMsg msg = when traceOn (hPutStrLn stderr msg)
 
 
--- | Dynamic facts per predicate, oldest first. A 'Seq' keeps @assert@ an
--- O(1) snoc; a list appended with @old ++ [new]@ built a left-nested chain
--- of appends that cost O(n) per fact to force, so n asserts were O(n^2).
-type DynamicDb = Map.Map PredKey (Seq.Seq (Term, Int))
+-- | Dynamic facts per predicate, oldest first. Immediate 1- and 2-argument
+-- ground facts are stored as unboxed words to avoid heap export/import.
+data DynFact
+  = DFImm1 !Word'
+  | DFImm2 !Word' !Word'
+  | DFTerm !Term !Int
+
+type DynamicDb = Map.Map PredKey (Seq.Seq DynFact)
 
 data Step
   = Stop
@@ -146,6 +150,8 @@ data Alt
     AltMinimize !(IORef Minimum) !(IORef [SearchItem]) Cont
   | -- | remaining native choice frames on a clause unit's stack
     AltNative !Pred !JitKernel !Int !Int !Int !Int Cont
+  | -- | remaining dynamic facts to consume
+    AltDynFacts !PredKey !(Seq.Seq DynFact) !Int !Int Cont
 
 -- | The state of a minimize scope: entry marks and the best candidate so
 -- far as the bindings it made to older cells, its output, tables and facts.
@@ -936,14 +942,22 @@ step' m goal goals base barrier depth next = case goal of
     when (pending > 0) (normalizeArgs m (pArity predicate))
     callTabled m predicate (if null goals then next else CGoals goals base barrier depth next)
   GCallFacts key patterns -> do
-    let s = mStore m
-        arity = length patterns
-    buildArgs m base patterns 0
-    pending <- arithData s
-    when (pending > 0) (normalizeArgs m arity)
-    saved <- saveArgs s arity
-    facts <- toList . Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
-    consumeAnswers m [(fact, n, []) | (fact, n) <- facts] saved arity (CGoals goals base barrier depth next)
+    let !s = mStore m
+        !arity = length patterns
+        !cont = CGoals goals base barrier depth next
+    factsSeq <- Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
+    if Seq.null factsSeq
+      then backtrack m
+      else do
+        pending <- arithData s
+        case (pending == 0, unwrapFindAllCont cont) of
+          (True, Just (results, template, faBase, entryHeap)) ->
+            drainDynamicFindAll m key factsSeq base patterns results template faBase entryHeap
+          _ -> do
+            buildArgs m base patterns 0
+            when (pending > 0) (normalizeArgs m arity)
+            saved <- saveArgs s arity
+            consumeDynFacts m key factsSeq 0 saved arity cont
   GMinimize cost inner -> do
     let s = mStore m
     entryHeap <- heapTop s
@@ -956,18 +970,54 @@ step' m goal goals base barrier depth next = case goal of
     pushScope m (SBuffer buffer)
     runGoals m inner base (sentinel + 1) depth (CExitMinimize cost base ref)
   GAssert pattern -> do
-    word <- buildArg m base False pattern
-    fact <- exportFor m word
-    case S.functorOf fact of
-      Nothing -> raiseError m (TypeError "callable fact" fact)
-      Just key@(name, _)
-        | not (P.nameHasFlag (mProgram m) name S.FlagDynamic) ->
-            raiseError m (UserError (showPredKey key ++ " is not declared dynamic (add `" ++ name ++ " : dynamic.`)"))
-        | otherwise -> do
-            let (canon, vs) = canonicalize emptySubst fact
-                entry = (canon, length vs)
-            modifyIORef' (mDynamic m) (Map.alter (Just . maybe (Seq.singleton entry) (Seq.|> entry)) key)
-            continue
+    let !s = mStore m
+        isImmTag t = t == tagInt || t == tagAtm || t == tagChr
+    hBefore <- heapTop s
+    pending <- arithData s
+    case pattern of
+      PStruct f [a0] | pending == 0 -> do
+        w0 <- buildArg m base False a0 >>= deref s
+        if isImmTag (tagOf w0)
+          then do
+            key@(name, _) <- functorName (symbols s) (funId f)
+            if not (P.nameHasFlag (mProgram m) name S.FlagDynamic)
+              then raiseError m (UserError (showPredKey key ++ " is not declared dynamic (add `" ++ name ++ " : dynamic.`)"))
+              else do
+                setHeapTop s hBefore
+                let !entry = DFImm1 w0
+                modifyIORef' (mDynamic m) (Map.alter (Just . maybe (Seq.singleton entry) (Seq.|> entry)) key)
+                continue
+          else generalAssert s hBefore
+      PStruct f [a0, a1] | pending == 0 -> do
+        w0 <- buildArg m base False a0 >>= deref s
+        w1 <- buildArg m base False a1 >>= deref s
+        if isImmTag (tagOf w0) && isImmTag (tagOf w1)
+          then do
+            key@(name, _) <- functorName (symbols s) (funId f)
+            if not (P.nameHasFlag (mProgram m) name S.FlagDynamic)
+              then raiseError m (UserError (showPredKey key ++ " is not declared dynamic (add `" ++ name ++ " : dynamic.`)"))
+              else do
+                setHeapTop s hBefore
+                let !entry = DFImm2 w0 w1
+                modifyIORef' (mDynamic m) (Map.alter (Just . maybe (Seq.singleton entry) (Seq.|> entry)) key)
+                continue
+          else generalAssert s hBefore
+      _ -> generalAssert s hBefore
+    where
+      generalAssert s hBefore = do
+        word <- buildArg m base False pattern
+        fact <- exportFor m word
+        case S.functorOf fact of
+          Nothing -> raiseError m (TypeError "callable fact" fact)
+          Just key@(name, _)
+            | not (P.nameHasFlag (mProgram m) name S.FlagDynamic) ->
+                raiseError m (UserError (showPredKey key ++ " is not declared dynamic (add `" ++ name ++ " : dynamic.`)"))
+            | otherwise -> do
+                let (canon, vs) = canonicalize emptySubst fact
+                    !entry = DFTerm canon (length vs)
+                when (null vs) (setHeapTop s hBefore)
+                modifyIORef' (mDynamic m) (Map.alter (Just . maybe (Seq.singleton entry) (Seq.|> entry)) key)
+                continue
   GRetract pattern -> do
     let s = mStore m
     word <- buildArg m base False pattern
@@ -975,7 +1025,8 @@ step' m goal goals base barrier depth next = case goal of
     case S.functorOf shown of
       Nothing -> raiseError m (TypeError "callable fact" shown)
       Just key -> do
-        facts <- toList . Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
+        rawFacts <- toList . Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
+        facts <- mapM (dynFactToTerm m key) rawFacts
         saved <- reserveCells s 1
         writeCell s saved word
         retractFacts m [(i, fact, n) | (i, (fact, n)) <- zip [0 ..] facts] key saved (CGoals goals base barrier depth next)
@@ -986,8 +1037,9 @@ step' m goal goals base barrier depth next = case goal of
       Nothing -> raiseError m (TypeError "callable fact" shown)
       Just key -> do
         fresh <- freshId (mStore m)
-        facts <- toList . Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
-        let keep = [(canon, n) | (canon, n) <- facts, Nothing <- [unifyPlain emptySubst shown (instantiate fresh canon)]]
+        rawFacts <- toList . Map.findWithDefault Seq.empty key <$> readIORef (mDynamic m)
+        facts <- mapM (dynFactToTerm m key) rawFacts
+        let keep = [df | (df, (canon, _)) <- zip rawFacts facts, Nothing <- [unifyPlain emptySubst shown (instantiate fresh canon)]]
         modifyIORef' (mDynamic m) (Map.insert key (Seq.fromList keep))
         continue
   GCallDyn direct callable extra -> do
@@ -1519,8 +1571,8 @@ unwrapFindAllCont cont = case cont of
     | unsafeAt (csCode stream) pc == opProceed -> unwrapFindAllCont next
   _ -> Nothing
 
-drainNativeFindAll :: Machine -> JitKernel -> Int -> Int -> Int -> IORef [(Copy, [OutputEvent])] -> Pattern -> Int -> Int -> Bool -> IO Step
-drainNativeFindAll m kernel !entryH !entryTR !d results template !base !entryHeap !hasMore0 = do
+drainNativeFindAll :: Machine -> Pred -> JitKernel -> Int -> Int -> Int -> Int -> IORef [(Copy, [OutputEvent])] -> Pattern -> Int -> Int -> Bool -> Cont -> IO Step
+drainNativeFindAll m predicate kernel !saved !entryH !entryTR !d results template !base !entryHeap !hasMore0 cont0 = do
   let !s = mStore m
       loop !hasMore = do
         hAfterSol <- heapTop s
@@ -1536,6 +1588,14 @@ drainNativeFindAll m kernel !entryH !entryTR !d results template !base !entryHea
               Just (1, _, more) -> loop more
               Just (0, _, _) -> backtrack m
               Just (3, _, _) -> raiseItems m [BranchExhausted] (backtrack m)
+              Nothing -> do
+                unwindTrail s entryTR
+                when (saved > 0) $ do
+                  loadArgs s saved (pArity predicate)
+                  setHeapTop s saved
+                writeIORef results []
+                entry <- choiceTop m
+                callClausesInterpreted m 0 predicate entry d cont0
               _ -> backtrack m
   loop hasMore0
 
@@ -1566,7 +1626,8 @@ callPlain m frame !depth predicate cont0 = do
             let !s = mStore m
                 !immCommit = commitsImmediately cont
                 !rf = jitRerunFree kernel
-                !noCallCommit = immCommit || commitsWithoutCall rf cont
+                !findAllTarget = unwrapFindAllCont cont
+                !noCallCommit = immCommit || commitsWithoutCall rf cont || isJust findAllTarget
             switchCommit <-
               if noCallCommit
                 then pure False
@@ -1574,8 +1635,7 @@ callPlain m frame !depth predicate cont0 = do
                   Nothing -> pure False
                   Just positions -> switchGround s positions
             let !allowChoices = noCallCommit || switchCommit
-                !findAllTarget = if rf then unwrapFindAllCont cont else Nothing
-                !needSaved = noCallCommit && not immCommit && isNothing findAllTarget
+                !needSaved = (noCallCommit && not immCommit && isNothing findAllTarget) || (not rf && isJust findAllTarget)
             saved <- if needSaved then saveArgs s (pArity predicate) else pure 0
             entryH <- heapTop s
             entryTR <- trailTop s
@@ -1583,7 +1643,7 @@ callPlain m frame !depth predicate cont0 = do
             case outcome of
               Just (1, _, hasMore) -> case findAllTarget of
                 Just (results, template, base, entryHeap) | hasMore ->
-                  drainNativeFindAll m kernel entryH entryTR depth results template base entryHeap hasMore
+                  drainNativeFindAll m predicate kernel saved entryH entryTR depth results template base entryHeap hasMore cont
                 _ -> do
                   when (hasMore && needSaved) $ do
                     _ <- pushChoice m (AltNative predicate kernel saved entryH entryTR depth cont)
@@ -1609,7 +1669,23 @@ callPlain m frame !depth predicate cont0 = do
           if outcome == scanNoMatch
             then backtrack m
             else callClausesInterpreted m frame' predicate entry d returnCont
-    enterPlainInterpreted frame' cont d = do
+    enterPlainInterpreted frame' cont d = case pFact2 predicate of
+      Just table -> do
+        let !s = mStore m
+        a0 <- readArg s 0 >>= deref s
+        let !t0 = tagOf a0
+        if t0 == tagInt || t0 == tagAtm || t0 == tagChr
+          then
+            let !w1 = lookupFact2 table a0
+             in if w1 == 0
+                  then backtrack m
+                  else do
+                    a1 <- readArg s 1
+                    ok <- unify s w1 a1
+                    if ok then run m cont else backtrack m
+          else enterPlainInterpretedSlow frame' cont d
+      Nothing -> enterPlainInterpretedSlow frame' cont d
+    enterPlainInterpretedSlow frame' cont d = do
       let !s = mStore m
       entry <- choiceTop m
       cands <- candidateClauses s predicate
@@ -2894,6 +2970,12 @@ backtrackChoice m top =
               setHeapTop s saved
               entry <- choiceTop m
               callClausesInterpreted m 0 predicate entry d cont
+        AltDynFacts key factsSeq saved arity cont -> do
+          nextIdx <- unsafeRead (csMarks cs) (at + markNext)
+          if nextIdx + 1 >= Seq.length factsSeq
+            then pop
+            else unsafeWrite (csMarks cs) (at + markNext) (nextIdx + 1)
+          tryDynFact m key (Seq.index factsSeq nextIdx) saved arity cont
   where
     pop = do
       top <- choiceTop m
@@ -3404,6 +3486,7 @@ exportState m = do
   store <- constraintSnapshot m
   tables <- readIORef (mTables m)
   dynamic <- readIORef (mDynamic m)
+  dynamicExport <- Map.traverseWithKey (\k -> mapM (dynFactToTerm m k) . toList) dynamic
   let subst = IM.fromList [(i, term) | (i, term) <- bindings, term /= Var i]
       base = initialState fresh
   pure
@@ -3412,7 +3495,7 @@ exportState m = do
         ssOutput = events,
         ssOutLen = count,
         ssTables = tables,
-        ssDynamic = Map.map toList dynamic
+        ssDynamic = dynamicExport
       }
 
 -- | Export a goal for @call/N@ and the leaf builtins: distinct unbound
@@ -3502,7 +3585,7 @@ callTabled m predicate cont0 = do
           Nothing -> do
             entryOut <- outLen s
             issues <- newIORef []
-            let delta = P.lookupPred key (mProgram m) >>= \source -> Delta.recursiveClauses (mProgram m) source callKey
+            let delta = P.lookupPredOrDefault key (mProgram m) >>= \source -> Delta.recursiveClauses (mProgram m) source callKey
             fixRef <- newIORef Fix
               { fxKey = callKey, fxPred = predicate, fxArgs = saved, fxEntryOut = entryOut, fxDepth = depth,
                 fxTables = tables, fxInitialTables = tables, fxDeltaClauses = delta, fxDelta = [],
@@ -3625,6 +3708,125 @@ consumeAnswers m answers saved arity cont = case answers of
       cell <- readCell s (saved + i)
       ok <- unify s cell w
       if ok then unifyArgs s table (i + 1) rest else pure False
+
+dynFactToTerm :: Machine -> PredKey -> DynFact -> IO (Term, Int)
+dynFactToTerm m (name, _) df = case df of
+  DFImm1 w0 -> do
+    t0 <- exportTerm (mStore m) w0
+    pure (Compound name [t0], 0)
+  DFImm2 w0 w1 -> do
+    let s = mStore m
+    t0 <- exportTerm s w0
+    t1 <- exportTerm s w1
+    pure (Compound name [t0, t1], 0)
+  DFTerm t n -> pure (t, n)
+
+consumeDynFacts :: Machine -> PredKey -> Seq.Seq DynFact -> Int -> Int -> Int -> Cont -> IO Step
+consumeDynFacts m key factsSeq !idx !saved !arity cont
+  | idx >= Seq.length factsSeq = backtrack m
+  | otherwise = do
+      when (idx + 1 < Seq.length factsSeq) $ do
+        _ <- pushChoice m (AltDynFacts key factsSeq saved arity cont)
+        pure ()
+      tryDynFact m key (Seq.index factsSeq idx) saved arity cont
+
+tryDynFact :: Machine -> PredKey -> DynFact -> Int -> Int -> Cont -> IO Step
+tryDynFact m _ df !saved !_ cont = do
+  let !s = mStore m
+  case df of
+    DFImm1 w0 -> do
+      c0 <- readCell s saved
+      ok <- unify s c0 w0
+      if ok then run m cont else backtrack m
+    DFImm2 w0 w1 -> do
+      c0 <- readCell s saved
+      ok0 <- unify s c0 w0
+      if not ok0
+        then backtrack m
+        else do
+          c1 <- readCell s (saved + 1)
+          ok1 <- unify s c1 w1
+          if ok1 then run m cont else backtrack m
+    DFTerm answer count -> do
+      block <- allocSlots s (max 1 count)
+      table <- newIORef (IM.fromList [(v, refWord (block + v)) | v <- [0 .. count - 1]])
+      let args = case answer of Compound _ as -> as; _ -> []
+          unifyArgs _ [] = pure True
+          unifyArgs !i (term : rest) = do
+            w <- importTermWords s table term
+            cell <- readCell s (saved + i)
+            ok <- unify s cell w
+            if ok then unifyArgs (i + 1) rest else pure False
+      ok <- unifyArgs 0 args
+      if ok then run m cont else backtrack m
+
+drainDynamicFindAll :: Machine -> PredKey -> Seq.Seq DynFact -> Int -> [Pattern] -> IORef [(Copy, [OutputEvent])] -> Pattern -> Int -> Int -> IO Step
+drainDynamicFindAll m _ factsSeq !base patterns results template !faBase !entryHeap = case (patterns, template) of
+  ([PFirst s0], PSlot ts0) | base == faBase && s0 == ts0 -> fastSlot1 s0
+  ([PSlot s0], PSlot ts0) | base == faBase && s0 == ts0 -> do
+    let !s = mStore m
+    w <- readCell s (base + s0) >>= deref s
+    if tagOf w == tagRef && valOf w >= entryHeap
+      then fastSlot1 s0
+      else generalLoop
+  _ -> generalLoop
+  where
+    !s = mStore m
+    !len = Seq.length factsSeq
+    fastSlot1 !_ = do
+      let go !i
+            | i >= len = backtrack m
+            | otherwise = case Seq.index factsSeq i of
+                DFImm1 w0 -> do
+                  modifyIORef' results ((CpWord w0, []) :)
+                  go (i + 1)
+                _ -> generalFrom i
+      go 0
+    generalLoop = generalFrom 0
+    generalFrom !startIdx = do
+      buildArgs m base patterns 0
+      let !arity = length patterns
+      saved <- saveArgs s arity
+      h0 <- heapTop s
+      tr0 <- trailTop s
+      olderHb <- hb s
+      setHb s h0
+      let loop !i
+            | i >= len = do
+                setHb s olderHb
+                setHeapTop s saved
+                backtrack m
+            | otherwise = do
+                ok <- matchOne (Seq.index factsSeq i) saved
+                when ok $ do
+                  hAfter <- heapTop s
+                  word <- buildArg m faBase False template
+                  copy <- copyOut m entryHeap word
+                  setHeapTop s hAfter
+                  modifyIORef' results ((copy, []) :)
+                unwindTrail s tr0
+                setHeapTop s h0
+                loop (i + 1)
+      loop startIdx
+    matchOne df !saved = case df of
+      DFImm1 w0 -> readCell s saved >>= \c0 -> unify s c0 w0
+      DFImm2 w0 w1 -> do
+        c0 <- readCell s saved
+        ok0 <- unify s c0 w0
+        if not ok0
+          then pure False
+          else readCell s (saved + 1) >>= \c1 -> unify s c1 w1
+      DFTerm answer count -> do
+        block <- allocSlots s (max 1 count)
+        table <- newIORef (IM.fromList [(v, refWord (block + v)) | v <- [0 .. count - 1]])
+        let args = case answer of Compound _ as -> as; _ -> []
+            unifyArgs _ [] = pure True
+            unifyArgs !i (term : rest) = do
+              w <- importTermWords s table term
+              cell <- readCell s (saved + i)
+              ok <- unify s cell w
+              if ok then unifyArgs (i + 1) rest else pure False
+        unifyArgs 0 args
 
 -- | Retract alternatives: each fact that unifies with the saved term is
 -- removed from the facts as they were when the retract began.
@@ -3844,6 +4046,7 @@ collect m cont nargs = do
         AltLabel _ _ _ c -> markCont c
         AltOptimize _ _ _ _ _ c -> markCont c
         AltNative predicate _ saved _ _ _ c -> forM_ [saved .. saved + pArity predicate - 1] markCell >> markCont c
+        AltDynFacts _ _ saved arity c -> forM_ [saved .. saved + arity - 1] markCell >> markCont c
       -- Constraint stores retain logical variables independently of the
       -- suspended syntax. Their watched cells, and pending reconciliation
       -- cells, must survive even when a local has no remaining goal use.
@@ -4024,6 +4227,8 @@ collect m cont nargs = do
         AltOptimize variables selected value goal minimum c -> AltOptimize variables selected value goal minimum <$> relocCont c
         AltNative predicate kernel saved entryH entryTR d c ->
           AltNative predicate kernel <$> forward saved <*> forward entryH <*> unsafeRead keptBelow entryTR <*> pure d <*> relocCont c
+        AltDynFacts key factsSeq saved arity c ->
+          AltDynFacts key factsSeq <$> forward saved <*> pure arity <*> relocCont c
   cont' <- relocCont cont
   forM_ [0 .. nargs - 1] $ \i -> readArg s i >>= reloc >>= writeArg s i
   varCells <- readIORef (mVarCells m)
