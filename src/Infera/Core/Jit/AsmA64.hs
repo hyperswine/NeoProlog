@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 
 -- | AArch64 (AAPCS64) native code emitter for the Infera JIT tier.
@@ -33,16 +34,17 @@ module Infera.Core.Jit.AsmA64
   )
 where
 
+import Control.Monad (forM_)
+import Control.Monad.ST (ST)
+import Data.Array.ST (STUArray, newArray_, readArray, runSTUArray, writeArray)
+import Data.Array.Unboxed (elems)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Int (Int64)
 import qualified Data.Map.Strict as M
-import Data.Word (Word32, Word8)
+import Data.Word (Word32, Word64, Word8)
 import Infera.Core.Jit.IR
 
 type I = Word32
-
-w :: I -> [Word8]
-w x = [fromIntegral (x `shiftR` s .&. 0xFF) | s <- [0, 8, 16, 24]]
 
 hwReg :: Reg -> Int
 hwReg = \case
@@ -153,13 +155,17 @@ orrRR d n m = 0xAA000000 .|. fromIntegral (m `shiftL` 16) .|. fromIntegral (n `s
 
 movImm64 :: Int -> Int64 -> [I]
 movImm64 r v =
-  let u = fromIntegral v :: Integer
-      hs = [(fromIntegral ((u `shiftR` (16 * k)) .&. 0xFFFF) :: I, k) | k <- [0 .. 3]]
-      movz (h, k) = 0xD2800000 .|. (fromIntegral k `shiftL` 21) .|. (h `shiftL` 5) .|. fromIntegral r
-      movk (h, k) = 0xF2800000 .|. (fromIntegral k `shiftL` 21) .|. (h `shiftL` 5) .|. fromIntegral r
-   in case hs of
-        [] -> []
-        (h0 : rest) -> movz h0 : [movk hk | hk@(h, _) <- rest, h /= 0]
+  let !u = fromIntegral v :: Word64
+      !h0 = fromIntegral (u .&. 0xFFFF) :: I
+      !h1 = fromIntegral ((u `shiftR` 16) .&. 0xFFFF) :: I
+      !h2 = fromIntegral ((u `shiftR` 32) .&. 0xFFFF) :: I
+      !h3 = fromIntegral ((u `shiftR` 48) .&. 0xFFFF) :: I
+      movz h k = 0xD2800000 .|. (fromIntegral k `shiftL` 21) .|. (h `shiftL` 5) .|. fromIntegral r
+      movk h k = 0xF2800000 .|. (fromIntegral k `shiftL` 21) .|. (h `shiftL` 5) .|. fromIntegral r
+   in movz h0 (0 :: Int)
+        : [movk h1 1 | h1 /= 0]
+        ++ [movk h2 2 | h2 /= 0]
+        ++ [movk h3 3 | h3 /= 0]
 
 -- Condition codes for B.cond:
 condEQ, condNE, condMI, condVS, condGE, condLT, condGT, condLE :: I
@@ -399,22 +405,34 @@ emitOp seqId = \case
     _ = seqId
 
 assembleA64 :: JitUnit -> [Word8]
-assembleA64 (JitUnit ops) = concatMap w patched
+assembleA64 (JitUnit ops) =
+  foldr
+    ( \x rest ->
+        fromIntegral (x .&. 0xFF)
+          : fromIntegral ((x `shiftR` 8) .&. 0xFF)
+          : fromIntegral ((x `shiftR` 16) .&. 0xFF)
+          : fromIntegral ((x `shiftR` 24) .&. 0xFF)
+          : rest
+    )
+    []
+    (elems patched)
   where
     laid = (ws prologueWords, Nothing) : [emitOp i op | (i, op) <- zip [0 ..] ops]
-    offs = scanl (\acc (Frag is _, _) -> acc + length is) 0 laid
+    offs = scanl (\ !acc (Frag is _, _) -> acc + length is) 0 laid
+    totalWords = last offs
     labels = M.fromList [(lbl, off) | ((_, Just lbl), off) <- zip laid offs]
-    patched = concat [patchFrag base frag | ((frag, _), base) <- zip laid offs]
-    patchFrag base (Frag is fx) =
-      foldl
-        ( \acc (wo, lbl, isCond) ->
-            let target = M.findWithDefault (error ("Infera.Core.Jit.AsmA64: unknown label " ++ lbl)) lbl labels
-                delta = target - (base + wo)
-                enc =
-                  if isCond
-                    then fromIntegral (delta .&. 0x7FFFF) `shiftL` 5
-                    else fromIntegral (delta .&. 0x3FFFFFF)
-             in take wo acc ++ [acc !! wo .|. enc] ++ drop (wo + 1) acc
-        )
-        is
-        fx
+    patched = runSTUArray $ do
+      arr <- newArray_ (0, max 0 (totalWords - 1)) :: ST s (STUArray s Int I)
+      forM_ (zip laid offs) $ \((Frag is fx, _), !base) -> do
+        forM_ (zip [base ..] is) $ \(!idx, insn) -> writeArray arr idx insn
+        forM_ fx $ \(wo, lbl, isCond) -> do
+          let !target = M.findWithDefault (error ("Infera.Core.Jit.AsmA64: unknown label " ++ lbl)) lbl labels
+              !delta = target - (base + wo)
+              !enc =
+                if isCond
+                  then fromIntegral (delta .&. 0x7FFFF) `shiftL` 5
+                  else fromIntegral (delta .&. 0x3FFFFFF)
+              !at = base + wo
+          old <- readArray arr at
+          writeArray arr at (old .|. enc)
+      pure arr

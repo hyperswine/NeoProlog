@@ -27,7 +27,7 @@ import Control.Monad (forM, forM_, unless, when, zipWithM_)
 import Control.Monad.State.Strict
 import Data.Bits (complement, (.|.))
 import Data.Int (Int64)
-import Data.List (nub, sortOn)
+import Data.List (group, nub, sortOn)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as M
 import qualified Data.Set as Set
@@ -43,7 +43,10 @@ data UnitPlan = UnitPlan
   { upUnit :: JitUnit,
     -- | argument slots the unit's calls use (the largest arity)
     upArgSlots :: Int,
-    upPreds :: [PredKey]
+    upPreds :: [PredKey],
+    -- | True when native choice-point enumeration is guaranteed not to hit
+    -- a mid-enumeration interpreter rerun once preflight checks pass
+    upRerunFree :: !Bool
   }
 
 -- | Compile the unit rooted at a predicate, or say why not. The second
@@ -54,7 +57,16 @@ planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry 
   Left why -> pure (Left why)
   Right preds -> do
     let clausesOf k = maybe [] (IM.elems . P.predClauses) (P.lookupPred k prog)
-        terms = concat [S.clauseHead c : concatMap flatten (S.clauseBody c) | (k, _) <- preds, c <- clausesOf k]
+        allClauses = [cl | (k, _) <- preds, cl <- clausesOf k]
+        terms = concat [S.clauseHead c : concatMap flatten (S.clauseBody c) | c <- allClauses]
+        dataTerms = concat [headArgs c ++ concatMap goalDataTerms (concatMap flatten (S.clauseBody c)) | c <- allClauses]
+        goalDataTerms = \case
+          S.Compound "unify" [a, b] -> [a, b]
+          S.Compound "equiv" [a, b] -> [a, b]
+          S.Compound "neq" [a, b] -> [a, b]
+          g
+            | isInlineGuard g || g == S.Atom "!" -> []
+            | otherwise -> callArgs g
     atoms <- forM (nub (concatMap atomsIn terms)) $ \a -> (,) a . fromIntegral . atmWord <$> internAtom syms a
     funs <- forM (nub (concatMap funsIn terms)) $ \(f, n) -> do
       fid <- internFunctor syms f n
@@ -63,10 +75,40 @@ planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry 
         idx = M.fromList (zip (map fst preds) [0 :: Int ..])
     pure $ do
       let sels = [(k, selectOrNondet p (clausesOf k)) | (k, p) <- preds]
-      bodies <- forM (zip [0 :: Int ..] sels) $ \(i, (k, sel)) -> compilePred env idx i k (clausesOf k) sel
+          selMap = M.fromList sels
+          unitCanReclaimH =
+            null (concatMap funsIn dataTerms)
+              && all (selExclusive . snd) sels
+              && not (any (\cl -> countControlTemps cl > 0) allClauses)
+          freshOutMap = inferFreshOutArgs preds clausesOf
+          (choiceSafe, needIntMap, needGndMap) = inferChoiceNeeds env preds clausesOf selMap
+      bodies <- forM (zip [0 :: Int ..] sels) $ \(i, (k, sel)) ->
+        compilePred env idx unitCanReclaimH (M.findWithDefault Set.empty k freshOutMap) i k (clausesOf k) sel
       let entrySel = case sels of
             (_, sel) : _ -> sel
             [] -> Selection True [] [] []
+          entryArity = snd entry
+          entryNeedInt = Set.toAscList (M.findWithDefault Set.empty entry needIntMap `Set.difference` Set.fromList (selInt entrySel))
+          entryNeedGnd =
+            Set.toAscList
+              ( M.findWithDefault Set.empty entry needGndMap
+                  `Set.difference` Set.fromList (selInt entrySel ++ entryNeedInt ++ selGround entrySel)
+              )
+          checkedEntryArgs = Set.fromList (selInt entrySel ++ entryNeedInt ++ selGround entrySel ++ entryNeedGnd)
+          otherEntryArgs = [p | p <- [0 .. entryArity - 1], Set.notMember p checkedEntryArgs]
+          choiceChecks =
+            [ JLoadImm RT0 RState stateAllowChoicesIdx,
+              JBranchImm JEq RT0 0 "choices_checked"
+            ]
+              ++ concat [intCheck p "no_choices" | p <- entryNeedInt]
+              ++ concat [groundCheck ("cpre_" ++ show p) p "no_choices" | p <- entryNeedGnd]
+              ++ concat [argSafeCheck ("asafe_" ++ show p) p "no_choices" | p <- otherEntryArgs]
+              ++ [ JJump "choices_checked",
+                   JLabel "no_choices",
+                   JMovImm RT0 0,
+                   JStoreImm RT0 RState stateAllowChoicesIdx,
+                   JLabel "choices_checked"
+                 ]
           maxArity = maximum (1 : map (snd . fst) preds)
           preflight =
             [ JLoadImm RT0 RState stateBIdx,
@@ -76,6 +118,7 @@ planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry 
             ]
               ++ concat [intCheck p "decline" | p <- selInt entrySel]
               ++ concat [groundCheck ("pre_" ++ show p) p "decline" | p <- selGround entrySel]
+              ++ choiceChecks
               ++ [JLoadLabel RT7 "unit_done", JJump (predLabel 0)]
           exits =
             [ JLabel "resume",
@@ -112,7 +155,221 @@ planClauseUnit syms isBuiltin prog entry = case gatherUnit isBuiltin prog entry 
             ]
               ++ unifySlowOps
               ++ gndClearOps
-      pure (UnitPlan (JitUnit (preflight ++ concat bodies ++ exits)) maxArity (map fst preds))
+          rerunFree = choiceSafe && not (any hasDeepNonGroundTerm terms)
+      pure (UnitPlan (JitUnit (preflight ++ concat bodies ++ exits)) maxArity (map fst preds) rerunFree)
+
+-- | Whether a term has nested compound structures of depth >= 3 containing
+-- variables that could trigger a deep occurs-check or deep structure
+-- unification bailout in 'unifySlowOps'.
+hasDeepNonGroundTerm :: S.Term -> Bool
+hasDeepNonGroundTerm = \case
+  S.Compound _ as -> any (\a -> compDepth a >= 2 && not (null (termVarIds a))) as
+  _ -> False
+  where
+    compDepth :: S.Term -> Int
+    compDepth = \case
+      S.Compound _ bs -> 1 + maximum (0 : map compDepth bs)
+      _ -> 0
+
+-- | Contiguous constant-key groups at argument 0 when a predicate of arity >= 2
+-- has >= 4 distinct constants and every clause has an immediate constant at
+-- argument 0 grouped contiguously by constant key. Returns @(sortedFirstPairs, groupLastSet)@.
+arg0ConstGroups :: CEnv -> Int -> [S.Clause] -> Maybe ([(Int64, Int)], Set.Set Int)
+arg0ConstGroups env arity clauses
+  | arity < 2 = Nothing
+  | otherwise = do
+      cws <- mapM (arg0Const env) clauses
+      let gs = group cws
+          heads = [cw | (cw : _) <- gs]
+      if length gs >= 4 && length (nub heads) == length heads
+        then
+          let lens = map length gs
+              starts = init (scanl (+) 0 lens)
+              ends = [s + len - 1 | (s, len) <- zip starts lens]
+           in Just (sortOn fst (zip heads starts), Set.fromList ends)
+        else Nothing
+
+-- | Infer which arguments of each predicate in the unit must be integers or
+-- ground at entry so that no clause can evaluate an unbound variable or trigger
+-- a read-only / non-ground bailout during native choice enumeration.
+inferChoiceNeeds ::
+  CEnv ->
+  [(PredKey, P.Pred)] ->
+  (PredKey -> [S.Clause]) ->
+  M.Map PredKey Selection ->
+  (Bool, M.Map PredKey (Set.Set Int), M.Map PredKey (Set.Set Int))
+inferChoiceNeeds env preds clausesOf selMap = go True initInt initGnd
+  where
+    keys = map fst preds
+    hasArg0Switch k = case arg0ConstGroups env (snd k) (clausesOf k) of
+      Just _ -> True
+      Nothing -> False
+    initInt = M.fromList [(k, Set.fromList (maybe [] selInt (M.lookup k selMap))) | k <- keys]
+    initGnd =
+      M.fromList
+        [ ( k,
+            Set.fromList
+              ( maybe [] selGround (M.lookup k selMap)
+                  ++ [0 | hasArg0Switch k]
+                  ++ [pos | Just sel <- [M.lookup k selMap], set <- selReadOnly sel, (pos, _) <- Set.toList set]
+              )
+          )
+          | k <- keys
+        ]
+    go !ok0 iMap gMap =
+      let stepPred k =
+            let cls = clausesOf k
+                res = map (clauseNeeds iMap gMap) cls
+                okP = all (\(b, _, _) -> b) res
+                is = [x | (_, x, _) <- res]
+                gs = [y | (_, _, y) <- res]
+             in ( okP,
+                  Set.union (M.findWithDefault Set.empty k iMap) (Set.unions is),
+                  Set.union (M.findWithDefault Set.empty k gMap) (Set.unions gs)
+                )
+          nextPairs = [(k, stepPred k) | k <- keys]
+          ok' = ok0 && all (\(_, (b, _, _)) -> b) nextPairs
+          iMap' = M.fromList [(k, is) | (k, (_, is, _)) <- nextPairs]
+          gMap' = M.fromList [(k, gs) | (k, (_, _, gs)) <- nextPairs]
+       in if iMap' == iMap && gMap' == gMap then (ok', iMap, gMap) else go ok' iMap' gMap'
+
+    clauseNeeds iMap gMap cl =
+      let hArgs = headArgs cl
+          varOwner =
+            M.fromListWith
+              (\_ first -> first)
+              [(v, (i, isPlainVar a)) | (i, a) <- zip [0 :: Int ..] hArgs, v <- termVarIds a]
+          isPlainVar (S.Var _) = True
+          isPlainVar _ = False
+          needIntVar bound v (!ok, accI, accG)
+            | Set.member v bound = (ok, accI, accG)
+            | Just (i, True) <- M.lookup v varOwner = (ok, Set.insert i accI, accG)
+            | Just (i, False) <- M.lookup v varOwner = (False, accI, Set.insert i accG)
+            | otherwise = (False, accI, accG)
+          needGndVar bound v (!ok, accI, accG)
+            | Set.member v bound = (ok, accI, accG)
+            | Just (i, _) <- M.lookup v varOwner = (ok, accI, Set.insert i accG)
+            | otherwise = (False, accI, accG)
+          walkGoals _ !ok accI accG [] = (ok, accI, accG)
+          walkGoals bound !ok accI accG (g : gs) = case g of
+            S.Compound "is" [lhs, rhs] ->
+              let (ok', accI', accG') = foldr (needIntVar bound) (ok, accI, accG) (termVarIds rhs)
+                  bound' = Set.union bound (Set.fromList (termVarIds lhs))
+               in walkGoals bound' ok' accI' accG' gs
+            S.Compound op [a, b] | op `elem` ["gt", "lt", "gte", "lte"] ->
+              let (ok', accI', accG') = foldr (needIntVar bound) (ok, accI, accG) (termVarIds a ++ termVarIds b)
+                  bound' = Set.union bound (Set.fromList (termVarIds a ++ termVarIds b))
+               in walkGoals bound' ok' accI' accG' gs
+            S.Compound op [a, b] | op `elem` ["neq", "equiv"] ->
+              let bothVars = isVarTerm a && isVarTerm b
+                  (ok', accI', accG') = foldr (needGndVar bound) (ok && not bothVars, accI, accG) (termVarIds a ++ termVarIds b)
+               in walkGoals bound ok' accI' accG' gs
+            S.Compound "is_int" [a] ->
+              let hasCompoundHeadVar = any (\v -> Set.notMember v bound && case M.lookup v varOwner of Just (_, False) -> True; _ -> False) (termVarIds a)
+               in walkGoals bound (ok && not hasCompoundHeadVar) accI accG gs
+            S.Compound "ground" [a] ->
+              let (ok', accI', accG') = foldr (needGndVar bound) (ok, accI, accG) (termVarIds a)
+               in walkGoals bound ok' accI' accG' gs
+            S.Compound "unify" [a, b] ->
+              let vs = Set.fromList (termVarIds a ++ termVarIds b)
+                  bound' =
+                    if all (`Set.member` bound) (termVarIds a) || all (`Set.member` bound) (termVarIds b)
+                      then Set.union bound vs
+                      else bound
+               in walkGoals bound' ok accI accG gs
+            S.Compound "once" [inner] ->
+              let (ok', accI', accG') = walkGoals bound ok accI accG (flatten inner)
+               in walkGoals bound ok' accI' accG' gs
+            S.Compound "not" [inner] ->
+              let (ok', accI', accG') = walkGoals bound ok accI accG (flatten inner)
+               in walkGoals bound ok' accI' accG' gs
+            _ ->
+              let ck = case g of
+                    S.Atom f -> (f, 0)
+                    S.Compound f as -> (f, length as)
+                    _ -> ("", 0)
+                  cArgs = callArgs g
+                  calleeInt = M.findWithDefault Set.empty ck iMap
+                  calleeGnd = M.findWithDefault Set.empty ck gMap
+                  (ok', accI', accG') =
+                    foldr
+                      ( \(j, arg) (okAcc, ai, ag) ->
+                          if Set.member j calleeInt
+                            then case arg of
+                              S.IntLit _ -> (okAcc, ai, ag)
+                              S.Var v -> needIntVar bound v (okAcc, ai, ag)
+                              _ -> foldr (needGndVar bound) (False, ai, ag) (termVarIds arg)
+                            else
+                              if Set.member j calleeGnd
+                                then foldr (needGndVar bound) (okAcc && not (any (< 0) (allVarsIn arg)), ai, ag) (termVarIds arg)
+                                else (okAcc, ai, ag)
+                      )
+                      (ok, accI, accG)
+                      (zip [0 :: Int ..] cArgs)
+                  bound' = Set.union bound (Set.fromList (concatMap termVarIds cArgs))
+               in walkGoals bound' ok' accI' accG' gs
+       in walkGoals Set.empty True Set.empty Set.empty (concatMap flatten (S.clauseBody cl))
+
+-- | Greatest-fixpoint analysis for internal predicates (@pIx > 0@): an argument
+-- position @(k, i)@ is 'FreshOut' when every call site to @k@ in the unit
+-- passes a fresh, unseen variable (or forwards a 'FreshOut' head variable of
+-- the caller before it has been used anywhere else).
+inferFreshOutArgs :: [(PredKey, P.Pred)] -> (PredKey -> [S.Clause]) -> M.Map PredKey (Set.Set Int)
+inferFreshOutArgs preds clausesOf = go initMap
+  where
+    internalKeys = map fst (drop 1 preds)
+    hasCalls = Set.fromList [ck | (k, _) <- preds, cl <- clausesOf k, g <- concatMap goalsIn (S.clauseBody cl), let ck = goalKey g, ck `elem` internalKeys]
+    initMap =
+      M.fromList
+        [ (k, if Set.member k hasCalls then Set.fromList [0 .. snd k - 1] else Set.empty)
+          | k <- internalKeys
+        ]
+    goalKey = \case
+      S.Atom f -> (f, 0)
+      S.Compound f as -> (f, length as)
+      _ -> ("", -1)
+    go cur =
+      let next = foldr (checkClause cur) cur [(k, cl) | (k, _) <- preds, cl <- clausesOf k]
+       in if next == cur then cur else go next
+    checkClause cur (callerKey, cl) acc =
+      let hArgs = headArgs cl
+          callerFresh = M.findWithDefault Set.empty callerKey cur
+          headVarCount v = length [u | a <- hArgs, u <- termVarIds a, u == v]
+          freshHeadVars =
+            Set.fromList
+              [ v
+                | (i, S.Var v) <- zip [0 :: Int ..] hArgs,
+                  v >= 0,
+                  Set.member i callerFresh,
+                  headVarCount v == 1
+              ]
+          seen0 = Set.fromList (concatMap termVarIds hArgs) `Set.difference` freshHeadVars
+          walk seen m [] = (seen, m)
+          walk seen m (g : gs) = case g of
+            S.Compound "once" [inner] ->
+              let (seen', m') = walk seen m (flatten inner)
+               in walk seen' m' gs
+            S.Compound "not" [inner] ->
+              let (seen', m') = walk seen m (flatten inner)
+               in walk seen' m' gs
+            _
+              | isInlineGuard g || g == S.Atom "!" ->
+                  walk (Set.union seen (Set.fromList (termVarIds g))) m gs
+              | S.Compound "unify" [a, b] <- g ->
+                  walk (Set.union seen (Set.fromList (termVarIds a ++ termVarIds b))) m gs
+              | otherwise ->
+                  let ck = goalKey g
+                      cArgs = callArgs g
+                      argVarCount v = length [u | a <- cArgs, u <- termVarIds a, u == v]
+                      okAt arg = case arg of
+                        S.Var v | v < 0 -> True
+                        S.Var v -> Set.notMember v seen && argVarCount v == 1
+                        _ -> False
+                      keep = Set.fromList [j | (j, a) <- zip [0 :: Int ..] cArgs, okAt a]
+                      m' = M.adjust (`Set.intersection` keep) ck m
+                      seen' = Set.union seen (Set.fromList (concatMap termVarIds cArgs))
+                   in walk seen' m' gs
+       in snd (walk seen0 acc (concatMap flatten (S.clauseBody cl)))
 
 -- | Whether a predicate may root a unit: everything it reaches is in the
 -- fragment. Cheap (no selection proofs, no code), so the loader asks it of
@@ -139,12 +396,13 @@ gatherUnit isBuiltin prog entry = gather [entry] []
       | P.nameHasFlag prog (fst k) S.FlagDynamic = Left (show k ++ " is dynamic")
       | snd k > 8 = Left (show k ++ " has more than 8 arguments")
       | IM.null (P.predClauses p) = Left (show k ++ " has no clauses")
-      | IM.size (P.predClauses p) > 16 = Left (show k ++ " has more than 16 clauses")
+      | IM.size (P.predClauses p) > 128 = Left (show k ++ " has more than 128 clauses")
       | k /= entry && isTrmcCallee k p = Left (show k ++ " is a TRMC list kernel")
       | otherwise = mapM_ (admissibleClause k) (IM.elems (P.predClauses p))
     isTrmcCallee (name, arity) p =
-      arity >= 2
-        && P.sigDet (P.predInferred p) `elem` [S.Det, S.Semidet]
+      arity == 3
+        && IM.size (P.predClauses p) == 2
+        && P.sigDet (P.predInferred p) == S.Det
         && any isTrmcClause (IM.elems (P.predClauses p))
       where
         isTrmcClause cl = case (headArgs cl, reverse (concatMap flatten (S.clauseBody cl))) of
@@ -407,7 +665,7 @@ selection p clauses = do
           _ -> []
         guardRoPaths cl =
           let evalStructPaths = case evaluatedPaths cl of
-                Just ep -> Set.fromList [ (argI, take len sub) | (argI, sub) <- Set.toList ep, len <- [0 .. length sub - 1], not (null sub) ]
+                Just ep -> Set.fromList [(argI, take len sub) | (argI, sub) <- Set.toList ep, len <- [0 .. length sub - 1], not (null sub)]
                 Nothing -> Set.empty
            in intLitPaths cl `Set.union` evalStructPaths
     allGuards cl = all isEarlyGuard (concatMap flatten (S.clauseBody cl))
@@ -591,8 +849,47 @@ countControlTemps cl = sum (map countG (concatMap flatten (S.clauseBody cl)))
         inner -> 1 + sum (map countG inner)
       _ -> 0
 
-compilePred :: CEnv -> M.Map PredKey Int -> Int -> PredKey -> [S.Clause] -> Selection -> Either String [JitOp]
-compilePred env idx pIx key clauses sel = do
+-- | Extract the immediate constant word at argument 0 of a clause if present.
+arg0Const :: CEnv -> S.Clause -> Maybe Int64
+arg0Const env cl = case headArgs cl of
+  a : _ -> constWord env a
+  [] -> Nothing
+
+-- | Emit a binary search dispatch tree over sorted @(constWord, clauseIndex)@
+-- pairs against @RT0@, using @RT1@ as scratch.
+emitConstBinSearch :: String -> [(Int64, Int)] -> (Int -> Label) -> Label -> [JitOp]
+emitConstBinSearch base pairs targetLbl missLbl = go "root" pairs
+  where
+    go _ [] = [JJump missLbl]
+    go _ [(cw, k)] =
+      [ JMovImm RT1 cw,
+        JBranchCmp JEq RT0 RT1 (targetLbl k),
+        JJump missLbl
+      ]
+    go _ [(cw1, k1), (cw2, k2)] =
+      [ JMovImm RT1 cw1,
+        JBranchCmp JEq RT0 RT1 (targetLbl k1),
+        JMovImm RT1 cw2,
+        JBranchCmp JEq RT0 RT1 (targetLbl k2),
+        JJump missLbl
+      ]
+    go tag xs =
+      let mid = length xs `div` 2
+          (left, rest) = splitAt mid xs
+       in case rest of
+            (cwMid, kMid) : right ->
+              let rightLbl = base ++ "_" ++ tag ++ "_r"
+               in [ JMovImm RT1 cwMid,
+                    JBranchCmp JEq RT0 RT1 (targetLbl kMid),
+                    JBranchCmp JGt RT0 RT1 rightLbl
+                  ]
+                    ++ go (tag ++ "l") left
+                    ++ [JLabel rightLbl]
+                    ++ go (tag ++ "r") right
+            [] -> [JJump missLbl]
+
+compilePred :: CEnv -> M.Map PredKey Int -> Bool -> Set.Set Int -> Int -> PredKey -> [S.Clause] -> Selection -> Either String [JitOp]
+compilePred env idx unitCanReclaimH freshOutArgs pIx key clauses sel = do
   let lbl = predLabel pIx
       n = length clauses
       arity = snd key
@@ -605,21 +902,29 @@ compilePred env idx pIx key clauses sel = do
       clauseLbl k = lbl ++ "_c" ++ show k
       undoLbl k = lbl ++ "_u" ++ show k
       retryLbl k = lbl ++ "_r" ++ show k
+      sharedUndoFailLbl = lbl ++ "_ufail"
+      arg0SwitchInfo = arg0ConstGroups env arity clauses
+      isArg0Switch = case arg0SwitchInfo of
+        Just _ -> True
+        Nothing -> False
+      groupLastSet = case arg0SwitchInfo of
+        Just (_, ends) -> ends
+        Nothing -> Set.singleton (n - 1)
       saveArgsOps =
         concat
           [ [JLoadImm RT0 RArgs i, JStoreImm RT0 RE (frameHeader + i)]
-            | i <- [0 .. savedArgWords - 1]
+            | i <- [if isArg0Switch then 1 else 0 .. savedArgWords - 1]
           ]
       loadArgsOps =
         concat
           [ [JLoadImm RT0 RE (frameHeader + i), JStoreImm RT0 RArgs i]
-            | i <- [0 .. savedArgWords - 1]
+            | i <- [if isArg0Switch then 1 else 0 .. savedArgWords - 1]
           ]
       entry =
         [ JLabel lbl,
-          -- RT7 holds the return address. Reserve 8 extra words above RSP for
+          -- RT7 holds the return address. Reserve 10 extra words above RSP for
           -- temporary register spills in unifyWords/not.
-          JAddImm RT6 RSP (8 * (frameSize + 8)),
+          JAddImm RT6 RSP (8 * (frameSize + 10)),
           JLoadImm RT5 RState stateNStackLimIdx,
           JBranchCmp JGt RT6 RT5 "stackfull",
           JAddImm RT6 RSP (8 * frameSize),
@@ -641,22 +946,68 @@ compilePred env idx pIx key clauses sel = do
                      JMov RHB RH
                    ]
                      ++ saveArgsOps
-                 else []
+                 else [JStoreImm RH RE frameH | unitCanReclaimH]
+             )
+          ++ ( case arg0SwitchInfo of
+                 Just (sortedPairs, _) ->
+                   [ JLoadImm RT0 RArgs 0,
+                     JDeref RT0 RT0,
+                     JTagOf RT1 RT0,
+                     JBranchImm JEq RT1 (fromIntegral tagRef) "rerun"
+                   ]
+                     ++ emitConstBinSearch (lbl ++ "_bs") sortedPairs clauseLbl "fail"
+                 Nothing -> []
              )
   blocks <- forM (zip [0 ..] clauses) $ \(k, cl) -> do
-    let isLast = k == n - 1
-        headFailL = if isLast then "fail" else undoLbl k
-        ro = selReadOnly sel !! k
-        tempBase = varBase + S.clauseNVars cl
+    let isLast = Set.member k groupLastSet
+        goals = concatMap flatten (S.clauseBody cl)
         guardPred = if exclusive then isEarlyGuard else isInlineGuard
+        (prefix, rest) = span guardPred goals
+        remArgs = drop 1 (headArgs cl)
+        -- When an arg0Switch clause has no guards and at most one remaining
+        -- ground argument (or distinct first-time variables), matching remArgs
+        -- cannot fail after binding, so no trail undo is needed on failure.
+        remVars = concatMap termVarIds remArgs
+        remNoUndoOnFail =
+          isArg0Switch
+            && null prefix
+            && (all groundTermOk remArgs && length remArgs <= 1 || all isVarTerm remArgs && length remVars == length (nub remVars))
+        arg0DirectCommit = remNoUndoOnFail && isLast
+        headFailL
+          | remNoUndoOnFail = if isLast then "fail" else clauseLbl (k + 1)
+          | isArg0Switch && isLast = sharedUndoFailLbl
+          | isLast = "fail"
+          | otherwise = undoLbl k
+        ro = selReadOnly sel !! k
+        gndArgs = Set.fromList (selGround sel)
+        tempBase = varBase + S.clauseNVars cl
     (ops, _) <- runGen 0 varBase tempBase frameSize $ do
       emit [JLabel (clauseLbl k)]
-      when (isLast && n > 1) (emit [JLoadImm RHB RE frameHB])
-      zipWithM_ (\i a -> matchArg env ro (i, []) a i headFailL (if i == 0 && not isLast then Just (clauseLbl (k + 1)) else Nothing)) [0 ..] (headArgs cl)
-      let goals = concatMap flatten (S.clauseBody cl)
-          (prefix, rest) = span guardPred goals
+      when ((isLast && n > 1) || arg0DirectCommit) (emit [JLoadImm RHB RE frameHB])
+      if isArg0Switch
+        then
+          zipWithM_
+            (\i a -> matchArg env (Set.member i gndArgs) (Set.member i freshOutArgs) ro (i, []) a i headFailL Nothing)
+            [1 ..]
+            remArgs
+        else
+          zipWithM_
+            ( \i a ->
+                matchArg
+                  env
+                  (Set.member i gndArgs)
+                  (Set.member i freshOutArgs)
+                  ro
+                  (i, [])
+                  a
+                  i
+                  headFailL
+                  (if i == 0 && not isLast then Just (clauseLbl (k + 1)) else Nothing)
+            )
+            [0 ..]
+            (headArgs cl)
       mapM_ (compileGuard env headFailL) prefix
-      unless isLast $
+      unless (isLast || arg0DirectCommit) $
         if exclusive
           then do
             -- Commit: drop trail entries for cells >= the caller's RHB.
@@ -688,9 +1039,9 @@ compilePred env idx pIx key clauses sel = do
                 JStoreImm RE RState stateBIdx,
                 JMov RHB RH
               ]
-      compileBody env idx cl (lbl ++ "_c" ++ show k) True rest
+      compileBody env idx unitCanReclaimH cl (lbl ++ "_c" ++ show k) True rest
     let undo
-          | isLast = []
+          | isLast || remNoUndoOnFail = []
           | otherwise =
               [ JLabel (undoLbl k),
                 JLoadImm RT0 RE frameTR,
@@ -727,10 +1078,27 @@ compilePred env idx pIx key clauses sel = do
                 JStoreImm RT0 RState stateBIdx
               ]
                 ++ loadArgsOps
-                ++ [JMov RHB RH | k + 1 < n - 1]
+                ++ [JMov RHB RH | not (Set.member (k + 1) groupLastSet)]
                 ++ [JJump (clauseLbl (k + 1))]
     pure (relabel (lbl ++ "_c" ++ show k ++ "_") ops ++ undo ++ retry)
-  pure (entry ++ concat blocks)
+  let sharedUndo
+        | not isArg0Switch = []
+        | otherwise =
+            [ JLabel sharedUndoFailLbl,
+              JLoadImm RT0 RE frameTR,
+              JLabel (sharedUndoFailLbl ++ "_loop"),
+              JBranchCmp JLe RTR RT0 (sharedUndoFailLbl ++ "_done"),
+              JSubImm RTR RTR 1,
+              JLoadIx RT1 RTrail RTR,
+              JShr RT1 RT1 1,
+              JMkWord RT2 RT1 tagRef,
+              JStoreIx RT2 RCells RT1,
+              JJump (sharedUndoFailLbl ++ "_loop"),
+              JLabel (sharedUndoFailLbl ++ "_done"),
+              JLoadImm RH RE frameH,
+              JJump "fail"
+            ]
+  pure (entry ++ concat blocks ++ sharedUndo)
   where
     relabel pre = map $ \case
       JLabel l | local l -> JLabel (pre ++ l)
@@ -775,18 +1143,72 @@ groundCheck base p failLbl =
         JLabel ok
       ]
 
+-- | Branch to @failLbl@ if argument @p@ is a boxed value or a non-ground
+-- structure (unbound @tagRef@, immediate constants, and ground structures pass).
+argSafeCheck :: String -> Int -> Label -> [JitOp]
+argSafeCheck base p failLbl =
+  let ok = base ++ "_ok"
+   in [ JLoadImm RT0 RArgs p,
+        JDeref RT0 RT0,
+        JTagOf RT1 RT0,
+        JBranchImm JEq RT1 (fromIntegral tagBox) failLbl,
+        JBranchImm JNe RT1 (fromIntegral tagStr) ok,
+        JValOf RT0 RT0,
+        JLoadIx RT0 RCells RT0,
+        JMovImm RT1 (fromIntegral groundBit),
+        JAnd RT0 RT0 RT1,
+        JBranchImm JEq RT0 0 failLbl,
+        JLabel ok
+      ]
+
 lbl' :: String -> G Label
 lbl' = newLabel . ("L_" ++)
 
-matchArg :: CEnv -> Set.Set (Int, [Int]) -> (Int, [Int]) -> S.Term -> Int -> Label -> Maybe Label -> G ()
-matchArg env ro path t i failL mDirectNext = do
+matchArg :: CEnv -> Bool -> Bool -> Set.Set (Int, [Int]) -> (Int, [Int]) -> S.Term -> Int -> Label -> Maybe Label -> G ()
+matchArg env isGnd isFreshOut ro path t i failL mDirectNext = do
   r <- allocReg
   emit [JLoadImm r RArgs i]
-  matchTermWith env (Just ro) path t r failL mDirectNext
+  if isFreshOut
+    then matchFreshOutArg env t r failL
+    else matchTermWith env isGnd (Just ro) path t r failL mDirectNext
   freeReg r
 
-matchTerm :: CEnv -> Maybe (Set.Set (Int, [Int])) -> (Int, [Int]) -> S.Term -> Reg -> Label -> G ()
-matchTerm env ro path t w failL = matchTermWith env ro path t w failL Nothing
+-- | Match a head argument proven to be a freshly allocated, unaliased
+-- unbound @tagRef@ cell at every call site in the unit: elides the dead
+-- read-mode matcher and binds the built term directly without occurs checks.
+matchFreshOutArg :: CEnv -> S.Term -> Reg -> Label -> G ()
+matchFreshOutArg env t w failL = case t of
+  S.Var v
+    | v < 0 -> pure ()
+    | otherwise -> do
+        seen <- isSeen v
+        sv <- slot v
+        if seen
+          then do
+            r <- allocReg
+            emit [JLoadImm r RE sv]
+            unifyWords r w failL
+            freeReg r
+          else emit [JStoreImm w RE sv] >> markSeen v
+  S.Compound _ _ -> do
+    emit [JDeref w w, JTagOf RT7 w, JBranchImm JNe RT7 (fromIntegral tagRef) "rerun"]
+    b <- buildTerm env t
+    emit [JValOf w w, JBindRef w b "rerun"]
+    freeReg b
+  _ -> case constWord env t of
+    Just cw ->
+      emit
+        [ JDeref w w,
+          JTagOf RT7 w,
+          JBranchImm JNe RT7 (fromIntegral tagRef) "rerun",
+          JValOf w w,
+          JMovImm RT7 cw,
+          JBindRef w RT7 "rerun"
+        ]
+    Nothing -> decline ("constant outside the fragment: " ++ show t)
+
+matchTerm :: CEnv -> Bool -> Maybe (Set.Set (Int, [Int])) -> (Int, [Int]) -> S.Term -> Reg -> Label -> G ()
+matchTerm env isGnd ro path t w failL = matchTermWith env isGnd ro path t w failL Nothing
 
 -- | Match a term against the word in @w@ (clobbered), binding unbound cells
 -- (write mode) except at read-only paths, where the call goes back to the
@@ -794,8 +1216,8 @@ matchTerm env ro path t w failL = matchTermWith env ro path t w failL Nothing
 -- @Just nextClauseLbl@ (for the outer tag/functor check of argument 0 before
 -- any trail or heap write has occurred), a mismatch jumps directly to
 -- @nextClauseLbl@ instead of going through the trail-unwind block.
-matchTermWith :: CEnv -> Maybe (Set.Set (Int, [Int])) -> (Int, [Int]) -> S.Term -> Reg -> Label -> Maybe Label -> G ()
-matchTermWith env ro path t w failL mDirectNext = case t of
+matchTermWith :: CEnv -> Bool -> Maybe (Set.Set (Int, [Int])) -> (Int, [Int]) -> S.Term -> Reg -> Label -> Maybe Label -> G ()
+matchTermWith env isGnd ro path t w failL mDirectNext = case t of
   S.Var v
     | v < 0 -> pure ()
     | otherwise -> do
@@ -854,12 +1276,12 @@ matchTermWith env ro path t w failL mDirectNext = case t of
     forM_ initial $ \(k, a) -> do
       r <- allocReg
       emit [JAddImm r s k, JLoadIx r RCells r]
-      matchTerm env ro (fst path, snd path ++ [k]) a r failL
+      matchTerm env isGnd ro (fst path, snd path ++ [k]) a r failL
       freeReg r
     case reverse ordered of
       (k, a) : _ -> do
         emit [JAddImm RT7 s k, JLoadIx s RCells RT7]
-        matchTerm env ro (fst path, snd path ++ [k]) a s failL
+        matchTerm env isGnd ro (fst path, snd path ++ [k]) a s failL
       [] -> pure ()
     emit [JLabel doneL]
     -- Both modes give the same variables a slot.
@@ -875,40 +1297,30 @@ matchTermWith env ro path t w failL mDirectNext = case t of
       emit [JLabel okL]
     Nothing -> decline ("constant outside the fragment: " ++ show t)
   where
-    readOnly = maybe False (Set.member path) ro
+    readOnly = isGnd || maybe False (Set.member path) ro
 
--- | Unify two words (both clobbered): equal words finish inline in 3 ops;
--- unequal words spill RT0..RT5 to RSP[0..5], store fail/done return labels in
--- RSP[6..7], and jump to the per-unit @unify_slow@ subroutine.
+-- | Unify two words: identical words finish in 1 instruction; distinct words
+-- store the operands in @RSP[0..1]@, failure target in @RSP[8]@, and success
+-- target in @RT7@ before jumping to the shared @unify_slow@ subroutine.
 unifyWords :: Reg -> Reg -> Label -> G ()
 unifyWords a b failL = do
   done <- lbl' "u_done"
   emit
-    [ JDeref a a,
-      JDeref b b,
-      JBranchCmp JEq a b done,
-      JStoreImm RT0 RSP 0,
-      JStoreImm RT1 RSP 1,
-      JStoreImm RT2 RSP 2,
-      JStoreImm RT3 RSP 3,
-      JStoreImm RT4 RSP 4,
-      JStoreImm RT5 RSP 5,
+    [ JBranchCmp JEq a b done,
+      JStoreImm a RSP 0,
+      JStoreImm b RSP 1,
       JLoadLabel RT7 failL,
-      JStoreImm RT7 RSP 6,
+      JStoreImm RT7 RSP 8,
       JLoadLabel RT7 done,
-      JStoreImm RT7 RSP 7,
-      JMov RT7 a,
-      JMov RT1 b,
-      JMov RT0 RT7,
       JJump "unify_slow",
       JLabel done
     ]
 
--- | Per-unit shared slow path for 'unifyWords': handles unbound cells,
+-- | Per-unit shared slow path for 'unifyWords': saves @RT0..RT5@ to
+-- @RSP[2..7]@ and @RT7@ (done label) to @RSP[9]@, dereferences the two
+-- operands from @RSP[0..1]@ into @RT0@ and @RT1@, and handles unbound cells,
 -- constants, 1-level occurs checks, and 1-level structure unification.
--- Expects dereferenced operands in @RT0@ and @RT1@ (@RT0 /= RT1@), saved
--- @RT0..RT5@ in @RSP[0..5]@, failure target in @RSP[6]@, and success target
--- in @RSP[7]@. Leaves @RT6@ untouched.
+-- Leaves @RT6@ untouched.
 unifySlowOps :: [JitOp]
 unifySlowOps =
   let a = RT0
@@ -918,14 +1330,26 @@ unifySlowOps =
       r2 = RT4
       r3 = RT5
       unspill =
-        [ JLoadImm RT0 RSP 0,
-          JLoadImm RT1 RSP 1,
-          JLoadImm RT2 RSP 2,
-          JLoadImm RT3 RSP 3,
-          JLoadImm RT4 RSP 4,
-          JLoadImm RT5 RSP 5
+        [ JLoadImm RT0 RSP 2,
+          JLoadImm RT1 RSP 3,
+          JLoadImm RT2 RSP 4,
+          JLoadImm RT3 RSP 5,
+          JLoadImm RT4 RSP 6,
+          JLoadImm RT5 RSP 7
         ]
    in [ JLabel "unify_slow",
+        JStoreImm RT7 RSP 9,
+        JStoreImm RT0 RSP 2,
+        JStoreImm RT1 RSP 3,
+        JStoreImm RT2 RSP 4,
+        JStoreImm RT3 RSP 5,
+        JStoreImm RT4 RSP 6,
+        JStoreImm RT5 RSP 7,
+        JLoadImm a RSP 0,
+        JLoadImm b RSP 1,
+        JDeref a a,
+        JDeref b b,
+        JBranchCmp JEq a b "us_done",
         JTagOf RT7 a,
         JBranchImm JEq RT7 (fromIntegral tagRef) "us_aref",
         JTagOf RT7 b,
@@ -1077,12 +1501,12 @@ unifySlowOps =
         JLabel "us_fail"
       ]
         ++ unspill
-        ++ [ JLoadImm RT7 RSP 6,
+        ++ [ JLoadImm RT7 RSP 8,
              JJumpReg RT7,
              JLabel "us_done"
            ]
         ++ unspill
-        ++ [ JLoadImm RT7 RSP 7,
+        ++ [ JLoadImm RT7 RSP 9,
              JJumpReg RT7
            ]
 
@@ -1138,7 +1562,7 @@ buildTerm env t = do
             sv <- slot v
             r <- allocReg
             if seen
-              then emit [JLoadImm r RE sv]
+              then emit [JLoadImm r RE sv, JDeref r r]
               else do
                 emit [JMkWord r RH tagRef, JStoreIx r RCells RH, JAddImm RH RH 1, JStoreImm r RE sv]
                 markSeen v
@@ -1168,6 +1592,9 @@ buildTerm env t = do
       seen0 <- gets gsSeen
       let hasFresh term = any (\v -> v < 0 || not (Set.member v seen0)) (allVarsIn term)
           staticNon = any hasFresh as
+          seenVarCount = length [() | S.Var v <- as, v >= 0, Set.member v seen0]
+          isComp = \case S.Compound _ _ -> True; _ -> False
+          batchGroundCheck = not staticNon && not (any isComp as) && seenVarCount >= 2
       emit [JMovImm RT7 (if staticNon then fw else fw .|. fromIntegral groundBit), JStoreIx RT7 RCells RH, JAddImm RH RH (n + 1)]
       let store off k r = do
             a' <- allocReg
@@ -1193,7 +1620,7 @@ buildTerm env t = do
                       w <- allocReg
                       emit [JLoadImm w RE sv]
                       store off k w
-                      unless staticNon (groundOrClear w off fw)
+                      unless (staticNon || batchGroundCheck) (groundOrClear w off fw)
                       freeReg w
                   fill off (k + 1) rest
             S.Compound g bs -> do
@@ -1218,7 +1645,20 @@ buildTerm env t = do
               Nothing -> decline ("constant outside the fragment: " ++ show c)
       totalOff <- fill (n + 1) (1 :: Int) as
       b <- allocReg
-      emit [JSubImm b RH totalOff, JMkWord b b tagStr]
+      emit [JSubImm b RH totalOff]
+      when batchGroundCheck $ do
+        retL <- lbl' "gnds"
+        emit
+          [ JStoreImm b RSP 1,
+            JMovImm RT7 fw,
+            JStoreImm RT7 RSP 2,
+            JMovImm RT7 (fromIntegral n),
+            JStoreImm RT7 RSP 0,
+            JLoadLabel RT7 retL,
+            JJump "gnd_struct",
+            JLabel retL
+          ]
+      emit [JMkWord b b tagStr]
       let static
             | staticNon = Just False
             | all constant as = Just True
@@ -1241,9 +1681,12 @@ buildTerm env t = do
           JLabel retL
         ]
 
--- | Per-unit shared helper for 'groundOrClear': tests whether the word in
--- @RSP[0]@ is ground, and if not, clears the structure header at @RSP[1]@
--- using the un-grounded functor word in @RSP[2]@. Returns to @RT7@.
+-- | Per-unit shared helpers for 'groundOrClear' and 'gnd_struct':
+-- * @gnd_clear@ tests whether the word in @RSP[0]@ is ground, and if not,
+--   clears the structure header at @RSP[1]@ using @RSP[2]@.
+-- * @gnd_struct@ loops over @RSP[0]@ fields of the flat structure at cell
+--   @RSP[1]@, clearing its header to @RSP[2]@ if any field is non-ground.
+-- Both return to @RT7@.
 gndClearOps :: [JitOp]
 gndClearOps =
   [ JLabel "gnd_clear",
@@ -1266,6 +1709,39 @@ gndClearOps =
     JLabel "gc_ret",
     JLoadImm RT0 RSP 3,
     JLoadImm RT1 RSP 4,
+    JJumpReg RT7,
+    JLabel "gnd_struct",
+    JStoreImm RT0 RSP 3,
+    JStoreImm RT1 RSP 4,
+    JStoreImm RT2 RSP 5,
+    JStoreImm RT3 RSP 6,
+    JLoadImm RT2 RSP 0,
+    JLoadImm RT3 RSP 1,
+    JLabel "gs_loop",
+    JBranchImm JEq RT2 0 "gs_ret",
+    JAddImm RT3 RT3 1,
+    JLoadIx RT0 RCells RT3,
+    JDeref RT0 RT0,
+    JTagOf RT1 RT0,
+    JBranchImm JEq RT1 (fromIntegral tagRef) "gs_clear",
+    JBranchImm JNe RT1 (fromIntegral tagStr) "gs_next",
+    JValOf RT0 RT0,
+    JLoadIx RT0 RCells RT0,
+    JMovImm RT1 (fromIntegral groundBit),
+    JAnd RT0 RT0 RT1,
+    JBranchImm JEq RT0 0 "gs_clear",
+    JLabel "gs_next",
+    JSubImm RT2 RT2 1,
+    JJump "gs_loop",
+    JLabel "gs_clear",
+    JLoadImm RT0 RSP 1,
+    JLoadImm RT1 RSP 2,
+    JStoreIx RT1 RCells RT0,
+    JLabel "gs_ret",
+    JLoadImm RT0 RSP 3,
+    JLoadImm RT1 RSP 4,
+    JLoadImm RT2 RSP 5,
+    JLoadImm RT3 RSP 6,
     JJumpReg RT7
   ]
 
@@ -1333,15 +1809,40 @@ matchGroundTerm env t w failL = case t of
     Just cw -> emit [JDeref w w, JMovImm RT7 cw, JBranchCmp JNe w RT7 failL]
     Nothing -> decline ("constant outside the fragment: " ++ show t)
 
--- | Structural equality (@==@) between two operands, branching to @eqL@ when
--- equal and @neL@ when distinct; reruns on the interpreter only when both are
--- boxed values or both are structures with the same functor at different cells.
-compileEquivBranch :: CEnv -> S.Term -> S.Term -> Label -> Label -> G ()
-compileEquivBranch env a b eqL neL = do
+-- | Structural equality (@==@) or disequality (@!=@) between two operands,
+-- branching to @eqL@ when equal and @neL@ when distinct; reruns on the
+-- interpreter when @requireGround@ is True and either operand is non-ground,
+-- or when both operands are boxed values or structures with the same functor
+-- at different cells.
+compileEquivBranch :: CEnv -> Bool -> S.Term -> S.Term -> Label -> Label -> G ()
+compileEquivBranch env requireGround a b eqL neL = do
   ra <- loadOperand a
   rb <- loadOperand b
   t1 <- allocReg
   t2 <- allocReg
+  when requireGround $ do
+    gndA <- lbl' "eq_ga"
+    gndB <- lbl' "eq_gb"
+    emit
+      [ JTagOf t1 ra,
+        JBranchImm JEq t1 (fromIntegral tagRef) "rerun",
+        JBranchImm JNe t1 (fromIntegral tagStr) gndA,
+        JValOf t2 ra,
+        JLoadIx t2 RCells t2,
+        JMovImm RT7 (fromIntegral groundBit),
+        JAnd t2 t2 RT7,
+        JBranchImm JEq t2 0 "rerun",
+        JLabel gndA,
+        JTagOf t2 rb,
+        JBranchImm JEq t2 (fromIntegral tagRef) "rerun",
+        JBranchImm JNe t2 (fromIntegral tagStr) gndB,
+        JValOf t1 rb,
+        JLoadIx t1 RCells t1,
+        JMovImm RT7 (fromIntegral groundBit),
+        JAnd t1 t1 RT7,
+        JBranchImm JEq t1 0 "rerun",
+        JLabel gndB
+      ]
   emit
     [ JBranchCmp JEq ra rb eqL,
       JTagOf t1 ra,
@@ -1441,15 +1942,13 @@ compileGuard env failL = \case
     freeReg ra
   -- Structural disequality: decided when both sides are ground.
   S.Compound "neq" [a, b] -> do
-    ra <- atomic a
-    rb <- atomic b
-    emit [JBranchCmp JEq ra rb failL]
-    freeReg rb
-    freeReg ra
+    okL <- lbl' "neq_ok"
+    compileEquivBranch env True a b failL okL
+    emit [JLabel okL]
   S.Compound "equiv" [a, b]
     | atomicOk a && atomicOk b -> do
         okL <- lbl' "eq_ok"
-        compileEquivBranch env a b okL failL
+        compileEquivBranch env False a b okL failL
         emit [JLabel okL]
     | S.Var v <- a, v >= 0, groundTermOk b -> do
         seen <- isSeen v
@@ -1488,38 +1987,17 @@ compileGuard env failL = \case
       "gt" -> Just JLe
       "gte" -> Just JLt
       _ -> Nothing
-    atomic t = do
-      r <- allocReg
-      case t of
-        S.Var v | v >= 0 -> do
-          seen <- isSeen v
-          unless seen (decline "!= on an unbound variable")
-          sv <- slot v
-          okL <- lbl' "atm"
-          emit
-            [ JLoadImm r RE sv,
-              JDeref r r,
-              JTagOf RT7 r,
-              JBranchImm JEq RT7 (fromIntegral tagRef) "rerun",
-              JBranchImm JEq RT7 (fromIntegral tagStr) "rerun",
-              JBranchImm JEq RT7 (fromIntegral tagBox) "rerun",
-              JLabel okL
-            ]
-        _ -> case constWord env t of
-          Just cw -> emit [JMovImm r cw]
-          Nothing -> decline "!= on a term outside the fragment"
-      pure r
 
 compileNegatedTest :: CEnv -> Label -> S.Term -> G ()
 compileNegatedTest env failL = \case
   S.Compound "equiv" [a, b] | atomicOk a && atomicOk b -> do
     okL <- lbl' "neq_ok"
-    compileEquivBranch env a b failL okL
+    compileEquivBranch env False a b failL okL
     emit [JLabel okL]
   S.Compound "neq" [a, b] | atomicOk a && atomicOk b -> do
     okL <- lbl' "not_neq_ok"
-    compileGuard env okL (S.Compound "neq" [a, b])
-    emit [JJump failL, JLabel okL]
+    compileEquivBranch env True a b okL failL
+    emit [JLabel okL]
   g -> do
     okL <- lbl' "not_ok"
     compileGuard env okL g
@@ -1550,9 +2028,9 @@ compileTypeTest x mTag boxRerun invert failL = case x of
                    )
                 ++ [JLabel okL]
             freeReg r
-  S.IntLit _ -> when ( (mTag == Just tagInt) == invert ) (emit [JJump failL])
-  S.Atom _ -> when ( (mTag == Just tagAtm) == invert ) (emit [JJump failL])
-  S.CharLit _ -> when ( (mTag == Just tagChr) == invert ) (emit [JJump failL])
+  S.IntLit _ -> when ((mTag == Just tagInt) == invert) (emit [JJump failL])
+  S.Atom _ -> when ((mTag == Just tagAtm) == invert) (emit [JJump failL])
+  S.CharLit _ -> when ((mTag == Just tagChr) == invert) (emit [JJump failL])
   _ -> unless invert (emit [JJump failL])
 
 compileVarTest :: S.Term -> Bool -> Label -> G ()
@@ -1608,22 +2086,25 @@ compileGroundTest x failL = case x of
 -- final goal of the sequence returns or tail-calls directly; when False
 -- (inside @once@ or @not@), execution falls through so the enclosing control
 -- construct can clean up.
-compileBody :: CEnv -> M.Map PredKey Int -> S.Clause -> String -> Bool -> [S.Term] -> G ()
-compileBody env idx cl base allowTail = go
+compileBody :: CEnv -> M.Map PredKey Int -> Bool -> S.Clause -> String -> Bool -> [S.Term] -> G ()
+compileBody env idx unitCanReclaimH cl base allowTail = go
   where
+    headVarSet = Set.fromList (termVarIds (S.clauseHead cl))
     allClauseVars = allVarsIn (S.clauseHead cl) ++ concatMap allVarsIn (concatMap flatten (S.clauseBody cl))
     varOccurrences v = length (filter (== v) allClauseVars)
     go [] = when allowTail $ do
       skipL <- lbl' "keep_sp"
-      emit
+      emit $
         [ JLoadImm RT7 RE frameRet,
           JLoadImm RT0 RState stateBIdx,
           JBranchCmp JLe RE RT0 skipL,
-          JMov RSP RE,
-          JLabel skipL,
-          JLoadImm RE RE frameLink,
-          JJumpReg RT7
+          JMov RSP RE
         ]
+          ++ [JLoadImm RH RE frameH | unitCanReclaimH]
+          ++ [ JLabel skipL,
+               JLoadImm RE RE frameLink,
+               JJumpReg RT7
+             ]
     go (g : gs) = case g of
       S.Atom "!" -> emitCut >> go gs
       S.Compound "$cut" [S.IntLit _] -> emitCut >> go gs
@@ -1651,7 +2132,7 @@ compileBody env idx cl base allowTail = go
             JStoreImm RH RE slotH
           ]
         seenBefore <- gets gsSeen
-        compileBody env idx cl (base ++ "_once") False innerGoals
+        compileBody env idx unitCanReclaimH cl (base ++ "_once") False innerGoals
         when deadHeap $ modify' (\st -> st {gsSeen = seenBefore})
         emit
           ( [ JLoadImm RT0 RE slotB,
@@ -1673,7 +2154,7 @@ compileBody env idx cl base allowTail = go
           notPassLoopL <- lbl' "not_ploop"
           notPassDoneL <- lbl' "not_pdone"
           emit
-            [ JAddImm RT6 RSP (8 * (frameHeader + 8)),
+            [ JAddImm RT6 RSP (8 * (frameHeader + 10)),
               JLoadImm RT5 RState stateNStackLimIdx,
               JBranchCmp JGt RT6 RT5 "stackfull",
               JStoreImm RSP RE slotB,
@@ -1691,7 +2172,7 @@ compileBody env idx cl base allowTail = go
               JMov RHB RH
             ]
           seenBefore <- gets gsSeen
-          compileBody env idx cl (base ++ "_not") False innerGoals
+          compileBody env idx unitCanReclaimH cl (base ++ "_not") False innerGoals
           modify' (\st -> st {gsSeen = seenBefore})
           -- Inner succeeded -> unwind to B_not and fail!
           emit
@@ -1738,23 +2219,47 @@ compileBody env idx cl base allowTail = go
         | isInlineGuard g -> compileGuard env "fail" g >> go gs
         | otherwise -> do
             let k = (calleeName g, length (callArgs g))
+                isTailCall = null gs && allowTail
             target <- maybe (decline ("call outside the unit: " ++ show k)) pure (M.lookup k idx)
+            seenBeforeCall <- gets gsSeen
             forM_ (zip [0 ..] (callArgs g)) $ \(i, a) -> do
               r <- buildTerm env a
               emit [JStoreImm r RArgs i]
               freeReg r
-            if null gs && allowTail
+            if isTailCall
               then do
                 skipL <- lbl' "keep_tail_sp"
-                emit
+                let localArgIndices =
+                      [ i
+                        | (i, S.Var v) <- zip [0 :: Int ..] (callArgs g),
+                          v < 0 || Set.notMember v headVarSet
+                      ]
+                    anyFreshInTail =
+                      any
+                        (\a -> case a of S.Var v -> v < 0 || Set.notMember v seenBeforeCall; _ -> False)
+                        (callArgs g)
+                emit $
                   [ JLoadImm RT7 RE frameRet,
                     JLoadImm RT0 RState stateBIdx,
                     JBranchCmp JLe RE RT0 skipL,
-                    JMov RSP RE,
-                    JLabel skipL,
-                    JLoadImm RE RE frameLink,
-                    JJump (predLabel target)
+                    JMov RSP RE
                   ]
+                    ++ ( if unitCanReclaimH && not anyFreshInTail
+                           then
+                             concat
+                               [ [ JLoadImm RT0 RArgs i,
+                                   JTagOf RT1 RT0,
+                                   JBranchImm JEq RT1 (fromIntegral tagRef) skipL
+                                 ]
+                                 | i <- localArgIndices
+                               ]
+                               ++ [JLoadImm RH RE frameH]
+                           else []
+                       )
+                    ++ [ JLabel skipL,
+                         JLoadImm RE RE frameLink,
+                         JJump (predLabel target)
+                       ]
               else do
                 ret <- newLabel (base ++ "_ret")
                 emit
@@ -1798,5 +2303,5 @@ compileBody env idx cl base allowTail = go
         else do
           r <- allocReg
           emit [JLoadImm r RE sv]
-          matchTerm env Nothing (0, []) t r "fail"
+          matchTerm env False Nothing (0, []) t r "fail"
           freeReg r

@@ -171,3 +171,25 @@ Primary rows (one per workload: hello, nrev, tak, fib, queens, primes, zebra, de
 
 The `findall` query in the rebuilt harness was not wrapped in `once`, so Infera's REPL also printed the whole 50k-element list `L` (about 339 KB of stdout) while SWI and gprolog printed only the sum. That inflated Infera's findall time. With the same query wrapped in `once` (prints only the sum), interleaved median of 5 at `9a93cfe`: Infera 0.040 s vs SWI 0.019 s, about **2.1×**, not 4.5×. The assertz and index queries were already `once`-wrapped and are unaffected. The table rows above are left as originally measured.
 
+## Addendum (2026-11-10): Follow-Up Fixes for Clause-Unit Heap Reclamation, Native Choice Enumeration, and Arg-0 Indexing
+
+Following this report, three targeted engine and clause-JIT updates were landed on macOS arm64 (Apple M4):
+
+1. **Functor-Free Heap Reclamation (`unitCanReclaimH` in `Clause.hs`)**:
+   - Previously, `fib/2` and `tak/4` allocated body-local `tagRef` cells on the native heap (`F1, F2` in `fib`, `A1, A2, A3` in `tak`) without reclaiming them on clause return, exhausting the native heap at `fib(27)` and `tak(24,16,8)` and falling back to the interpreter (`heap limit -> interpreter`).
+   - Exclusive functor-free clause units now snapshot and restore the heap pointer `H` across non-tail calls and before tail/return exits after dereferencing output registers, eliminating the fallback completely.
+2. **Rerun-Free Native Choice Enumeration (`upRerunFree` & `drainNativeFindAll` in `Clause.hs`, `Jit.hs`, `Run.hs`)**:
+   - Statically proves when a compiled clause unit cannot return `jitStatusRerun` for well-moded entry calls (`inferChoiceNeeds`), enabling `allowChoices = True` for top-level `CDone`, `CExitFindAll`, and `CExitMinimize` continuations, plus a tight `drainNativeFindAll` loop and in-place `AltNative` mark updates.
+3. **Raised Clause Cap (128), Grouped Arg-0 Binary Search (`arg0ConstGroups`), Tightened `isTrmcCallee`, Mode-Specialized Head Codegen, & 0-Var Ground Fact Fast Path**:
+   - Raises `admitClauseUnit` to 128 clauses, emits a binary-search dispatch tree on argument 0 for predicates (`arity >= 2`) with `>= 4` constant groups (e.g., 112-clause `knight_edge/2`), tightens `isTrmcCallee` so `absent/2` and `bulls/6` inline into callers' native units, shrinks `unifyWords` call sites from 31 to 7 AArch64 instructions, and skips `allocFrame` on 0-variable ground facts.
+
+### macOS arm64 Before/After (`<- notable.`, median of 5, whole-process wall clock)
+
+| Workload | Native Unit Size | `JIT=0` (s) | `JIT=1` Before (s) | `JIT=1` After (s) | Speedup (`JIT=0 ÷ JIT=1`) | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| `fib(27)` | 3,800 B | 0.106 | 0.137 (fallback) | **0.020** | **5.31×** | 0 heap fallbacks |
+| `tak(24, 16, 8)` | 4,296 B | 0.403 | 0.471 (fallback) | **0.032** | **12.59×** | 0 heap fallbacks |
+| `findall_50k` (`once`-wrapped) | 2,160 B | 0.044 | 0.044 | **0.020** | **2.15×** | Native `drainNativeFindAll` |
+| `peg_solitaire` (20× `peg_solution_count`) | 35,400 B | 0.032 | 0.032 | **0.016** | **1.97×** | Code size −48.5% (from 68,780 B) |
+| `mastermind` (10× `solve_clues` + `sample_secret`) | 14,496 B / 16,132 B | 0.125 | 0.125 | **0.083** | **1.51×** | Full 8-predicate unit |
+| `send_more_money` (20× `send_more_money`) | 13,560 B | 0.029 | 0.029 | **0.016** | **1.76×** | Native choice enumeration |

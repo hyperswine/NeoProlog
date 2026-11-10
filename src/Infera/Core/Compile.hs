@@ -1406,7 +1406,7 @@ compileClause ctx sigs clause = do
         facts <- readIORef (ctxFacts ctx)
         proven <- mapM (patternSort ctx facts) headPatterns
         pure (and [maybe False (\sort -> all (\sig -> subSort sort (argSort sig i)) sigs) p | (i, p) <- zip [0 ..] proven])
-  let count = max 1 (S.clauseNVars clause)
+  let count = if S.clauseNVars clause == 0 && null body then 0 else max 1 (S.clauseNVars clause)
       headWrites = IS.fromList (concatMap firstSlots headPatterns)
       initialize = filter (`IS.notMember` headWrites) [0 .. count - 1]
   let compiled = Clause count initialize headPatterns body trusted Nothing

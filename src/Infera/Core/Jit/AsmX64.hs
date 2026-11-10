@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 
 -- | x86-64 (SysV ABI) native code emitter for the Infera JIT tier.
@@ -34,19 +35,38 @@ module Infera.Core.Jit.AsmX64
   )
 where
 
+import Control.Monad (forM_)
+import Control.Monad.ST (ST)
+import Data.Array.ST (STUArray, newArray_, runSTUArray, writeArray)
+import Data.Array.Unboxed (elems)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Int (Int64)
 import qualified Data.Map.Strict as M
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import Infera.Core.Jit.IR
 
 type B = [Word8]
 
 imm32 :: Int -> B
-imm32 v = [fromIntegral (v `shiftR` s .&. 0xFF) | s <- [0, 8, 16, 24]]
+imm32 v =
+  [ fromIntegral (v .&. 0xFF),
+    fromIntegral ((v `shiftR` 8) .&. 0xFF),
+    fromIntegral ((v `shiftR` 16) .&. 0xFF),
+    fromIntegral ((v `shiftR` 24) .&. 0xFF)
+  ]
 
 imm64 :: Int64 -> B
-imm64 v = [fromIntegral (fromIntegral v `shiftR` s .&. (0xFF :: Integer)) | s <- [0, 8, 16, 24, 32, 40, 48, 56]]
+imm64 v =
+  let !u = fromIntegral v :: Word64
+   in [ fromIntegral (u .&. 0xFF),
+        fromIntegral ((u `shiftR` 8) .&. 0xFF),
+        fromIntegral ((u `shiftR` 16) .&. 0xFF),
+        fromIntegral ((u `shiftR` 24) .&. 0xFF),
+        fromIntegral ((u `shiftR` 32) .&. 0xFF),
+        fromIntegral ((u `shiftR` 40) .&. 0xFF),
+        fromIntegral ((u `shiftR` 48) .&. 0xFF),
+        fromIntegral ((u `shiftR` 56) .&. 0xFF)
+      ]
 
 hwLoc :: Reg -> Either Int Int
 hwLoc = \case
@@ -383,18 +403,22 @@ emitOp = \case
   JReturn code -> (bytes (epilogueBytes code), Nothing)
 
 assembleX64 :: JitUnit -> [Word8]
-assembleX64 (JitUnit ops) = patched
+assembleX64 (JitUnit ops) = elems patched
   where
     laid = (bytes prologueBytes, Nothing) : map emitOp ops
-    offs = scanl (\acc (Frag b _, _) -> acc + length b) 0 laid
+    offs = scanl (\ !acc (Frag b _, _) -> acc + length b) 0 laid
+    totalBytes = last offs
     labels = M.fromList [(lbl, off) | ((_, Just lbl), off) <- zip laid offs]
-    patched = concat [patchFrag base frag | ((frag, _), base) <- zip laid offs]
-    patchFrag base (Frag b fx) =
-      foldl
-        ( \acc (fo, lbl) ->
-            let target = M.findWithDefault (error ("Infera.Core.Jit.AsmX64: unknown label " ++ lbl)) lbl labels
-                rel = target - (base + fo + 4)
-             in take fo acc ++ imm32 rel ++ drop (fo + 4) acc
-        )
-        b
-        fx
+    patched = runSTUArray $ do
+      arr <- newArray_ (0, max 0 (totalBytes - 1)) :: ST s (STUArray s Int Word8)
+      forM_ (zip laid offs) $ \((Frag b fx, _), !base) -> do
+        forM_ (zip [base ..] b) $ \(!idx, byte) -> writeArray arr idx byte
+        forM_ fx $ \(fo, lbl) -> do
+          let !target = M.findWithDefault (error ("Infera.Core.Jit.AsmX64: unknown label " ++ lbl)) lbl labels
+              !rel = target - (base + fo + 4)
+              !at = base + fo
+          writeArray arr at (fromIntegral (rel .&. 0xFF))
+          writeArray arr (at + 1) (fromIntegral ((rel `shiftR` 8) .&. 0xFF))
+          writeArray arr (at + 2) (fromIntegral ((rel `shiftR` 16) .&. 0xFF))
+          writeArray arr (at + 3) (fromIntegral ((rel `shiftR` 24) .&. 0xFF))
+      pure arr

@@ -29,13 +29,14 @@ import Data.Array.Unboxed (UArray)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
+import Data.Maybe (isNothing)
 import Foreign.Ptr (Ptr)
 import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble, numericTerm)
 import qualified Infera.CLP as CLP
 import qualified Infera.CLP.Mutable as Mutable
 import qualified Infera.Core.Constraint as NativeConstraint
 import Infera.Core.Compile
-import Infera.Core.Jit (JitKernel (..), invokeJitKernel, invokeJitKernelWith, invokeScanKernel, jitEnabled, resumeClauseUnit)
+import Infera.Core.Jit (JitKernel (..), invokeJitKernel, invokeJitKernelWith, invokeScanKernel, jitEnabled, jitRerunFree, resumeClauseUnit)
 import Infera.Core.Jit.IR (jitBailout, jitFailure, jitSuccess)
 import Infera.Core.Ops
 import qualified Infera.Core.Liveness as Liveness
@@ -1462,19 +1463,23 @@ commitsImmediately cont = case cont of
 
 -- | Is the continuation guaranteed not to invoke another native clauseUnit
 -- (which would overwrite the store's single native choice stack) before
--- cutting this call's choices?
-commitsWithoutCall :: Cont -> Bool
-commitsWithoutCall cont = case cont of
-  CExitIf {} -> True
-  CExitNot {} -> True
-  CReturn h _ Nothing _ | h >= 0 -> True
-  CReturn (-1) _ Nothing next -> commitsWithoutCall next
-  CGoals gs _ _ _ next -> goalsWithoutCall gs && commitsWithoutCall next
-  CStream stream pc _ _ _ h _ next
-    | h >= 0 -> True
-    | otherwise -> streamWithoutCall (csCode stream) pc next
-  _ -> False
+-- cutting or backtracking into this call's choices?
+commitsWithoutCall :: Bool -> Cont -> Bool
+commitsWithoutCall !rerunFree = go
   where
+    go cont = case cont of
+      CDone -> rerunFree
+      CExitFindAll {} -> rerunFree
+      CExitMinimize {} -> rerunFree
+      CExitIf {} -> True
+      CExitNot {} -> True
+      CReturn h _ Nothing _ | h >= 0 -> True
+      CReturn (-1) _ Nothing next -> go next
+      CGoals gs _ _ _ next -> goalsWithoutCall gs && go next
+      CStream stream pc _ _ _ h _ next
+        | h >= 0 -> True
+        | otherwise -> streamWithoutCall (csCode stream) pc next
+      _ -> False
     goalsWithoutCall [] = True
     goalsWithoutCall (g : gs) = case g of
       GTrue -> goalsWithoutCall gs
@@ -1490,7 +1495,7 @@ commitsWithoutCall cont = case cont of
       GNl -> goalsWithoutCall gs
       _ -> False
     streamWithoutCall code !pc next = case unsafeAt code pc of
-      op | op == opProceed -> commitsWithoutCall next
+      op | op == opProceed -> go next
          | op == opCut -> True
          | op == opFail -> True
          | op == opCheckBound -> streamWithoutCall code (pc + 1) next
@@ -1501,6 +1506,38 @@ commitsWithoutCall cont = case cont of
          | op == opPushFirst || op == opPushVar || op == opPushConst -> streamWithoutCall code (pc + 2) next
          | op == opPushStruct -> streamWithoutCall code (pc + 3) next
          | otherwise -> False
+
+-- | Unwrap a direct 'CExitFindAll' continuation (with no intervening goals or
+-- return checks) so a rerun-free native clause unit can drain all solutions
+-- into @results@ without pushing/popping WAM choice points on each answer.
+unwrapFindAllCont :: Cont -> Maybe (IORef [(Copy, [OutputEvent])], Pattern, Int, Int)
+unwrapFindAllCont cont = case cont of
+  CExitFindAll _ results template base entryHeap _ _ -> Just (results, template, base, entryHeap)
+  CGoals [] _ _ _ next -> unwrapFindAllCont next
+  CReturn (-1) (-1) Nothing next -> unwrapFindAllCont next
+  CStream stream pc _ _ _ (-1) (-1) next
+    | unsafeAt (csCode stream) pc == opProceed -> unwrapFindAllCont next
+  _ -> Nothing
+
+drainNativeFindAll :: Machine -> JitKernel -> Int -> Int -> Int -> IORef [(Copy, [OutputEvent])] -> Pattern -> Int -> Int -> Bool -> IO Step
+drainNativeFindAll m kernel !entryH !entryTR !d results template !base !entryHeap !hasMore0 = do
+  let !s = mStore m
+      loop !hasMore = do
+        hAfterSol <- heapTop s
+        word <- buildArg m base False template
+        copy <- copyOut m entryHeap word
+        setHeapTop s hAfterSol
+        modifyIORef' results ((copy, []) :)
+        if not hasMore
+          then backtrack m
+          else do
+            outcome <- resumeClauseUnit s entryH entryTR d maxResolutionDepth kernel
+            case outcome of
+              Just (1, _, more) -> loop more
+              Just (0, _, _) -> backtrack m
+              Just (3, _, _) -> raiseItems m [BranchExhausted] (backtrack m)
+              _ -> backtrack m
+  loop hasMore0
 
 -- | Call with the arguments in the registers.
 callPredicate :: Machine -> Int -> Int -> Pred -> Maybe Trust -> Cont -> IO Step
@@ -1528,7 +1565,8 @@ callPlain m frame !depth predicate cont0 = do
           (Just kernel, Nothing) | jitEnabled -> if jkScan kernel >= 0 then scanPlain frame' kernel depth cont else do
             let !s = mStore m
                 !immCommit = commitsImmediately cont
-                !noCallCommit = immCommit || commitsWithoutCall cont
+                !rf = jitRerunFree kernel
+                !noCallCommit = immCommit || commitsWithoutCall rf cont
             switchCommit <-
               if noCallCommit
                 then pure False
@@ -1536,17 +1574,21 @@ callPlain m frame !depth predicate cont0 = do
                   Nothing -> pure False
                   Just positions -> switchGround s positions
             let !allowChoices = noCallCommit || switchCommit
-                !needSaved = noCallCommit && not immCommit
+                !findAllTarget = if rf then unwrapFindAllCont cont else Nothing
+                !needSaved = noCallCommit && not immCommit && isNothing findAllTarget
             saved <- if needSaved then saveArgs s (pArity predicate) else pure 0
             entryH <- heapTop s
             entryTR <- trailTop s
             outcome <- invokeJitKernelWith allowChoices s depth maxResolutionDepth kernel
             case outcome of
-              Just (1, _, hasMore) -> do
-                when (hasMore && needSaved) $ do
-                  _ <- pushChoice m (AltNative predicate kernel saved entryH entryTR depth cont)
-                  pure ()
-                run m cont
+              Just (1, _, hasMore) -> case findAllTarget of
+                Just (results, template, base, entryHeap) | hasMore ->
+                  drainNativeFindAll m kernel entryH entryTR depth results template base entryHeap hasMore
+                _ -> do
+                  when (hasMore && needSaved) $ do
+                    _ <- pushChoice m (AltNative predicate kernel saved entryH entryTR depth cont)
+                    pure ()
+                  run m cont
               Just (0, _, _) -> do
                 when needSaved (setHeapTop s saved)
                 backtrack m
@@ -2334,8 +2376,13 @@ shallowCandidates m !frame predicate ordinals !saved !h0 !tr0 !older !k !barrier
           !cont' = case returnCont of
             CReturn h g (Just _) next | clTrustReturn clause -> CReturn h g Nothing next
             _ -> returnCont
-      base <- allocFrame s (clVars clause) (clInitSlots clause)
-      recordSlots m False (clVars clause)
+      base <-
+        if clVars clause == 0 && isNothing (mSlotStats m)
+          then pure 0
+          else do
+            b <- allocFrame s (clVars clause) (clInitSlots clause)
+            recordSlots m False (clVars clause)
+            pure b
       resume <- matchClauseHead m clause base
       if resume == streamFailed
         then do
@@ -2421,16 +2468,19 @@ tryClauseWithFrame :: Machine -> Int -> Pred -> Int -> Int -> Int -> Cont -> IO 
 tryClauseWithFrame m frame predicate ordinal barrier depth cont = do
   let clause = pClauses predicate ! ordinal
       s = mStore m
-  capacity <- tailFrame s frame cont
-  if capacity >= clVars clause
-    then do
-      resetFrame s frame capacity (clInitSlots clause)
-      recordSlots m True (clVars clause)
-      enterClause m clause frame barrier depth cont
+  if clVars clause == 0 && isNothing (mSlotStats m)
+    then enterClause m clause 0 barrier depth cont
     else do
-      base <- allocFrame s (clVars clause) (clInitSlots clause)
-      recordSlots m False (clVars clause)
-      enterClause m clause base barrier depth cont
+      capacity <- tailFrame s frame cont
+      if capacity >= clVars clause
+        then do
+          resetFrame s frame capacity (clInitSlots clause)
+          recordSlots m True (clVars clause)
+          enterClause m clause frame barrier depth cont
+        else do
+          base <- allocFrame s (clVars clause) (clInitSlots clause)
+          recordSlots m False (clVars clause)
+          enterClause m clause base barrier depth cont
 
 recordSlots :: Machine -> Bool -> Int -> IO ()
 recordSlots m reused count = case mSlotStats m of
@@ -2818,21 +2868,28 @@ backtrackChoice m top =
                 writeReg s rBOUND 0
                 run m cont
         AltNative predicate kernel saved entryH entryTR d cont -> do
-          pop
           outcome <- resumeClauseUnit s entryH entryTR d maxResolutionDepth kernel
           case outcome of
             Just (1, _, hasMore) -> do
-              when hasMore $ do
-                _ <- pushChoice m (AltNative predicate kernel saved entryH entryTR d cont)
-                pure ()
+              if hasMore
+                then do
+                  newH <- heapTop s
+                  newTR <- trailTop s
+                  unsafeWrite (csMarks cs) (at + markH) newH
+                  unsafeWrite (csMarks cs) (at + markTR) newTR
+                  setHb s newH
+                else pop
               run m cont
             Just (0, _, _) -> do
+              pop
               setHeapTop s saved
               backtrack m
             Just (3, _, _) -> do
+              pop
               setHeapTop s saved
               raiseItems m [BranchExhausted] (backtrack m)
             _ -> do
+              pop
               loadArgs s saved (pArity predicate)
               setHeapTop s saved
               entry <- choiceTop m
@@ -2863,8 +2920,13 @@ minimumCopyCells rebuilt = go IM.empty
 
 copyOut :: Machine -> Int -> Word' -> IO Copy
 copyOut m entryHeap word = do
-  fresh <- newIORef IM.empty
-  copyOutWith m fresh entryHeap word
+  w <- deref (mStore m) word
+  let !t = tagOf w
+  if t /= tagRef && t /= tagStr
+    then pure (CpWord w)
+    else do
+      fresh <- newIORef IM.empty
+      copyOutWith m fresh entryHeap w
 
 -- | Copy several roots in a shared variable namespace. A minimum winner
 -- needs this across its saved bindings; findall uses 'copyOut' separately
@@ -2897,10 +2959,13 @@ copyOutWith m fresh entryHeap word = do
 
 rebuildList :: Machine -> [Copy] -> IO Word'
 rebuildList m copies = do
-  items <- forM copies $ \copy -> do
-    fresh <- newIORef IM.empty
-    rebuildCopyWith m False fresh copy
-  foldM (\tl hd -> structure s (cpCons (mCore m)) [hd, tl]) (cpNil (mCore m)) (reverse items)
+  items <- forM copies $ \copy -> case copy of
+    CpWord w -> pure w
+    CpRef addr -> pure (refWord addr)
+    _ -> do
+      fresh <- newIORef IM.empty
+      rebuildCopyWith m False fresh copy
+  foldM (\tl hd -> structure2 s (cpCons (mCore m)) hd tl) (cpNil (mCore m)) (reverse items)
   where
     s = mStore m
 

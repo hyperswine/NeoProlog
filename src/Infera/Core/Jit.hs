@@ -11,6 +11,7 @@ module Infera.Core.Jit
     ParamRole (..),
     jitEnabled,
     jitDebugOn,
+    jitRerunFree,
     compileJitKernel,
     compileGeneralTailJit,
     invokeJitKernel,
@@ -103,8 +104,19 @@ data JitKernel = JitKernel
     jkStack :: !(Maybe (IORef (ForeignPtr Int64, Int))),
     -- | for a deferred clause unit (@jkScan == -3@): the unit, compiled
     -- when the predicate is first called (lazy on purpose)
-    jkLazy :: Maybe JitKernel
+    jkLazy :: Maybe JitKernel,
+    -- | True when a clause unit is guaranteed not to hit a mid-search
+    -- interpreter rerun once its preflight checks pass
+    jkRerunFree :: !Bool
   }
+
+-- | Whether a clause unit kernel is guaranteed not to hit a mid-search
+-- interpreter rerun once its preflight checks pass.
+jitRerunFree :: JitKernel -> Bool
+jitRerunFree kernel
+  | jkScan kernel == -3 = maybe False jkRerunFree (jkLazy kernel)
+  | otherwise = jkRerunFree kernel
+{-# INLINE jitRerunFree #-}
 
 assembleHost :: JitUnit -> [Word8]
 assembleHost unit = case arch of
@@ -150,7 +162,7 @@ installUnitAs key arity cellsPerIter scanPos unit
               let addr = fromIntegral (ptrToIntPtr ptr)
                   fnPtr = castPtrToFunPtr ptr
               jitDebug (show key ++ ": compiled (" ++ show (length bytes) ++ " bytes, " ++ arch ++ ")")
-              pure (Just (JitKernel key arity fnPtr addr cellsPerIter scratch scanPos Nothing Nothing))
+              pure (Just (JitKernel key arity fnPtr addr cellsPerIter scratch scanPos Nothing Nothing False))
 
 -- | Attempt to compile a predicate into a native 'JitKernel' at program load
 -- time. Checks 2-level nested callers (@safe/1@, @nrev/2@) and then runs the
@@ -197,7 +209,7 @@ compileJitKernel syms isBuiltin nilW consW prog key decls inferred clauses
 
 -- | A clause unit compiled on first use; 'invokeJitKernel' forces it.
 deferredUnit :: PredKey -> Maybe JitKernel -> JitKernel
-deferredUnit key unit = JitKernel key (snd key) nullFunPtr 0 0 noScratch (-3) Nothing unit
+deferredUnit key unit = JitKernel key (snd key) nullFunPtr 0 0 noScratch (-3) Nothing unit False
 
 noScratch :: ForeignPtr Int64
 noScratch = unsafePerformIO (mallocForeignPtrArray 1)
@@ -216,7 +228,7 @@ cuBudgetsAt = 12
 cuArgsAt = 14
 
 cuInitialStack, cuMaxStack :: Int
-cuInitialStack = 4096
+cuInitialStack = 65536
 cuMaxStack = 1 `shiftL` 26
 
 installClauseUnit :: PredKey -> UnitPlan -> IO (Maybe JitKernel)
@@ -238,7 +250,7 @@ installClauseUnit key up = do
           stack <- mallocForeignPtrArray cuInitialStack
           stackRef <- newIORef (stack, cuInitialStack)
           jitDebug (show key ++ ": clause unit of " ++ show (upPreds up) ++ " (" ++ show (length bytes) ++ " bytes, " ++ arch ++ ")")
-          pure (Just (JitKernel key (snd key) (castPtrToFunPtr ptr) (fromIntegral (ptrToIntPtr ptr)) slots scratch (-2) (Just stackRef) Nothing))
+          pure (Just (JitKernel key (snd key) (castPtrToFunPtr ptr) (fromIntegral (ptrToIntPtr ptr)) slots scratch (-2) (Just stackRef) Nothing (upRerunFree up)))
 
 -- ─── Horizon 1 + Horizon 4: General Tail-Recursive & TRMC JIT Compiler ───────
 
@@ -1505,7 +1517,7 @@ invokeClauseUnit allowChoices s currentDepth maxDepth kernel stackRef =
     gcLim <- readReg s rGCLIM
     tCap <- readReg s rTRAILCAP
     clp <- readReg s rCLP
-    let effectiveCap = min cap gcLim
+    let effectiveCap = min cap (max gcLim (entryH + 524288))
         depthRem = maxDepth - currentDepth
         bailIdx = cuStateWords + 2 + argSlotsOf kernel
     bailCap <- peekElemOff basePtr bailIdx
@@ -1601,7 +1613,7 @@ resumeClauseUnit s entryH entryTR currentDepth maxDepth kernel
           pokeElemOff statePtr stateTrailIdx (fromIntegral (ptrToIntPtr tPtr))
           pokeElemOff statePtr stateHIdx (fromIntegral curH)
           pokeElemOff statePtr stateTRIdx (fromIntegral curTR)
-          pokeElemOff statePtr stateCapIdx (fromIntegral (min cap gcLim))
+          pokeElemOff statePtr stateCapIdx (fromIntegral (min cap (max gcLim (entryH + 524288))))
           pokeElemOff statePtr stateTrailCapIdx (fromIntegral tCap)
           pokeElemOff statePtr stateAllowChoicesIdx 1
           callNativeFn (jkFunPtr kernel) statePtr argsPtr budgetsPtr
