@@ -68,7 +68,7 @@ mypred : <span class="k">semidet</span> (<span class="k">int</span>: &lt;=) (<sp
 <tr><td><code>= == != #= #!= is in</code></td><td>unify, structural equality, disequality, CLP(Z) equality/disequality, arithmetic evaluation, domain</td></tr>
 <tr><td><code>,</code> <code>-&gt;</code> <code>;</code></td><td>conjunction, if-then, disjunction (inside bodies and parentheses)</td></tr>
 </table>
-<p>Ground arithmetic in call arguments is evaluated before head matching, so <code>fact (N - 1) R</code> calls <code>fact 4 R</code> when <code>N</code> is 5. Arithmetic left in answers is evaluated when printed.</p>
+<p>Ground arithmetic in a call argument is evaluated before head matching only where the callee expects a number (a declared or inferred <code>int</code>, <code>float</code> or <code>num</code> argument), so <code>fact (N - 1) R</code> calls <code>fact 4 R</code> when <code>N</code> is 5, while <code>deriv (plus X 1) D</code> receives the structure. <code>is</code>, comparisons and CLP(Z) operators always evaluate; unification, <code>write</code> and printed answers never do, so <code>X = 1 + 2</code> answers <code>X = 1 + 2</code>.</p>
 
 <h2 id="control" data-dash="Guide:Control constructs">Clause bodies and control <a class="anchor" href="#control">#</a></h2>
 <pre><code>sign <span class="v">N</span> <span class="v">S</span> <span class="k">&lt;-</span> (<span class="v">N</span> &gt; <span class="n">0</span> <span class="k">-&gt;</span> <span class="v">S</span> = pos ; <span class="v">N</span> &lt; <span class="n">0</span> <span class="k">-&gt;</span> <span class="v">S</span> = neg ; <span class="v">S</span> = zero).

@@ -84,13 +84,19 @@ diagnose items = concatMap inspect items
                       then "a DCG rule adds two arguments, so rename the nonterminal (for example my_" ++ name ++ ")"
                       else "rename the predicate (for example " ++ showPredKey ("my_" ++ name, arity) ++ ")"))]
       _ -> []
-    -- Arithmetic functors in call arguments are evaluated when ground, so a
-    -- head pattern on one never matches a ground argument.
+    -- Ground arithmetic is evaluated in the argument positions a predicate
+    -- expects a number ('evalArgPositions'), so a head pattern on an
+    -- arithmetic functor in such a position never matches a ground
+    -- argument. In every other position the functor is ordinary data.
     arithFunctorAsData item cl =
       [ Diagnostic (fromMaybe (locatedSpan item) (locatedHeadSpan item)) Warning "arith-functor-as-data"
-          ("head pattern on arithmetic functor `" ++ f ++ "` can never match a ground argument: ground "
-            ++ "arithmetic in call arguments is evaluated before head matching; rename the constructor (for example add/sub)")
-      | Compound _ args <- [clauseHead cl], arg <- args, Compound f as <- [arg],
+          ("head pattern on arithmetic functor `" ++ f ++ "` in numeric argument " ++ show (i + 1 :: Int)
+            ++ " can never match a ground argument: ground arithmetic passed to a numeric argument is "
+            ++ "evaluated before head matching; rename the constructor (for example add/sub) "
+            ++ "or give the argument a non-numeric sort")
+      | Compound _ args <- [clauseHead cl],
+        Just p <- [clauseKey cl >>= (`lookupPred` prog)],
+        (i, True, Compound f as) <- zip3 [0 ..] (predEvalArgs p) args,
         f `elem` arithOps, not (null as) ]
     effects item cl = case clauseKey cl of
       Just key -> [emit item Error "unsafe-call" (describeViolation prog key g) | g <- clauseViolations prog cl]

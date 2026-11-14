@@ -32,11 +32,12 @@ env_lookup K [_ | Rest] V <- env_lookup K Rest V.
 # ── Substitution ─────────────────────────────────────────────────
 # subst Expr Env Result
 #
-# Recursively walks Expr, replacing every atom identifier that
-# exists as a key in Env with its value.  Numeric literals and
-# identifiers not in Env are returned unchanged (the fallback
-# clause handles both — env_lookup fails on numbers, so they
-# fall through to identity).
+# Recursively walks Expr, replacing every atom identifier with its
+# value in Env.  Numeric literals are returned unchanged.  The
+# clauses are exclusive (operator, atom, number), so each
+# expression has exactly one substitution; an unbound identifier
+# fails.  Arithmetic functors passed to a predicate whose argument
+# is not numeric are data, so  subst (A + B)  sees the structure.
 
 subst (A + B) Env (Sa + Sb) <- subst A Env Sa, subst B Env Sb.
 subst (A - B) Env (Sa - Sb) <- subst A Env Sa, subst B Env Sb.
@@ -44,8 +45,8 @@ subst (A * B) Env (Sa * Sb) <- subst A Env Sa, subst B Env Sb.
 subst (A / B) Env (Sa / Sb) <- subst A Env Sa, subst B Env Sb.
 subst (A % B) Env (Sa % Sb) <- subst A Env Sa, subst B Env Sb.
 subst (A ^ B) Env (Sa ^ Sb) <- subst A Env Sa, subst B Env Sb.
-subst X Env V              <- env_lookup X Env V.
-subst X _ X.
+subst X Env V              <- is_atom X, env_lookup X Env V.
+subst X _ X                <- is_num X.
 
 # ── Statement list processor ─────────────────────────────────────
 # process Stmts Env Result

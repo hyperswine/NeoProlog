@@ -31,7 +31,7 @@ import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import Data.Maybe (isJust, isNothing)
 import Foreign.Ptr (Ptr)
-import Infera.Arith (NumericValue (..), compareNumeric, deepEval, numericDouble, numericTerm)
+import Infera.Arith (NumericValue (..), compareNumeric, numericDouble, numericTerm)
 import qualified Infera.CLP as CLP
 import qualified Infera.CLP.Mutable as Mutable
 import qualified Infera.Core.Constraint as NativeConstraint
@@ -929,17 +929,17 @@ step' m goal goals base barrier depth next = case goal of
   GAnd inner -> runGoals m (inner ++ goals) base barrier depth next
   GCall ref patterns trust -> do
     predicate <- readIORef ref
-    buildArgs m base patterns 0
+    buildArgs m base (pEvalArgs predicate) patterns 0
     pending <- arithData (mStore m)
-    when (pending > 0) (normalizeArgs m (pArity predicate))
+    when (pending > 0) (normalizeArgs m (pEvalArgs predicate))
     let !cont = if null goals then next else CGoals goals base barrier depth next
         !callDepth = if null goals then contDepth next + 1 else depth + 1
     callPredicate m (if null goals then base else 0) callDepth predicate trust cont
   GTabled ref patterns -> do
     predicate <- readIORef ref
-    buildArgs m base patterns 0
+    buildArgs m base (pEvalArgs predicate) patterns 0
     pending <- arithData (mStore m)
-    when (pending > 0) (normalizeArgs m (pArity predicate))
+    when (pending > 0) (normalizeArgs m (pEvalArgs predicate))
     callTabled m predicate (if null goals then next else CGoals goals base barrier depth next)
   GCallFacts key patterns -> do
     let !s = mStore m
@@ -954,8 +954,9 @@ step' m goal goals base barrier depth next = case goal of
           (True, Just (results, template, faBase, entryHeap)) ->
             drainDynamicFindAll m key factsSeq base patterns results template faBase entryHeap
           _ -> do
-            buildArgs m base patterns 0
-            when (pending > 0) (normalizeArgs m arity)
+            let evals = dynamicEvalArgs m key
+            buildArgs m base evals patterns 0
+            when (pending > 0) (normalizeArgs m evals)
             saved <- saveArgs s arity
             consumeDynFacts m key factsSeq 0 saved arity cont
   GMinimize cost inner -> do
@@ -1244,7 +1245,7 @@ step' m goal goals base barrier depth next = case goal of
   GWrite newline pattern -> do
     word <- buildArg m base False pattern
     term <- exportFor m word
-    emitOutput m (WriteEvent (showValue (deepEval emptySubst term)))
+    emitOutput m (WriteEvent (showValue term))
     when newline (emitOutput m NewlineEvent)
     continue
   GNl -> emitOutput m NewlineEvent >> continue
@@ -1839,7 +1840,7 @@ streamCode m !stream !pc !sp !base !barrier !depth !next = case () of
             !arity = unsafeAt code (pc + 2)
         predicate <- streamCallTarget stream entry
         pending <- arithData s
-        when (pending > 0) (normalizeArgs m arity)
+        when (pending > 0) (normalizeArgs m (pEvalArgs predicate))
         callPredicate m 0 (depth + 1) predicate (streamCallTrust stream entry)
           (CStream stream (pc + 3) base barrier depth (-1) (-1) next)
     | op == opExecute -> do
@@ -1847,7 +1848,7 @@ streamCode m !stream !pc !sp !base !barrier !depth !next = case () of
             !arity = unsafeAt code (pc + 2)
         predicate <- streamCallTarget stream entry
         pending <- arithData s
-        when (pending > 0) (normalizeArgs m arity)
+        when (pending > 0) (normalizeArgs m (pEvalArgs predicate))
         callPredicate m base depth predicate (streamCallTrust stream entry) next
     | op == opEscape ->
         runGoals m (streamEscapeGoals stream (unsafeAt code (pc + 1))) base barrier depth next
@@ -2597,10 +2598,12 @@ writeFirst :: Store -> Int -> Word' -> IO ()
 writeFirst s addr word = deref s word >>= writeCell s addr
 {-# INLINE writeFirst #-}
 
--- | Build call arguments into the registers.
-buildArgs :: Machine -> Int -> [Pattern] -> Int -> IO ()
-buildArgs _ _ [] _ = pure ()
-buildArgs m base (pattern : patterns) !i = do
+-- | Build call arguments into the registers. Arithmetic in the positions
+-- @evals@ (ascending; see 'pEvalArgs') is evaluated when ground; in every
+-- other position it is built as data.
+buildArgs :: Machine -> Int -> [Int] -> [Pattern] -> Int -> IO ()
+buildArgs _ _ _ [] _ = pure ()
+buildArgs m base evals (pattern : patterns) !i = do
   case pattern of
     PSlot k
       | base == 0 -> writeArg (mStore m) i (refWord k)
@@ -2614,13 +2617,25 @@ buildArgs m base (pattern : patterns) !i = do
             then operandAt s base k >>= writeArg s i
             else writeArg s i word
     PWord w -> writeArg (mStore m) i w
-    _ -> buildArg m base True pattern >>= writeArg (mStore m) i
-  buildArgs m base patterns (i + 1)
+    _ -> buildArg m base evaluate pattern >>= writeArg (mStore m) i
+  buildArgs m base evals' patterns (i + 1)
+  where
+    (evaluate, evals') = case evals of
+      e : rest | e == i -> (True, rest)
+      _ -> (False, evals)
 
-normalizeArgs :: Machine -> Int -> IO ()
-normalizeArgs m n = forM_ [0 .. n - 1] $ \i -> do
+-- | Evaluate arithmetic data already in the argument registers, in the
+-- callee's numeric positions only.
+normalizeArgs :: Machine -> [Int] -> IO ()
+normalizeArgs m evals = forM_ evals $ \i -> do
   w <- readArg (mStore m) i
   normalizeWord m w >>= writeArg (mStore m) i
+
+-- | Numeric positions of a dynamic predicate, from its declarations.
+dynamicEvalArgs :: Machine -> PredKey -> [Int]
+dynamicEvalArgs m key = case P.lookupPred key (mProgram m) of
+  Just p -> [i | (i, True) <- zip [0 ..] (P.predEvalArgs p)]
+  Nothing -> []
 
 -- | Match a head pattern against a word, building only where the word is
 -- an unbound variable.
@@ -3761,7 +3776,7 @@ tryDynFact m _ df !saved !_ cont = do
       if ok then run m cont else backtrack m
 
 drainDynamicFindAll :: Machine -> PredKey -> Seq.Seq DynFact -> Int -> [Pattern] -> IORef [(Copy, [OutputEvent])] -> Pattern -> Int -> Int -> IO Step
-drainDynamicFindAll m _ factsSeq !base patterns results template !faBase !entryHeap = case (patterns, template) of
+drainDynamicFindAll m key factsSeq !base patterns results template !faBase !entryHeap = case (patterns, template) of
   ([PFirst s0], PSlot ts0) | base == faBase && s0 == ts0 -> fastSlot1 s0
   ([PSlot s0], PSlot ts0) | base == faBase && s0 == ts0 -> do
     let !s = mStore m
@@ -3784,7 +3799,7 @@ drainDynamicFindAll m _ factsSeq !base patterns results template !faBase !entryH
       go 0
     generalLoop = generalFrom 0
     generalFrom !startIdx = do
-      buildArgs m base patterns 0
+      buildArgs m base (dynamicEvalArgs m key) patterns 0
       let !arity = length patterns
       saved <- saveArgs s arity
       h0 <- heapTop s

@@ -9,6 +9,8 @@ module Infera.Program
     ArgIndex (..),
     Signature (..),
     defaultSignature,
+    evalArgPositions,
+    predEvalArgs,
     Pred (..),
     Program (..),
     emptyProgram,
@@ -122,6 +124,27 @@ data Signature = Signature
 -- | The most general signature: any sort, in/out, nondet.
 defaultSignature :: Int -> Signature
 defaultSignature arity = Signature Nondet (replicate arity (ArgSpec SAny ModeInOut)) []
+
+-- | Argument positions (0-based) whose ground arithmetic is evaluated
+-- before the call. An argument is evaluated only where the predicate
+-- expects a number: a position every declaration gives a numeric sort
+-- (@int@, @float@, @num@), or, with no declarations, a position whose
+-- inferred sort is numeric. Elsewhere an arithmetic functor is data, so
+-- @deriv (plus X Y) D@ receives the structure and @fact (N - 1) R@ still
+-- calls @fact 4 R@.
+evalArgPositions :: [Signature] -> Signature -> [Bool]
+evalArgPositions decls inferred = case decls of
+  [] -> map numericSpec (sigArgs inferred)
+  _ -> foldr1 (zipWith (&&)) [map numericSpec (sigArgs d) | d <- decls]
+  where
+    numericSpec spec = case argSort spec of
+      SNum -> True
+      SInt -> True
+      SFloat -> True
+      _ -> False
+
+predEvalArgs :: Pred -> [Bool]
+predEvalArgs p = evalArgPositions (predDecls p) (predInferred p)
 
 data Pred = Pred
   { predKey :: PredKey,

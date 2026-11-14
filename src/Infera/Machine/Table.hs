@@ -9,7 +9,7 @@ import qualified Data.IntMap.Strict as IM
 import Data.List (foldl', nub)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Infera.Arith (normArithTerm)
+import Infera.Arith (normArithArgs)
 import Infera.CLP (Store (..), isConstrained, storeUnify)
 import Infera.Engine.Reference (Env (..), OutputEvent (..), Search, SearchItem (..), SolverState (..), TableEntry (..))
 import qualified Infera.Engine.Reference as Reference
@@ -120,7 +120,7 @@ evalTabled solveNative env fuel st0 p goal
                 Right Nothing -> True -- This clause cannot contribute.
                 Right (Just store) ->
                   let s = stSubst store
-                   in fst (canonicalize s (normArithTerm s (renameTerm base recursive))) == callKey
+                   in fst (canonicalize s (normArithArgs (predEvalArgs p) s (renameTerm base recursive))) == callKey
         safeContract predicate =
           null (predDecls predicate)
             && not (predIsUnsafe (envProg env) predicate)
@@ -313,7 +313,7 @@ evalTabledTracedWithContext callers solveNative env fuel st0 p goal
                 Right Nothing -> True -- This clause cannot contribute.
                 Right (Just store) ->
                   let s = stSubst store
-                   in fst (canonicalize s (normArithTerm s (renameTerm base recursive))) == callKey
+                   in fst (canonicalize s (normArithArgs (predEvalArgs p) s (renameTerm base recursive))) == callKey
         safeContract predicate =
           null (predDecls predicate)
             && not (predIsUnsafe (envProg env) predicate)

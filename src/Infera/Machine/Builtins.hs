@@ -14,7 +14,7 @@ where
 
 import Data.Char (toLower, toUpper)
 import qualified Data.Map.Strict as Map
-import Infera.Arith (compareNumeric, deepEval, evalArithSafe, evalNumeric)
+import Infera.Arith (compareNumeric, evalArithSafe, evalNumeric)
 import Infera.CLP
 import Infera.Compile (BuiltinTag (..))
 import Infera.Engine.Reference (Env (..), OutputEvent (..), Search, SearchItem (..), SolverState (..))
@@ -168,7 +168,7 @@ ordinaryBuiltin environment state original = case walk substitution original of
   Compound "retract" [fact] -> Just (retractFact state fact)
   Compound "retractall" [fact] -> Just (retractAll state fact)
   Compound "seq" [items, input, rest] -> Just (seqGoal state items input rest)
-  Compound "wr" [value, input, rest] -> Just (dcgText state (showValue (deepEval substitution value)) input rest)
+  Compound "wr" [value, input, rest] -> Just (dcgText state (showValue (deepWalk substitution value)) input rest)
   Compound "nl" [input, rest] -> Just (dcgText state "\n" input rest)
   Compound "sp" [input, rest] -> Just (dcgText state " " input rest)
   Compound "padl" [value, width, input, rest] -> Just (padGoal True state value width input rest)
@@ -180,13 +180,13 @@ ordinaryBuiltin environment state original = case walk substitution original of
     (CharLit value, _) -> checked state (storeUnify store number (IntLit (fromIntegral (fromEnum value))))
     (_, IntLit value) -> checked state (storeUnify store character (CharLit (toEnum (fromIntegral value))))
     (other, _) -> [BranchError (InstantiationError other)]
-  Compound "term_str" [term, text] -> Just (checked state (storeUnify store text (StrLit (showValue (deepEval substitution term)))))
+  Compound "term_str" [term, text] -> Just (checked state (storeUnify store text (StrLit (showValue (deepWalk substitution term)))))
   Compound "str_lines" [text, items] -> Just $ case walk substitution text of
     StrLit contents -> checked state (storeUnify store items (mkList (map StrLit (lines contents)) Nothing))
     other -> [BranchError (TypeError "string" other)]
   Compound "write" [value] -> output value
   Compound "print" [value] -> output value
-  Compound "writeln" [value] -> one (emit NewlineEvent (emit (WriteEvent (showValue (deepEval substitution value))) state))
+  Compound "writeln" [value] -> one (emit NewlineEvent (emit (WriteEvent (showValue (deepWalk substitution value))) state))
   Compound "var" [term] -> yesNo (isVar (walk substitution term))
   Compound "nonvar" [term] -> yesNo (not (isVar (walk substitution term)))
   Compound "ground" [term] -> yesNo (isGround substitution term)
@@ -227,7 +227,7 @@ ordinaryBuiltin environment state original = case walk substitution original of
     substitution = stSubst store
     one accepted = Just [Found accepted]
     yesNo accepted = Just [Found state | accepted]
-    output value = one (emit (WriteEvent (showValue (deepEval substitution value))) state)
+    output value = one (emit (WriteEvent (showValue (deepWalk substitution value))) state)
     isVar (Var _) = True
     isVar _ = False
 
@@ -310,7 +310,7 @@ seqGoal state items input rest = case deepWalk substitution items of
 padGoal :: Bool -> SolverState -> Term -> Term -> Term -> Term -> Search
 padGoal left state value width input rest = case walk substitution width of
   IntLit number ->
-    let text = showValue (deepEval substitution value)
+    let text = showValue (deepWalk substitution value)
         padding = replicate (fromIntegral number - length text) ' '
      in dcgText state (if left then padding ++ text else text ++ padding) input rest
   other -> [BranchError (TypeError "integer width" other)]
@@ -326,7 +326,7 @@ formatText substitution format arguments = case (walk substitution format, unfol
     go ('~' : '~' : rest) values = ('~' :) <$> go rest values
     go ('~' : 'n' : rest) values = ('\n' :) <$> go rest values
     go ('~' : directiveName : rest) (value : values) | directiveName `elem` "wsda" = do
-      piece <- directive directiveName (deepEval substitution value)
+      piece <- directive directiveName (deepWalk substitution value)
       (piece ++) <$> go rest values
     go ('~' : directiveName : _) [] | directiveName `elem` "wsda" = Left (UserError "fmt: not enough arguments for the format string")
     go ('~' : directiveName : _) _ = Left (UserError ("fmt: unknown directive ~" ++ [directiveName]))

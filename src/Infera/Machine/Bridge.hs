@@ -13,6 +13,7 @@ module Infera.Machine.Bridge
     rebuild,
     importTerms,
     normalizeTermGraph,
+    normalizeCallGraph,
     exportTerms,
     exportRawTerms,
     exportState,
@@ -214,10 +215,41 @@ importTerms heap (Bindings roots names environment) terms = atomic heap $ do
 -- Folding numeric scalar children uses the same evaluator as normArithTerm.
 -- The complete operation rolls back allocations if any handle is invalid.
 normalizeTermGraph :: Heap s -> Bindings -> Address -> ST s (Either HeapError Address)
-normalizeTermGraph heap (Bindings _ names _) root = atomic heap $
-  fst . fst <$> normalize Map.empty root
+normalizeTermGraph heap bindings root = normalizeGraph heap bindings Nothing root
+
+-- | 'normalizeTermGraph' applied only to the arguments of a call goal that
+-- the callee evaluates ('Infera.Program.evalArgPositions'); every other
+-- argument, and arithmetic inside it, is left as data. A goal that is not a
+-- compound is returned unchanged.
+normalizeCallGraph :: Heap s -> Bindings -> [Bool] -> Address -> ST s (Either HeapError Address)
+normalizeCallGraph heap bindings mask root = normalizeGraph heap bindings (Just mask) root
+
+normalizeGraph :: Heap s -> Bindings -> Maybe [Bool] -> Address -> ST s (Either HeapError Address)
+normalizeGraph heap (Bindings _ names _) selection root = atomic heap $ case selection of
+  Nothing -> fst . fst <$> normalize True Map.empty root
+  Just mask -> goal mask root
   where
-    normalize memo address = case Map.lookup address memo of
+    -- An unselected argument still has its bound reference chains collapsed
+    -- (as 'Infera.Arith.normArithArgs' resolves bindings); only arithmetic
+    -- folding is restricted to the selected positions.
+    goal mask address = do
+      shape <- checked (Heap.viewRaw heap address)
+      case shape of
+        Heap.VariableView _ -> do
+          target <- checked (Heap.referenceTarget heap address)
+          case target of
+            Just bound | bound /= address -> goal mask bound
+            _ -> pure address
+        Heap.CompoundView name children -> do
+          normalized <- selected Map.empty (zip (mask ++ repeat False) children)
+          if normalized == children then pure address
+            else checked (Heap.newCompound heap name normalized)
+        _ -> pure address
+    selected _ [] = pure []
+    selected memo ((fold, address) : rest) = do
+      ((value, _), next) <- normalize fold memo address
+      (value :) <$> selected next rest
+    normalize fold memo address = case Map.lookup (fold, address) memo of
       Just result -> pure (result, memo)
       Nothing -> do
         shape <- checked (Heap.viewRaw heap address)
@@ -226,15 +258,15 @@ normalizeTermGraph heap (Bindings _ names _) root = atomic heap $
             unless (Map.member original names) (throwError IncompatibleBindings)
             target <- checked (Heap.referenceTarget heap address)
             case target of
-              Just bound | bound /= address -> normalize memo bound
+              Just bound | bound /= address -> normalize fold memo bound
               Just _ -> pure ((address, Nothing), memo)
               Nothing -> throwError IncompatibleBindings
           Heap.IntegerView value -> pure ((address, Just (IntLit value)), memo)
           Heap.FloatView value -> pure ((address, Just (FloatLit value)), memo)
           Heap.CompoundView name children -> do
-            (values, normalizedMemo) <- normalizeChildren memo children
+            (values, normalizedMemo) <- normalizeChildren fold memo children
             let normalized = map fst values
-                numeric = if name `elem` arithOps then traverse snd values else Nothing
+                numeric = if fold && name `elem` arithOps then traverse snd values else Nothing
                 folded = numeric >>= \arguments -> case evalArithSafe Unify.emptySubst (Compound name arguments) of
                   Right (Just value) -> Just value
                   _ -> Nothing
@@ -247,12 +279,12 @@ normalizeTermGraph heap (Bindings _ names _) root = atomic heap $
                   else checked (Heap.newCompound heap name normalized)
                 pure ((constructor, Nothing), normalizedMemo)
           _ -> pure ((address, Nothing), memo)
-        let updated = Map.insert address result next
+        let updated = Map.insert (fold, address) result next
         updated `seq` pure (result, updated)
-    normalizeChildren memo [] = pure ([], memo)
-    normalizeChildren memo (address : rest) = do
-      (value, next) <- normalize memo address
-      (values, final) <- normalizeChildren next rest
+    normalizeChildren _ memo [] = pure ([], memo)
+    normalizeChildren fold memo (address : rest) = do
+      (value, next) <- normalize fold memo address
+      (values, final) <- normalizeChildren fold next rest
       pure (value : values, final)
 
 -- Every free heap variable has a stable logical root in Bindings. Export its

@@ -327,6 +327,9 @@ data Pred = Pred
     pIndexed :: !Bool,
     pDecls :: [P.Signature],
     pInferred :: !P.Signature,
+    -- | argument positions whose ground arithmetic is evaluated before the
+    -- call ('P.evalArgPositions'); arithmetic elsewhere is data
+    pEvalArgs :: [Int],
     -- | inferred semidet: the argument positions that must be ground for
     -- the call to commit after its first solution
     pSwitch :: !(Maybe [Int]),
@@ -581,6 +584,7 @@ compilePred ctx p = do
         pIndexed = indexed,
         pDecls = P.predDecls p,
         pInferred = P.predInferred p,
+        pEvalArgs = [i | (i, True) <- zip [0 ..] (P.predEvalArgs p)],
         pSwitch =
           if P.sigDet (P.predInferred p) == S.Semidet
             then Just (filter (< arity) (P.sigSwitch (P.predInferred p)))

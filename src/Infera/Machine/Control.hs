@@ -39,7 +39,7 @@ import qualified Data.Map.Lazy as Map
 import qualified Data.Set as Set
 import qualified Infera.Compile as Compile
 import qualified Infera.Compile.Cache as CodeCache
-import Infera.Arith (arithOps, evalIntExpr, normArithTerm)
+import Infera.Arith (arithOps, evalIntExpr, normArithArgs)
 import Infera.CLP (Store (..))
 import qualified Infera.CLP as CLP
 import Infera.Engine.Reference (Env (..), OutputEvent (..), Search, SearchItem (..), SolverState (..))
@@ -1001,7 +1001,7 @@ callPredicate environment heap running address fuel scopes route = do
       definition = routeDefinition route
   syntax <- checked (Bridge.exportRawTerms heap (branchBindings branch) [address])
   goal <- single syntax
-  let normalized = normArithTerm (stSubst (ssStore state)) goal
+  let normalized = normArithArgs (predEvalArgs definition) (stSubst (ssStore state)) goal
       args = case normalized of Compound _ as -> as; _ -> []
       argsW = map (deepWalk (stSubst (ssStore state))) args
       key = predKey definition
@@ -1049,7 +1049,7 @@ callPredicate environment heap running address fuel scopes route = do
       -- Normalize the shared graph itself. Exporting and importing a fully
       -- expanded term duplicates unchanged grid/list suffixes at every call.
       normalizedAddress <- if requiresNormalization (stSubst (ssStore state)) goal
-        then checked (Bridge.normalizeTermGraph activeHeap (branchBindings activeBranch) activeGoal)
+        then checked (Bridge.normalizeCallGraph activeHeap (branchBindings activeBranch) (predEvalArgs definition) activeGoal)
         else pure activeGoal
       let bindings = branchBindings activeBranch
       normalizedShape <- checked (Heap.view activeHeap normalizedAddress)

@@ -279,7 +279,7 @@ solveGoal env fuel st g0 =
         Compound "retractall" [t] -> retractAll st t
         -- pure DCG helpers: NT S0 S
         Compound "seq" [cs, s0, s1] -> seqGoal st cs s0 s1
-        Compound "wr" [x, s0, s1] -> dcgText st (showValue (deepEval s x)) s0 s1
+        Compound "wr" [x, s0, s1] -> dcgText st (showValue (deepWalk s x)) s0 s1
         Compound "nl" [s0, s1] -> dcgText st "\n" s0 s1
         Compound "sp" [s0, s1] -> dcgText st " " s0 s1
         Compound "padl" [x, w, s0, s1] -> padGoal True st x w s0 s1
@@ -291,7 +291,7 @@ solveGoal env fuel st g0 =
           (CharLit ch, _) -> checked st (storeUnify store n (IntLit (fromIntegral (fromEnum ch))))
           (_, IntLit code) -> checked st (storeUnify store c (CharLit (toEnum (fromIntegral code))))
           (other, _) -> [BranchError (InstantiationError other)]
-        Compound "term_str" [t, str] -> checked st (storeUnify store str (StrLit (showValue (deepEval s t))))
+        Compound "term_str" [t, str] -> checked st (storeUnify store str (StrLit (showValue (deepWalk s t))))
         Compound "str_lines" [a, l] -> case walk s a of
           StrLit str -> checked st (storeUnify store l (mkList (map StrLit (lines str)) Nothing))
           other -> [BranchError (TypeError "string" other)]
@@ -306,9 +306,9 @@ solveGoal env fuel st g0 =
         Compound "findall" [tmpl, g, l] -> findAll env fuel st tmpl g l
         Compound "minimize" [cost, g] -> minimizeGoal env fuel st cost g
         -- output
-        Compound "write" [x] -> [Found (emit (WriteEvent (showValue (deepEval s x))) st)]
-        Compound "print" [x] -> [Found (emit (WriteEvent (showValue (deepEval s x))) st)]
-        Compound "writeln" [x] -> [Found (emit NewlineEvent (emit (WriteEvent (showValue (deepEval s x))) st))]
+        Compound "write" [x] -> [Found (emit (WriteEvent (showValue (deepWalk s x))) st)]
+        Compound "print" [x] -> [Found (emit (WriteEvent (showValue (deepWalk s x))) st)]
+        Compound "writeln" [x] -> [Found (emit NewlineEvent (emit (WriteEvent (showValue (deepWalk s x))) st))]
         -- type checks
         Compound "var" [x] -> yesNo (isVar (walk s x))
         Compound "nonvar" [x] -> yesNo (not (isVar (walk s x)))
@@ -388,7 +388,7 @@ seqGoal st cs s0 s =
 padGoal :: Bool -> SolverState -> Term -> Term -> Term -> Term -> Search
 padGoal left st x w s0 s =
   let sub = subst st
-      text = showValue (deepEval sub x)
+      text = showValue (deepWalk sub x)
    in case walk sub w of
         IntLit n ->
           let fill = replicate (fromIntegral n - length text) ' '
@@ -406,7 +406,7 @@ formatText s f args = case (walk s f, unfoldCons (deepWalk s args)) of
     go ('~' : '~' : rest) as = ('~' :) <$> go rest as
     go ('~' : 'n' : rest) as = ('\n' :) <$> go rest as
     go ('~' : c : rest) (a : as) | c `elem` "wsda" = do
-      piece <- directive c (deepEval s a)
+      piece <- directive c (deepWalk s a)
       (piece ++) <$> go rest as
     go ('~' : c : _) [] | c `elem` "wsda" = Left (UserError "fmt: not enough arguments for the format string")
     go ('~' : c : _) _ = Left (UserError ("fmt: unknown directive ~" ++ [c]))
@@ -768,7 +768,7 @@ callPred env fuel st goal = case functorOf goal of
       | otherwise -> [BranchError (UnknownPredicate key)]
     Just p ->
       let s = subst st
-          goalN = normArithTerm s goal
+          goalN = normArithArgs (predEvalArgs p) s goal
           args = case goalN of Compound _ as -> as; _ -> []
           argsW = map (deepWalk s) args
        in case Contracts.selectSignature key p argsW of
@@ -893,7 +893,7 @@ evalTabled env fuel st0 p goal
                 Right Nothing -> True -- This clause cannot contribute.
                 Right (Just store) ->
                   let s = stSubst store
-                   in fst (canonicalize s (normArithTerm s (renameTerm base recursive))) == callKey
+                   in fst (canonicalize s (normArithArgs (predEvalArgs p) s (renameTerm base recursive))) == callKey
         safeContract predicate =
           null (predDecls predicate)
             && not (predIsUnsafe (envProg env) predicate)
@@ -1001,7 +1001,7 @@ projectAnswer q st =
   let store = ssStore st
       s = stSubst store
       names = queryNames q
-      bindingsRaw = [(n, deepEval s (Var v)) | (n, v) <- names]
+      bindingsRaw = [(n, deepWalk s (Var v)) | (n, v) <- names]
       -- A query variable bound to an otherwise unnamed free variable lends it
       -- its name instead of showing as a binding.
       (aliases, bindings) = foldl' alias (IM.empty, []) bindingsRaw
@@ -1030,7 +1030,7 @@ projectAnswer q st =
             Nothing -> showVarDefault v
       render = showTermWith nameOf
       residualDomains = [nameOf v ++ " in " ++ showDomain d | (v, d) <- domains]
-      residualConstraints = [render (deepEval s (constraintTerm c)) | c <- relevant]
+      residualConstraints = [render (deepWalk s (constraintTerm c)) | c <- relevant]
       displayNames = IM.fromList [(v, nameOf v) | t <- map snd bindings, v <- termVars t]
    in Answer
         { answerBindings = bindings,

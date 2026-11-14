@@ -83,6 +83,22 @@ factProg =
       "factorial N R <- N > 0, R = R2 * N, factorial (N - 1) R2."
     ]
 
+evalFactProg :: String
+evalFactProg =
+  unlines
+    [ "factorial 0 1.",
+      "factorial N R <- N > 0, factorial (N - 1) R2, R is R2 * N."
+    ]
+
+derivProg :: String
+derivProg =
+  unlines
+    [ "d X X 1.",
+      "d C X 0 <- is_num C.",
+      "d (plus U V) X (plus DU DV) <- d U X DU, d V X DV.",
+      "d (mul U V) X (plus (mul DU V) (mul U DV)) <- d U X DU, d V X DV."
+    ]
+
 colorsProg :: String
 colorsProg = unlines ["color red.", "color green.", "color blue."]
 
@@ -235,13 +251,39 @@ prop_engine_lists = unit $ do
 
 prop_engine_arith_in_heads :: Property
 prop_engine_arith_in_heads = unit $ do
-  assertAnswers factProg "factorial 5 R?" ["R = 120"]
+  -- factProg builds its result with `=`, so the product is data.
+  assertAnswers factProg "factorial 5 R?" ["R = 1 * 1 * 2 * 3 * 4 * 5"]
+  assertAnswers evalFactProg "factorial 5 R?" ["R = 120"]
   assertAnswers "" "X is 2 + 3 * 4?" ["X = 14"]
   assertAnswers "" "X is 7 / 2?" ["X = 3"]
   assertAnswers "" "X is 7.0 / 2?" ["X = 3.5"]
   assertAnswers "" "3 > 2, 2 >= 2, 1 < 2, 2 <= 2?" ["true."]
   assertErrorContains "" "X is Y + 1?" "not sufficiently instantiated"
   assertErrorContains "" "X is 1 / 0?" "division by zero"
+
+-- Ground arithmetic is evaluated only in arguments the callee expects to be
+-- numeric (docs/2026-11-15-GENERAL-PURPOSE.md, Step 0); elsewhere it is data.
+prop_engine_arith_as_data :: Property
+prop_engine_arith_as_data = unit $ do
+  assertAnswers evalFactProg "factorial (2 + 3) R?" ["R = 120"]
+  assertAnswers evalFactProg "E = 5 - 1, factorial E R?" ["E = 5 - 1, R = 24"]
+  assertAnswers evalFactProg "call factorial (1 + 2) R?" ["R = 6"]
+  assertAnswers "" "X = 1 + 2?" ["X = 1 + 2"]
+  assertAnswers "" "X = plus 1 2, Y is X?" ["X = 1 + 2, Y = 3"]
+  assertAnswers "" "write (1 + 2), nl?" ["1 + 2\n", "true."]
+  assertAnswers derivProg "d (plus 1 2) x D?" ["D = 0 + 0"]
+  assertAnswers derivProg "d (plus x 2) x D?" ["D = 1 + 0"]
+  assertAnswers derivProg "d (mul x x) x D?" ["D = 1 * x + x * 1"]
+  assertAnswers "wrap E (box E).\n" "wrap (1 + 2) W?" ["W = box (1 + 2)"]
+  -- A declared numeric argument evaluates; a declared `any` one does not.
+  let declared = unlines
+        [ "num_in : det (int: <=) (any: =>).",
+          "num_in N (got N).",
+          "any_in : det (any: <=) (any: =>).",
+          "any_in T (got T)."
+        ]
+  assertAnswers declared "num_in (2 * 3) R?" ["R = got 6"]
+  assertAnswers declared "any_in (2 * 3) R?" ["R = got (2 * 3)"]
 
 prop_engine_cut :: Property
 prop_engine_cut = unit $ do
@@ -890,6 +932,7 @@ inferaGroup =
       ("unify prefers older var", prop_unify_prefers_older_variable),
       ("engine lists", prop_engine_lists),
       ("engine arithmetic", prop_engine_arith_in_heads),
+      ("engine arithmetic as data", prop_engine_arith_as_data),
       ("engine cut", prop_engine_cut),
       ("engine control", prop_engine_control),
       ("engine disequality", prop_engine_disequality),

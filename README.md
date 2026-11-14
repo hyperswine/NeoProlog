@@ -140,16 +140,22 @@ DCG helpers `seq wr nl sp fmt padl padr`,
 type checks `var nonvar ground is_int is_float is_num is_str is_atom is_char is_list`,
 strings `str_concat str_length str_chars str_atom str_num str_upper str_lower`.
 
-Ground arithmetic inside call arguments is evaluated before head matching, so
-`fact (N - 1) R` calls `fact 4 R`, and arithmetic in answers is evaluated.
+Ground arithmetic in a call argument is evaluated before head matching only
+where the callee expects a number: an argument position that every declaration
+gives the sort `int`, `float` or `num`, or, for an undeclared predicate, a
+position whose inferred sort is numeric (`:sig` shows it). So `fact (N - 1) R`
+calls `fact 4 R`, while `deriv (plus X 1) D` receives the structure. The
+arithmetic contexts `is`, comparisons and the CLP(Z) operators always
+evaluate. Unification, `==`, `write` and printed answers never do: `X = 1 + 2`
+answers `X = 1 + 2`.
 
 The evaluated functors are `plus minus mul div mod ^ neg abs min max`; the
-operators `+ - * / % ^` are the same functors as `plus minus mul div mod ^`, so
-`plus 1 0` is evaluated like `1 + 0`. This also applies to a structure passed
-through a variable, although unification and `==` do not evaluate. Symbolic
-programs should use other constructor names (for example `add`/`sub`); `infera
-check` warns (`arith-functor-as-data`) when a clause head matches on one of
-these functors.
+operators `+ - * / % ^` are the same functors as `plus minus mul div mod ^`.
+Evaluation also applies to a structure passed through a variable into a numeric
+argument. Symbolic programs may use these functors freely as data in
+non-numeric positions; `infera check` warns (`arith-functor-as-data`) when a
+clause head matches on one in a numeric position, where it could never match a
+ground argument. See [GENERAL-PURPOSE, Step 0](docs/2026-11-15-GENERAL-PURPOSE.md#step-0-arithmetic-functors-as-data).
 
 ## Declarations
 

@@ -8,7 +8,7 @@ module Infera.Arith
     evalIntExpr,
     arithOps,
     normArithTerm,
-    deepEval,
+    normArithArgs,
     compareNumeric,
   )
 where
@@ -134,16 +134,15 @@ normArithTerm s t = case walk s t of
     | otherwise -> Compound f (map (normArithTerm s) as)
   t' -> t'
 
--- | Dereference and evaluate ground arithmetic (used when rendering answers).
-deepEval :: Subst -> Term -> Term
-deepEval s t = tryEval (deepWalk s t)
+-- | Evaluate ground arithmetic only in the given argument positions
+-- (0-based) of a call; see 'Infera.Program.evalArgPositions'. Other
+-- arguments, and arithmetic functors inside them, are data; like
+-- 'normArithTerm', every argument comes back with its bindings resolved.
+normArithArgs :: [Bool] -> Subst -> Term -> Term
+normArithArgs mask s t = case walk s t of
+  Compound f as -> Compound f (zipWith arg (mask ++ repeat False) as)
+  t' -> t'
   where
-    tryEval t' = case t' of
-      Compound f as
-        | f `elem` arithOps ->
-            let t'' = Compound f (map tryEval as)
-             in case evalArithSafe emptySubst t'' of
-                  Right (Just v) -> v
-                  _ -> t''
-        | otherwise -> Compound f (map tryEval as)
-      _ -> t'
+    arg True a = normArithTerm s a
+    arg False a = deepWalk s a
+

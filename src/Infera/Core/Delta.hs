@@ -9,7 +9,7 @@ module Infera.Core.Delta (recursiveClauses) where
 
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Set as Set
-import Infera.Arith (normArithTerm)
+import Infera.Arith (normArithArgs)
 import qualified Infera.Engine.Contracts as Contracts
 import Infera.Infer (builtinDet)
 import qualified Infera.Program as P
@@ -48,7 +48,7 @@ recursiveClauses program predicate call
       let base = 1 + maximum (-1 : termVarIds call)
        in case unifyPlain emptySubst call (renameTerm base (clauseHead clause)) of
             Nothing -> True -- This clause cannot contribute to this variant.
-            Just subst -> fst (canonicalize subst (normArithTerm subst (renameTerm base recursive))) == call
+            Just subst -> fst (canonicalize subst (normArithArgs (P.predEvalArgs predicate) subst (renameTerm base recursive))) == call
     safeContract p = null (P.predDecls p)
       && not (P.predIsUnsafe program p) && not (P.predIsDynamic program p)
     safeGoal _ (Atom name) | name `elem` ["true", "fail", "false"] = True

@@ -98,6 +98,48 @@ Acceptance:
 - every example and parity query keeps its answers;
 - the lint reports only the sites whose meaning still depends on evaluation.
 
+### 2026-11-15: Step 0 implemented
+
+Branch `step0-arith-as-data`. The rule lives in one place,
+`Infera.Program.evalArgPositions`: positions every declaration types `int`,
+`float` or `num`, or, with no declarations, positions inferred numeric. All
+engines use it:
+
+- the Core interpreter (`buildArgs`, `normalizeArgs`, the stream `opCall`
+  and `opExecute`, and dynamic facts);
+- the earlier machine (`Bridge.normalizeCallGraph`);
+- the reference resolver;
+- the tabling variant keys (`Delta`, `Machine.Table`, the reference).
+
+Bound references are still resolved in every argument; only arithmetic folding
+is restricted. The JIT already refused arithmetic functors in body arguments,
+so it is unchanged.
+
+Printed answers, `write`, `wr`, `term_str` and `fmt` no longer evaluate
+(`deepEval` is gone), so `X = 1 + 2` answers `X = 1 + 2`. Without this, a
+correct symbolic answer such as `plus 1 0` would still print as `1`.
+
+The `arith-functor-as-data` lint now fires only for a head pattern on an
+arithmetic functor in a numeric position.
+
+Results:
+- The full Haskell suite passes (524 checks), with a new
+  `engine arithmetic as data` group. So do `test/example_programs.py`,
+  `test/cli.py` and the 61 language-server tests.
+- Two examples changed output, and both were fixed to say what they meant:
+  - `facts.nprolog` built `R2 * N` with `=` and never evaluated it; it now uses
+    `is`.
+  - `mathexpr.nprolog`'s `subst` clauses overlapped and only looked
+    deterministic because the input used to be pre-evaluated. With exclusive
+    guards, its stray error branches are gone too.
+- On the repo's `bench_deriv` expressions, with sizes summed over 30,000
+  iterations on an Apple M4 (whole process, 3 runs):
+
+  | constructors | 2.5.0 | Step 0 |
+  | --- | --- | --- |
+  | `add`/`sub` | 377 / 11,310,000, 3.68–3.69 s | 377 / 11,310,000, 3.48–3.75 s |
+  | `plus`/`minus` | **373 / 11,190,000 (wrong)**, 25.2–26.1 s | **377 / 11,310,000**, 3.66–3.84 s |
+
 ## Step 1: the term toolkit (engine)
 
 | predicate | meaning |
