@@ -18,7 +18,12 @@ renderRules rules = "[" ++ intercalate ", "
   ["window " ++ unwords (map show [w, h, cap]) | Window w h cap <- rules] ++ "]"
 
 loadExample :: PropertyT IO Program
-loadExample = evalIO (readFile "examples/minesweeper.nprolog") >>= evalEither . loadProgramText
+loadExample = do
+  source <- evalIO (readFile "examples/minesweeper.nprolog")
+  items <- evalEither (parseFile source)
+  -- The shipped file includes an inline query for interactive use. Build and
+  -- check its declarations/clauses without executing that entry point.
+  evalEither (buildChecked [item | item <- items, case item of TLQuery _ -> False; _ -> True])
 
 solve :: Program -> String -> PropertyT IO QuerySummary
 solve prog text = do
