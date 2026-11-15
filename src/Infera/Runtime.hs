@@ -12,7 +12,7 @@ import Data.Data (Typeable)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
-import Data.List (intercalate)
+import Data.List (intercalate, nub)
 import Data.Unique (newUnique, hashUnique)
 import Foreign.C.Types
 import qualified Data.ByteString as BS
@@ -32,6 +32,8 @@ import Infera.Program
 import Infera.Module (loadRunnable)
 import Infera.Error
 import qualified Infera.Engine.Reference as R
+import qualified Infera.Core as Core
+import Infera.AttributeSupport (usesAttributes)
 import Infera.CLP
 import Infera.Unify
 import Infera.Effects
@@ -48,7 +50,10 @@ data Resource = Resource Object Bool
 data Runner = Runner { program :: Program, resources :: IORef (IM.IntMap Resource),
   serial :: Int, world :: IORef Int, nextHandle :: IORef Int,
   parseCaches :: IORef (IM.IntMap (IORef (IM.IntMap Char, Bool, Int))),
-  positions :: IORef (IM.IntMap Int), parseBudget :: IORef Int }
+  positions :: IORef (IM.IntMap Int), parseBudget :: IORef Int,
+  -- | No attributes and no dynamic predicates: pure goals can run on the
+  -- Core engine ('pureSearch') and no attribute hooks are ever pending.
+  coreEligible :: Bool }
 
 type State = R.SolverState
 
@@ -111,6 +116,63 @@ runEffectQuery p q
 newRunner :: Program -> IO Runner
 newRunner p = Runner p <$> newIORef (IM.fromList [(0,Resource (Stream H.stdin) False),(1,Resource (Stream H.stdout) False),(2,Resource (Stream H.stderr) False)])
   <*> (hashUnique <$> newUnique) <*> newIORef 0 <*> newIORef 3 <*> newIORef IM.empty <*> newIORef IM.empty <*> newIORef 0
+  <*> pure (not (usesAttributes p []) && null (dynamicNames p))
+
+-- | Solve pure goals from the runner's state. Programs without attributes or
+-- dynamic predicates run on the Core engine (and its JIT): the walked goals
+-- become a query over their free variables, and each answer's bindings are
+-- unified back into the runner's state, with the answer's own fresh
+-- variables renamed above 'R.ssFresh'. A state or answer carrying
+-- constraints, attributes or residual goals cannot cross that boundary, so
+-- those searches use the reference resolver from the same state; answers
+-- already delivered are skipped, since both produce answers in the same order.
+pureSearch :: Runner -> State -> [Term] -> R.Search
+pureSearch r s goals
+  | not (coreEligible r) || carriesStore s = reference
+  | otherwise = answers (0 :: Int) (Core.solveQueryOrFallback (program r) query)
+  where
+    reference = R.solveGoals (R.mkEnv (program r)) R.maxResolutionDepth s goals
+    walked = map (walkS s) goals
+    vars = nub (concatMap termVarIds walked)
+    n = length vars
+    index = IM.fromList (zip vars [0 ..])
+    query = Query (map (renameWith (\v -> Var (index IM.! v))) walked)
+      [("V" ++ show i, i) | i <- [0 .. n - 1]] n
+    base = R.ssFresh s
+    original = IM.fromList (zip [0 ..] vars)
+    back j = Var (IM.findWithDefault (base + j) j original)
+    answers _ [] = []
+    answers k (R.Found st : rest)
+      | carriesStore st = dropFound k reference
+      | otherwise = case restore st of
+          Just s' -> R.Found s' : answers (k + 1) rest
+          Nothing -> dropFound k reference
+    answers k (item : rest) = item : answers k rest
+    restore st =
+      let sub = stSubst (R.ssStore st)
+          values = [(Var v, renameWith back (deepWalk sub (Var i))) | (i, v) <- zip [0 ..] vars]
+          fresh = maximum (base : [v + 1 | (_, t) <- values, v <- termVarIds t])
+          step store (a, b) = store >>= \st' -> case storeUnify st' a b of
+            Right (Just st'') -> Just st''
+            _ -> Nothing
+       in (\store -> s {R.ssStore = store, R.ssFresh = fresh}) <$> foldl step (Just (R.ssStore s)) values
+    dropFound _ [] = []
+    dropFound 0 items = items
+    dropFound k (R.Found _ : rest) = dropFound (k - 1) rest
+    dropFound k (_ : rest) = dropFound k rest
+
+carriesStore :: State -> Bool
+carriesStore st =
+  let store = R.ssStore st
+   in not (IM.null (stDomains store)) || not (null (stConstraints store))
+        || not (null (R.ssResidualGoals st)) || not (Map.null (R.ssAttributes st))
+        || not (Map.null (R.ssDynamic st))
+
+renameWith :: (VarId -> Term) -> Term -> Term
+renameWith f t = case t of
+  Var v -> f v
+  Compound name xs -> Compound name (map (renameWith f) xs)
+  _ -> t
 
 cleanup :: Runner -> IO ()
 cleanup r = readIORef (resources r) >>= mapM_ (\(Resource o owned) -> when owned (ignore (closeObject o))) . IM.elems
@@ -140,7 +202,8 @@ requireBind g frames s a b = bind g frames s a b >>= maybe (fault g frames (User
 -- Any remaining alternatives at the effect boundary violate linearity.
 execGoals :: Runner -> [String] -> State -> [Term] -> IO (Maybe State)
 execGoals r frames state goals = do
-  ready<-selectPure frames (Atom "$attribute_boundary") (R.solveGoals (R.mkEnv(program r)) R.maxResolutionDepth state [])
+  ready<-if coreEligible r then pure (Just (state,False))
+    else selectPure frames (Atom "$attribute_boundary") (R.solveGoals (R.mkEnv(program r)) R.maxResolutionDepth state [])
   case ready of
     Nothing->pure Nothing
     Just(_,True)->fault (Atom "$attribute_boundary") frames (UserError "attribute hook left an effect choice point")
@@ -151,7 +214,7 @@ execReady _ _ s [] = pure (Just s)
 execReady r frames s goals = do
   let (prefix,rest) = span (not . effectful r s) goals
   if not (null prefix) then do
-    let answers = R.solveGoals (R.mkEnv (program r)) R.maxResolutionDepth s prefix
+    let answers = pureSearch r s prefix
     selected <- selectPure frames (head prefix) answers
     case selected of
       Nothing -> pure Nothing
@@ -204,7 +267,7 @@ execOne r frames s goal = case goal of
   Compound "," [a,b] -> execGoals r frames s [a,b]
   Compound ";" [Compound "->" [c,t],e] -> do
     when (effectful r s c) (fault c frames (UserError "effect in condition"))
-    found <- firstPure frames c (R.solveGoal (R.mkEnv (program r)) R.maxResolutionDepth s c)
+    found <- firstPure frames c (pureSearch r s [c])
     maybe (execGoals r frames s [e]) (\s' -> execGoals r frames s' [t]) found
   Compound "->" [c,t] -> execOne r frames s (Compound ";" [Compound "->" [c,t],Atom "fail"])
   Compound ";" [a,b] -> do
@@ -423,7 +486,7 @@ renderGrammar _ _ _ s (StrLit xs)=pure(xs,s)
 renderGrammar r g f s nt = do
   let v=R.ssFresh s; target=Var v
       goal=case nt of Atom n->Compound n [target,nil]; Compound n as->Compound n (as++[target,nil]); _->Compound "call" [nt,target,nil]
-  found<-firstPure f g (R.solveGoal (R.mkEnv(program r)) R.maxResolutionDepth s {R.ssFresh=v+1} goal)
+  found<-firstPure f g (pureSearch r s {R.ssFresh=v+1} [goal])
   case found of
     Nothing->fault g f (UserError "text grammar failed")
     Just s'->case unfoldCons(walkS s' target) of

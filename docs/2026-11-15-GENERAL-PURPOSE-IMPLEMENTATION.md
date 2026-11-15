@@ -186,3 +186,35 @@ platform-specific error mapping is induced by the tests. The JSON and Lisp
 examples are small language implementations, not a claim of full standards
 conformance. Full native attributed-variable tracing and common CLP/attribute
 residual plumbing remain future work.
+
+## 2026-11-16: pure goals of `infera run` on the Core engine
+
+The effect runner solved every pure prefix, if-then-else condition and text
+grammar with the reference resolver. Under `infera run`, nrev30 × 3000 took
+8.28 s against 0.03 s as an inline query, and the deriv loop 6.19 s against
+0.40 s. `Runtime.pureSearch` now turns the walked goals into a query over
+their free variables, solves it with `Core.solveQueryOrFallback` (and so the
+JIT), and unifies each answer's bindings back into the runner's state, with
+the answer's own fresh variables renamed above `ssFresh`.
+
+The reference resolver still runs a search when the program uses attributes
+or dynamic predicates, or when the state or an answer carries domains,
+constraints, attributes, residual goals or dynamic facts. An answer that
+cannot cross the boundary sends the whole search to the reference resolver,
+skipping the answers already delivered. In programs without attributes the
+per-goal attribute boundary is skipped.
+
+Measured on an Apple M4, whole process, warm: nrev30 × 30000 takes 0.17 s
+under `infera run` against 0.19 s inline, and the deriv loop × 3000 0.47 s
+against 0.40 s.
+
+`examples/lisp.nprolog` now declares `<- notable.`. Its symbol tokenizer is
+ambiguous, so `expr`, which is tabled automatically, has exponentially many
+parses. A tabled call collects them all before `once` takes the first, so
+`(plus 2 (times 3 4))` took 34 s on the Core and over 100 s on the earlier
+machine; the reference resolver had hidden this. Untabled, it takes 0.05 s.
+Automatic tabling of ambiguous grammars under `once` remains a trap worth a
+diagnostic.
+
+The Minesweeper properties load the example without its inline query, as the
+Breadboard properties do, so the Haskell suite passes with the shipped file.

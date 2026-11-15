@@ -1,4 +1,7 @@
 <- import "std/dcg".
+# Grammars over text have many parses (a symbol can split anywhere), so
+# tabling would collect them all before `once` takes the first.
+<- notable.
 # One S-expression per line. An intentionally small Scheme-like evaluator:
 # integers, +, *, quote and if. EOF exits the REPL normally.
 main : io.
