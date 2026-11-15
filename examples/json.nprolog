@@ -1,0 +1,29 @@
+<- import "std/dcg".
+# JSON values: null, true, false, num N, str S, array Vs, object Pairs.
+json V -> whites, value V, whites, eos.
+value null -> "null".
+value true -> "true".
+value false -> "false".
+value (num N) -> number N.
+value (str S) -> quoted S.
+value (array Xs) -> "[", whites, elements Xs, whites, "]".
+value (object Ps) -> "{", whites, members Ps, whites, "}".
+elements [] -> [].
+elements [X | Xs] -> value X, whites, more_elements Xs.
+more_elements [] -> [].
+more_elements [X | Xs] -> ",", whites, value X, whites, more_elements Xs.
+members [] -> [].
+members [pair K V | Ps] -> quoted K, whites, ":", whites, value V, whites, more_members Ps.
+more_members [] -> [].
+more_members [pair K V | Ps] -> ",", whites, quoted K, whites, ":", whites, value V, whites, more_members Ps.
+quoted S -> ({ nonvar S } -> { str_chars S Cs }, "\"", chars Cs, "\"" ; "\"", chars Cs, "\"", { str_chars S Cs }).
+chars [] -> [].
+chars [C | Cs] -> json_char C, chars Cs.
+json_char '"' -> "\\\"".
+json_char '\\' -> "\\\\".
+json_char '\n' -> "\\n".
+json_char '\r' -> "\\r".
+json_char '\t' -> "\\t".
+json_char C -> [C], { char_code C N, N >= 32, C != '"', C != '\\' }.
+> phrase (json (object [pair "answer" (num 42),pair "ok" true])) Text?
+> phrase (json V) "[1,true,\"x\"]"?

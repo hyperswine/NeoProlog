@@ -1,0 +1,20 @@
+# Count user-clause resolutions with an explicit budget. Exhausting the
+# budget is ordinary failure; there are no exceptions or mutable counters.
+<- notable.
+
+edge a b.
+edge b c.
+edge a d.
+path X Y <- edge X Y.
+path X Y <- edge X Z, path Z Y.
+
+cost true B B.
+cost (A, C) B0 B <- cost A B0 B1, cost C B1 B.
+cost G B0 B <- G != true, G != (_, _), B0 > 0,
+  clause G Body, B1 is B0 - 1, cost Body B1 B.
+
+measured G Budget Used <- cost G Budget Left, Used is Budget - Left.
+
+> findall Y (measured (path a Y) 2 _) Result?
+> findall N (measured (path a c) 10 N) Result?
+> findall Y (measured (path a Y) 1 _) Result?

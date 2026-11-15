@@ -28,6 +28,7 @@ import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Infera.Arith (arithOps, compareNumeric, evalNumeric)
+import Infera.Effects (effectKeys)
 import Infera.Program
 import Infera.Syntax
 
@@ -51,7 +52,7 @@ inferProgram prog0 =
               [ ArgSpec (display s) (mode i o)
               | (s, i, o) <- zip3 ss is os
               ]
-         in p {predInferred = Signature d args sw}
+         in p {predInferred = Signature (if FlagIo `elem` effectiveFlags prog1 p then Det else d) args sw}
       display SNone = SAny
       display (SList s) = SList (display s)
       display s = s
@@ -73,8 +74,12 @@ subGoals g = case g of
   Compound "once" [a] -> subGoals a
   Compound "forall" [a, b] -> subGoals a ++ subGoals b
   Compound "findall" [_, a, _] -> subGoals a
+  Compound f [_, a, _] | f `elem` ["bagof","setof","std_native_bagof","std_native_setof"] -> subGoals (strip a)
   Compound "minimize" [_, a] -> subGoals a
   _ -> [g]
+  where
+    strip (Compound "^" [_,a]) = strip a
+    strip a = a
 
 bodyGoals :: Clause -> [Term]
 bodyGoals = concatMap subGoals . clauseBody
@@ -372,7 +377,14 @@ exprSort ev t = case t of
 builtinSorts :: Map (String, Int) [Sort]
 builtinSorts =
   Map.fromList
-    [ (("str_concat", 3), [SStr, SStr, SStr]),
+    [ (("functor",3), [SAny,SAtom,SInt]),
+      (("arg",3), [SInt,SAny,SAny]),
+      (("univ",2), [SAny,SList SAny]),
+      (("copy_term",2), [SAny,SAny]),
+      (("term_variables",2), [SAny,SList SAny]),
+      (("compare",3), [SAtom,SAny,SAny]),
+      (("clause",2), [SAny,SAny]),
+      (("str_concat", 3), [SStr, SStr, SStr]),
       (("str_length", 2), [SStr, SInt]),
       (("str_chars", 2), [SStr, SList SChar]),
       (("str_atom", 2), [SStr, SAtom]),
@@ -684,6 +696,7 @@ inferGroundness prog ins = go (env0, env0)
 
 -- | Determinism of builtins (Nothing = not a builtin).
 builtinDet :: String -> Int -> Maybe Det
+builtinDet name arity | (name,arity) `elem` effectKeys = Just Det
 builtinDet name arity = case (name, arity) of
   ("true", 0) -> Just Det
   ("fail", 0) -> Just Semidet
@@ -739,6 +752,22 @@ builtinDet name arity = case (name, arity) of
   ("str_num", 2) -> Just Semidet
   ("str_upper", 2) -> Just Semidet
   ("str_lower", 2) -> Just Semidet
+  ("put_attr", 3) -> Just Semidet
+  ("get_attr", 3) -> Just Semidet
+  ("del_attr", 2) -> Just Semidet
+  ("copy_term_nat", 2) -> Just Semidet
+  ("std_native_msort", 2) -> Just Semidet
+  ("std_native_sort", 2) -> Just Semidet
+  ("std_native_sort_by", 4) -> Just Semidet
+  ("std_native_bagof", 3) -> Just Nondet
+  ("std_native_setof", 3) -> Just Nondet
+  ("functor", 3) -> Just Semidet
+  ("arg", 3) -> Just Nondet
+  ("univ", 2) -> Just Semidet
+  ("copy_term", 2) -> Just Semidet
+  ("term_variables", 2) -> Just Semidet
+  ("compare", 3) -> Just Semidet
+  ("clause", 2) -> Just Nondet
   ("term_str", 2) -> Just Semidet
   ("char_code", 2) -> Just Semidet
   ("str_lines", 2) -> Just Semidet

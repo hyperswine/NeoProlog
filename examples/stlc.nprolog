@@ -1,0 +1,11 @@
+# Type inference with let polymorphism, using native unification.
+infer Env (var Name) Type <- member (binding Name Scheme) Env, instantiate Scheme Type.
+infer _ (int _) int.
+infer Env (lam X Body) (arrow A B) <- infer [binding X (mono A) | Env] Body B.
+infer Env (app F X) B <- infer Env F (arrow A B), infer Env X A.
+infer Env (let X Value Body) Type <- infer Env Value A, infer [binding X (poly Env A) | Env] Body Type.
+instantiate (mono T) T.
+instantiate (poly Env T) Fresh <- copy_term (pair Env T) (pair Env Fresh).
+> infer [] (lam x (var x)) T?
+> infer [] (let id (lam x (var x)) (app (var id) (int 7))) T?
+> infer [] (app (int 1) (int 2)) T?

@@ -1,0 +1,4 @@
+events : nondet notable (any: <=>) (any: <=>) (any: <=>).
+<- import "std/dcg".
+events [] -> [].
+events [E | Es] -> wr E, nl, events Es.

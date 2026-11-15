@@ -1,0 +1,31 @@
+digits : nondet notable (any: <=>) (any: <=>).
+digit : nondet notable (any: <=>) (any: <=>).
+blank : nondet notable (any: <=>) (any: <=>).
+blanks : nondet notable (any: <=>) (any: <=>).
+whites : nondet notable (any: <=>) (any: <=>).
+std_dcg_whites : nondet notable (any: <=>) (any: <=>).
+string_without : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+integer : nondet notable (any: <=>) (any: <=>) (any: <=>).
+number : nondet notable (any: <=>) (any: <=>) (any: <=>).
+eos : nondet notable (any: <=>) (any: <=>).
+rest : nondet notable (any: <=>) (any: <=>) (any: <=>).
+note : nondet notable (any: <=>) (any: <=>) (any: <=>).
+with_events : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+<- import "std/list".
+digits -> digit, digits.
+digits -> [].
+digit -> [C], { char_code C N, N >= 48, N <= 57 }.
+blank -> [C], { (C = ' ' ; C = '\t') }.
+blanks -> blank, blanks.
+blanks -> [].
+whites A B <- (var A -> A = B ; std_dcg_whites A B).
+std_dcg_whites -> [C], { char_code C N, (N = 32 ; N >= 9, N <= 13) }, std_dcg_whites.
+std_dcg_whites -> [].
+string_without Stop [C | Cs] -> [C], { not (memberchk C Stop) }, string_without Stop Cs.
+string_without _ [] -> [].
+integer N -> ({ nonvar N } -> { is_int N, str_num S N, str_chars S Cs }, seq Cs ; seq Cs, { Cs != [], str_chars S Cs, str_num S N, is_int N }).
+number N -> ({ nonvar N } -> { str_num S N, str_chars S Cs }, seq Cs ; seq Cs, { Cs != [], str_chars S Cs, str_num S N }).
+eos [] [].
+rest Xs Xs [].
+note Event [Event | Es] Es.
+with_events Grammar E0 E S0 S <- call Grammar E0 E S0 S.

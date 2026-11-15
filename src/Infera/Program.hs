@@ -307,7 +307,7 @@ nameHasFlag prog name flag =
 -- | Unsafe predicates may perform effects (output, file reads, cut,
 -- assert/retract) and call other unsafe predicates.
 predIsUnsafe :: Program -> Pred -> Bool
-predIsUnsafe prog p = FlagUnsafe `elem` effectiveFlags prog p
+predIsUnsafe prog p = any (`elem` effectiveFlags prog p) [FlagUnsafe,FlagIo]
 
 -- | Dynamic predicates have no static clauses; their facts live in the
 -- solver state and are changed with assert/retract.

@@ -42,6 +42,7 @@ import qualified Infera.Compile.Cache as CodeCache
 import Infera.Arith (arithOps, evalIntExpr, normArithArgs)
 import Infera.CLP (Store (..))
 import qualified Infera.CLP as CLP
+import Infera.AttributeSupport (usesAttributes)
 import Infera.Engine.Reference (Env (..), OutputEvent (..), Search, SearchItem (..), SolverState (..))
 import qualified Infera.Engine.Reference as Reference
 import qualified Infera.Engine.Contracts as Contracts
@@ -341,9 +342,11 @@ solveQuery :: Program -> Query -> Search
 solveQuery = solveQueryWithBackend Interpreted
 
 solveQueryWithBackend :: ExecutionBackend -> Program -> Query -> Search
+solveQueryWithBackend _ program query | usesAttributes program (queryGoals query) = Reference.solveQuery program query
 solveQueryWithBackend backend program query = unfold (startWithBackend backend program query)
 
 solveGoals :: Env -> Int -> SolverState -> [Term] -> Search
+solveGoals environment fuel state goals | usesAttributes (envProg environment) goals || not (Map.null (ssAttributes state)) = Reference.solveGoals environment fuel state goals
 solveGoals environment fuel state goals = unfold (startGoals environment fuel state goals)
 
 unfold :: Either Heap.HeapError Checkpoint -> Search

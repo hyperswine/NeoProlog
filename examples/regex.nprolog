@@ -1,0 +1,8 @@
+# Regex syntax: char C, cat A B, alt A B, star A, empty.
+match empty -> [].
+match (char C) -> [C].
+match (cat A B) -> match A, match B.
+match (alt A B) -> (match A ; match B).
+match (star A) S0 S <- (S0 = S ; match A S0 S1, not (S0 == S1), match (star A) S1 S).
+> phrase (match (cat (star (char 'a')) (char 'b'))) "aaab"?
+> phrase (match (star empty)) ""?

@@ -35,10 +35,13 @@ isImpureBuiltin k = k `elem` impureBuiltinKeys
 unsafeGoals :: Program -> [Term] -> [Term]
 unsafeGoals prog = concatMap goal
   where
+    strip (Compound "^" [_,g]) = strip g
+    strip t = t
     goal t = case t of
       Compound f [a, b] | f `elem` [",", ";", "->", "forall"] -> goal a ++ goal b
       Compound f [g] | f `elem` ["not", "once"] -> goal g
       Compound "findall" [_, g, _] -> goal g
+      Compound f [_, g, _] | f `elem` ["bagof","setof","std_native_bagof","std_native_setof"] -> goal (strip g)
       Compound "minimize" [_, g] -> goal g
       Compound "call" (callee : extra) -> case callee of
         Atom f -> goal (Compound f extra)

@@ -9,6 +9,7 @@ module Infera.Module
     processTopLevels,
     loadSource,
     loadFile,
+    loadRunnable,
     loadLocatedFile,
     loadLocatedWithSources,
     buildChecked,
@@ -26,6 +27,8 @@ import Data.List (nub)
 import qualified Data.IntMap.Strict as IM
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Infera.Effects (effectViolations)
+import Infera.Standard (expandStandard, standardModule, standardItems)
 import Infera.Infer (inferProgram)
 import Infera.Machine.Trace.Types (sourceMap)
 import Infera.Purity (describeViolation, programViolations)
@@ -151,16 +154,23 @@ expandImports conf visited = foldM step (Right ([], []))
 
 -- | Resolve imports and directives in a parsed file.
 processTopLevels :: ModuleConf -> [TopLevel] -> IO (Either String ([TopLevel], [Query]))
-processTopLevels conf = expandImports conf []
+processTopLevels conf items = do
+  expanded <- expandImports conf [] [i | i <- items, case i of TLDirective [Atom "noprelude"] -> False; TLDirective [Compound "import" [StrLit n]] -> take 4 n /= "std/"; _ -> True]
+  pure $ do
+    (own,qs) <- expanded
+    lib <- standardItems (own ++ [i | i <- items, case i of TLDirective [Atom "noprelude"] -> True; TLDirective [Compound "import" [StrLit n]] -> take 4 n == "std/"; _ -> False])
+    pure (lib,qs)
 
 -- | Build and analyse a program, refusing it when a predicate performs
 -- effects without an @unsafe@ declaration.
 buildChecked :: [TopLevel] -> Either String Program
 buildChecked items =
   let prog = inferProgram (buildProgram items)
-   in case programViolations prog of
-        [] -> Right prog
-        ((key, g) : _) -> Left ("unsafe-call: " ++ describeViolation prog key g)
+   in case effectViolations prog of
+        (key,msg):_ -> Left ("io-error: " ++ show key ++ ": " ++ msg)
+        [] -> case programViolations prog of
+          [] -> Right prog
+          ((key, g) : _) -> Left ("unsafe-call: " ++ describeViolation prog key g)
 
 -- | Literal file paths named by read_file / phrase_from_file goals.
 fileGoals :: [Term] -> [String]
@@ -196,13 +206,15 @@ loadSource conf src = case parseLocatedFile "<source>" src of
     case expanded of
       Left err -> pure (Left (show (err :: CE.IOException)))
       Right (Left (_, err)) -> pure (Left err)
-      Right (Right located) -> case buildChecked (map locatedItem located) of
+      Right (Right raw) -> case expandStandard raw of
         Left err -> pure (Left err)
-        Right prog -> do
-          let queries = [query | item <- located, TLQuery query <- [locatedItem item]]
-              sourced = prog {progSources = sourceMap located}
-          loaded <- preloadFiles sourced (programGoals sourced ++ concatMap queryGoals queries)
-          pure (Right (loaded, queries))
+        Right located -> case buildChecked (map locatedItem located) of
+          Left err -> pure (Left err)
+          Right prog -> do
+            let queries = [query | item <- located, TLQuery query <- [locatedItem item]]
+                sourced = prog {progSources = sourceMap located}
+            loaded <- preloadFiles sourced (programGoals sourced ++ concatMap queryGoals queries)
+            pure (Right (loaded, queries))
   where
     readItems visited file = do
       result <- CE.try (readFile file >>= \text -> length text `seq` pure text)
@@ -211,6 +223,16 @@ loadSource conf src = case parseLocatedFile "<source>" src of
         Right text -> case parseLocatedFile file text of
           Left err -> pure (Left err)
           Right located -> expandLocatedItems readItems conf visited located
+
+-- Run mode loads code and source maps without reading any legacy literal
+-- paths or inline-query inputs ahead of execution.
+loadRunnable :: FilePath -> IO (Either String Program)
+loadRunnable path = do
+  loaded<-loadLocatedFile path
+  pure $ do
+    items<-either (Left . snd) Right loaded
+    p<-buildChecked(map locatedItem items)
+    pure p{progSources=sourceMap items}
 
 loadFile :: FilePath -> IO (Either String (Program, [Query]))
 loadFile path = do
@@ -244,7 +266,7 @@ loadLocatedWithSources sources path = do
     expand overrides conf [] absolute
   pure $ case result of
     Left ex -> Left (SourceSpan path 1 1 1 2, show (ex :: CE.IOException))
-    Right value -> value
+    Right value -> value >>= \items -> either (Left . (,) (SourceSpan path 1 1 1 2)) Right (expandStandard items)
   where
     expand overrides conf visited file = do
       input <- case Map.lookup file overrides of
@@ -267,6 +289,11 @@ expandLocatedItems readItems conf visited items0 = fmap reverse <$> foldM step (
     -- quadratic in the number of clauses.
     step (Left err) _ = pure (Left err)
     step (Right acc) item = case locatedItem item of
+      TLDirective [Compound "import" [StrLit ref]] | take 4 ref == "std/" ->
+        pure $ case standardModule ref of
+          Left err -> Left (locatedSpan item,err)
+          Right _ -> Right (item:acc)
+      TLDirective [Atom "noprelude"] -> pure (Right (item:acc))
       TLDirective [Compound "import" [StrLit ref]] ->
         case parseModRef ref of
           Nothing -> pure (Left (locatedSpan item, "Invalid module reference: " ++ ref))

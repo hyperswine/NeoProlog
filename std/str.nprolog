@@ -1,0 +1,24 @@
+split : nondet notable (any: <=>) (any: <=>) (any: <=>).
+std_str_split : nondet notable (any: <=>) (any: <=>) (any: <=>).
+std_str_piece : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+join : nondet notable (any: <=>) (any: <=>) (any: <=>).
+std_str_join : nondet notable (any: <=>) (any: <=>) (any: <=>).
+trim : nondet notable (any: <=>) (any: <=>).
+std_str_ltrim : nondet notable (any: <=>) (any: <=>).
+sub_str : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+str_code_list : nondet notable (any: <=>) (any: <=>).
+<- import "std/list".
+split Text Sep Parts <- str_chars Text Cs, str_chars Sep Ds, Ds != [], std_str_split Cs Ds Chunks, maplist str_chars Parts Chunks.
+std_str_split Cs Ds [Part | Rest] <- std_str_piece Cs Ds Part Tail Hit, (Hit = yes -> std_str_split Tail Ds Rest ; Rest = []).
+std_str_piece [] _ [] [] no.
+std_str_piece [C | Cs] Ds Part Tail Hit <- (append Ds R [C | Cs] -> Part = [], Tail = R, Hit = yes ; Part = [C | Ps], std_str_piece Cs Ds Ps Tail Hit).
+join Parts Sep Text <- maplist str_chars Parts Chunks, str_chars Sep Ds, std_str_join Chunks Ds Cs, str_chars Text Cs.
+std_str_join [] _ [].
+std_str_join [Xs] _ Xs.
+std_str_join [Xs,Ys | Rest] Ds Cs <- append Xs Ds A, append A Tail Cs, std_str_join [Ys | Rest] Ds Tail.
+trim Text Out <- str_chars Text Cs, std_str_ltrim Cs L, reverse L R, std_str_ltrim R T, reverse T O, str_chars Out O.
+std_str_ltrim [] [].
+std_str_ltrim [C | Cs] R <- char_code C N, (N = 32 ; N >= 9, N <= 13) -> std_str_ltrim Cs R.
+std_str_ltrim [C | Cs] [C | Cs] <- char_code C N, not ((N = 32 ; N >= 9, N <= 13)).
+sub_str Text Before Length After Sub <- str_chars Text Cs, append A Rest Cs, append Middle Z Rest, length A Before, length Middle Length, length Z After, str_chars Sub Middle.
+str_code_list Text Codes <- str_chars Text Cs, maplist char_code Cs Codes.

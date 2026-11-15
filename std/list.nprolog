@@ -1,0 +1,100 @@
+member : nondet notable (any: <=>) (any: <=>).
+memberchk : nondet notable (any: <=>) (any: <=>).
+append : nondet notable (any: <=>) (any: <=>) (any: <=>).
+length : nondet notable (any: <=>) (any: <=>).
+std_list_len_to : nondet notable (any: <=>) (any: <=>).
+std_list_len_from : nondet notable (any: <=>) (any: <=>).
+nth0 : nondet notable (any: <=>) (any: <=>) (any: <=>).
+nth1 : nondet notable (any: <=>) (any: <=>) (any: <=>).
+last : nondet notable (any: <=>) (any: <=>).
+reverse : nondet notable (any: <=>) (any: <=>).
+std_list_rev : nondet notable (any: <=>) (any: <=>) (any: <=>).
+select : nondet notable (any: <=>) (any: <=>) (any: <=>).
+permutation : nondet notable (any: <=>) (any: <=>).
+sum_list : nondet notable (any: <=>) (any: <=>).
+std_list_sum : nondet notable (any: <=>) (any: <=>) (any: <=>).
+max_list : nondet notable (any: <=>) (any: <=>).
+std_list_max : nondet notable (any: <=>) (any: <=>) (any: <=>).
+min_list : nondet notable (any: <=>) (any: <=>).
+std_list_min : nondet notable (any: <=>) (any: <=>) (any: <=>).
+between : nondet notable (any: <=>) (any: <=>) (any: <=>).
+numlist : nondet notable (any: <=>) (any: <=>) (any: <=>).
+take : nondet notable (any: <=>) (any: <=>) (any: <=>).
+std_list_take : nondet notable (any: <=>) (any: <=>) (any: <=>).
+drop : nondet notable (any: <=>) (any: <=>) (any: <=>).
+std_list_drop : nondet notable (any: <=>) (any: <=>) (any: <=>).
+zip : nondet notable (any: <=>) (any: <=>) (any: <=>).
+maplist : nondet notable (any: <=>) (any: <=>).
+maplist : nondet notable (any: <=>) (any: <=>) (any: <=>).
+maplist : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+maplist : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+foldl : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+foldl : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+foldl : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+include : nondet notable (any: <=>) (any: <=>) (any: <=>).
+exclude : nondet notable (any: <=>) (any: <=>) (any: <=>).
+partition : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+# Standard lists. The loader supplies conservative relational declarations.
+member X [X | _].
+member X [_ | T] <- member X T.
+memberchk X L <- once (member X L).
+append [] L L.
+append [X | Xs] Y [X | Zs] <- append Xs Y Zs.
+length Xs N <- (nonvar N -> N >= 0, std_list_len_to N Xs ; std_list_len_from Xs N).
+std_list_len_to 0 [].
+std_list_len_to N [_ | Xs] <- N > 0, M is N - 1, std_list_len_to M Xs.
+std_list_len_from [] 0.
+std_list_len_from [_ | Xs] N <- std_list_len_from Xs M, N is M + 1.
+nth0 0 [X | _] X.
+nth0 N [_ | Xs] X <- (var N -> nth0 M Xs X, N is M + 1 ; N > 0, M is N - 1, nth0 M Xs X).
+nth1 N Xs X <- (var N -> nth0 M Xs X, N is M + 1 ; N > 0, M is N - 1, nth0 M Xs X).
+last [X] X.
+last [_ , Y | Xs] X <- last [Y | Xs] X.
+reverse Xs Ys <- std_list_rev Xs [] Ys.
+std_list_rev [] A A.
+std_list_rev [X | Xs] A R <- std_list_rev Xs [X | A] R.
+select X [X | Xs] Xs.
+select X [Y | Xs] [Y | Ys] <- select X Xs Ys.
+permutation [] [].
+permutation Xs [Y | Ys] <- select Y Xs Rest, permutation Rest Ys.
+sum_list Xs S <- std_list_sum Xs 0 S.
+std_list_sum [] S S.
+std_list_sum [X | Xs] A S <- B is A + X, std_list_sum Xs B S.
+max_list [X | Xs] M <- std_list_max Xs X M.
+std_list_max [] M M.
+std_list_max [X | Xs] A M <- (X > A -> B = X ; B = A), std_list_max Xs B M.
+min_list [X | Xs] M <- std_list_min Xs X M.
+std_list_min [] M M.
+std_list_min [X | Xs] A M <- (X < A -> B = X ; B = A), std_list_min Xs B M.
+between Lo Hi Lo <- Lo <= Hi.
+between Lo Hi X <- Lo < Hi, Next is Lo + 1, between Next Hi X.
+numlist Lo Hi [] <- Lo > Hi.
+numlist Lo Hi [Lo | Xs] <- Lo <= Hi, Next is Lo + 1, numlist Next Hi Xs.
+take Xs N Ys <- (N <= 0 -> Ys = [] ; std_list_take Xs N Ys).
+std_list_take [] _ [].
+std_list_take [X | Xs] N [X | Ys] <- M is N - 1, take Xs M Ys.
+drop Xs N Ys <- (N <= 0 -> Ys = Xs ; std_list_drop Xs N Ys).
+std_list_drop [] _ [].
+std_list_drop [_ | Xs] N Ys <- M is N - 1, drop Xs M Ys.
+zip [] [] [].
+zip [X | Xs] [Y | Ys] [pair X Y | Zs] <- zip Xs Ys Zs.
+maplist _ [].
+maplist F [X | Xs] <- call F X, maplist F Xs.
+maplist _ [] [].
+maplist F [X | Xs] [Y | Ys] <- call F X Y, maplist F Xs Ys.
+maplist _ [] [] [].
+maplist F [X | Xs] [Y | Ys] [Z | Zs] <- call F X Y Z, maplist F Xs Ys Zs.
+maplist _ [] [] [] [].
+maplist F [X | Xs] [Y | Ys] [Z | Zs] [W | Ws] <- call F X Y Z W, maplist F Xs Ys Zs Ws.
+foldl _ [] A A.
+foldl F [X | Xs] A R <- call F X A B, foldl F Xs B R.
+foldl _ [] [] A A.
+foldl F [X | Xs] [Y | Ys] A R <- call F X Y A B, foldl F Xs Ys B R.
+foldl _ [] [] [] A A.
+foldl F [X | Xs] [Y | Ys] [Z | Zs] A R <- call F X Y Z A B, foldl F Xs Ys Zs B R.
+include _ [] [].
+include F [X | Xs] Ys <- (call F X -> Ys = [X | Zs] ; Ys = Zs), include F Xs Zs.
+exclude _ [] [].
+exclude F [X | Xs] Ys <- (call F X -> Ys = Zs ; Ys = [X | Zs]), exclude F Xs Zs.
+partition _ [] [] [].
+partition F [X | Xs] Yes No <- (call F X -> Yes = [X | Ys], No = Ns ; Yes = Ys, No = [X | Ns]), partition F Xs Ys Ns.

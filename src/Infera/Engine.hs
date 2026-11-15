@@ -30,6 +30,8 @@ module Infera.Engine
   )
 where
 
+import Infera.AttributeSupport (usesAttributes)
+import qualified Infera.Engine.Reference as Reference
 import Infera.Engine.Reference hiding (solveGoal, solveGoals, solveQuery, solveAll, runInfera)
 import qualified Infera.Core as Core
 import qualified Infera.Machine.Control as Machine
@@ -38,10 +40,12 @@ import Infera.Syntax (Query, Term, parseQuery)
 import Infera.Error (showSolveError)
 
 solveGoal :: Env -> Int -> SolverState -> Term -> Search
-solveGoal environment fuel state goal = Machine.solveGoals environment fuel state [goal]
+solveGoal environment fuel state goal = solveGoals environment fuel state [goal]
 
 solveGoals :: Env -> Int -> SolverState -> [Term] -> Search
-solveGoals = Machine.solveGoals
+solveGoals env fuel st goals
+  | usesAttributes (envProg env) goals = Reference.solveGoals env fuel st goals
+  | otherwise = Machine.solveGoals env fuel st goals
 
 -- | Queries run on the core; a construct the core cannot execute continues
 -- on the machine from the same point in the stream.

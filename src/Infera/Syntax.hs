@@ -226,7 +226,7 @@ data ArgSpec = ArgSpec
   }
   deriving (Show, Eq, Ord)
 
-data Flag = FlagTable | FlagNoTable | FlagIndex | FlagNoIndex | FlagUnsafe | FlagDynamic
+data Flag = FlagTable | FlagNoTable | FlagIndex | FlagNoIndex | FlagUnsafe | FlagDynamic | FlagIo
   deriving (Show, Eq, Ord)
 
 -- | A predicate declaration: @name : det flags (sort: mode) ...@
@@ -271,6 +271,7 @@ showFlag FlagIndex = "index"
 showFlag FlagNoIndex = "noindex"
 showFlag FlagUnsafe = "unsafe"
 showFlag FlagDynamic = "dynamic"
+showFlag FlagIo = "io"
 
 showDecl :: Decl -> String
 showDecl (Decl n d fs as) =
@@ -680,6 +681,13 @@ desugarDCG n0 hd body = (hd', flattenConj bodyT, nEnd)
         let (a', s1, n1) = translate a sIn n
             (b', s2, n2) = translate b s1 n1
          in (Compound "," [a', b'], s2, n2)
+      Compound ";" [Compound "->" [c,t], e] ->
+        let (c', sc, n1) = translate c sIn n
+            (t', st, n2) = translate t sc n1
+            (e', se, n3) = translate e sIn n2
+            s = Var n3
+            finish x sx = Compound "," [x, Compound "unify" [sx,s]]
+         in (Compound ";" [Compound "->" [c',finish t' st],finish e' se],s,n3+1)
       Compound ";" [a, b] ->
         let (a', sa, n1) = translate a sIn n
             (b', sb, n2) = translate b sIn n1
@@ -708,7 +716,9 @@ desugarDCG n0 hd body = (hd', flattenConj bodyT, nEnd)
 
 pDecl :: Parser Decl
 pDecl = do
-  name <- pPlainIdent
+  -- A second colon distinguishes a qualified declaration from compact
+  -- syntax such as p:det, which remains a declaration of p.
+  name <- try (do qualified <- pAtomIdent; lookAhead (char ':'); pure qualified) <|> pPlainIdent
   void $ lexeme (char ':' <* notFollowedBy (oneOf ":-="))
   items <- many pDeclItem
   symbol "."
@@ -741,6 +751,7 @@ pDeclItem =
       DIFlag FlagNoIndex <$ keyword "noindex",
       DIFlag FlagUnsafe <$ keyword "unsafe",
       DIFlag FlagDynamic <$ keyword "dynamic",
+      DIFlag FlagIo <$ keyword "io",
       DIArg <$> pArgSpec
     ]
 

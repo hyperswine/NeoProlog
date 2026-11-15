@@ -1,0 +1,17 @@
+# Count newlines, whitespace-delimited words and Unicode characters.
+main : io.
+main [] -> wc_handle stdin 0 0 0 no L W C, say (fmt "~d ~d ~d\n" [L,W,C]).
+main [Path] -> open (file Path) read Result,
+  ({ Result = ok H } -> wc_handle H 0 0 0 no L W C, close H, say (fmt "~d ~d ~d\n" [L,W,C])
+  ; say_to stderr (fmt "cannot open ~s: ~w\n" [Path,Result]), halt 1).
+wc_handle : io.
+wc_handle H L0 W0 C0 In L W C -> read_chars H 4096 Result,
+  ({ Result = eof } -> { L=L0, W=W0, C=C0 }
+  ; { Result = ok Text } -> { str_chars Text Cs, wc_chars Cs L0 W0 C0 In L1 W1 C1 Next }, wc_handle H L1 W1 C1 Next L W C
+  ; say_to stderr (fmt "read error: ~w\n" [Result]), halt 1).
+wc_chars [] L W C In L W C In.
+wc_chars [Ch | Cs] L0 W0 C0 In L W C Out <- char_code Ch N,
+  (N = 10 -> L1 is L0 + 1 ; L1 = L0), C1 is C0 + 1,
+  ((N = 32 ; N >= 9, N <= 13) -> Next = no, W1 = W0
+  ; Next = yes, (In = no -> W1 is W0 + 1 ; W1 = W0)),
+  wc_chars Cs L1 W1 C1 Next L W C Out.

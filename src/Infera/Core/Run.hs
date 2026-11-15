@@ -1371,7 +1371,12 @@ delegateReference m goal cont = do
   let s = mStore m
   store <- constraintSnapshot m
   fresh <- freshId s
-  let state = (initialState fresh) {ssStore = store}
+  dynamicTerms <- case goal of
+    Compound "clause" _ -> do
+      dynamic <- readIORef (mDynamic m)
+      Map.traverseWithKey (\key -> mapM (dynFactToTerm m key) . toList) dynamic
+    _ -> pure Map.empty
+  let state = (initialState fresh) {ssStore = store, ssDynamic = dynamicTerms}
       items = Reference.solveGoal (mEnv m) maxResolutionDepth state goal
   when traceOn $ do
     cells' <- readIORef (mVarCells m)
@@ -1488,7 +1493,10 @@ leafItems m items previous cont = case items of
         current <- freshId s
         setFreshId s (max current (ssFresh state))
         ok <- installStore m previous (ssStore state)
-        if ok then run m cont else backtrack m
+        if ok then do
+          mapM_ (emitOutput m) (reverse (ssOutput state))
+          run m cont
+        else backtrack m
       BranchError err -> raiseItems m [BranchError err] (backtrack m)
       BranchExhausted -> raiseItems m [BranchExhausted] (backtrack m)
       _ -> backtrack m
@@ -2855,7 +2863,11 @@ backtrackChoice m top =
       cs <- readIORef (mChoices m)
       let at = index * markStride
       unsafeRead (csMarks cs) (at + markTR) >>= unwindTrail s
-      unsafeRead (csMarks cs) (at + markH) >>= setHeapTop s
+      restoredHeap <- unsafeRead (csMarks cs) (at + markH)
+      setHeapTop s restoredHeap
+      -- Exported logical IDs must never retain addresses in the discarded
+      -- suffix. Reflective builtins allocate fresh variables on each retry.
+      modifyIORef' (mVarCells m) (IM.filter (< restoredHeap))
       unsafeRead (csMarks cs) (at + markOut) >>= truncateOutput m
       unsafeRead (csMarks cs) (at + markScopes) >>= truncateScopes m
       unsafeRead (csTables cs) index >>= writeIORef (mTables m)

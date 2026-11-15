@@ -262,7 +262,7 @@ prop_generic_control_and_meta_fallback = unit $ do
 
 prop_stdlib_first_order_execution :: Property
 prop_stdlib_first_order_execution = unit $ do
-  source <- evalIO (readFile "examples/stdlib.nprolog")
+  source <- evalIO (readFile "test/fixtures/legacy-stdlib.nprolog")
   let definitions = unlines [line | line <- lines source, case dropWhile isSpace line of
         '>' : _ -> False
         _ -> True]

@@ -1,0 +1,11 @@
+<- import "std/assoc".
+
+# Semi-naive transitive closure: extend only the newest delta each round.
+closure Edges Paths <- list_to_assoc [] Empty, add_edges Edges Empty Table Delta, saturate Edges Delta Table Final, assoc_to_keys Final Paths.
+add_edges [] A A [].
+add_edges [pair X Y | Es] A R D <- (get_assoc (pair X Y) A _ -> add_edges Es A R D ; put_assoc (pair X Y) A yes B, D = [pair X Y | Ds], add_edges Es B R Ds).
+saturate _ [] A A.
+saturate Edges Delta A Final <- Delta != [],
+  findall (pair X Z) (member (pair X Y) Delta, member (pair Y Z) Edges) Candidates,
+  add_edges Candidates A B Next, saturate Edges Next B Final.
+> closure [pair a b,pair b c,pair c a] Result?

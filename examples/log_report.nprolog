@@ -1,0 +1,7 @@
+<- import "std/io".
+# note is a pure writer grammar. Only main prints the resulting event list.
+main : io.
+main _ -> { phrase (analyse [1,2,3] Sum) Events }, say (fmt "sum: ~d\n" [Sum]), say_to stderr (events Events).
+analyse [] 0 -> [].
+analyse [X | Xs] Sum -> note (visiting X), analyse Xs Rest, { Sum is X + Rest }.
+> phrase (analyse [1,2,3] Sum) Events?

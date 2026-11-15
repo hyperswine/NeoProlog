@@ -115,11 +115,11 @@ test('builtins, CLP goals and queries retain editor symbols', () => {
   assert.equal(a.queryPositions.size, 1)
 })
 
-test('the shipped examples retain predicate symbols', () => {
+test('the shipped examples retain definitions or standard imports', () => {
   const dir = path.join(__dirname, '..', '..', 'examples')
   for (const f of fs.readdirSync(dir).filter(n => n.endsWith('.nprolog'))) {
     const a = analyzeDocument(fs.readFileSync(path.join(dir, f), 'utf8'))
-    assert.ok(a.predicateDefs.size > 0, f)
+    assert.ok(a.predicateDefs.size > 0 || a.imports.some(i => i.modId.startsWith('std/')), f)
     assert.ok(!Object.hasOwn(a, 'diagnostics'))
   }
 })

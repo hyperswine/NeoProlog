@@ -1,0 +1,24 @@
+<- import "std/dcg".
+# A ground Horn-clause subset, with scoped cut. Terms are lower-case atoms;
+# bodies are comma-separated calls or !. This interpreter owns its clause
+# list and never uses the engine's cut or global database.
+program Rules -> blanks, rules Rules.
+rules [rule H B | Rs] -> atom_text H, blanks, rule_tail B, blanks, rules Rs.
+rules [] -> eos.
+rule_tail [] -> ".".
+rule_tail Body -> ":-", blanks, body_text Body, ".".
+body_text [G | Gs] -> goal_text G, blanks, more_goals Gs.
+more_goals [G | Gs] -> ",", blanks, goal_text G, blanks, more_goals Gs.
+more_goals [] -> [].
+goal_text cut -> "!".
+goal_text (call G) -> atom_text G.
+atom_text Name -> seq Cs, { Cs != [], maplist lower Cs, str_chars S Cs, str_atom S Name }.
+lower C <- char_code C N, N >= 97, N <= 122.
+interpret Rules Goal <- candidates Rules Goal Bodies, run_candidates Rules Bodies.
+candidates [] _ [].
+candidates [rule H B | Rs] G Bodies <- (H == G -> Bodies=[B | Rest] ; Bodies=Rest), candidates Rs G Rest.
+run_candidates Rules [B | Bs] <- run_body Rules B Status, (Status = success -> true ; Status = cut_success -> true ; Status = failure -> run_candidates Rules Bs ; Status = cut_failure -> fail).
+run_body _ [] success.
+run_body Rules [cut | Rest] Status <- run_body Rules Rest S, (S = failure -> Status = cut_failure ; S = cut_failure -> Status=cut_failure ; Status=cut_success).
+run_body Rules [call G | Rest] Status <- (interpret Rules G -> run_body Rules Rest Status ; Status=failure).
+> phrase (program Rules) "a. b :- a, !. b :- missing.", interpret Rules b?

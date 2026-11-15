@@ -1,0 +1,43 @@
+empty_assoc : nondet notable (any: <=>).
+get_assoc : nondet notable (any: <=>) (any: <=>) (any: <=>).
+put_assoc : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+std_assoc_height : nondet notable (any: <=>) (any: <=>).
+std_assoc_node : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+std_assoc_balance : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+list_to_assoc : nondet notable (any: <=>) (any: <=>).
+std_assoc_from : nondet notable (any: <=>) (any: <=>) (any: <=>).
+assoc_to_list : nondet notable (any: <=>) (any: <=>).
+std_assoc_list : nondet notable (any: <=>) (any: <=>) (any: <=>).
+assoc_to_keys : nondet notable (any: <=>) (any: <=>).
+std_assoc_keys : nondet notable (any: <=>) (any: <=>).
+assoc_to_values : nondet notable (any: <=>) (any: <=>).
+std_assoc_values : nondet notable (any: <=>) (any: <=>).
+<- import "std/list".
+empty_assoc empty.
+get_assoc K (node L V _ A B) X <- compare O K L, (O = eq -> X = V ; O = lt -> get_assoc K A X ; get_assoc K B X).
+put_assoc K empty V (node K V 1 empty empty).
+put_assoc K (node L W _ A B) V R <- compare O K L,
+  (O = eq -> std_assoc_node L V A B R ; O = lt -> put_assoc K A V C, std_assoc_balance L W C B R ; put_assoc K B V C, std_assoc_balance L W A C R).
+std_assoc_height empty 0.
+std_assoc_height (node _ _ H _ _) H.
+std_assoc_node K V A B (node K V H A B) <- std_assoc_height A AH, std_assoc_height B BH, (AH >= BH -> H is AH + 1 ; H is BH + 1).
+std_assoc_balance K V A B R <- std_assoc_height A AH, std_assoc_height B BH, D is AH - BH,
+  (D > 1 -> A = (node AK AV _ AL AR), std_assoc_height AL LH, std_assoc_height AR RH,
+    (LH >= RH -> std_assoc_node K V AR B RB, std_assoc_node AK AV AL RB R
+    ; AR = (node MK MV _ ML MR), std_assoc_node AK AV AL ML LA, std_assoc_node K V MR B RB, std_assoc_node MK MV LA RB R)
+  ; D < (0 - 1) -> B = (node BK BV _ BL BR), std_assoc_height BL LH, std_assoc_height BR RH,
+    (RH >= LH -> std_assoc_node K V A BL LA, std_assoc_node BK BV LA BR R
+    ; BL = (node MK MV _ ML MR), std_assoc_node K V A ML LA, std_assoc_node BK BV MR BR RB, std_assoc_node MK MV LA RB R)
+  ; std_assoc_node K V A B R).
+list_to_assoc Ps A <- std_assoc_from Ps empty A.
+std_assoc_from [] A A.
+std_assoc_from [pair K V | Ps] A R <- put_assoc K A V B, std_assoc_from Ps B R.
+assoc_to_list A L <- std_assoc_list A L [].
+std_assoc_list empty T T.
+std_assoc_list (node K V _ A B) L T <- std_assoc_list A L [pair K V | R], std_assoc_list B R T.
+assoc_to_keys A Ks <- assoc_to_list A Ps, std_assoc_keys Ps Ks.
+std_assoc_keys [] [].
+std_assoc_keys [pair K _ | Ps] [K | Ks] <- std_assoc_keys Ps Ks.
+assoc_to_values A Vs <- assoc_to_list A Ps, std_assoc_values Ps Vs.
+std_assoc_values [] [].
+std_assoc_values [pair _ V | Ps] [V | Vs] <- std_assoc_values Ps Vs.

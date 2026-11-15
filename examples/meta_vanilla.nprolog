@@ -1,0 +1,31 @@
+# A vanilla meta-interpreter, bounded search and proof trees.
+# Reflection exposes all loaded user clauses; this interpreter handles
+# conjunction and pure user predicates. Builtin leaves use call/N.
+<- notable.
+
+edge a b.
+edge b c.
+edge a d.
+path X Y <- edge X Y.
+path X Y <- edge X Z, path Z Y.
+
+solve true.
+solve (A, B) <- solve A, solve B.
+solve G <- G != true, G != (_, _), clause G B, solve B.
+
+# The supported builtin leaf is explicit: a user predicate whose matching
+# clauses fail must not be retried as a direct native call.
+solve (is N E) <- call is N E.
+
+bounded true _.
+bounded (A, B) N <- bounded A N, bounded B N.
+bounded G N <- G != true, G != (_, _), N > 0, clause G B, N1 is N - 1, bounded B N1.
+
+proof true done.
+proof (A, B) (both PA PB) <- proof A PA, proof B PB.
+proof G (because G P) <- G != true, G != (_, _), clause G B, proof B P.
+
+> findall Y (solve (path a Y)) Result?
+> findall Y (bounded (path a Y) 2) Result?
+> proof (path a c) Tree?
+> solve (is N (2 + 3))?

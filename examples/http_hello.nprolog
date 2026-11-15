@@ -1,0 +1,14 @@
+<- import "std/dcg".
+<- import "std/net".
+# Serve one request. Port 0 chooses an available port and prints its address.
+main : io.
+main [PortText] -> { str_num PortText Port }, open (listen "127.0.0.1" Port) update Result,
+  ({ Result = ok Listener } -> handle_address Listener Address, say (fmt "~w\n" [Address]),
+    accept Listener ClientResult,
+    ({ ClientResult = ok Client } -> phrase_from Client request,
+      say_to Client "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nhello\n", close Client
+    ; say_to stderr (fmt "~w\n" [ClientResult]), halt 1), close Listener
+  ; say_to stderr (fmt "~w\n" [Result]), halt 1).
+request -> string_without ['\r','\n'] _, crlf, headers.
+headers -> crlf.
+headers -> string_without ['\r','\n'] [_ | _], crlf, headers.

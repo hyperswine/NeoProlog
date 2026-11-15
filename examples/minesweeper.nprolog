@@ -13,12 +13,9 @@
 # minefield_seed shuffles search order with a reproducible integer seed. This
 # gives varied valid grids, but does not sample all valid grids uniformly.
 
-mines Width Height Bombs Max Grid <-
-  minefield Width Height Bombs [window 2 2 Max] Grid.
+mines Width Height Bombs Max Grid <- minefield Width Height Bombs [window 2 2 Max] Grid.
 
-minefield Width Height Bombs Rules Grid <-
-  minefield_constraints Width Height Bombs Rules Grid Cells,
-  label Cells.
+minefield Width Height Bombs Rules Grid <- minefield_constraints Width Height Bombs Rules Grid Cells, label Cells.
 
 minefield_seed Width Height Bombs Rules Seed Grid <-
   is_int Seed,
@@ -35,25 +32,20 @@ minefield_constraints Width Height Bombs Rules Grid Cells <-
   apply_rules Rules Grid Bombs.
 
 make_grid _ 0 [].
-make_grid Width Height [Row | Rows] <-
-  Height > 0, make_row Width Row,
-  Next is Height - 1, make_grid Width Next Rows.
+make_grid Width Height [Row | Rows] <- Height > 0, make_row Width Row, Next is Height - 1, make_grid Width Next Rows.
 
 make_row 0 [].
-make_row Width [_ | Cells] <-
-  Width > 0, Next is Width - 1, make_row Next Cells.
+make_row Width [_ | Cells] <- Width > 0, Next is Width - 1, make_row Next Cells.
 
 append [] Ys Ys.
 append [X | Xs] Ys [X | Zs] <- append Xs Ys Zs.
 
 flatten_grid [] [].
-flatten_grid [Row | Rows] Cells <-
-  flatten_grid Rows Rest, append Row Rest Cells.
+flatten_grid [Row | Rows] Cells <- flatten_grid Rows Rest, append Row Rest Cells.
 
 # Build one linear expression; the solver propagates the whole sum together.
 sum_cells [] 0.
-sum_cells [Cell | Cells] Sum <-
-  sum_cells Cells Rest, Sum = Cell + Rest.
+sum_cells [Cell | Cells] Sum <- sum_cells Cells Rest, Sum = Cell + Rest.
 
 apply_rules [] _ _.
 apply_rules [window W H Max | Rules] Grid Bombs <-
@@ -83,8 +75,7 @@ window_cols W Max Block <-
   ; true).
 
 take_cols _ [] [].
-take_cols W [Row | Rows] Cells <-
-  take W Row Prefix, take_cols W Rows Rest, append Prefix Rest Cells.
+take_cols W [Row | Rows] Cells <- take W Row Prefix, take_cols W Rows Rest, append Prefix Rest Cells.
 
 drop_cols [] [].
 drop_cols [[_ | Row] | Rows] [Row | Rest] <- drop_cols Rows Rest.
@@ -92,12 +83,10 @@ drop_cols [[_ | Row] | Rows] [Row | Rest] <- drop_cols Rows Rest.
 # Partition the board into disjoint tiles, including partial boundary tiles.
 split 0 Xs [] Xs.
 split N [] [] [] <- N > 0.
-split N [X | Xs] [X | Prefix] Rest <-
-  N > 0, Next is N - 1, split Next Xs Prefix Rest.
+split N [X | Xs] [X | Prefix] Rest <- N > 0, Next is N - 1, split Next Xs Prefix Rest.
 
 split_cols _ [] [] [].
-split_cols W [Row | Rows] [Left | Lefts] [Right | Rights] <-
-  split W Row Left Right, split_cols W Rows Lefts Rights.
+split_cols W [Row | Rows] [Left | Lefts] [Right | Rights] <- split W Row Left Right, split_cols W Rows Lefts Rights.
 
 count_cells [] 0.
 count_cells [_ | Cells] N <- count_cells Cells Rest, N is Rest + 1.
@@ -127,19 +116,18 @@ shuffle_cells Cells Seed [Cell | Order] <-
   remove_at Index Cells Cell Rest, shuffle_cells Rest Next Order.
 
 remove_at 0 [Cell | Rest] Cell Rest.
-remove_at Index [Cell | Cells] Chosen [Cell | Rest] <-
-  Index > 0, Next is Index - 1, remove_at Next Cells Chosen Rest.
+remove_at Index [Cell | Cells] Chosen [Cell | Rest] <- Index > 0, Next is Index - 1, remove_at Next Cells Chosen Rest.
 
 # Rendering is a DCG (pure); print it with `emit` at the top level:
 #   > emit (show_seeded 10 10 50 [window 2 2 2] 42)?
-show_mines Width Height Bombs Rules ->
-  { once (minefield Width Height Bombs Rules Grid) }, grid Grid.
+show_mines Width Height Bombs Rules -> { once (minefield Width Height Bombs Rules Grid) }, grid Grid.
 
-show_seeded Width Height Bombs Rules Seed ->
-  { once (minefield_seed Width Height Bombs Rules Seed Grid) }, grid Grid.
+show_seeded Width Height Bombs Rules Seed -> { once (minefield_seed Width Height Bombs Rules Seed Grid) }, grid Grid.
 
 grid [] -> [].
 grid [Row | Rows] -> grid_row Row, nl, grid Rows.
 
 grid_row [] -> [].
 grid_row [Cell | Cells] -> ( { Cell == 1 } -> "* " ; ". " ), grid_row Cells.
+
+> once (mines 10 10 50 2 Grid)?

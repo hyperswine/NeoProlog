@@ -15,14 +15,17 @@ import qualified Data.IntMap.Strict as IM
 import Data.List (dropWhileEnd, isPrefixOf, nub)
 import Data.Text (unpack)
 import Infera.Engine
+import Infera.Runtime (runEffectQuery)
+import Infera.Effects (effectKeys)
+import Infera.TermToolkit (toolkitSignatures)
 import Infera.Error
-import Infera.Infer (inferProgram)
+import Infera.Infer (inferProgram, builtinDet)
 import qualified Infera.Machine.Trace as Trace
 import Infera.Purity (describeViolation, programViolations)
 import Infera.Module
 import Infera.Program
 import Infera.Syntax
-import Prettyprinter
+import Prettyprinter hiding (SChar)
 import Prettyprinter.Render.Terminal
 import System.Console.Haskeline
 import System.Environment (getArgs, lookupEnv)
@@ -171,9 +174,18 @@ runRepl = do
           prog <- liftIO (readIORef progRef)
           let name = dropWhile (== ' ') (drop 4 trimmed)
               selected = [p | p <- programPreds prog, null name || fst (predKey p) == name]
-          if null selected
+          let builtins = [(n,sig) | (n,sig) <- toolkitSignatures ++
+                [(n, Signature (maybe Nondet id (builtinDet n (length sorts))) [ArgSpec sort ModeInOut | sort<-sorts] [])
+                  | (n,sorts)<-[("str_concat",[SStr,SStr,SStr]),("str_length",[SStr,SInt]),
+                    ("str_chars",[SStr,SList SChar]),("str_atom",[SStr,SAtom]),("str_num",[SStr,SNum]),
+                    ("str_upper",[SStr,SStr]),("str_lower",[SStr,SStr]),("str_lines",[SStr,SList SStr]),
+                    ("char_code",[SChar,SInt]),("seq",[SList SAny,SAny,SAny])]] ++
+                [(n, Signature Det (replicate arity (ArgSpec SAny ModeInOut)) []) | (n,arity)<-effectKeys], null name || n == name]
+          if null selected && null builtins
             then outputStrLn (renderDoc (docErr ("no such predicate: " ++ name)))
-            else mapM_ (mapM_ (outputStrLn . renderDoc . docInfo) . describePred prog) selected
+            else do
+              mapM_ (mapM_ (outputStrLn . renderDoc . docInfo) . describePred prog) selected
+              mapM_ (\(n,sig) -> outputStrLn (showSignature n sig)) builtins
           loop progRef fileRef
       | ":help" == trimmed = do
           outputStrLn "Clauses end with '.', queries with '?'.  Declarations: name : det (sort: mode) ..."
@@ -197,7 +209,7 @@ runRepl = do
             Right q -> do
               prog0 <- liftIO (readIORef progRef)
               prog <- liftIO (preloadFiles prog0 (queryGoals q))
-              renderQuerySummary (solveAll prog q)
+              renderEntry prog q
           loop progRef fileRef
       | null trimmed = loop progRef fileRef
       | otherwise = do
@@ -238,7 +250,11 @@ runRepl = do
             annotate (colorDull White) (pretty "> ")
               <> hsep (punctuate comma (map (pretty . showTermWith (queryVarName q)) (queryGoals q)))
       outputStrLn (renderDoc label)
-      renderQuerySummary (solveAll prog q)
+      renderEntry prog q
+
+    renderEntry prog q = do
+      effectResult <- liftIO (runEffectQuery prog q)
+      renderQuerySummary (maybe (solveAll prog q) id effectResult)
 
     queryVarName q v = maybe (showVarDefault v) id (lookup v [(vid, n) | (n, vid) <- queryNames q])
 

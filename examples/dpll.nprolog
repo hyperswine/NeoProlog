@@ -1,0 +1,18 @@
+<- import "std/coroutine".
+# Boolean attributes enforce the domain; two watched non-ground literals wake
+# a clause when either becomes ground. No global mutable watch lists.
+boolean X <- (var X -> put_attr X boolean domain ; (X = 0 ; X = 1)).
+boolean:attr_unify_hook _ Other <- boolean Other.
+boolean:attribute_goals V -> [boolean V].
+sat Clauses Vars <- maplist boolean Vars, maplist watch_clause Clauses, assign Vars.
+assign [].
+assign [X | Xs] <- (var X -> (X = 0 ; X = 1) ; true), assign Xs.
+watch_clause Lits <- simplify Lits Remaining Satisfied,
+  (Satisfied = yes -> true ; Remaining = [] -> fail
+  ; Remaining = [lit X Pol] -> X = Pol
+  ; Remaining = [lit X _,lit Y _ | _], when ((nonvar X) ; (nonvar Y)) (watch_clause Remaining)).
+simplify [] [] no.
+simplify [lit X Pol | Xs] R Yes <- (var X -> R = [lit X Pol | Rs], simplify Xs Rs Yes
+  ; X = Pol -> R = [], Yes = yes ; simplify Xs R Yes).
+> findall [X,Y] (sat [[lit X 1,lit Y 1],[lit X 0,lit Y 1]] [X,Y]) Result?
+> sat [[lit X 0],[lit X 1]] [X]?

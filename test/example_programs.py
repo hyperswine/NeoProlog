@@ -22,7 +22,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = (
-    "sudoku4", "river_crossing", "job_shop", "route_planning", "supply_packing",
+    "meta_vanilla", "meta_cost", "meta_tabled", "stlc", "datalog", "dpll", "json", "regex", "lisp", "prolog_in_infera", "sudoku4", "river_crossing", "job_shop", "route_planning", "supply_packing",
     "send_more_money", "magic_square", "knight_tour", "peg_solitaire", "mastermind", "water_jugs",
 )
 
@@ -54,7 +54,7 @@ class Runner:
         require("\n> " in source, "missing demo boundary: " + name)
         program = source.split("\n> ", 1)[0]
         path = self.directory / (name + ".nprolog")
-        path.write_text(program + "\n> " + goal + "?\n")
+        path.write_text(program + "\nexample_probe Result <- " + goal + ".\n> example_probe Result?\n")
         stdout = self.run(path)
         matches = re.findall(r"^Result = (.+)$", stdout, re.M)
         require(len(matches) == 1, "expected one collected ground result: " + stdout)
@@ -321,6 +321,49 @@ def check_water_jugs(runner):
             "water jugs shortest sequence mismatch")
 
 
+def check_meta(runner):
+    # Independent depth and cost enumeration of the graph in both examples.
+    edges = {"a": ["b", "d"], "b": ["c"], "c": [], "d": []}
+    def paths(x, cost=0):
+        return [(y, cost + 2) for y in edges[x]] + [
+            result for z in edges[x] for result in paths(z, cost + 2)]
+    expected = paths("a")
+    require(runner.query("meta_vanilla", "findall Y (solve (path a Y)) Result")
+            == [y for y, _ in expected], "vanilla meta-interpreter answers")
+    for budget in range(1, 7):
+        require(runner.query("meta_cost", f"findall Y (measured (path a Y) {budget} _) Result")
+                == [y for y, cost in expected if cost <= budget], "meta-interpreter budget")
+    require(runner.query("meta_cost", "findall N (measured (path a c) 10 N) Result")
+            == [4], "meta-interpreter inference count")
+    require(runner.query("meta_vanilla", "findall Y (bounded (path a Y) 2) Result")
+            == ["b", "d"], "depth bound")
+    # Check the proof's exact structure by unifying it in the goal.
+    require(runner.query("meta_vanilla", "findall 1 (proof (path a c) (because (path a c) (both (because (edge a b) done) (because (path b c) (because (edge b c) done))))) Result")
+            == [1], "meta-interpreter proof tree")
+
+
+def check_general_examples(runner):
+    # Independently computed graph closure, compared as a set to both tables.
+    nodes = ["a", "b", "c"]
+    edges = [("a","b"),("b","c"),("c","a")]
+    closure = set(edges)
+    while True:
+        more = closure | {(x,z) for x,y in closure for yy,z in edges if y == yy}
+        if more == closure: break
+        closure = more
+    actual = runner.query("meta_tabled", "findall Y (table_solve (path a Y)) Result")
+    require(sorted(actual) == sorted(y for x,y in closure if x == "a"), "independent ground-variant table")
+    actual = runner.query("datalog", "closure [pair a b,pair b c,pair c a] P, findall [X,Y] (member (pair X Y) P) Result")
+    require({tuple(x) for x in actual} == closure, "semi-naive Datalog closure")
+    require(runner.query("stlc", "findall 1 (infer [] (let id (lam x (var x)) (app (var id) (int 7))) int) Result") == [1], "let polymorphism")
+    require(runner.query("stlc", "findall 1 (infer [] (app (int 1) (int 2)) _) Result") == [], "type rejection")
+    require(runner.query("dpll", "findall [X,Y] (sat [[lit X 1,lit Y 1],[lit X 0,lit Y 1]] [X,Y]) Result") == [[0,1],[1,1]], "watched SAT")
+    require(runner.query("json", 'findall 1 (once (phrase (json (array [num 1,true,str "x"])) "[1,true,\\"x\\"]")) Result') == [1], "JSON parse")
+    require(runner.query("regex", 'findall 1 (phrase (match (cat (star (char \'a\')) (char \'b\'))) "aaab") Result') == [1], "regex language")
+    require(runner.query("lisp", 'findall V (once (phrase (sexpr E) "(plus 2 (times 3 4))"), eval E V) Result') == [14], "Lisp arithmetic")
+    require(runner.query("prolog_in_infera", "findall 1 (interpret [rule b [cut,call missing],rule b []] b) Result") == [], "interpreted cut failure")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -340,8 +383,8 @@ def main():
             runner = Runner(binary, Path(directory), {**os.environ, "INFERA_JIT": jit, "INFERA_CORE_STREAM": stream})
             for name in EXAMPLES:
                 output = runner.run(ROOT / "examples" / (name + ".nprolog"))
-                require("\nfalse." not in output, "demonstration failed: " + name)
-            for check in (check_sudoku, check_river, check_jobs, check_routes, check_packing,
+                require(name in {"stlc", "dpll"} or "\nfalse." not in output, "demonstration failed: " + name)
+            for check in (check_general_examples, check_meta, check_sudoku, check_river, check_jobs, check_routes, check_packing,
                           check_cryptarithmetic, check_magic_square, check_knight_tour,
                           check_peg_solitaire, check_mastermind, check_water_jugs):
                 check(runner)

@@ -47,6 +47,17 @@ const BUILTIN_DOCS = {
   str_lower: '`str_lower S L` — lower-cases S.',
   import: '`<- import "mod#hash".` — imports a registered module; its predicates are called as `mod:name`.',
   table: '`<- table.` — tabling on by default (the default).',
+  io: 'Flag: a deterministic effect grammar with a linear world, run with infera run.',
+  noprelude: 'Disable implicit standard-library imports in this file.',
+  put_attr: 'Set a trailed module attribute on an unbound variable.',
+  get_attr: 'Read a module attribute; fails if absent.',
+  del_attr: 'Delete a module attribute; undone on backtracking.',
+  copy_term_nat: 'Copy term structure without user attributes or CLP constraints.',
+  open: 'Effect grammar: open Address Mode Result. Result is ok Handle or err Reason.',
+  close: 'Effect grammar: close Handle. Reusing a closed handle is a fault.',
+  say: 'Effect grammar: print a text grammar to stdout, optionally returning a result.',
+  say_to: 'Effect grammar: print a text grammar to a handle, optionally returning a result.',
+  phrase_from: 'Effect grammar: parse a handle on demand, keeping unread input for the next operation.',
   unsafe: 'Flag: the predicate may perform effects (write, emit, read_file, cut, assert/retract) and call other unsafe predicates.',
   dynamic: 'Flag: the predicate has no clauses; its facts are added and removed with assert/retract.',
   notable: '`<- notable.` — tabling off by default.',
@@ -74,6 +85,13 @@ const BUILTIN_DOCS = {
   fmt: '`fmt "~w ~d ~s ~a ~n" Args` (DCG) — formatted text.',
   padl: '`padl Term Width` (DCG) — the text of Term right-aligned in Width.',
   padr: '`padr Term Width` (DCG) — the text of Term left-aligned in Width.',
+  functor: '`functor T Name Arity` — inspect or build a positive-arity non-list compound; invalid requests fault.',
+  arg: '`arg N T A` — 1-based compound argument; enumerates an unbound N.',
+  univ: '`univ T L` — a positive-arity non-list compound as [Name, Arg1, ...] and back.',
+  copy_term: '`copy_term T C` — fresh structural copy preserving sharing; CLP constraints are not copied.',
+  term_variables: '`term_variables T Vs` — distinct unbound variables in depth-first order.',
+  compare: '`compare Order A B` — standard term order: lt, eq or gt; integers precede floats.',
+  clause: '`clause Head Body` — fresh copies of all loaded user clauses, including library clauses; facts have body true.',
   term_str: '`term_str Term S` — S is the text of Term.',
   str_lines: '`str_lines S Lines` — splits a string into lines.',
   char_code: '`char_code C N` — converts between a character and its code.',
@@ -104,11 +122,25 @@ const DECL_DOCS = {
 }
 
 const DET_WORDS = ['det', 'semidet', 'multi', 'nondet']
-const FLAG_WORDS = ['table', 'notable', 'index', 'noindex', 'unsafe', 'dynamic']
+const FLAG_WORDS = ['table', 'notable', 'index', 'noindex', 'unsafe', 'dynamic', 'io']
 const SORT_WORDS = ['int', 'float', 'num', 'str', 'char', 'atom', 'any', 'list']
-const DIRECTIVES = new Set(['import', 'table', 'notable', 'index', 'noindex'])
+const DIRECTIVES = new Set(['import', 'table', 'notable', 'index', 'noindex', 'noprelude'])
 
 const KEYWORD_ATOMS = new Set(['true', 'fail', 'false', 'nl', 'not', 'once', 'call', 'forall', 'findall', 'minimize', 'write', 'writeln', 'print', 'phrase', 'is', 'in', 'label', 'labeling', 'import'])
+
+// Standard-library names are available without a user declaration. These
+// entries provide completion/hover; the compiler owns their signatures.
+for (const [module, names] of Object.entries({
+  list: 'length nth0 nth1 last append member memberchk reverse select permutation sum_list max_list min_list numlist between take drop zip exclude partition maplist foldl include',
+  order: 'msort sort predsort keysort pairs_keys_values pairs_keys pairs_values',
+  aggregate: 'bagof setof aggregate_all',
+  assoc: 'empty_assoc put_assoc get_assoc list_to_assoc assoc_to_list assoc_to_keys assoc_to_values',
+  str: 'split join trim sub_str str_code_list',
+  dcg: 'digits blank blanks whites string_without integer number eos rest note with_events',
+  coroutine: 'dif freeze when frozen'
+})) {
+  for (const name of names.split(' ')) BUILTIN_DOCS[name] ??= `Standard library std/${module}. Inspect its declaration with :sig ${name}.`
+}
 
 const BUILTIN_PREDICATES = new Set(Object.keys(BUILTIN_DOCS).filter(k => /^[a-z]/.test(k)))
 
@@ -451,7 +483,7 @@ function predicateModifiers(a, name, arity, declaration = false) {
   if (arity === null && !declaration) return 0
   const flags = new Set((a.decls.get(name) || [])
     .filter(d => d.flagsOnly || d.arity === arity).flatMap(d => d.flags))
-  return (flags.has('unsafe') ? TM.unsafe : 0) | (flags.has('dynamic') ? TM.dynamic : 0)
+  return ((flags.has('unsafe') || flags.has('io')) ? TM.unsafe : 0) | (flags.has('dynamic') ? TM.dynamic : 0)
 }
 
 function predicateModifierPositions(a, resolveImport = () => null) {

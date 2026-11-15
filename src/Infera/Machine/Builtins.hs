@@ -12,8 +12,10 @@ module Infera.Machine.Builtins
   )
 where
 
+import qualified Infera.Engine.Reference as Reference
 import Data.Char (toLower, toUpper)
 import qualified Data.Map.Strict as Map
+import qualified Infera.TermToolkit as Toolkit
 import Infera.Arith (compareNumeric, evalArithSafe, evalNumeric)
 import Infera.CLP
 import Infera.Compile (BuiltinTag (..))
@@ -161,6 +163,11 @@ reifyRelation substitution relation truth = case walk substitution relation of
 -- goal first would change shallow control and malformed-input behavior.
 ordinaryBuiltin :: Env -> SolverState -> Term -> Maybe Search
 ordinaryBuiltin environment state original = case walk substitution original of
+  goal@(Compound name [_,_,_]) | name `elem` ["std_native_bagof","std_native_setof"] -> Just (Reference.solveGoal environment Reference.maxResolutionDepth state goal)
+  goal | Just result <- Toolkit.toolkit (envProg environment) (ssDynamic state) store (ssFresh state) goal -> Just $
+    map (\item -> case item of
+      Left err -> BranchError err
+      Right (store',next) -> Found state {ssStore = store', ssFresh = next}) result
   Atom "nl" -> one (emit NewlineEvent state)
   Compound "read_file" [path, result] -> Just $ withFile environment substitution path $ \contents ->
     checked state (storeUnify store result (StrLit contents))

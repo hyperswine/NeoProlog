@@ -15,6 +15,10 @@ module Infera.Core
   )
 where
 
+import Infera.AttributeSupport (usesAttributes, attributeNames)
+import Data.List (isInfixOf)
+import qualified Infera.Engine.Reference as Reference
+import Infera.Syntax (queryGoals)
 import Infera.Core.Compile (CoreProgram (..), Unsupported (..), compileProgram, programScope)
 import Infera.Core.Run (Step (..), runCore, runCoreWith)
 import Infera.Engine.Reference (Search)
@@ -29,6 +33,7 @@ import System.IO.Unsafe (unsafeInterleaveIO, unsafePerformIO)
 -- query, so the two prefixes agree. (Nothing is reserved for a future
 -- program-level rejection; every program currently starts on the core.)
 solveQuery :: Program -> Query -> Maybe Search
+solveQuery program query | usesAttributes program (queryGoals query) = Just (Reference.solveQuery program query)
 solveQuery program query = unsafePerformIO $ do
   (_, first) <- runCore program query
   Just <$> stream (0 :: Int) first
@@ -38,11 +43,13 @@ solveQuery program query = unsafePerformIO $ do
       case step of
         Stop -> pure []
         Yield item continue -> (item :) <$> stream (produced + 1) continue
-        Abandon _ -> pure (drop produced (Machine.solveQuery program query))
+        Abandon reason -> pure (drop produced (if any (`isInfixOf` reason) attributeNames
+          then Reference.solveQuery program query else Machine.solveQuery program query))
 {-# NOINLINE solveQuery #-}
 
 -- | 'solveQuery' with an explicit initial collection threshold in cells.
 solveQueryWith :: Int -> Program -> Query -> Maybe Search
+solveQueryWith _ program query | usesAttributes program (queryGoals query) = Just (Reference.solveQuery program query)
 solveQueryWith limit program query = unsafePerformIO $ do
   (_, first) <- runCoreWith limit program query
   Just <$> stream (0 :: Int) first
@@ -52,7 +59,8 @@ solveQueryWith limit program query = unsafePerformIO $ do
       case step of
         Stop -> pure []
         Yield item continue -> (item :) <$> stream (produced + 1) continue
-        Abandon _ -> pure (drop produced (Machine.solveQuery program query))
+        Abandon reason -> pure (drop produced (if any (`isInfixOf` reason) attributeNames
+          then Reference.solveQuery program query else Machine.solveQuery program query))
 {-# NOINLINE solveQueryWith #-}
 
 -- | The core when it applies, otherwise the existing machine.
@@ -65,6 +73,7 @@ solveQueryOrFallback program query =
 -- half comes from its loaded image, so this compiles only the query's goals
 -- and starts no machine.
 coreSupports :: Program -> Query -> Maybe String
+coreSupports program query | usesAttributes program (queryGoals query) = Just "attributed variables use the interpreter"
 coreSupports program query = unsafePerformIO $ do
   scope <- programScope program
   compiled <- compileProgram scope query
@@ -76,6 +85,7 @@ coreSupports program query = unsafePerformIO $ do
 -- | Run a query to completion on the core alone: the item count, or the
 -- reason the run was abandoned.
 coreOutcome :: Program -> Query -> IO (Either String Int)
+coreOutcome program query | usesAttributes program (queryGoals query) = pure (Left "attributed variables use the interpreter")
 coreOutcome program query = do
   (_, first) <- runCore program query
   let go count next = do

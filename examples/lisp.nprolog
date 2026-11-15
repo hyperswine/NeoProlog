@@ -1,0 +1,23 @@
+<- import "std/dcg".
+# One S-expression per line. An intentionally small Scheme-like evaluator:
+# integers, +, *, quote and if. EOF exits the REPL normally.
+main : io.
+main _ -> repl.
+repl : io.
+repl -> read_line stdin R,
+  ({ R = eof } -> []
+  ; { R = ok Line } -> ({ once (phrase (sexpr Expr) Line), eval Expr Value } -> say (fmt "~w\n" [Value]) ; say "invalid expression\n"), repl
+  ; halt 1).
+sexpr E -> whites, expr E, whites, eos.
+expr (num N) -> integer N.
+expr (sym Name) -> string_without [' ', '\t', '\r', '\n', '(', ')'] Cs, { Cs != [], str_chars S Cs, str_atom S Name }.
+expr (list Es) -> "(", whites, exprs Es, ")".
+exprs [] -> [].
+exprs [E | Es] -> expr E, whites, exprs Es.
+eval (num N) N.
+eval (list [sym quote,X]) X.
+eval (list [sym if,C,A,B]) R <- eval C V, (V = 0 -> eval B R ; eval A R).
+eval (list [sym plus | Es]) R <- maplist eval Es Ns, sum_list Ns R.
+eval (list [sym times | Es]) R <- maplist eval Es Ns, foldl multiply Ns 1 R.
+multiply X A R <- R is X * A.
+> phrase (sexpr E) "(plus 2 (times 3 4))", eval E Result?

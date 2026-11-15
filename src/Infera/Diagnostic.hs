@@ -11,6 +11,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
 import Infera.Error (showPredKey)
 import Infera.Arith (arithOps, evalArithSafe)
+import Infera.Effects (effectKeys, effectViolations)
 import Infera.Infer (builtinDet)
 import Infera.Module (loadLocatedFile, loadLocatedWithSources)
 import Infera.Infer (inferProgram)
@@ -44,7 +45,9 @@ diagnoseLoaded result = case result of
   Right items -> diagnose items
 
 diagnose :: [LocatedTopLevel] -> [Diagnostic]
-diagnose items = concatMap inspect items
+diagnose items = concatMap inspect [i | i <- items, take 5 (spanFile (locatedSpan i)) /= "<std/"] ++
+  [Diagnostic (maybe (SourceSpan "<program>" 1 1 1 2) id (Map.lookup key firstClauseSpans)) Error "io-error" msg
+  | (key,msg) <- effectViolations prog]
   where
     prog = buildProgram (map locatedItem items)
     -- Graph facts and determinism, for the tabling hint only.
@@ -161,6 +164,7 @@ diagnose items = concatMap inspect items
       Compound f [a, b] | f `elem` [",", ";", "->", "forall"] -> calls item [a, b]
       Compound f [g] | f `elem` ["not", "once"] -> goal item g
       Compound "findall" [_, g, _] -> goal item g
+      Compound f [_, g, _] | f `elem` ["bagof","setof","std_native_bagof","std_native_setof"] -> goal item (stripExists g)
       Compound "minimize" [_, g] -> goal item g
       Compound "call" (callee : extra) -> case callee of
         Atom f -> goal item (Compound f extra)
@@ -189,7 +193,7 @@ diagnose items = concatMap inspect items
                     then emit item Error "undefined-predicate" ("undefined predicate: " ++ showPredKey key)
                     else emit item Error "wrong-arity" ("no clauses for " ++ showPredKey key ++ "; available: " ++ intercalate ", " (map showPredKey alternatives))]
     isBuiltin ("call", n) = n >= 1
-    isBuiltin (n, a) = isJust (builtinDet n a)
+    isBuiltin (n, a) = isJust (builtinDet n a) || (n,a) `elem` effectKeys
     incompatible args sig = or (zipWith (\arg spec -> definitelyWrong (argSort spec) arg) args (sigArgs sig))
 
 arguments :: Term -> [Term]
@@ -384,3 +388,7 @@ jsonString s = "\"" ++ concatMap escape s ++ "\""
     escape '\\' = "\\\\"
     escape c | ord c < 32 = let h = showHex (ord c) "" in "\\u" ++ replicate (4 - length h) '0' ++ h
     escape c = [c]
+
+stripExists :: Term -> Term
+stripExists (Compound "^" [_,g]) = stripExists g
+stripExists g = g

@@ -80,6 +80,14 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     assert rows[0]["file"] == str(imported), rows
     imported.write_text("greet.\n")
     check('<- import "lib#test".\n> lib:greet?\n', success=True)
+    # Reflection includes imported user code under its qualified name.
+    imported.write_text("item a.\nitem b.\n")
+    target = root / "reflect.nprolog"
+    target.write_text('<- import "lib#test".\n> findall X (clause (lib:item X) true) Result?\n')
+    reflected = subprocess.run([binary, str(target)], input=":sig functor\n:quit\n",
+                               cwd=root, capture_output=True, text=True, timeout=20)
+    assert reflected.returncode == 0 and "Result = [a, b]" in reflected.stdout, reflected
+    assert "functor : semidet" in reflected.stdout, reflected
     imported.write_text("walk X <- walk X, true.\n")
     rows = check('<- import "lib#test".\n> lib:walk 1?\n', "perf-non-tail-recursion", success=True)
     suggestion = next(d for d in rows if d["code"] == "perf-non-tail-recursion")

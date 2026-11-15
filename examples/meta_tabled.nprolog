@@ -1,0 +1,20 @@
+<- import "std/assoc".
+# A finite ground-variant meta-interpreter. Each fixed-point round interprets
+# reflected Horn bodies against its own AVL table, not the engine's table.
+edge a b.
+edge b c.
+edge c a.
+path X Y <- edge X Y.
+path X Y <- path X Z, edge Z Y.
+allowed edge 2.
+allowed path 2.
+table_solve Goal <- empty_assoc Empty, table_fix Empty Table, assoc_to_keys Table Keys, member Goal Keys.
+table_fix A R <- findall H (allowed Name Arity, functor H Name Arity, clause H Body, table_body Body A) New,
+  table_add New A B Changed, (Changed = yes -> table_fix B R ; R = B).
+table_body true _.
+table_body (A,B) T <- table_body A T, table_body B T.
+table_body G T <- G != true, G != (_,_), assoc_to_keys T Keys, member G Keys.
+table_add [] A A no.
+table_add [H | Hs] A R Changed <- (get_assoc H A _ -> table_add Hs A R Changed ; put_assoc H A yes B, table_add Hs B R _, Changed = yes).
+> findall Y (table_solve (path a Y)) Result?
+> findall Y (path a Y) Result?

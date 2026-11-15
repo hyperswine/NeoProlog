@@ -19,6 +19,7 @@ module Infera
   )
 where
 
+import Infera.Runtime (runProgram)
 import Infera.Arith
 import Infera.CLP
 import Infera.Engine
@@ -43,6 +44,8 @@ main = do
   args <- getArgs
   case args of
     ["--version"] -> putStrLn ("infera " ++ showVersion version)
+    ("run" : file : argv) -> runProgram file argv
+    ["run"] -> hPutStrLn stderr "Usage: infera run FILE [ARGS...]" >> exitFailure
     ("reg" : paths) -> mapM_ registerModule paths
     ["--trace", file] -> runTraceFile file Nothing
     ["--trace", file, query] -> runTraceFile file (Just query)

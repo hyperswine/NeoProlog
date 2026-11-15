@@ -1,0 +1,14 @@
+# A bounded two-client line relay, using one readiness loop and no threads.
+main : io.
+main [PortText] -> { str_num PortText Port }, open (listen "127.0.0.1" Port) update (ok L),
+  handle_address L Addr, say (fmt "~w\n" [Addr]), accept L (ok A), accept L (ok B),
+  relay [A,B] 4, close A, close B, close L.
+relay : io.
+relay _ 0 -> [].
+relay Hs N -> wait Hs 10000 Ready,
+  ({ Ready = [H | _] } -> read_line H R,
+    ({ R = ok Line } -> broadcast Hs H Line, { M is N - 1 }, relay Hs M ; [])
+  ; halt 1).
+broadcast : io.
+broadcast [] _ _ -> [].
+broadcast [H | Hs] Sender Line -> ({ H == Sender } -> [] ; say_to H (fmt "~s\n" [Line])), broadcast Hs Sender Line.

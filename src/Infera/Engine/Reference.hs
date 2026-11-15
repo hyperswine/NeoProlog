@@ -43,12 +43,14 @@ where
 
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
-import Data.List (foldl', intercalate, mapAccumL, nub, sortOn)
+import Data.List (foldl', intercalate, mapAccumL, nub, sortOn, sortBy, groupBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Char (toLower, toUpper)
+import qualified Infera.TermToolkit as Toolkit
+import Infera.Standard (expandStandard)
 import Infera.Arith
 import Infera.CLP
 import Infera.Error
@@ -84,6 +86,8 @@ data TableEntry = TableEntry
 data SolverState = SolverState
   { ssStore :: !Store,
     ssFresh :: !Int,
+    ssAttributes :: Map (VarId,String) Term,
+    ssResidualGoals :: [Term],
     -- | Output events, most recent first.
     ssOutput :: [OutputEvent],
     ssOutLen :: !Int,
@@ -132,6 +136,8 @@ initialState fresh =
   SolverState
     { ssStore = emptyStore,
       ssFresh = fresh,
+      ssAttributes = Map.empty,
+      ssResidualGoals = [],
       ssOutput = [],
       ssOutLen = 0,
       ssTables = Map.empty,
@@ -205,15 +211,49 @@ checked st (Right (Just store)) = [Found st {ssStore = store}]
 -- ─── GOALS ───────────────────────────────────────────────────────────────────
 
 solveGoals :: Env -> Int -> SolverState -> [Term] -> Search
-solveGoals _ _ st [] = [Found st]
-solveGoals env fuel st (g : gs) =
-  bindSearch (solveGoal env fuel st g) (\st' -> solveGoals env fuel st' gs)
+solveGoals env fuel st goals = bindSearch (wakeAttributes env fuel st) (\ready -> go ready goals)
+  where
+    go s [] = [Found s]
+    go s (g:gs) = bindSearch (solveGoal env fuel s g) (\next -> solveGoals env fuel next gs)
 
 solveGoal :: Env -> Int -> SolverState -> Term -> Search
-solveGoal env fuel st g0 =
+solveGoal env fuel st goal = bindSearch (wakeAttributes env fuel st) (\ready ->
+  bindSearch (solveGoalRaw env fuel ready goal) (wakeAttributes env fuel))
+
+-- Hooks run at goal boundaries, so all of a head has unified before a hook
+-- observes it. The persistent map is removed before invoking queued hooks.
+wakeAttributes :: Env -> Int -> SolverState -> Search
+wakeAttributes env fuel st =
+  let pending=[((v,m),value,walk (subst st) (Var v)) | ((v,m),value)<-Map.toAscList(ssAttributes st), walk (subst st) (Var v)/=Var v]
+  in if null pending then [Found st] else
+       let ready=st{ssAttributes=foldr (Map.delete . (\(key,_,_)->key)) (ssAttributes st) pending}
+           hooks=[Compound (m++":attr_unify_hook") [value,other] | ((_,m),value,other)<-pending]
+       in solveGoals env fuel ready hooks
+
+solveGoalRaw :: Env -> Int -> SolverState -> Term -> Search
+solveGoalRaw env fuel st g0 =
   let store = ssStore st
       s = stSubst store
    in case walk s g0 of
+        Compound "put_attr" [variable,moduleName,value] -> case (walk s variable,walk s moduleName) of
+          (Var v,Atom m) -> [Found st{ssAttributes=Map.insert (v,m) value (ssAttributes st)}]
+          (_,other) -> [BranchError(TypeError "unbound variable and attribute module atom" other)]
+        Compound "get_attr" [variable,moduleName,value] -> case (walk s variable,walk s moduleName) of
+          (Var v,Atom m) -> maybe [] (\x->checked st(storeUnify store value x)) (Map.lookup(v,m)(ssAttributes st))
+          _ -> []
+        Compound "del_attr" [variable,moduleName] -> case (walk s variable,walk s moduleName) of
+          (Var v,Atom m) -> [Found st{ssAttributes=Map.delete(v,m)(ssAttributes st)}]
+          (_,other) -> [BranchError(TypeError "unbound variable and attribute module atom" other)]
+        Compound "copy_term" [source,target] -> copyAttributed st source target
+        Compound "copy_term_nat" [source,target] -> solveGoalRaw env fuel st (Compound "$copy_plain" [source,target])
+        Compound "$copy_plain" [source,target] ->
+          case Toolkit.toolkit (envProg env) (ssDynamic st) store (ssFresh st) (Compound "copy_term" [source,target]) of
+            Just result -> map (\item->case item of Left err->BranchError err; Right (store',next)->Found st{ssStore=store',ssFresh=next}) result
+            Nothing -> []
+        goal | Just result <- Toolkit.toolkit (envProg env) (ssDynamic st) store (ssFresh st) goal ->
+          map (\item -> case item of
+            Left err -> BranchError err
+            Right (store',next) -> Found st {ssStore = store', ssFresh = next}) result
         Var _ -> [BranchError (InstantiationError g0)]
         Atom "true" -> [Found st]
         Atom "fail" -> []
@@ -229,6 +269,7 @@ solveGoal env fuel st g0 =
         Compound "unify" [a, b] -> checked st (storeUnify store a b)
         Compound "equiv" [a, b] ->
           if deepWalk s a == deepWalk s b then [Found st] else []
+        Compound "neq" [a,b] | Just _ <- lookupPred ("dif",2) (envProg env) -> solveGoal env fuel st (Compound "dif" [a,b])
         Compound "neq" [a, b] -> checked st (addDiseq a b store)
         Compound "is" [lhs, rhs] -> case evalArithSafe s rhs of
           Left err -> [BranchError err]
@@ -304,6 +345,8 @@ solveGoal env fuel st g0 =
         Compound "forall" [c, a] ->
           negation env fuel st (Compound "," [c, Compound "not" [a]])
         Compound "findall" [tmpl, g, l] -> findAll env fuel st tmpl g l
+        Compound "std_native_bagof" [tmpl, g, l] -> bagOf False env fuel st tmpl g l
+        Compound "std_native_setof" [tmpl, g, l] -> bagOf True env fuel st tmpl g l
         Compound "minimize" [cost, g] -> minimizeGoal env fuel st cost g
         -- output
         Compound "write" [x] -> [Found (emit (WriteEvent (showValue (deepWalk s x))) st)]
@@ -584,6 +627,64 @@ findAll env fuel st tmpl g l =
         (e : _) -> [i | i@(ConsumedIncomplete _) <- pass] ++ [e]
         [] -> pass ++ checked st1 (storeUnify (ssStore st1) l (mkList results Nothing))
 
+-- Structural copies carry user attributes, preserving sharing through
+-- attribute values too. Native CLP domains remain deliberately separate.
+copyAttributed :: SolverState -> Term -> Term -> Search
+copyAttributed st source target =
+  let value=deepWalk(subst st) source
+      close ids=let extra=[v | ((owner,_),attr)<-Map.toList(ssAttributes st),owner `elem` ids,v<-termVarIds(deepWalk(subst st)attr)]
+                    next=nub(ids++extra)
+                in if next==ids then ids else close next
+      ids=close(nub(termVarIds value))
+      mapping=IM.fromList(zip ids [ssFresh st..])
+      rename t=case t of Var v->Var(IM.findWithDefault v v mapping); Compound f xs->Compound f(map rename xs); _->t
+      attributes=Map.fromList [((mapping IM.! v,m),rename(deepWalk(subst st)attr)) | ((v,m),attr)<-Map.toList(ssAttributes st),IM.member v mapping]
+      copied=st{ssFresh=ssFresh st+length ids,ssAttributes=Map.union attributes(ssAttributes st)}
+  in checked copied(storeUnify(ssStore copied) target(rename value))
+
+-- | Group free goal variables, excluding template and existential variables.
+-- Copies of a key and its template share one renaming namespace.
+bagOf :: Bool -> Env -> Int -> SolverState -> Term -> Term -> Term -> Search
+bagOf unique env fuel st template quantified target =
+  let strip t = case walk (subst st) t of
+        Compound "^" [v,g] -> let (vs,body) = strip g in (termVarIds (deepWalk (subst st) v) ++ vs,body)
+        g -> ([],g)
+      (existential,g) = strip quantified
+      free = nub [v | v <- termVarIds (deepWalk (subst st) g), v `notElem` (existential ++ termVarIds (deepWalk (subst st) template))]
+      sub = opaque (solveGoal env fuel st g)
+      founds = [s | Found s <- sub]
+      raw = [Compound "$bag" [deepWalk (subst s) (mkList (map Var free) Nothing),deepWalk (subst s) template] | s <- founds]
+      -- Every answer is a fresh structural copy, including pre-existing
+      -- unbound template variables; collection must not alias caller variables.
+      copy next t = let ids = nub (termVarIds t); mapping = IM.fromList (zip ids [next..])
+                        go (Var v) = Var (mapping IM.! v)
+                        go (Compound f xs) = Compound f (map go xs)
+                        go x = x
+                    in (next + length ids,go t)
+      (next,copies) = mapAccumL copy (ssFresh st) raw
+      entries = [(fst (canonicalize emptySubst key),key,value) | Compound "$bag" [key,value] <- copies]
+      groups = groupBy (\(a,_,_) (b,_,_) -> a == b) (sortBy (\(a,_,_) (b,_,_) -> Toolkit.compareTerms a b) entries)
+      issues = passThrough sub
+      outputs = concat [reverse (take (ssOutLen s - ssOutLen st) (ssOutput s)) | s <- founds]
+      base = (foldl' (flip emit) st outputs) {ssFresh=next}
+      answer xs = case xs of
+        [] -> []
+        (_,key,_):_ ->
+          let align search (_,other,_) = bindSearch search (\state -> checked state (storeUnify (ssStore state) key other))
+              aligned = foldl' align [Found base] xs
+          in bindSearch aligned $ \state ->
+               let vals = [deepWalk (subst state) v | (_,_,v) <- xs]
+                   sorted = sortBy Toolkit.compareTerms vals
+                   values = if unique then [x | x:_ <- groupBy (\a b -> Toolkit.compareTerms a b == EQ) sorted] else vals
+               in bindSearch (checked state (storeUnify (ssStore state) (mkList (map Var free) Nothing) key))
+                    (\s -> checked s (storeUnify (ssStore s) target (mkList values Nothing)))
+  in if any isError issues || any isExhausted issues then issues else issues ++ concatMap answer groups
+  where
+    isError (BranchError _) = True
+    isError _ = False
+    isExhausted BranchExhausted = True
+    isExhausted _ = False
+
 -- | Rename the variables at or above @start@ in each term to fresh ids,
 -- with a separate namespace per term; returns the next free id.
 renameApart :: VarId -> [Term] -> ([Term], VarId)
@@ -848,7 +949,7 @@ tryClause env fuel st base goal cl =
 -- constraints, fall back to plain evaluation.
 evalTabled :: Env -> Int -> SolverState -> Pred -> Term -> Search
 evalTabled env fuel st0 p goal
-  | any (isConstrained store0) callVars = plain st0
+  | any (isConstrained store0) callVars || any (\((v,_),_)->v `elem` callVars) (Map.toList(ssAttributes st0)) = plain st0
   | otherwise = case Map.lookup callKey (ssTables st0) of
       Just te
         | teComplete te -> [BranchExhausted | teTruncated te] ++ consumeAnswers st0 (teAnswers te)
@@ -958,7 +1059,7 @@ evalTabled env fuel st0 p goal
     extract stf =
       let sf = subst stf
           (ans, vs) = canonicalize sf goal
-          bad = any (isConstrained (ssStore stf)) vs
+          bad = any (isConstrained (ssStore stf)) vs || not (Map.null (ssAttributes stf))
           out = reverse (take (ssOutLen stf - ssOutLen st0) (ssOutput stf))
        in (ans, length vs, out, bad)
 
@@ -981,7 +1082,24 @@ solveQuery :: Program -> Query -> Search
 solveQuery prog q =
   let barrier = -1
       goals = map (replaceCuts barrier) (queryGoals q)
-   in consumeMarkers barrier (solveGoals (mkEnv prog) maxResolutionDepth (initialState (queryNVars q)) goals)
+   in map residual (consumeMarkers barrier (solveGoals (mkEnv prog) maxResolutionDepth (initialState (queryNVars q)) goals))
+  where
+    residual (Found st) =
+      let seeds=nub(map snd(queryNames q) ++ concatMap (termVarIds . deepWalk(subst st) . Var . snd) (queryNames q))
+          close vs=let next=nub(vs++[w | ((v,_),a)<-Map.toList(ssAttributes st),v `elem` vs,w<-termVarIds(deepWalk(subst st)a)])
+                   in if next==vs then vs else close next
+          visible=close seeds
+          goals=concat [attributeGoals st v m value | ((v,m),value)<-Map.toAscList(ssAttributes st),v `elem` visible]
+      in Found st{ssResidualGoals=goals}
+    residual item=item
+    attributeGoals st v m value =
+      let key=(m++":attribute_goals",3); next=ssFresh st
+          goal=Compound(fst key)[Var v,Var next,nil]
+      in case lookupPred key prog of
+        Nothing->[Compound "put_attr"[Var v,Atom m,deepWalk(subst st)value]]
+        Just _->case [deepWalk(subst s)(Var next) | Found s<-solveGoal(mkEnv prog) maxResolutionDepth st{ssFresh=next+1} goal] of
+          first:_->case unfoldCons first of (xs,Nothing)->xs; _->[]
+          _->[]
 
 data Answer = Answer
   { answerBindings :: [(String, Term)],
@@ -1018,7 +1136,7 @@ projectAnswer q st =
       domains = [(v, d) | v <- relevantVars, Just d <- [domainOf store v], isFree v]
       isFree v = case walk s (Var v) of Var w -> w == v; _ -> False
       -- naming
-      allTerms = map snd bindings ++ map constraintTerm relevant ++ [Var v | (v, _) <- domains]
+      allTerms = ssResidualGoals st ++ map snd bindings ++ map constraintTerm relevant ++ [Var v | (v, _) <- domains]
       internal = nub [v | t <- allTerms, v <- termVars t, v `notElem` map snd names, not (IM.member v aliases)]
       internalNames = IM.fromList (zip internal [0 :: Int ..])
       nameOf v = case lookup v [(vid, n) | (n, vid) <- names] of
@@ -1034,7 +1152,7 @@ projectAnswer q st =
       displayNames = IM.fromList [(v, nameOf v) | t <- map snd bindings, v <- termVars t]
    in Answer
         { answerBindings = bindings,
-          answerResiduals = residualDomains ++ residualConstraints,
+          answerResiduals = residualDomains ++ residualConstraints ++ map (render . deepWalk s) (ssResidualGoals st),
           answerOutput = reverse (ssOutput st),
           answerNames = displayNames
         }
@@ -1082,8 +1200,10 @@ solveAll prog q = summarizeSearch q (solveQuery prog q)
 -- | Build an inferred program from source text (clauses and declarations).
 loadProgramText :: String -> Either String Program
 loadProgramText src = do
-  items <- parseProgram src
-  located <- either (Left . snd) Right (parseLocatedFile "<program>" src)
+  _ <- parseProgram src
+  raw <- either (Left . snd) Right (parseLocatedFile "<program>" src)
+  located <- expandStandard raw
+  let items = map locatedItem located
   let prog = inferProgram ((buildProgram items) {progSources = sourceMap located})
   case programViolations prog of
     [] -> pure prog

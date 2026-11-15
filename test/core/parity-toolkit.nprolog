@@ -1,0 +1,37 @@
+<- notable.
+p a.
+p b <- q b.
+q b.
+> functor (plus 1 2) N A?
+> functor T node 3, arg 2 T x, term_variables T Vs?
+> arg N (node a b a) A?
+> univ (node X X) L?
+> univ T [node,X,X], arg 1 T a?
+> copy_term (node X X) C, X = bound?
+> copy_term (node X X) (node A B), A = a, var X, B = a?
+> term_variables (node X (box Y X) Z) Vs?
+> compare O X Y?
+> compare O 1 1.0?
+> compare O (box z) (a x y)?
+> clause (p X) B?
+> findall X (clause (p X) B, (B = true ; B != true, call B)) L?
+> clause H B?
+> clause (write X) B?
+> functor [] N A?
+> functor T box 0?
+> univ T [box]?
+> arg 5 (box a) X?
+
+# Freshness and rollback on retries, including branch-local asserted facts.
+d : dynamic.
+> assert (d a), clause (d X) B?
+> (assert (d a), fail ; not (clause (d a) _))?
+> (functor T box 2, arg 1 T a, fail ; functor T box 2), term_variables T Vs?
+> X in 1 .. 3, copy_term (box X X) (box A A), A = 9, X = 2?
+
+ordered 1.
+ordered a.
+> X in 1 .. 2, arg N (node 1 a) X?
+> X in 1 .. 2, once (arg N (node 1 a) X)?
+> X in 1 .. 2, clause (ordered X) B?
+> X in 1 .. 2, once (clause (ordered X) B)?

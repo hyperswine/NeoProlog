@@ -1,7 +1,14 @@
 # Infera as a general-purpose language
 
-Date: 15 November 2026. Kind: design proposal. Status: proposed; nothing here
-is implemented at `154eaa8` (2.5.0 + 4).
+Date: 15 November 2026. Kind: design proposal. Status: Steps 0–5 implemented locally, with qualification
+limits recorded in the [implementation report](2026-11-15-GENERAL-PURPOSE-IMPLEMENTATION.md). The original gap inventory below describes
+`154eaa8` (2.5.0 + 4).
+
+
+Current local validation: 475 Haskell checks (isolated committed Minesweeper
+fixture), 261 general-purpose cases per execution configuration, 21 example
+programs per configuration, CLI acceptance and all 61 language-server tests.
+See the implementation report for the remaining qualification work.
 
 ## Why
 
@@ -147,27 +154,72 @@ Results:
 | `functor T Name Arity` | principal functor; builds a term of fresh arguments when `T` is unbound |
 | `arg N T A` | the `N`th argument (1-based); enumerates `N` when unbound |
 | `univ T L` | `T` as a list `[Name, A1, ..., An]` and back (ISO `=..`) |
-| `copy_term T C` | a copy with fresh variables, copying attributes (Step 5) |
+| `copy_term T C` | a structural copy with fresh variables; CLP constraints are not copied; general attributes belong to Step 5 |
 | `term_variables T Vs` | the variables of `T` in depth-first order |
 | `compare Order A B` | standard order of terms; `Order` is `lt`, `eq` or `gt` |
 | `clause H B` | clauses of a predicate visible to the caller, for meta-interpreters |
 
-`clause` is the only new reflective capability. It sees predicates in the
-caller's module and predicates its module exports. Builtins have no clauses
+`clause` is the only new reflective capability. It exposes all loaded user
+predicates, including imported and standard-library clauses under their
+existing qualified names; there is no export/public visibility gate. Builtins have no clauses
 and fail, rather than fault, so a meta-interpreter can dispatch them to
 `call`. `call/N` already exists in the core compiler.
 
 Standard order extends the existing ordering of numbers, characters, strings
 and atoms:
 
-`Var < Number < Char < Atom < String < Compound`
+`Var < Integer < Float < Char < Atom < String < Compound`
+
+Integers precede floats regardless of numeric value. Variables compare by
+logical ID within the current execution.
 
 Compounds compare by arity, then name, then arguments left to right.
 
 Acceptance: generated tests against an independent Haskell model of each
 predicate in every mode, through both the JIT and the interpreter.
 
+### 2026-11-15: Step 1 implementation
+
+The [term toolkit reference](2026-11-15-TERM-TOOLKIT.md) specifies the shipped
+signatures, modes and edge cases. `functor`, `arg` and `univ` trap on lists,
+zero-arity/atomic terms and invalid construction/index requests. The other
+operations accept arbitrary terms. `copy_term` preserves structural sharing
+but does not clone the constraint store. Reflection freshens head/body pairs
+and includes branch-local asserted facts.
+
+The Core uses its existing trailed builtin boundary, shared with the reference
+and earlier machine; JIT-enabled programs safely use that boundary for these
+operations. Retrying reflective answers also required pruning exported variable
+addresses when the Core rolls back its heap suffix.
+
+`meta_vanilla.nprolog` demonstrates vanilla interpretation, builtin leaves,
+depth bounds and proof trees; `meta_cost.nprolog` counts clause resolutions
+and fails normally when its explicit budget is exhausted. The independent ground-variant table example is now implemented with Step 2 and `std/assoc`.
+
+Validation (local macOS arm64, GHC 9.8.2):
+
+- The generated toolkit group passes 200 cases, including construction,
+  deconstruction, ordering, variable sharing and reflected source facts.
+- Core/reference/machine parity includes forced collection, retries,
+  branch-local facts, CLP inputs and successful prefixes before later errors.
+  The core groups pass in all four JIT/stream configurations.
+- All 13 independently checked example programs pass in all four
+  configurations (47 model-checked queries per configuration).
+- CLI acceptance passes, including imported-clause reflection and `:sig`.
+  Language-server checks pass (52 passed, 9 skipped).
+- The working-tree Haskell suite has four Minesweeper fixture failures:
+  the existing edited example contains inline queries, which those tests
+  reject. All 474 Haskell checks pass in an isolated copy with the committed
+  Minesweeper example; the edited working-tree file is preserved.
+
+No throughput improvement or native JIT implementation is claimed.
+
 ## Step 2: the standard library
+
+Implemented locally: embedded sources with explicit declarations, imports,
+prelude/opt-out and whole-predicate user shadowing. Sorting/grouping use private
+native helpers behind shadowable wrappers. See the implementation report for
+interfaces, examples, tests and the pending performance gate.
 
 `std` is a set of modules shipped with the binary and imported by name rather
 than by hash:
@@ -204,6 +256,11 @@ Acceptance:
 - the generated tests compare each against an independent model.
 
 ## Step 3: faults, `main` and effects
+
+Implemented locally in an explicit resource-scoped runner for `infera run`
+and surface effect queries. Worlds are hidden and checked at static and runtime
+boundaries. The existing pure Search API retains its error-item contract.
+The report records result-bearing convenience forms and fault-frame scope.
 
 ### Faults
 
@@ -307,6 +364,11 @@ Acceptance:
 
 ## Step 4: handles, files, sockets and the OS
 
+Implemented locally: file/string/process streams, TCP/listen/UDP/Unix,
+readiness, OS effects and cached on-demand DCG parsing. Runtime file paths
+are accepted. Tests use independent socket peers and a two-client relay.
+Linux CI and exhaustive platform-error induction remain qualification gates.
+
 Every external object is opened from an **address term** and used through the
 same operations:
 
@@ -353,6 +415,12 @@ Acceptance:
 - the `string` address round-trips every grammar in the examples.
 
 ## Step 5: attributed variables (engine)
+
+Implemented locally using persistent attributes and goal-boundary hooks.
+`std/coroutine` and a Boolean attribute domain support the watched-literal
+SAT example. Attributed queries conservatively use the interpreter for the
+entire search; native checkpoints/traces and per-kernel bailout are later
+optimization/integration work. Native CLP(Z) domains are not copied.
 
 The interface follows SWI-Prolog's, keyed by module:
 
@@ -426,15 +494,10 @@ depends only on Step 1 (`copy_term`).
 
 ## Open questions
 
-- **Evaluating by sort (Step 0) under several declaration modes.** Should a
-  predicate with several declaration modes evaluate per selected mode, or only
-  when every mode agrees the argument is numeric? The proposal leans to "every
-  mode agrees", which is conservative.
-- **Visibility of `clause`.** Is "module-visible" enough, or should
-  predicates opt in with a `public` flag to keep JIT-compiled predicates free of
-  reflection? Reflection does not stop compilation, since clauses are retained
-  for the interpreter anyway, but an opt-in flag documents intent.
-- **The world token.** Should it be visible to the programmer, as a type the
-  analyser checks, or hidden entirely by the `io` rule translation? Hidden is
-  simpler; visible allows passing a world to a pure helper that only threads
-  it.
+- **Evaluating by sort under several declaration modes: resolved in Step 0.**
+  Arithmetic is folded only when every declaration mode agrees the argument
+  is numeric.
+- **Visibility of `clause`: resolved.** All loaded user-defined clauses,
+  including library clauses, are reflected; no public opt-in is required.
+- **The world token: resolved.** Hidden grammar state; handwritten expanded
+  clauses are still checked statically and at runtime.

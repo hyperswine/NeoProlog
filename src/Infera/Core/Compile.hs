@@ -68,6 +68,7 @@ import Infera.Error (PredKey, SolveError (..))
 import System.IO.Unsafe (unsafePerformIO)
 import Infera.Infer (joinSort)
 import qualified Infera.Program as P
+import Infera.AttributeSupport (attributeNames)
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
 import System.Mem.StableName (StableName, makeStableName)
@@ -1749,6 +1750,7 @@ compileGoal ctx term = case term of
   Compound "retract" [t] -> GRetract <$> arg t
   Compound "retractall" [t] -> GRetractAll <$> arg t
   Compound f as
+    | f `elem` attributeNames -> pure (GUnsupported term)
     | (f, length as) `elem` leafBuiltins -> GLeaf f <$> mapM arg as
     | f `elem` constraintBuiltins -> GLeaf f <$> mapM arg as
     | otherwise -> userCall f as
@@ -1815,7 +1817,8 @@ coreBuiltinGoal f n =
 -- arguments (and the preloaded files): run through 'GLeaf'.
 leafBuiltins :: [(String, Int)]
 leafBuiltins =
-  [ ("str_concat", 3), ("str_length", 2), ("str_chars", 2), ("str_atom", 2), ("str_num", 2),
+  [ ("std_native_msort",2), ("std_native_sort",2), ("std_native_sort_by",4), ("std_native_bagof",3), ("std_native_setof",3), ("functor",3), ("arg",3), ("univ",2), ("copy_term",2), ("term_variables",2), ("compare",3), ("clause",2),
+    ("str_concat", 3), ("str_length", 2), ("str_chars", 2), ("str_atom", 2), ("str_num", 2),
     ("str_upper", 2), ("str_lower", 2), ("str_lines", 2), ("term_str", 2), ("char_code", 2),
     ("read_file", 2), ("fmt", 4), ("wr", 3), ("sp", 2), ("nl", 2), ("seq", 3), ("padl", 4), ("padr", 4)
   ]

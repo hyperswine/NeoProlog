@@ -285,6 +285,72 @@ prop_engine_arith_as_data = unit $ do
   assertAnswers declared "num_in (2 * 3) R?" ["R = got 6"]
   assertAnswers declared "any_in (2 * 3) R?" ["R = got (2 * 3)"]
 
+-- Independent expectations are constructed from generated source values,
+-- rather than from another execution of the toolkit.
+prop_term_toolkit_generated :: Property
+prop_term_toolkit_generated = withTests 200 . property $ do
+  xs <- forAll (Gen.list (Range.linear 1 12) (Gen.int (Range.linear (-100) 100)))
+  let term = "node " ++ unwords (map (\x -> "(" ++ show x ++ ")") xs)
+      list ys = "[" ++ concat (zipWith (++) ("":repeat ", ") ys) ++ "]"
+      sourceList = list (map show xs)
+      repr = "[node," ++ drop 1 sourceList
+      n = show (length xs)
+  assertAnswers "" ("functor (" ++ term ++ ") node " ++ n ++ "?") ["true."]
+  assertAnswers "" ("univ (" ++ term ++ ") " ++ repr ++ "?") ["true."]
+  assertAnswers "" ("univ T " ++ repr ++ ", T = (" ++ term ++ "), ground T?")
+    ["T = " ++ unwords ("node":map show xs)]
+  assertAnswers "" ("findall A (arg I (" ++ term ++ ") A) L?") ["L = " ++ list (map show xs)]
+  assertAnswers "" ("functor T node " ++ n ++ ", term_variables T Vs, length Vs " ++ n ++ ", T = (" ++ term ++ ")?")
+    ["T = " ++ unwords ("node":map show xs) ++ ", Vs = " ++ sourceList]
+  let copyProbe = "probe <- copy_term (node X X Y) (node A B C), A = 17, B = 17, var X, var Y, var C, compare lt X C, term_variables (node X Y X) [X,Y]."
+  assertAnswers copyProbe "probe?" ["true."]
+  let facts = unlines ["p (" ++ show x ++ ")." | x <- xs]
+  assertAnswers facts "findall X (clause (p X) true) L?" ["L = " ++ sourceList]
+  assertAnswers "" ("compare eq (" ++ term ++ ") (" ++ term ++ ")?") ["true."]
+  let a = head xs
+      o = if a < 0 then "lt" else if a == 0 then "eq" else "gt"
+  assertAnswers "" ("compare " ++ o ++ " (" ++ show a ++ ") 0?") ["true."]
+
+prop_term_toolkit_edges :: Property
+prop_term_toolkit_edges = unit $ do
+  assertAnswers "" "functor (1 + 2) plus 2, univ (1 + 2) [plus,1,2]?" ["true."]
+  assertAnswers "" "findall N (arg N (box a b c) b) Ns?" ["Ns = [2]"]
+  assertAnswers "" "arg 2 (box a b) a?" ["false."]
+  assertAnswers "" "copy_term (box X X) (box A B), A = 7, B = 7, var X, term_variables (box X X) [X]?" ["A = 7, B = 7"]
+  assertAnswers "" "compare eq X X, compare lt 100000000000000000000 0.0, compare lt a \"a\", compare lt (z a) (a b c)?" ["true."]
+  assertAnswers "" "functor (box a) other 1?" ["false."]
+  mapM_ (\q -> assertErrorContains "" q "term toolkit request")
+    ["functor [] N A?", "functor atom N A?", "functor T box 0?",
+     "functor T box (-1)?", "functor T 7 2?", "functor T box N?",
+     "arg 0 (box a) X?", "arg 2 (box a) X?", "arg 1 [] X?",
+     "univ T []?", "univ T [box]?", "univ T [box | X]?", "univ [] L?"]
+  assertAnswers "" "X in 1..2, once (arg N (node 1 a) X)?" ["X = 1, N = 1"]
+  assertAnswers "p 1.\np a." "X in 1..2, once (clause (p X) B)?" ["X = 1, B = true"]
+  let prog = "<- notable.\np a.\np b <- q b.\nq b.\n"
+  assertAnswers prog "findall X (clause (p X) true) L?" ["L = [a]"]
+  assertAnswers prog "findall X (clause (p X) B, (B = true ; B != true, call B)) L?" ["L = [a, b]"]
+  assertAnswers prog "clause (is X Y) B?" ["false."]
+  assertAnswers prog "findall X (clause (p X) B, (B = true ; B != true, call B)) A, findall X (clause (p X) B, (B = true ; B != true, call B)) C?" ["A = [a, b], C = [a, b]"]
+
+-- Hook timing, persistence and table fallback are semantic boundaries, not
+-- just tests of the attribute map operations.
+prop_attributes_boundaries :: Property
+prop_attributes_boundaries = unit $ do
+  let source = unlines
+        [ "<- import \"std/coroutine\".",
+          "head a b.",
+          "ready:attr_unify_hook Expected Other <- Expected = b, Other = a.",
+          "p : table.", "p a.", "p b." ]
+  assertAnswers source "put_attr X ready Y, head X Y?" ["X = a, Y = b"]
+  assertAnswers source "findall [X,Y] (freeze X (is Y 1), p X) Answers?" ["Answers = [[a, 1], [b, 1]]"]
+  prog <- loadOrFail source
+  query <- either (\e -> annotate e >> failure) pure (parseQuery "freeze X (is Y 1), p X?")
+  let stream = solveQuery prog query
+      answers = [showAnswer (projectAnswer query st) | Found st <- stream]
+  take 1 answers === ["X = a, Y = 1"]
+  drop 1 answers === ["X = b, Y = 1"]
+  take 1 answers === ["X = a, Y = 1"]
+
 prop_engine_cut :: Property
 prop_engine_cut = unit $ do
   let prog =
@@ -494,7 +560,7 @@ prop_infer_commit_is_sound = unit $ do
 -- for pruning. Input hints may overestimate prerequisites of relational calls.
 prop_infer_stdlib_golden :: Property
 prop_infer_stdlib_golden = unit $ do
-  res <- evalIO (loadFile "examples/stdlib.nprolog")
+  res <- evalIO (loadFile "test/fixtures/legacy-stdlib.nprolog")
   prog <- case res of
     Left err -> annotate err >> failure
     Right (p, _) -> pure p
@@ -892,7 +958,7 @@ prop_modules_import_and_qualify = unit $ do
       modSrc = unlines ["twice : det (int: <=) (int: =>).", "twice X Y <- Y is X * 2.", "helper 1."]
       conf = Map.fromList [("mymod#abc", modPath)]
   evalIO (writeFile modPath modSrc)
-  res <- evalIO (loadSource conf (unlines ["<- import \"mymod#abc\".", "main R <- mymod:twice 21 R.", "> main R?"]))
+  res <- evalIO (loadSource conf (unlines ["<- noprelude.", "<- import \"mymod#abc\".", "main R <- mymod:twice 21 R.", "> main R?"]))
   case res of
     Left err -> annotate err >> failure
     Right (prog, queries) -> do
@@ -933,6 +999,9 @@ inferaGroup =
       ("engine lists", prop_engine_lists),
       ("engine arithmetic", prop_engine_arith_in_heads),
       ("engine arithmetic as data", prop_engine_arith_as_data),
+      ("term toolkit generated", prop_term_toolkit_generated),
+      ("term toolkit edges", prop_term_toolkit_edges),
+      ("attributed variable boundaries", prop_attributes_boundaries),
       ("engine cut", prop_engine_cut),
       ("engine control", prop_engine_control),
       ("engine disequality", prop_engine_disequality),

@@ -1,0 +1,14 @@
+aggregate_all : nondet notable (any: <=>) (any: <=>) (any: <=>).
+bagof : nondet notable (any: <=>) (any: <=>) (any: <=>).
+setof : nondet notable (any: <=>) (any: <=>) (any: <=>).
+<- import "std/list".
+<- import "std/order".
+aggregate_all count Goal N <- findall 1 Goal Xs, length Xs N.
+aggregate_all (sum X) Goal N <- findall X Goal Xs, sum_list Xs N.
+aggregate_all (max X) Goal N <- findall X Goal Xs, max_list Xs N.
+aggregate_all (min X) Goal N <- findall X Goal Xs, min_list Xs N.
+aggregate_all (bag X) Goal Xs <- findall X Goal Xs.
+aggregate_all (set X) Goal Xs <- findall X Goal Bag, sort Bag Xs.
+
+bagof Template Goal Bag <- std_native_bagof Template Goal Bag.
+setof Template Goal Set <- std_native_setof Template Goal Set.

@@ -268,10 +268,25 @@ line [row N S] -> seq Cs, " ", wr S, { str_chars NS Cs, str_atom NS N }.
 ```
 
 DCG helpers: `"literal"`, `seq Xs`, `wr Term`, `nl`, `sp`,
-`fmt "~w ~d ~s ~a ~n" Args`, `padl Term Width`, `padr Term Width`.  Plain
-builtins: `term_str`, `str_lines`, `char_code`; comparisons order characters,
-strings and atoms as well as numbers.  File paths must be string literals: the
-engine is pure, so the loader reads the files up front.
+`fmt "~w ~d ~s ~a ~n" Args`, `padl Term Width`, `padr Term Width`.
+
+The [general-purpose runtime](docs/2026-11-15-GENERAL-PURPOSE-IMPLEMENTATION.md)
+adds shipped `std/` modules, an optional prelude, `infera run FILE [ARGS...]`,
+linear effect grammars, file/string/socket handles and attributed variables.
+Examples include `wc`, a small Lisp REPL, HTTP and chat, type inference,
+Datalog and watched-literal SAT. See the report for precise interfaces and
+local qualification limits.
+
+The [term toolkit](docs/2026-11-15-TERM-TOOLKIT.md) provides `functor`, `arg`,
+`univ`, `copy_term`, `term_variables`, `compare` and `clause`, with fresh clause
+reflection for meta-interpreters. Structural requests on lists, zero-arity
+terms and invalid constructions raise runtime errors. See
+[`meta_vanilla.nprolog`](examples/meta_vanilla.nprolog) and
+[`meta_cost.nprolog`](examples/meta_cost.nprolog).
+
+Other builtins: `term_str`, `str_lines`, `char_code`; comparisons order characters,
+strings and atoms as well as numbers.  The pure API’s legacy file helpers
+preload literal paths; effect grammars accept paths computed at runtime.
 
 Dynamic facts: `seen : dynamic.` declares a predicate with no clauses whose
 facts are added with `assert (seen X)` and removed with `retract`/`retractall`

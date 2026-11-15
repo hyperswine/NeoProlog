@@ -1,0 +1,45 @@
+std_coroutine_has : nondet notable (any: <=>) (any: <=>).
+std_coroutine_add : nondet notable (any: <=>) (any: <=>).
+std_coroutine_watch : nondet notable (any: <=>) (any: <=>).
+dif : nondet notable (any: <=>) (any: <=>).
+freeze : nondet notable (any: <=>) (any: <=>).
+when : nondet notable (any: <=>) (any: <=>).
+std_coroutine_resume : nondet notable (any: <=>).
+std_coroutine_ready : nondet notable (any: <=>).
+frozen : nondet notable (any: <=>) (any: <=>).
+std_coroutine_goals : nondet notable (any: <=>) (any: <=>).
+coroutine:attr_unify_hook : nondet notable (any: <=>) (any: <=>).
+std_coroutine_run : nondet notable (any: <=>).
+coroutine:attribute_goals : nondet notable (any: <=>) (any: <=>) (any: <=>).
+<- import "std/list".
+# The private unbound token gives each suspension an identity. Re-watching
+# the same suspension does not register it twice on an aliased variable.
+std_coroutine_has Id [task Other _ _ | _] <- Id == Other.
+std_coroutine_has Id [task Other _ _ | Ts] <- not (Id == Other), std_coroutine_has Id Ts.
+std_coroutine_add V Task <- Task = (task Id _ _),
+  (get_attr V coroutine Tasks -> (std_coroutine_has Id Tasks -> true ; put_attr V coroutine [Task | Tasks]) ; put_attr V coroutine [Task]).
+std_coroutine_watch [] _.
+std_coroutine_watch [V | Vs] Task <- std_coroutine_add V Task, std_coroutine_watch Vs Task.
+dif A B <- std_coroutine_resume (task _ (different A B) true).
+freeze V Goal <- std_coroutine_resume (task _ (nonvar V) Goal).
+when Condition Goal <- std_coroutine_resume (task _ Condition Goal).
+std_coroutine_resume Task <- Task = (task _ Condition Goal),
+  (Condition = (different A B) ->
+    (A == B -> fail ; copy_term_nat (pair A B) (pair X Y), (X = Y -> term_variables (pair A B) Vs, std_coroutine_watch Vs Task ; true))
+  ; std_coroutine_ready Condition -> std_coroutine_call Goal
+  ; term_variables Condition Vs, Vs != [], std_coroutine_watch Vs Task).
+std_coroutine_ready (nonvar X) <- nonvar X.
+std_coroutine_ready (ground X) <- ground X.
+std_coroutine_ready (A, B) <- std_coroutine_ready A, std_coroutine_ready B.
+std_coroutine_ready (A ; B) <- (std_coroutine_ready A -> true ; std_coroutine_ready B).
+frozen V Goals <- (var V, get_attr V coroutine Tasks -> std_coroutine_goals Tasks Goals ; Goals = []).
+std_coroutine_goals [] [].
+std_coroutine_goals [task _ C G | Ts] [when C G | Gs] <- std_coroutine_goals Ts Gs.
+coroutine:attr_unify_hook Tasks _ <- std_coroutine_run Tasks.
+std_coroutine_run [].
+std_coroutine_run [Task | Tasks] <- std_coroutine_resume Task, std_coroutine_run Tasks.
+coroutine:attribute_goals V -> { get_attr V coroutine Tasks, std_coroutine_goals Tasks Goals }, seq Goals.
+
+std_coroutine_call : nondet notable (any: <=>).
+std_coroutine_call true.
+std_coroutine_call Goal <- not (Goal == true), call Goal.

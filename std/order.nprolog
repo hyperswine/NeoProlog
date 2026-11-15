@@ -1,0 +1,30 @@
+msort : nondet notable (any: <=>) (any: <=>).
+std_order_split : nondet notable (any: <=>) (any: <=>) (any: <=>).
+sort : nondet notable (any: <=>) (any: <=>).
+predsort : nondet notable (any: <=>) (any: <=>) (any: <=>).
+std_order_pred : nondet notable (any: <=>) (any: <=>) (any: <=>).
+std_order_pmerge : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+pairs_keys_values : nondet notable (any: <=>) (any: <=>) (any: <=>).
+pairs_keys : nondet notable (any: <=>) (any: <=>).
+pairs_values : nondet notable (any: <=>) (any: <=>).
+keysort : nondet notable (any: <=>) (any: <=>).
+sort : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+<- import "std/list".
+msort L S <- std_native_msort L S.
+std_order_split [] [] [].
+std_order_split [X] [X] [].
+std_order_split [X,Y | Xs] [X | A] [Y | B] <- std_order_split Xs A B.
+sort L S <- std_native_sort L S.
+predsort P L S <- std_order_pred P L S.
+std_order_pred _ [] [].
+std_order_pred _ [X] [X].
+std_order_pred P [X,Y | Xs] S <- std_order_split [X,Y | Xs] A B, std_order_pred P A AS, std_order_pred P B BS, std_order_pmerge P AS BS S.
+std_order_pmerge _ [] B B.
+std_order_pmerge _ [X | Xs] [] [X | Xs].
+std_order_pmerge P [X | Xs] [Y | Ys] S <- call P O X Y, (O = lt -> S = [X | R], std_order_pmerge P Xs [Y | Ys] R ; O = gt -> S = [Y | R], std_order_pmerge P [X | Xs] Ys R ; O = eq, S = [X | R], std_order_pmerge P Xs Ys R).
+pairs_keys_values [] [] [].
+pairs_keys_values [pair K V | Ps] [K | Ks] [V | Vs] <- pairs_keys_values Ps Ks Vs.
+pairs_keys Ps Ks <- pairs_keys_values Ps Ks _.
+pairs_values Ps Vs <- pairs_keys_values Ps _ Vs.
+keysort Ps S <- sort 1 lte Ps S.
+sort N O L S <- std_native_sort_by N O L S.
