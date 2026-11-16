@@ -103,7 +103,7 @@ library
         Infera.Core.Liveness
         Infera.Module
         Infera.Repl
-    other-modules:    Infera.Engine.Contracts Infera.TermToolkit Infera.Standard Infera.AttributeSupport Infera.Effects Infera.Runtime
+    other-modules:    Infera.Termination.Analysis Infera.Engine.Contracts Infera.TermToolkit Infera.Standard Infera.AttributeSupport Infera.Effects Infera.Runtime
                       Paths_infera
     autogen-modules:  Paths_infera
     build-depends:

@@ -1,5 +1,13 @@
 # Count user-clause resolutions with an explicit budget. Exhausting the
 # budget is ordinary failure; there are no exceptions or mutable counters.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# No supported well-founded measure is inferred for every recursive call.
+cost : unsafe.
+# Proof gap: calls cost/3 outside its currently verified modes.
+measured : unsafe.
+# No supported well-founded measure is inferred for every recursive call.
+path : unsafe.
+
 <- notable.
 
 edge a b.

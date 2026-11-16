@@ -15,6 +15,10 @@
 #
 # Undeclared predicates are analysed: see `:sig <name>` in the REPL.
 
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# No supported well-founded measure is inferred for every recursive call.
+nat : unsafe.
+
 fact : det (int: <=) (int: =>).
 fact 0 1.
 fact N R <- N > 0, N1 is N - 1, fact N1 R1, R is N * R1.

@@ -461,7 +461,7 @@ test('real compiler performance suggestions have exact identifier ranges and fol
   } } })
   await until(() => messages.slice(from).filter(m => m.method === 'textDocument/publishDiagnostics'
     && m.params.uri === uri).length >= 2)
-  assert.deepEqual(published(from), [], 'valid source remains valid when suggestions are hidden')
+  assert.ok(published(from).every(d => !String(d.code).startsWith('perf-')), 'hiding performance suggestions preserves recursion warnings')
 
   from = messages.length
   notify('textDocument/didChange', { textDocument: { uri, version: 2 }, contentChanges: [{ text: source + 'main <- missing.\n' }] })
@@ -706,4 +706,27 @@ test('disabled save checks preserve live checks during autosave, and both settin
   await new Promise(resolve => setTimeout(resolve, 500))
   const published = messages.slice(from).filter(m => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri)
   assert.ok(published.length > 0 && published.every(m => m.params.diagnostics.length === 0))
+})
+
+test('compiler recursion warnings offer applicable marker edits through the protocol', {
+  skip: !process.env.INFERA_BIN, timeout: 20000
+}, async t => {
+  const { uri } = fixture(t)
+  const text = 'loop : notable.\nloop N <-\n  N > 0,\n  loop N.\n'
+  const { notify, request, messages } = await client(t, process.env.INFERA_BIN)
+  notify('textDocument/didOpen', { textDocument: { uri, languageId: 'infera', version: 1, text } })
+  const published = () => messages.filter(m => m.method === 'textDocument/publishDiagnostics'
+    && m.params.uri === uri).at(-1)?.params.diagnostics
+  await until(() => published()?.some(d => d.code === 'partial-recursion'))
+  const diagnostic = published().find(d => d.code === 'partial-recursion')
+  const response = await request('textDocument/codeAction', {
+    textDocument: { uri }, range: diagnostic.range, context: { diagnostics: [diagnostic] }
+  })
+  assert.ok(!response.error, JSON.stringify(response.error))
+  const edit = response.result.find(a => a.title === 'Mark loop unsafe').edit.changes[uri][0]
+  assert.equal(edit.range.start.line, 0)
+  const checked = spawnSync(process.env.INFERA_BIN, ['check', '--json', '--stdin', path.join(os.tmpdir(), 'recursion-fixed.nprolog')],
+    { input: edit.newText + text, encoding: 'utf8' })
+  assert.equal(checked.status, 0, checked.stderr)
+  assert.ok(!JSON.parse(checked.stdout).diagnostics.some(d => d.code === 'partial-recursion'))
 })

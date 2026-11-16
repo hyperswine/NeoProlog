@@ -1,3 +1,17 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls whites/2 outside its currently verified modes.
+elements : unsafe.
+# Proof gap: calls value/3 outside its currently verified modes.
+json : unsafe.
+# Proof gap: calls whites/2 outside its currently verified modes.
+members : unsafe.
+# Proof gap: calls whites/2 outside its currently verified modes.
+more_elements : unsafe.
+# Proof gap: calls whites/2 outside its currently verified modes.
+more_members : unsafe.
+# Proof gap: calls whites/2 outside its currently verified modes.
+value : unsafe.
+
 <- import "std/dcg".
 # JSON values: null, true, false, num N, str S, array Vs, object Pairs.
 json V -> whites, value V, whites, eos.

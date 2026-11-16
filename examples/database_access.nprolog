@@ -39,6 +39,34 @@
 # and three binary semaphores, 1 when free.  A step that takes a semaphore is
 # only possible while it is free, which is how a process waits.
 
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls unseen/4 outside its currently verified modes.
+bfs : unsafe.
+# Proof gap: calls run/4 outside its currently verified modes.
+counterexample : unsafe.
+# Proof gap: calls reachable/2 outside its currently verified modes.
+deadlock : unsafe.
+# Proof gap: calls reachable/2 outside its currently verified modes.
+exclusion : unsafe.
+# Proof gap: calls overtaken/3 outside its currently verified modes.
+lasso : unsafe.
+# Proof gap: calls passing/4 outside its currently verified modes.
+loop : unsafe.
+# Proof gap: calls reachable/2 outside its currently verified modes.
+overtaken : unsafe.
+# Proof gap: calls lasso/3 outside its currently verified modes.
+overtaking : unsafe.
+# Proof gap: calls next/4 outside its currently verified modes.
+reachable : unsafe.
+# Proof gap: calls states/2 outside its currently verified modes.
+report : unsafe.
+# Proof gap: calls bfs/5 outside its currently verified modes.
+run : unsafe.
+# Proof gap: calls reachable/2 outside its currently verified modes.
+states : unsafe.
+# Proof gap: calls reachable/2 outside its currently verified modes.
+updates : unsafe.
+
 start (s [r idle, r idle, w want 0, w want 0] (g 0 0 1 1 1)).
 
 # next P S Step S1: under protocol P, one process moves from S to S1.  Any

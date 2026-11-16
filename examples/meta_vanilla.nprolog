@@ -1,6 +1,14 @@
 # A vanilla meta-interpreter, bounded search and proof trees.
 # Reflection exposes all loaded user clauses; this interpreter handles
 # conjunction and pure user predicates. Builtin leaves use call/N.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# No supported well-founded measure is inferred for every recursive call.
+bounded : unsafe.
+# No supported well-founded measure is inferred for every recursive call.
+path : unsafe.
+# No supported well-founded measure is inferred for every recursive call.
+solve : unsafe.
+
 <- notable.
 
 edge a b.

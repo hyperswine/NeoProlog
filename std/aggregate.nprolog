@@ -1,3 +1,13 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Invokes a run-time goal; its termination is not statically known.
+bagof : unsafe.
+# Proof gap: calls std_agg_take/4 outside its currently verified modes.
+std_agg_groups : unsafe.
+# Proof gap: calls std_agg_variant/2 outside its currently verified modes.
+std_agg_take : unsafe.
+# Proof gap: calls std_agg_number/3 outside its currently verified modes.
+std_agg_variant : unsafe.
+
 aggregate_all : notable.
 bagof : notable.
 setof : notable.

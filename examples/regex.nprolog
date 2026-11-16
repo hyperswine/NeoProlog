@@ -6,6 +6,24 @@
 
 # ── The specification: match a regular expression directly ────────────────
 
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls match/3 outside its currently verified modes.
+agree : unsafe.
+# Proof gap: calls member/2 outside its currently verified modes.
+closure : unsafe.
+# Proof gap: calls t/7 outside its currently verified modes.
+compile : unsafe.
+# No supported well-founded measure is inferred for every recursive call.
+match : unsafe.
+# Proof gap: calls compile/2 outside its currently verified modes.
+nfa_match : unsafe.
+# Proof gap: calls memberchk/2 outside its currently verified modes.
+run : unsafe.
+# Proof gap: calls closure/3 outside its currently verified modes.
+step : unsafe.
+# No supported well-founded measure is inferred for every recursive call.
+t : unsafe.
+
 match empty -> [].
 match any -> [_].
 match (char C) -> [C].

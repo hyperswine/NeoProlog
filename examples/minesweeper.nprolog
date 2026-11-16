@@ -13,6 +13,28 @@
 # minefield_seed shuffles search order with a reproducible integer seed. This
 # gives varied valid grids, but does not sample all valid grids uniformly.
 
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls window_rows/4 outside its currently verified modes.
+apply_rules : unsafe.
+# Proof gap: calls minefield_constraints/6 outside its currently verified modes.
+minefield : unsafe.
+# Proof gap: calls apply_rules/3 outside its currently verified modes.
+minefield_constraints : unsafe.
+# Proof gap: calls minefield_constraints/6 outside its currently verified modes.
+minefield_seed : unsafe.
+# Proof gap: calls minefield/5 outside its currently verified modes.
+mines : unsafe.
+# Proof gap: calls minefield/5 outside its currently verified modes.
+show_mines : unsafe.
+# Proof gap: calls minefield_seed/6 outside its currently verified modes.
+show_seeded : unsafe.
+# Proof gap: calls tile_cols/5 outside its currently verified modes.
+tile_rows : unsafe.
+# No supported well-founded measure is inferred for every recursive call.
+window_cols : unsafe.
+# Proof gap: calls window_cols/3 outside its currently verified modes.
+window_rows : unsafe.
+
 mines Width Height Bombs Max Grid <- minefield Width Height Bombs [window 2 2 Max] Grid.
 
 minefield Width Height Bombs Rules Grid <- minefield_constraints Width Height Bombs Rules Grid Cells, label Cells.

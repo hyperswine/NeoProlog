@@ -21,6 +21,20 @@
 #   demo L, emit (routes L)?                  demo L, emit (best L)?
 #   emit (show_level 7 42)?                   once (generate 8 7 L), emit (routes L)?
 
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls route/4 outside its currently verified modes.
+best : unsafe.
+# Proof gap: calls rows/6 outside its currently verified modes.
+board : unsafe.
+# Proof gap: calls board/4 outside its currently verified modes.
+play : unsafe.
+# Proof gap: calls route/4 outside its currently verified modes.
+routes : unsafe.
+# Proof gap: calls board/4 outside its currently verified modes.
+run : unsafe.
+# Proof gap: calls generate/3 outside its currently verified modes.
+show_level : unsafe.
+
 <- notable.
 
 # ─── Physics ─────────────────────────────────────────────────────────────────

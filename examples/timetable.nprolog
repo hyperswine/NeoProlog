@@ -23,6 +23,50 @@
 
 # Every predicate here either walks the data or searches; none benefits from
 # memoising its calls.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls timetable/1 outside its currently verified modes.
+checked : unsafe.
+# Proof gap: calls day_limits/3 outside its currently verified modes.
+daily_limit : unsafe.
+# Proof gap: calls sum/2 outside its currently verified modes.
+day_limits : unsafe.
+# Proof gap: calls daily_limit/1 outside its currently verified modes.
+each_student : unsafe.
+# Proof gap: calls daily_limit/1 outside its currently verified modes.
+each_teacher : unsafe.
+# Proof gap: calls length/2 outside its currently verified modes.
+enrolled : unsafe.
+# Proof gap: calls timetable/1 outside its currently verified modes.
+load_report : unsafe.
+# Proof gap: calls lessons_of/4 outside its currently verified modes.
+make_lessons : unsafe.
+# Proof gap: calls timetable/1 outside its currently verified modes.
+moved : unsafe.
+# Proof gap: calls suits/2 outside its currently verified modes.
+room_choices : unsafe.
+# Proof gap: calls room_choices/2 outside its currently verified modes.
+room_rules : unsafe.
+# Proof gap: calls timetable/1 outside its currently verified modes.
+rooms_free : unsafe.
+# Proof gap: calls timetable/1 outside its currently verified modes.
+school_report : unsafe.
+# Proof gap: calls each_student/2 outside its currently verified modes.
+student_rules : unsafe.
+# Proof gap: calls enrolled/2 outside its currently verified modes.
+suits : unsafe.
+# Proof gap: calls each_teacher/2 outside its currently verified modes.
+teacher_rules : unsafe.
+# Proof gap: calls make_lessons/2 outside its currently verified modes.
+timetable : unsafe.
+# Proof gap: calls violation/2 outside its currently verified modes.
+valid : unsafe.
+# Proof gap: calls suits/2 outside its currently verified modes.
+violation : unsafe.
+# Proof gap: calls timetable/1 outside its currently verified modes.
+week_of : unsafe.
+# Proof gap: calls timetable/1 outside its currently verified modes.
+week_report : unsafe.
+
 <- notable.
 
 # ── The school ───────────────────────────────────────────────────────────────

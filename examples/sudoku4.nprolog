@@ -5,6 +5,10 @@
 # Keep modeling separate from enumeration: sudoku_model can be composed with
 # extra clues before sudoku labels anything. Undeclared model predicates keep
 # their relational modes; output-mode declarations would require ground cells.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls count_grids/3 outside its currently verified modes.
+grid_count : unsafe.
+
 <- notable.
 
 sudoku_model [[A,B,C,D], [E,F,G,H], [I,J,K,L], [M,N,O,P]] Cells <-

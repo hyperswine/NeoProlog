@@ -2,6 +2,12 @@
 # Three missionaries and three cannibals must cross a river using a boat that
 # holds one or two people, never leaving missionaries outnumbered on either bank.
 # Run: infera examples/water_jugs.nprolog
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls mc_walk/4 outside its currently verified modes.
+mc_plans : unsafe.
+# Proof gap: calls mc_plans/1 outside its currently verified modes.
+report : unsafe.
+
 <- notable.
 
 # 1. Missionaries and Cannibals: state [MLeft, CLeft, BoatBank] (0=left, 1=right).

@@ -1,3 +1,11 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls assoc_to_keys/2 outside its currently verified modes.
+table_body : unsafe.
+# Proof gap: calls table_body/2 outside its currently verified modes.
+table_fix : unsafe.
+# Proof gap: calls table_fix/2 outside its currently verified modes.
+table_solve : unsafe.
+
 <- import "std/assoc".
 # A finite ground-variant meta-interpreter. Each fixed-point round interprets
 # reflected Horn bodies against its own AVL table, not the engine's table.

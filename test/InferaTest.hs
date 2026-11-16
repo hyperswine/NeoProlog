@@ -735,7 +735,8 @@ prop_infer_tabling_defaults = unit $ do
   predIsTabled lists <$> predOrFail lists ("length", 2) >>= (=== False)
   predIsTabled lists <$> predOrFail lists ("append", 3) >>= (=== False)
   fibP <- loadOrFail "fib 0 0.\nfib 1 1.\nfib N F <- N > 1, N1 is N - 1, N2 is N - 2, fib N1 F1, fib N2 F2, F is F1 + F2."
-  predIsTabled fibP <$> predOrFail fibP ("fib", 2) >>= (=== True)
+  -- Bounded integer descent is now a proof even when recursion is non-tail.
+  predIsTabled fibP <$> predOrFail fibP ("fib", 2) >>= (=== False)
   tabled ("edge", 2) >>= (=== False)
   tabled ("noisy", 1) >>= (=== False)
   tabled ("quiet", 1) >>= (=== False)

@@ -3,6 +3,12 @@
 # finite simple-path search plus minimize. For large networks use a priority
 # queue algorithm; this small model deliberately exposes all alternatives.
 # Run: infera examples/route_planning.nprolog
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# No supported well-founded measure is inferred for every recursive call.
+reachable : unsafe.
+# Proof gap: calls best_route/5 outside its currently verified modes.
+report : unsafe.
+
 <- notable.
 
 road depot market 4.

@@ -134,3 +134,12 @@ These markers describe declarations and effects, without adding warnings for
 intentional use of `unsafe` or `dynamic`. Diagnostic colors follow the active
 theme and editor settings. See VS Code's [semantic highlighting guide](https://code.visualstudio.com/api/language-extensions/semantic-highlight-guide#theming)
 for supported style overrides.
+
+
+Recursion verdicts come from the compiler: hover shows the verified modes or
+why recursion is unproven, together with the reason for an `unsafe` marker.
+`partial-recursion` is a warning; `nonterminating-mode` and
+`unnecessary-unsafe` are information. Quick fixes add or remove the marker,
+preserving single-line signatures and other flags. A missing-floor suggestion
+inserts a comment for review. Recursion diagnostics remain visible when
+performance hints are disabled.

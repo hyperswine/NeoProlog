@@ -10,6 +10,10 @@
 # `name : noindex.` / `<- noindex.` disable it.
 
 # Left recursion terminates under tabling.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# No supported well-founded measure is inferred for every recursive call.
+nat : unsafe.
+
 edge a b.
 edge b c.
 edge c a.

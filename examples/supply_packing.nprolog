@@ -2,6 +2,10 @@
 # Each item has finite stock, a weight, a price and a usefulness score.
 # Maximize usefulness by minimizing its negative; all accounting uses integers.
 # Run: infera examples/supply_packing.nprolog
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls best_pack/6 outside its currently verified modes.
+report : unsafe.
+
 <- notable.
 
 # item Name Weight Price Usefulness Stock

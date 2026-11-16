@@ -20,6 +20,22 @@
 # ── Moves ────────────────────────────────────────────────────────────────────
 
 # move State Move Next: Move takes block X off Y and puts it on Z.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls towers/2 outside its currently verified modes.
+picture : unsafe.
+# Proof gap: calls search/4 outside its currently verified modes.
+plan : unsafe.
+# No supported well-founded measure is inferred for every recursive call.
+reachable : unsafe.
+# Proof gap: calls unseen/4 outside its currently verified modes.
+search : unsafe.
+# Proof gap: calls plan/3 outside its currently verified modes.
+solution : unsafe.
+# Proof gap: calls reachable/2 outside its currently verified modes.
+states : unsafe.
+# Proof gap: calls tower/3 outside its currently verified modes.
+towers : unsafe.
+
 move State (move X Y Z) Next <-
   member (on X Y) State, clear X State,
   destination X Y Z State,

@@ -1,3 +1,9 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls std_order_pred/3 outside its currently verified modes.
+predsort : unsafe.
+# Proof gap: calls std_order_pmerge/4 outside its currently verified modes.
+std_order_pred : unsafe.
+
 msort : notable.
 std_order_split : notable.
 sort : notable.

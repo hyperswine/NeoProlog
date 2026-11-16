@@ -73,8 +73,9 @@ preserving answers, order and declared contracts remains the programmer's job.
 Checks do not execute inline queries or prove runtime mode/determinism
 contracts. Dynamic call targets remain runtime checks.
 
-JSON output is an array of `{file, severity, code, message, range}` objects on
-stdout. Ranges use zero-based lines and UTF-16 character offsets, with an
+JSON output is `{diagnostics: [...], predicates: [...]}` on stdout.
+Diagnostics contain `{file, severity, code, message, range}`; predicate facts
+include a recursion verdict, its conditions and the reason for `unsafe`. Ranges use zero-based lines and UTF-16 character offsets, with an
 exclusive end. Performance suggestions identify the recursive call, labeling
 name or first clause head precisely when the source site is unambiguous.
 Ambiguous sites and other semantic diagnostics retain the containing clause,
@@ -222,24 +223,15 @@ reverses the ordering; this does not change term identity.
 * **Indexing**: every argument position is indexed on its principal functor;
   a call only tries clauses compatible with its bound arguments.  Disable with
   `noindex` or `<- noindex.`.
-* **Tabling** (linear tabling with fixpoint iteration): calls are memoised by
-  variant, left recursion terminates, `fib` is linear.  On by default for
-  predicates that are recursive, pure (no output) and not merely structurally
-  recursive (list walkers, and grammars whose recursion follows consumed
-  input: every recursive call, also through mutual recursion, passes a proper
-  subterm of a head argument, including one reached through a body
-  unification such as a DCG terminal's `S0 = [c | S1]`), except *deterministic counter-driven loops*
-  (after 2.2.0; see [the criterion](docs/2026-11-01-AUTO-TABLING-COST.md#criterion)):
-  self-recursive predicates whose only self-call is the last goal and steps
-  a head variable by `V1 is V - c` / `V + c`, and whose clauses are exclusive
-  on that counter or whose inferred determinism is det/semidet.  Their calls
-  never repeat, so a table could not answer them.  Nondeterministic `between/3`-shaped
-  generators whose answer is the bounded counter itself are also untabled:
-  their answers are distinct, so a table would not change them.  `infera check` reports
-  `perf-tabled-counter-loop` for counter loops that are still tabled.  Disable with `notable` / `<- notable.`, force with
-  `table`.  A tabled call collects all its answers first, so predicates with
-  infinitely many answers must be declared `notable`; otherwise the fixpoint
-  never completes and runs until memory is exhausted.  Calls
+* **Tabling** (linear tabling with fixpoint iteration) memoises calls by
+  variant. It defaults on for recursive pure predicates without a verified
+  termination measure. Structural descent, bounded integer counters,
+  lexicographic descent and mutual size-change proofs run untabled.
+  Finite-domain Datalog recursion remains tabled. Force memoisation with
+  `table` (for example `fib : table.`), or disable it with `notable` /
+  `<- notable.`. Untabled finite searches preserve duplicate answers;
+  explicit tables deduplicate them. An infinite generator needs `notable`
+  because a table collects its entire answer set before returning. Calls
   involving constrained variables are never tabled.
 * **Cut** uses explicit choice-stack barriers. It is transparent through `,`,
   `;` and the selected arm of `->`; `call`, `not`, `once`, `findall` and an
@@ -252,9 +244,19 @@ reverses the ordering; this does not change term identity.
 Predicates are pure unless declared `unsafe`.  A clause of a predicate that
 is not `unsafe` may not use `write`/`writeln`/`print`/`nl`, `emit`,
 `read_file`/`phrase_from_file`, `assert`/`retract`/`retractall`, or cut, and
-may not call an unsafe predicate; the program is rejected at load time with
+may not call an effectful unsafe predicate; the program is rejected at load time with
 an `unsafe-call` error naming the fix.  Inline queries (`> ...?`) are the
 entry points and may do anything.
+
+`unsafe` also acknowledges recursion the checker cannot prove total.
+`partial-recursion` is a warning and does not prevent loading; it propagates
+through calls without a proven terminating mode. A marker used only for
+partiality does not make callers effectful. `nonterminating-mode` is
+information at calls outside the verified ground/integer modes, and
+`unnecessary-unsafe` suggests removing redundant markers. The language server
+shows verdicts on hover and offers marker quick fixes. See
+[total recursion inference](docs/2026-11-16-TOTAL-RECURSION.md) for supported
+proofs and conservative limits.
 
 Text is produced and consumed with DCGs, so a report is a grammar for its own
 output and effects stay at the edges:

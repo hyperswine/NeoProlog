@@ -8,11 +8,15 @@ module Infera.Purity
     clauseViolations,
     programViolations,
     describeViolation,
+    effectfulPredicates,
   )
 where
 
 import qualified Data.IntMap.Strict as IM
-import Infera.Error (PredKey, showPredKey)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
+import Infera.Termination.Analysis (calledPredicates)
+import Infera.Error (showPredKey)
 import Infera.Program
 import Infera.Syntax
 
@@ -35,6 +39,7 @@ isImpureBuiltin k = k `elem` impureBuiltinKeys
 unsafeGoals :: Program -> [Term] -> [Term]
 unsafeGoals prog = concatMap goal
   where
+    effectful = effectfulPredicates prog
     strip (Compound "^" [_,g]) = strip g
     strip t = t
     goal t = case t of
@@ -54,7 +59,7 @@ unsafeGoals prog = concatMap goal
       _ -> case functorOf t of
         Just key
           | isImpureBuiltin key -> [t]
-          | Just p <- lookupPred key prog, predIsUnsafe prog p -> [t]
+          | Just p <- lookupPred key prog, predIsUnsafe prog p, Set.member key effectful -> [t]
           | Nothing <- lookupPred key prog, nameHasFlag prog (fst key) FlagUnsafe -> [t]
         _ -> []
 
@@ -84,3 +89,14 @@ describeViolation prog key g =
           | otherwise -> showPredKey k ++ " is unsafe"
         Nothing -> show g
    in what ++ " but " ++ showPredKey key ++ " is not declared unsafe (add `" ++ fst key ++ " : unsafe.`)"
+
+-- The unsafe flag is permission, not evidence of an effect. A marker added
+-- for partial recursion must not turn a proven-mode call into an effect error.
+effectfulPredicates :: Program -> Set.Set PredKey
+effectfulPredicates p = close initial
+  where
+    graph=calledPredicates p
+    initial=Set.fromList [predKey q | q<-programPreds p,
+      FlagIo `elem` effectiveFlags p q || any isImpureBuiltin (Map.findWithDefault [] (predKey q) graph)]
+    close known=let next=Set.union known(Set.fromList [k | (k,targets)<-Map.toList graph,any (`Set.member` known) targets])
+                in if next==known then known else close next

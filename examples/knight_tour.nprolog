@@ -3,6 +3,10 @@
 # Exercises whole-clause JIT compilation, native choice-frame backtracking,
 # and cycle-free depth-first search.
 # Run: infera examples/knight_tour.nprolog
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls knight_tour/2 outside its currently verified modes.
+report : unsafe.
+
 <- notable.
 
 # Precomputed knight graph on a 5x5 board (0..24), ordered toward corners/edges

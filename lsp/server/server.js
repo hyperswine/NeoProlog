@@ -21,6 +21,7 @@ const {
 } = require('vscode-languageserver/node')
 
 const { TextDocument } = require('vscode-languageserver-textdocument')
+const { recursionActions } = require('./recursionActions')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -388,6 +389,7 @@ connection.onInitialize(params => {
     capabilities: {
       textDocumentSync: { openClose: true, change: TextDocumentSyncKind.Incremental, save: { includeText: false } },
       hoverProvider: true,
+      codeActionProvider: true,
       definitionProvider: true,
       referencesProvider: true,
       documentSymbolProvider: true,
@@ -487,6 +489,11 @@ connection.onDidChangeWatchedFiles(event => {
 
 // ─── Hover ─────────────────────────────────────────────────────────────────────
 
+connection.onCodeAction(({ textDocument, context }) => {
+  const document = documents.get(textDocument.uri)
+  return document ? recursionActions(textDocument.uri, document.getText(), context.diagnostics) : []
+})
+
 connection.onHover(({ textDocument, position }) => {
   const document = documents.get(textDocument.uri)
   const a = getAnalysis(textDocument.uri)
@@ -546,8 +553,8 @@ connection.onHover(({ textDocument, position }) => {
   if (a.predicateDefs.has(word)) {
     parts.push(describeDefs(word, a.predicateDefs.get(word), a.decls.get(word), null))
     const verdicts = (checkerPredicates.get(textDocument.uri) || [])
-      .filter(p => p.name === word && p.recursion !== 'not-recursive')
-    if (verdicts.length) parts.push(verdicts.map(p => `**Recursion** \`${p.name}/${p.arity}\`: ${p.verdict}`).join('\n\n'))
+      .filter(p => p.name === word && (p.recursion !== 'not-recursive' || p.unsafeReason))
+    if (verdicts.length) parts.push(verdicts.map(p => `**Recursion** \`${p.name}/${p.arity}\`: ${p.verdict}${p.unsafeReason ? `; unsafe: ${p.unsafeReason}` : ''}`).join('\n\n'))
   } else if (a.decls.has(word)) {
     parts.push(`**Declared:** \n\n\`\`\`infera\n${a.decls.get(word).map(d => d.text).join('\n')}\n\`\`\`\n\n_No clauses in this file._`)
   } else if (!BUILTIN_DOCS[word] && !declKind && a.predicateRefs.has(word)) {

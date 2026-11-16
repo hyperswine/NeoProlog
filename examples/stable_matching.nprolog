@@ -24,6 +24,30 @@
 
 # The algorithm and the search pass growing lists from call to call, so
 # memoising their calls would only copy those lists into tables.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls apply/3 outside its currently verified modes.
+admit : unsafe.
+# Proof gap: calls select/3 outside its currently verified modes.
+apply : unsafe.
+# Proof gap: calls admit/1 outside its currently verified modes.
+electives : unsafe.
+# Proof gap: calls admit/1 outside its currently verified modes.
+fair_admission : unsafe.
+# Proof gap: calls stable_pairing/1 outside its currently verified modes.
+follow_pessimal : unsafe.
+# Proof gap: calls propose/5 outside its currently verified modes.
+gale_shapley : unsafe.
+# Proof gap: calls stable_pairing/1 outside its currently verified modes.
+lattice : unsafe.
+# Proof gap: calls stable_pairing/1 outside its currently verified modes.
+lead_optimal : unsafe.
+# Proof gap: calls gale_shapley/3 outside its currently verified modes.
+proposals : unsafe.
+# No supported well-founded measure is inferred for every recursive call.
+propose : unsafe.
+# Proof gap: calls reverse/2 outside its currently verified modes.
+stable_pairing : unsafe.
+
 <- notable.
 
 # ── Preferences ──────────────────────────────────────────────────────────────

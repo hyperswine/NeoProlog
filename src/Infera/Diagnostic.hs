@@ -7,7 +7,7 @@ module Infera.Diagnostic
 
 import Data.Char (ord)
 import qualified Data.IntMap.Strict as IM
-import Data.List (intercalate, nub)
+import Data.List (intercalate, nub, isInfixOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
 import Infera.Error (showPredKey)
@@ -15,10 +15,11 @@ import Infera.Arith (arithOps, evalArithSafe)
 import Infera.Effects (effectKeys, effectViolations)
 import Infera.Infer (builtinDet)
 import Infera.Module (loadLocatedFile, loadLocatedWithSources)
-import Infera.Infer (inferProgram)
+import Infera.Infer (inferProgram, groundDependencies)
 import Infera.Program
-import Infera.Purity (clauseViolations, describeViolation)
-import Infera.Termination (Verdict, renderVerdict, verdictStatus, verdicts)
+import Infera.Purity (clauseViolations, describeViolation, effectfulPredicates)
+import Infera.Termination (Verdict (..), CallSite (..), callSites, renderVerdict, verdictStatus, verdicts)
+import qualified Data.Set as Set
 import Infera.Syntax
 import Infera.Unify (Subst, deepWalk, termVars, unifyPlain, walk)
 import Numeric (showHex)
@@ -46,6 +47,7 @@ checkSource path src dependencies =
 data PredicateFact = PredicateFact
   { factSpan :: SourceSpan,
     factKey :: PredKey,
+    factUnsafeReason :: String,
     factVerdict :: Verdict
   }
 
@@ -64,13 +66,18 @@ reportLoaded result = case result of
 -- | Facts for the predicates defined outside std, at their first clause.
 predicateFacts :: [LocatedTopLevel] -> [PredicateFact]
 predicateFacts items =
-  [ PredicateFact loc key verdict
+  [ PredicateFact loc key (unsafeReason key verdict) verdict
   | (key, loc) <- Map.toList firstClauses,
     take 5 (spanFile loc) /= "<std/",
     Just verdict <- [Map.lookup key found]
   ]
   where
-    found = verdicts (buildProgram (map locatedItem items))
+    prog = inferProgram (buildProgram (map locatedItem items))
+    found = verdicts prog
+    unsafeReason key verdict = case lookupPred key prog of
+      Just p | predIsUnsafe prog p -> intercalate " and "
+        (["effects" | Set.member key (effectfulPredicates prog)] ++ ["recursion not proven total" | Unproven _ <- [verdict]])
+      _ -> ""
     firstClauses = Map.fromListWith (\_ first -> first)
       [(key, locatedSpan item) | item <- items, TLClause cl <- [locatedItem item], Just key <- [clauseKey cl]]
 
@@ -83,10 +90,46 @@ diagnose :: [LocatedTopLevel] -> [Diagnostic]
 diagnose items = concatMap inspect [i | i <- items, take 5 (spanFile (locatedSpan i)) /= "<std/"] ++
   [Diagnostic (maybe (SourceSpan "<program>" 1 1 1 2) id (Map.lookup key firstClauseSpans)) Error "io-error" msg
   | (key,msg) <- effectViolations prog]
+  ++ recursionDiagnostics
   where
     prog = buildProgram (map locatedItem items)
-    -- Graph facts and determinism, for the tabling hint only.
+    -- Inferred graph facts and modes support both recursion and performance diagnostics.
     inferred = inferProgram prog
+    found = verdicts inferred
+    sites = callSites builtinDet (groundDependencies inferred) siteProgram found
+    queryKey = ("$termination-query", 0)
+    siteProgram = foldl (flip addClause) inferred
+      [Clause (Atom (fst queryKey)) (queryGoals q) (queryNVars q) | item <- items, TLQuery q <- [locatedItem item]]
+    visible loc = take 5 (spanFile loc) /= "<std/"
+    recursiveLocation key = fromMaybe (SourceSpan "<program>" 1 1 1 2) (Map.lookup key firstClauseSpans)
+    failureLocation key why = case
+      [goalSpan item (siteGoal site) | site <- sites, siteCaller site == key,
+        ("call " ++ show (siteGoal site) ++ " in clause " ++ show (siteClause site)) `isInfixOf` why,
+        let clauses = [i | i <- items, TLClause cl <- [locatedItem i], clauseKey cl == Just key],
+        item <- take 1 (drop (siteClause site - 1) clauses)] of
+      loc:_ -> loc
+      _ -> recursiveLocation key
+    recursionDiagnostics =
+      [ Diagnostic (failureLocation key why) Warning "partial-recursion"
+          (showPredKey key ++ ": " ++ renderVerdict verdict ++ "; add `" ++ fst key ++ " : unsafe.` to acknowledge partial recursion")
+      | (key, verdict@(Unproven why)) <- Map.toList found,
+        Just p <- [lookupPred key inferred], not (predIsUnsafe inferred p),
+        FlagIo `notElem` effectiveFlags inferred p, visible (recursiveLocation key),
+        all (\site -> siteCaller site /= key || maybe True (\target -> target `elem` defined || isBuiltin target || target == ("length",2)) (siteCallee site)) sites ]
+      ++ [ Diagnostic (goalSpan item (siteGoal site)) Information "nonterminating-mode"
+             ("This call is outside the proven modes of " ++ showPredKey key ++ ": " ++ siteReason site)
+         | site <- sites, not (siteCovered site), Just key <- [siteCallee site],
+           Just (Total _) <- [Map.lookup key found],
+           let clauses = if siteCaller site == queryKey
+                 then [i | i <- items, TLQuery _ <- [locatedItem i]]
+                 else [i | i <- items, TLClause cl <- [locatedItem i], clauseKey cl == Just (siteCaller site)],
+           item <- take 1 (drop (siteClause site - 1) clauses), visible (locatedSpan item) ]
+      ++ [ Diagnostic (locatedSpan item) Information "unnecessary-unsafe"
+             (declName d ++ " : unsafe. is unnecessary: its calls are proven total and have no effects")
+         | item <- items, visible (locatedSpan item), TLDecl d <- [locatedItem item], FlagUnsafe `elem` declFlags d,
+           let keys = [predKey p | p <- programPreds inferred, fst (predKey p) == declName d],
+           not (null keys), all (\k -> Set.notMember k (effectfulPredicates inferred) && case Map.lookup k found of
+             Just NotRecursive -> True; Just (Total _) -> True; Just TotalByTable -> True; _ -> False) keys ]
     defined = [predKey p | p <- programPreds prog, not (IM.null (predClauses p))]
     firstClauseSpans = Map.fromListWith (\_ first -> first)
       [(key, locatedSpan item) | item <- items, TLClause cl <- [locatedItem item], Just key <- [clauseKey cl]]
@@ -416,6 +459,7 @@ reportJSON ds facts =
             ++ ",\"arity\":" ++ show arity
             ++ ",\"line\":" ++ show (max 0 (spanLine loc - 1))
             ++ ",\"recursion\":" ++ jsonString (verdictStatus (factVerdict f))
+            ++ ",\"unsafeReason\":" ++ jsonString (factUnsafeReason f)
             ++ ",\"verdict\":" ++ jsonString (renderVerdict (factVerdict f)) ++ "}"
 
 diagnosticsJSON :: [Diagnostic] -> String

@@ -21,6 +21,44 @@
 #
 # Run:  infera examples/breadboard.nprolog   (or `> emit (report rc)?` in the REPL)
 
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls feasible/5 outside its currently verified modes.
+best : unsafe.
+# Proof gap: calls feasible_flex/6 outside its currently verified modes.
+best_flex : unsafe.
+# Proof gap: calls net_capacities/3 outside its currently verified modes.
+choose_jumpers : unsafe.
+# Proof gap: calls multi_nets/3 outside its currently verified modes.
+feasible : unsafe.
+# Proof gap: calls multi_nets/3 outside its currently verified modes.
+feasible_flex : unsafe.
+# Proof gap: calls net_pins/3 outside its currently verified modes.
+multi_nets : unsafe.
+# Proof gap: calls net_pins/3 outside its currently verified modes.
+net_capacities : unsafe.
+# Proof gap: calls join/3 outside its currently verified modes.
+net_lines : unsafe.
+# Proof gap: calls join/3 outside its currently verified modes.
+net_lines_flex : unsafe.
+# Proof gap: calls length/2 outside its currently verified modes.
+net_pins : unsafe.
+# Proof gap: calls dedup/2 outside its currently verified modes.
+nets : unsafe.
+# Proof gap: calls dedup/2 outside its currently verified modes.
+nodes_of : unsafe.
+# Proof gap: calls nets/2 outside its currently verified modes.
+placement_flex_constraints : unsafe.
+# Proof gap: calls nets/2 outside its currently verified modes.
+report : unsafe.
+# Proof gap: calls nets/2 outside its currently verified modes.
+report_flex : unsafe.
+# Proof gap: calls placement_flex_constraints/8 outside its currently verified modes.
+solve_flex : unsafe.
+# Proof gap: calls placement_flex_constraints/8 outside its currently verified modes.
+solve_flex_min : unsafe.
+# Proof gap: calls nodes_of/3 outside its currently verified modes.
+wire_lines : unsafe.
+
 <- notable.
 
 # ─── Circuits ────────────────────────────────────────────────────────────────

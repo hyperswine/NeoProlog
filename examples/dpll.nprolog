@@ -1,3 +1,13 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# May invoke an attribute hook whose termination is not statically known.
+boolean : unsafe.
+# Proof gap: calls boolean/1 outside its currently verified modes.
+boolean:attr_unify_hook : unsafe.
+# Proof gap: calls boolean/1 outside its currently verified modes.
+sat : unsafe.
+# Proof gap: calls when/2 outside its currently verified modes.
+watch_clause : unsafe.
+
 <- import "std/coroutine".
 # Boolean attributes enforce the domain; two watched non-ground literals wake
 # a clause when either becomes ground. No global mutable watch lists.

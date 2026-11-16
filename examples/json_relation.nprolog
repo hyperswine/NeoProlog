@@ -5,6 +5,30 @@
 # An object is an ordered list of (pair String Value), preserving duplicate keys.
 # Text must be supplied for parsing/validation; generation takes a ground value.
 # Helpers describe syntax once. There is no separate parser/printer/validator.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls j_value/3 outside its currently verified modes.
+j_document : unsafe.
+# Proof gap: calls j_ws/2 outside its currently verified modes.
+j_elements : unsafe.
+# Proof gap: calls j_digits/3 outside its currently verified modes.
+j_exponent : unsafe.
+# Proof gap: calls j_ws/2 outside its currently verified modes.
+j_members : unsafe.
+# Proof gap: calls j_ws/2 outside its currently verified modes.
+j_more_elements : unsafe.
+# Proof gap: calls j_ws/2 outside its currently verified modes.
+j_more_members : unsafe.
+# Proof gap: calls j_number_parts/4 outside its currently verified modes.
+j_number : unsafe.
+# Proof gap: calls j_exponent/3 outside its currently verified modes.
+j_number_parts : unsafe.
+# Proof gap: calls j_chars/3 outside its currently verified modes.
+j_quoted : unsafe.
+# Proof gap: calls j_ws/2 outside its currently verified modes.
+j_value : unsafe.
+# Proof gap: calls j_document/3 outside its currently verified modes.
+json : unsafe.
+
 <- import "std/dcg".
 <- notable.
 

@@ -1,7 +1,6 @@
 # Total recursion inference
 
-Date: 16 November 2026. Kind: design proposal. Status: step 0 implemented
-(see [Step 0](#2026-11-16-step-0-verdicts-with-no-behaviour-change)). Base:
+Date: 16 November 2026. Kind: design proposal. Status: steps 0–5 implemented, with conservative proof limits below. Base:
 `22280a6`.
 
 Infera should work out, for every recursive predicate, whether its recursion
@@ -443,3 +442,142 @@ Tests: `test/TerminationTest.hs` (structural, built subterms, grammars, the
 alternating case rejected, merge with conditions {3} or {1, 2}, Ackermann
 {1, 2}, mutual recursion, disjunction branches, closures, run-time goals,
 dynamic and io), and a language-server test for the report object.
+
+
+## 2026-11-16: Step 1, inferred norms
+
+The verifier now carries separate graph nodes for term size, list length,
+integer decrease/increase, pair sums and both orientations of guard
+differences. Integer arcs require integer entry arguments and a dominating
+lower or upper comparison for strict descent. A ground float is insufficient:
+subtracting one can stagnate. The report states the integer requirement
+alongside the groundness condition. Bounded non-tail recursion and mutually
+recursive counters use the same SCC closure check as structural descent.
+
+Structural and numeric entry modes are retained together. For example a
+relational range can terminate with a ground result list **or** two integer
+bounds. Finding its structural mode must not hide its useful numeric mode.
+
+Proof search tries empty modes, single positions, pairs, triples and the full
+argument set. It does not claim to enumerate every minimal condition at high
+arity. Graph closure stops conservatively at 4,096 graphs; reaching the
+budget produces an unproven verdict. Arithmetic is restricted to supported
+linear expressions and evaluated numeric argument positions.
+
+## 2026-11-16: Step 2, verified callee relations
+
+Successful-answer size relations are inferred by a greatest fixpoint over
+clause paths. They are implications about successful finite derivations,
+not assumptions that a callee terminates. A separate bottom-up SCC check
+requires each external callee to be total in the actual mode. This proves
+consumption through a grammar nonterminal and selection-based recursion,
+and rejects a shrinking caller that invokes a divergent helper.
+
+Groundness summaries additionally verify singleton-input modes rather than
+requiring every other argument to be ground. Closure element roles are
+verified from clause heads and calls, including preservation through recursive
+forwarding. They are not trusted from a library predicate's name. Dynamic
+predicates and unreachable user clauses shadowing builtins cannot supply
+trusted summaries. Runtime-constructed goals remain unproven.
+
+The implementation is deliberately incomplete for mode-dependent sizes,
+non-ground list spines, merge-sort partition bounds and indirect closure
+argument mappings. Shipped examples identify these as proof gaps rather
+than claiming that the predicates diverge.
+
+## 2026-11-16: Step 3, finite tables and builtin conditions
+
+A finite-table proof accepts range-restricted positive Datalog over ground
+facts and scalar constants, including constant-bounded native `between` and
+constant unification. Constructed terms, generated arithmetic values,
+nonground facts, dynamic dependencies and untabled recursive dependencies
+are rejected by this proof. These predicates report `total-tabled` and keep
+tabling enabled. This is a conservative subset of the proposed finite-domain
+analysis; arbitrary bounded arithmetic closure is not yet supported.
+
+Builtin termination conditions reject unbounded generators and opaque
+callbacks. Collectors inspect their inner goals. Labeling requires ground
+values or verified finite integer domains; finite-domain summaries can pass
+through user model predicates. Direct literal ranges are supported; arbitrary
+CLP bound reasoning remains conservative.
+
+A predicate receiving a closure has a conditional proof, and statically
+known closure calls are checked separately. In a program defining attribute
+hooks, measure proofs explicitly remain conditional on invoked hooks being
+total. This version does not infer precise attribute attachment and binding
+edges; it does not silently assume arbitrary hooks terminate.
+
+## 2026-11-16: Step 4, diagnostics, unsafe and tabling
+
+`partial-recursion` is a warning, including for transitive callers without a
+verified entry mode. It does not prevent loading. A known failing call uses
+its identifier range; SCC-wide failures can fall back to the predicate's
+first clause. Existing undefined-predicate errors suppress redundant partial
+warnings at that caller.
+
+`unsafe` now also acknowledges partiality. Effectfulness is inferred separately
+from permission, so a marker used only for recursion does not turn a pure
+caller into an effect error. Real effects retain the existing load-time
+checks. `unnecessary-unsafe` is informational. Compiler JSON and LSP hovers
+include the reason for unsafe: effects, unproven recursion, or both.
+
+The language server offers marker insertion and removal, preserving other
+flags, signatures and comments in single-line declarations. Insertion goes
+at the document start so it cannot split a multiline clause. A missing-floor
+fix adds a TODO comment, never an executable guessed guard. Imported-source
+diagnostics must be fixed in their own document.
+
+Default tabling now uses the verified measure verdict, with explicit table
+and notable policies retaining precedence. Finite-table proofs keep their
+tables. Bounded Fibonacci is untabled by default: request `fib : table.` for
+memoisation. Finite duplicate answers are preserved by untabled search;
+explicit tables still deduplicate them. The tabling acceptance tests cover
+both policies.
+
+The std/example census acknowledges 191 predicate names in 32 files with
+explanations. Many are conservative proof gaps, especially through collectors,
+mode-dependent grammars and higher-order searches; the marker does not claim
+those programs diverge. The Lisp evaluator explicitly selects depth-first
+execution with `notable` to avoid retaining environments and closures in
+default tables. `test/recursion_census.py` checks all 54 std/example files
+for unacknowledged partial recursion and is included in CI. Existing teaching
+examples with intentional sort errors are outside that census's remit.
+
+## 2026-11-16: Step 5, actual call modes
+
+`nonterminating-mode` information compares calls with the callee's alternative
+ground/integer conditions. It uses dominating goals, verified successful-answer
+groundness, explicit input declarations and the caller's verified entry
+modes. It also checks inline queries, while queries remain exempt from the
+partial-recursion marker requirement. Literal floats do not satisfy integer
+conditions. Information identifies an uncovered mode, not a proof that the
+particular query diverges.
+
+## 2026-11-16: Validation and remaining qualification
+
+The termination group has ten properties, including 30 generated positive
+integer-step cases paired with zero-step rejection. It covers built terms,
+pair sums, mutual and lexicographic recursion, upper/lower guards, callee
+consumption, widened and overridden helpers, finite tables, finite labeling,
+unsafe transitivity and literal-float call-site information. The std/example
+census reports 54 files and 771 predicate verdicts with no unacknowledged
+partial recursion.
+
+CLI, depth, assertion/unification scaling, tabling, determinism guards,
+if-then-else, indexing, JSON, general-purpose and example acceptance were
+rerun. General-purpose acceptance checks 262 cases per JIT/stream combination;
+example acceptance checks 86 independent queries and 21 demonstrations per
+combination. The LSP suite passes 66 tests with no skips, including an end-to-end
+compiler-warning/code-action/edit/recheck regression. The Python benchmark
+harness suite passes 56 tests. The full Haskell suite passes all 485 properties across 47 groups; the
+termination group includes 30 generated counter trials.
+
+The three-run library comparison is saved in
+[`bench/results/2026-11-16-recursion-std-gate.json`](../bench/results/2026-11-16-recursion-std-gate.json).
+It checks all checksums but **does not pass a universal 2× threshold**. Ratios
+of std/SWI were reverse 0.30, sum_list 1.80, length 3.14, msort 3.85,
+maplist 1.75, foldl 3.62, nth1 1.33, assoc 41.11, setof 3.12 and between-count
+8.07. These are whole-process medians minus startup, on this machine while
+other validation was running. The existing report already recorded substantial
+assoc, collection and VM/library gaps; these measurements are not isolated
+regression attribution or a claim that those gaps are closed.

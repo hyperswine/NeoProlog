@@ -5,6 +5,10 @@
 #
 # Times are integer ticks and intervals are half-open [Start,Start+Duration),
 # so one operation may start exactly when another finishes.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls job_shop/3 outside its currently verified modes.
+report : unsafe.
+
 <- notable.
 
 # Plan order is fixed, so clients can inspect or constrain individual starts.

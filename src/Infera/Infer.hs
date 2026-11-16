@@ -31,6 +31,7 @@ import qualified Data.IntSet as IS
 import qualified Data.Set as Set
 import Infera.Arith (arithOps, compareNumeric, evalNumeric)
 import Infera.Effects (effectKeys)
+import qualified Infera.Termination.Analysis as Termination
 import Infera.Program
 import Infera.Syntax
 
@@ -61,7 +62,10 @@ inferProgram prog0 =
       mode True _ = ModeIn
       mode False True = ModeOut
       mode False False = ModeInOut
-   in prog1 {progPreds = Map.map finish (progPreds prog1)}
+      base=prog1 {progPreds = Map.map finish (progPreds prog1)}
+      found=Termination.verdictsWith builtinDet deps base
+      annotate p=p{predMeasuredTotal=Termination.hasMeasure <$> Map.lookup(predKey p)found}
+   in base {progPreds=Map.map annotate(progPreds base)}
 
 -- | For each predicate, which arguments are ground after a successful call
 -- whenever all its other arguments were ground at the call.
@@ -96,22 +100,13 @@ bodyGoals = concatMap subGoals . clauseBody
 impureBuiltins :: [String]
 impureBuiltins = ["write", "writeln", "print", "nl", "emit", "read_file", "phrase_from_file", "assert", "retract", "retractall"]
 
-isUserCall :: Program -> Term -> Maybe PredKey
-isUserCall prog t = case functorOf t of
-  Just k | isJust (lookupPred k prog) -> Just k
-  _ -> Nothing
-
 -- ─── RECURSION AND PURITY ────────────────────────────────────────────────────
 
 markGraphFacts :: Program -> Program
 markGraphFacts prog =
   let preds = programPreds prog
       callees :: Map PredKey [PredKey]
-      callees =
-        Map.fromList
-          [ (predKey p, nub (mapMaybe (isUserCall prog) (concatMap bodyGoals (IM.elems (predClauses p)))))
-          | p <- preds
-          ]
+      callees = Map.map (filter (`Map.member` progPreds prog)) (Termination.calledPredicates prog)
       reachable k = go Set.empty (Map.findWithDefault [] k callees)
         where
           go seen [] = seen

@@ -25,6 +25,24 @@
 # tabled call computes all of its answers before returning the first.  These
 # predicates search through many different partial boards, so memoising them
 # gains nothing; the whole file turns tabling off.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls board_rows/4 outside its currently verified modes.
+board : unsafe.
+# Proof gap: calls squares/5 outside its currently verified modes.
+board_rows : unsafe.
+# Proof gap: calls solutions/2 outside its currently verified modes.
+count_rows : unsafe.
+# Proof gap: calls count_rows/4 outside its currently verified modes.
+count_table : unsafe.
+# Proof gap: calls queens/2 outside its currently verified modes.
+fundamental : unsafe.
+# Proof gap: calls fundamental/2 outside its currently verified modes.
+fundamentals : unsafe.
+# Proof gap: calls numlist/3 outside its currently verified modes.
+queens : unsafe.
+# Proof gap: calls queens/2 outside its currently verified modes.
+solutions : unsafe.
+
 <- notable.
 
 # The entry points: an integer in, a list of integers out, any number of

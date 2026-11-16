@@ -1,4 +1,8 @@
 # Type inference with let polymorphism, using native unification.
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls member/2 outside its currently verified modes.
+infer : unsafe.
+
 infer Env (var Name) Type <- member (binding Name Scheme) Env, instantiate Scheme Type.
 infer _ (int _) int.
 infer Env (lam X Body) (arrow A B) <- infer [binding X (mono A) | Env] Body B.

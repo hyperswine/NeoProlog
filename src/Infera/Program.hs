@@ -176,8 +176,10 @@ data Pred = Pred
     -- | A counter loop whose clause selection is mutually exclusive on the
     -- counter (see 'Infera.Infer.guardExclusive').
     predGuardedCounter :: Bool,
-    -- | A counter loop whose answers are pairwise distinct and finite (see
-    -- 'Infera.Infer.distinctCounterGenerator'), such as @between/3@.
+    -- | The inferred program's measure proof. Syntax-changing constructors
+    -- invalidate it; finite-table proofs must retain tabling.
+    predMeasuredTotal :: Maybe Bool,
+    -- | Legacy counter-generator fact, retained for performance diagnostics.
     predDistinctCounter :: Bool
   }
   deriving (Show)
@@ -197,6 +199,7 @@ newPred k@(_, arity) =
       predStructural = False,
       predCounterLoop = False,
       predGuardedCounter = False,
+      predMeasuredTotal = Nothing,
       predDistinctCounter = False
     }
 
@@ -280,7 +283,8 @@ addClause c prog = case clauseKey c of
             !clauses' = IM.insert n c (predClauses p)
             !idx' = [addToIndex i ai (n, c) | (i, ai) <- zip [0 .. arity - 1] (predIndex p)]
          in p
-              { predClauses = clauses',
+              { predMeasuredTotal = Nothing,
+                predClauses = clauses',
                 predClauseCache = ClauseCache.insertClause n c (predClauseCache p),
                 predIndex = idx'
               }
@@ -292,7 +296,7 @@ addDecl d prog
   | otherwise =
       let k = (declName d, length (declArgs d))
           sig = Signature (maybe Nondet id (declDet d)) (declArgs d) []
-       in withPred k (\p -> p {predDecls = predDecls p ++ [sig], predFlags = predFlags p ++ declFlags d}) prog
+       in withPred k (\p -> p {predMeasuredTotal = Nothing, predDecls = predDecls p ++ [sig], predFlags = predFlags p ++ declFlags d}) prog
 
 -- | Effective flags of a predicate: its own plus name-wide ones.
 effectiveFlags :: Program -> Pred -> [Flag]
@@ -339,17 +343,15 @@ buildProgram = foldl' step emptyProgram
     step prog (TLDirective goals) = maybe prog id (addDirective goals prog)
     step prog (TLQuery _) = prog
 
--- | Tabling is on by default for recursive, pure predicates that are not
--- merely structurally recursive.  A @table@ flag forces it on; @notable@ (or
+-- | Tabling defaults on for recursive pure predicates without a verified
+-- measure proof. Finite-domain table proofs must retain tabling.  A @table@ flag forces it on; @notable@ (or
 -- a global @<- notable.@) turns it off.
 predIsTabled :: Program -> Pred -> Bool
 predIsTabled prog p
   | FlagNoTable `elem` flags = False
   | FlagTable `elem` flags = True
   | otherwise =
-      progTableDefault prog && predRecursive p && predPure p && not (predStructural p)
-        && not (predIsDetCounterLoop p)
-        && not (predDistinctCounter p)
+      progTableDefault prog && predRecursive p && predPure p && predMeasuredTotal p /= Just True
   where
     flags = effectiveFlags prog p
 

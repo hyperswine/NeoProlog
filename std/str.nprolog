@@ -1,3 +1,9 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls std_str_join/3 outside its currently verified modes.
+join : unsafe.
+# Proof gap: calls std_str_split/3 outside its currently verified modes.
+split : unsafe.
+
 split : notable.
 std_str_split : notable.
 std_str_piece : notable.

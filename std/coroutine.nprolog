@@ -1,3 +1,23 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls std_coroutine_run/1 outside its currently verified modes.
+coroutine:attr_unify_hook : unsafe.
+# Proof gap: calls std_coroutine_goals/2 outside its currently verified modes.
+coroutine:attribute_goals : unsafe.
+# Proof gap: calls std_coroutine_resume/1 outside its currently verified modes.
+dif : unsafe.
+# Proof gap: calls std_coroutine_resume/1 outside its currently verified modes.
+freeze : unsafe.
+# Proof gap: calls std_coroutine_has/2 outside its currently verified modes.
+std_coroutine_add : unsafe.
+# Invokes a run-time goal; its termination is not statically known.
+std_coroutine_resume : unsafe.
+# Proof gap: calls std_coroutine_resume/1 outside its currently verified modes.
+std_coroutine_run : unsafe.
+# Proof gap: calls std_coroutine_add/2 outside its currently verified modes.
+std_coroutine_watch : unsafe.
+# Proof gap: calls std_coroutine_resume/1 outside its currently verified modes.
+when : unsafe.
+
 std_coroutine_has : notable.
 std_coroutine_add : notable.
 std_coroutine_watch : notable.

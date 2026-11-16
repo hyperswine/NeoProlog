@@ -58,7 +58,7 @@ const BUILTIN_DOCS = {
   say: 'Effect grammar: print a text grammar to stdout, optionally returning a result.',
   say_to: 'Effect grammar: print a text grammar to a handle, optionally returning a result.',
   phrase_from: 'Effect grammar: parse a handle on demand, keeping unread input for the next operation.',
-  unsafe: 'Flag: the predicate may perform effects (write, emit, read_file, cut, assert/retract) and call other unsafe predicates.',
+  unsafe: 'Flag: acknowledges effects (write, emit, read_file, cut, assert/retract) or recursion not proven total. Callers need their own marker when effects or unproven recursion propagate.',
   dynamic: 'Flag: the predicate has no clauses; its facts are added and removed with assert/retract.',
   notable: '`<- notable.` — tabling off by default.',
   index: '`<- index.` — argument indexing on (the default).',

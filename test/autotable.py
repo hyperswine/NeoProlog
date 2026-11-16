@@ -1,11 +1,8 @@
-"""Default tabling skips deterministic counter-driven loops and distinct-answer
-counter generators (between/3 shape), and only them.
+"""Default tabling follows verified termination measures.
 
-See docs/2026-11-01-AUTO-TABLING-COST.md for the criterion. Checks, with the
-JIT on and off: counter loops run untabled and fast; fib/tak-style recursion
-stays tabled (memoised); an explicit `table` still forces tabling; a counter
-loop whose clauses are not exclusive keeps tabling (and its deduplicated
-answers) and gets the `perf-tabled-counter-loop` hint.
+Bounded recursion runs untabled, preserving ordinary duplicate answers.
+Explicit table retains memoisation and answer deduplication. Unproven pure
+recursion remains tabled; see docs/2026-11-16-TOTAL-RECURSION.md.
 """
 import json
 import os
@@ -61,8 +58,8 @@ def tabled(source, name):
 
 assert not tabled(NREV, "bench_nrev"), "counter loop must not be tabled by default"
 assert not tabled(NREV, "count"), "accumulating counter loop must not be tabled by default"
-assert tabled(NREV, "fib"), "fib must stay tabled"
-assert tabled(NREV, "dup"), "non-exclusive counter loop must stay tabled"
+assert not tabled(NREV, "fib"), "bounded non-tail recursion has a measure proof"
+assert not tabled(NREV, "dup"), "finite duplicate answers do not invalidate termination"
 assert tabled(NREV + "bench_nrev : table.\n", "bench_nrev"), "explicit table must force tabling"
 
 for jit in ("1", "0"):
@@ -70,11 +67,13 @@ for jit in ("1", "0"):
     assert answer == "R = 200000", answer
     # Tabled, this took more than 60 s; untabled about 0.4 s (JIT) / 3 s (no JIT).
     assert seconds < 30, ("bench_nrev 30000", jit, seconds)
-    answer, seconds = run(NREV, "fib 90 F?", jit, timeout=30)
+    answer, seconds = run(NREV + "fib : table.\n", "fib 90 F?", jit, timeout=30)
     assert answer == "F = 2880067194370816120", answer  # only reachable when memoised
     assert seconds < 10, ("fib 90", jit, seconds)
     answer, _ = run(NREV, "findall X (dup 2 X) L?", jit)
-    assert answer == "L = [a]", answer  # tabled answers stay deduplicated
+    assert answer == "L = [a, a]", answer  # ordinary finite duplicate answers
+    answer, _ = run(NREV + "dup : table.\n", "findall X (dup 2 X) L?", jit)
+    assert answer == "L = [a]", answer  # explicit table deduplicates
     print("autotable jit=%s ok" % jit)
 
 
@@ -103,11 +102,12 @@ sum [X | T] A S <- A1 is A + X, sum T A1 S.
 
 assert not tabled(GEN, "btw"), "between-style generator must not be tabled by default"
 assert not tabled(GEN, "dn"), "counting-down generator must not be tabled by default"
-# Must stay tabled: the answer does not carry the counter, so untabled it
-# would repeat `a` (cg); no bounding guard (nat); the bound moves with the
-# counter (mv); two base clauses can give the same answer (d2).
-for name in ("cg", "nat", "mv", "d2"):
-    assert tabled(GEN, name), name + " must stay tabled"
+# Missing floors and moving bounds remain unproven. Duplicate answers are
+# finite, so cg and d2 now run untabled unless explicitly declared table.
+for name in ("nat", "mv"):
+    assert tabled(GEN, name), name + " has no decreasing bounded measure"
+for name in ("cg", "d2"):
+    assert not tabled(GEN, name), name + " has finite duplicate answers"
 assert tabled(GEN + "btw : table.\n", "btw"), "explicit table must force tabling"
 
 # Answers as SWI-Prolog gives them for the same programs (SWI-Prolog 10.0.0).
@@ -118,7 +118,7 @@ SWI = [
     ("findall Y (btw 1 4 X, btw 1 X Y) L?", "L = [1, 1, 2, 1, 2, 3, 1, 2, 3, 4]"),
     ("findall X (btw (-3) 2 X) L?", "L = [-3, -2, -1, 0, 1, 2]"),
     ("findall X (btw 1 2000 X) L, len L 0 N, sum L 0 S?", "L = [", ),
-    ("findall X (cg 1 3 X) L?", "L = [a]"),
+    ("findall X (cg 1 3 X) L?", "L = [a, a, a]"),
 ]
 
 for jit in ("1", "0"):
@@ -140,7 +140,7 @@ with tempfile.TemporaryDirectory(prefix="infera-autotable-") as tmp:
     rows = json.loads(subprocess.run([binary, "check", "--json", str(target)], cwd=tmp,
                                      capture_output=True, text=True, timeout=60).stdout)["diagnostics"]
     hints = [d for d in rows if d["code"] == "perf-tabled-counter-loop"]
-    assert len(hints) == 1 and "dup" in hints[0]["message"], rows
+    assert not hints, rows
     target.write_text(NREV + "dup : table.\n")
     rows = json.loads(subprocess.run([binary, "check", "--json", str(target)], cwd=tmp,
                                      capture_output=True, text=True, timeout=60).stdout)["diagnostics"]

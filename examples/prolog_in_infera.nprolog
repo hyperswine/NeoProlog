@@ -1,3 +1,43 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls split_cut/4 outside its currently verified modes.
+after_cut : unsafe.
+# Proof gap: calls blanks/2 outside its currently verified modes.
+args_text : unsafe.
+# Proof gap: calls object_term/4 outside its currently verified modes.
+bind_vars : unsafe.
+# Proof gap: calls term_text/3 outside its currently verified modes.
+clause_text : unsafe.
+# Proof gap: calls term_text/3 outside its currently verified modes.
+goal_text : unsafe.
+# Proof gap: calls goal_text/3 outside its currently verified modes.
+goals_text : unsafe.
+# Proof gap: calls solve/2 outside its currently verified modes.
+interpret : unsafe.
+# Proof gap: calls blanks/2 outside its currently verified modes.
+more_args : unsafe.
+# Proof gap: calls blanks/2 outside its currently verified modes.
+more_goals : unsafe.
+# Proof gap: calls object_term/4 outside its currently verified modes.
+object_goals : unsafe.
+# Proof gap: calls memberchk/2 outside its currently verified modes.
+object_term : unsafe.
+# Proof gap: calls memberchk/2 outside its currently verified modes.
+object_terms : unsafe.
+# Proof gap: calls rules/3 outside its currently verified modes.
+program : unsafe.
+# Proof gap: calls split_cut/4 outside its currently verified modes.
+prove : unsafe.
+# Proof gap: calls program/3 outside its currently verified modes.
+query : unsafe.
+# Proof gap: calls clause_text/3 outside its currently verified modes.
+rules : unsafe.
+# Proof gap: calls split_cut/4 outside its currently verified modes.
+solve : unsafe.
+# Proof gap: calls blanks/2 outside its currently verified modes.
+term_text : unsafe.
+# Proof gap: calls split_cut/4 outside its currently verified modes.
+try_rules : unsafe.
+
 <- import "std/dcg".
 # A small Prolog: a parser for Prolog clause syntax and an interpreter with
 # unification, backtracking and cut. Terms are atoms, variables (an upper

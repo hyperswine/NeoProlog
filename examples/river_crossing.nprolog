@@ -2,6 +2,10 @@
 # Neither wolf/goat nor goat/cabbage may be left together without the farmer.
 # State = [Farmer,Wolf,Goat,Cabbage], with banks 0 (left) and 1 (right).
 # Run: infera examples/river_crossing.nprolog
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls shortest/1 outside its currently verified modes.
+report : unsafe.
+
 <- notable.
 
 safe [F,W,G,C] <- not (W = G, F != W), not (G = C, F != G).

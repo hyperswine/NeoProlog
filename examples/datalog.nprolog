@@ -1,3 +1,9 @@
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls saturate/4 outside its currently verified modes.
+closure : unsafe.
+# Proof gap: calls member/2 outside its currently verified modes.
+saturate : unsafe.
+
 <- import "std/assoc".
 
 # Semi-naive transitive closure: extend only the newest delta each round.

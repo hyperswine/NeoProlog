@@ -1,3 +1,27 @@
+# The evaluator intentionally supports general recursion; use depth-first
+# execution rather than memoising environments and closure values.
+<- notable.
+
+# Explicit acknowledgements of partiality or conservative proof gaps.
+# Proof gap: calls bind_args/3 outside its currently verified modes.
+apply : unsafe.
+# Proof gap: calls bind_args/3 outside its currently verified modes.
+binding : unsafe.
+# Proof gap: calls eval_in/4 outside its currently verified modes.
+eval : unsafe.
+# Proof gap: calls bind_args/3 outside its currently verified modes.
+eval_in : unsafe.
+# Proof gap: calls integer/3 outside its currently verified modes.
+expr : unsafe.
+# Proof gap: calls integer/3 outside its currently verified modes.
+exprs : unsafe.
+# Proof gap: calls sexpr/3 outside its currently verified modes.
+session : unsafe.
+# Proof gap: calls expr/3 outside its currently verified modes.
+sexpr : unsafe.
+# Proof gap: calls eval_in/4 outside its currently verified modes.
+step : unsafe.
+
 <- import "std/dcg".
 # A small Scheme: integers, symbols, quote, if, lambda (closures), let,
 # define, and the primitives plus, times, minus, lt and eq (lt and eq answer
