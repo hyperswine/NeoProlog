@@ -1,16 +1,19 @@
-digits : nondet notable (any: <=>) (any: <=>).
-digit : nondet notable (any: <=>) (any: <=>).
-blank : nondet notable (any: <=>) (any: <=>).
-blanks : nondet notable (any: <=>) (any: <=>).
-whites : nondet notable (any: <=>) (any: <=>).
-std_dcg_whites : nondet notable (any: <=>) (any: <=>).
-string_without : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-integer : nondet notable (any: <=>) (any: <=>) (any: <=>).
-number : nondet notable (any: <=>) (any: <=>) (any: <=>).
-eos : nondet notable (any: <=>) (any: <=>).
-rest : nondet notable (any: <=>) (any: <=>) (any: <=>).
-note : nondet notable (any: <=>) (any: <=>) (any: <=>).
-with_events : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+digits : notable.
+digit : notable.
+blank : notable.
+blanks : notable.
+whites : notable.
+std_dcg_whites : notable.
+string_without : notable.
+integer : notable.
+number : notable.
+std_dcg_sign : notable.
+std_dcg_digits_max : notable.
+std_dcg_fraction : notable.
+eos : notable.
+rest : notable.
+note : notable.
+with_events : notable.
 <- import "std/list".
 digits -> digit, digits.
 digits -> [].
@@ -23,8 +26,19 @@ std_dcg_whites -> [C], { char_code C N, (N = 32 ; N >= 9, N <= 13) }, std_dcg_wh
 std_dcg_whites -> [].
 string_without Stop [C | Cs] -> [C], { not (memberchk C Stop) }, string_without Stop Cs.
 string_without _ [] -> [].
-integer N -> ({ nonvar N } -> { is_int N, str_num S N, str_chars S Cs }, seq Cs ; seq Cs, { Cs != [], str_chars S Cs, str_num S N, is_int N }).
-number N -> ({ nonvar N } -> { str_num S N, str_chars S Cs }, seq Cs ; seq Cs, { Cs != [], str_chars S Cs, str_num S N }).
+# Reading a number takes the longest numeral (maximal munch): an optional
+# '-', every following digit and, for number, an optional fraction. It is
+# deterministic, so "10" is one token, never 1 followed by 0.
+integer N -> ({ nonvar N } -> { is_int N, str_num S N, str_chars S Cs }, seq Cs
+  ; std_dcg_sign Sg, std_dcg_digits_max Ds, { Ds != [], append Sg Ds Cs, str_chars S Cs, str_num S N, is_int N }).
+number N -> ({ nonvar N } -> { str_num S N, str_chars S Cs }, seq Cs
+  ; std_dcg_sign Sg, std_dcg_digits_max Ds, { Ds != [] }, std_dcg_fraction Fs,
+    { append Sg Ds Whole, append Whole Fs Cs, str_chars S Cs, str_num S N }).
+std_dcg_sign Sg S0 S <- (S0 = ['-' | S1] -> Sg = ['-'], S = S1 ; Sg = [], S = S0).
+std_dcg_digits_max Ds S0 S <-
+  (S0 = [C | S1], char_code C N, N >= 48, N <= 57 -> Ds = [C | Ds1], std_dcg_digits_max Ds1 S1 S ; Ds = [], S = S0).
+std_dcg_fraction Fs S0 S <-
+  (S0 = ['.', C | S1], char_code C N, N >= 48, N <= 57 -> std_dcg_digits_max Ds S1 S, Fs = ['.', C | Ds] ; Fs = [], S = S0).
 eos [] [].
 rest Xs Xs [].
 note Event [Event | Es] Es.

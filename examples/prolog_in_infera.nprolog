@@ -1,24 +1,109 @@
 <- import "std/dcg".
-# A ground Horn-clause subset, with scoped cut. Terms are lower-case atoms;
-# bodies are comma-separated calls or !. This interpreter owns its clause
-# list and never uses the engine's cut or global database.
+# A small Prolog: a parser for Prolog clause syntax and an interpreter with
+# unification, backtracking and cut. Terms are atoms, variables (an upper
+# case or _ first letter), integers and compounds name(Arg, ...). Bodies are
+# comma-separated goals, ! and true. The interpreter owns its clause list:
+# it never uses the engine's database or cut. Object variables are Infera
+# variables, so unification is Infera's own, and each clause is renamed
+# apart with copy_term before it is used.
+
+# ── Parsing ──────────────────────────────────────────────────────────────
+# A clause parses to rule Head Body, where Body is a list of call G and cut.
+# Variables are read as var Name and replaced per clause, so each name stands
+# for one variable within its clause.
+
 program Rules -> blanks, rules Rules.
-rules [rule H B | Rs] -> atom_text H, blanks, rule_tail B, blanks, rules Rs.
+rules [Rule | Rs] -> clause_text Raw, blanks, { bind_vars Raw Rule }, rules Rs.
 rules [] -> eos.
-rule_tail [] -> ".".
-rule_tail Body -> ":-", blanks, body_text Body, ".".
-body_text [G | Gs] -> goal_text G, blanks, more_goals Gs.
+
+clause_text (rule H []) -> term_text H, blanks, ".".
+clause_text (rule H B) -> term_text H, blanks, ":-", blanks, goals_text B, blanks, ".".
+
+goals_text [G | Gs] -> goal_text G, blanks, more_goals Gs.
 more_goals [G | Gs] -> ",", blanks, goal_text G, blanks, more_goals Gs.
 more_goals [] -> [].
 goal_text cut -> "!".
-goal_text (call G) -> atom_text G.
-atom_text Name -> seq Cs, { Cs != [], maplist lower Cs, str_chars S Cs, str_atom S Name }.
+goal_text (call G) -> term_text G.
+
+term_text (var Name) -> var_name Name.
+term_text (int N) -> integer N.
+term_text (app Name Args) -> atom_name Name, args_text Args.
+args_text [A | As] -> "(", blanks, term_text A, blanks, more_args As, ")".
+args_text [] -> [].
+more_args [A | As] -> ",", blanks, term_text A, blanks, more_args As.
+more_args [] -> [].
+
+atom_name Name -> [C], { lower C }, word Cs, { str_chars S [C | Cs], str_atom S Name }.
+var_name Name -> [C], { upper C }, word Cs, { str_chars Name [C | Cs] }.
+word [C | Cs] -> [C], { word_char C }, word Cs.
+word [] -> [].
+
 lower C <- char_code C N, N >= 97, N <= 122.
-interpret Rules Goal <- candidates Rules Goal Bodies, run_candidates Rules Bodies.
-candidates [] _ [].
-candidates [rule H B | Rs] G Bodies <- (H == G -> Bodies=[B | Rest] ; Bodies=Rest), candidates Rs G Rest.
-run_candidates Rules [B | Bs] <- run_body Rules B Status, (Status = success -> true ; Status = cut_success -> true ; Status = failure -> run_candidates Rules Bs ; Status = cut_failure -> fail).
-run_body _ [] success.
-run_body Rules [cut | Rest] Status <- run_body Rules Rest S, (S = failure -> Status = cut_failure ; S = cut_failure -> Status=cut_failure ; Status=cut_success).
-run_body Rules [call G | Rest] Status <- (interpret Rules G -> run_body Rules Rest Status ; Status=failure).
-> phrase (program Rules) "a. b :- a, !. b :- missing.", interpret Rules b?
+upper C <- char_code C N, (N >= 65, N <= 90 ; N = 95).
+word_char C <- (lower C ; upper C ; char_code C N, N >= 48, N <= 57).
+
+# Replace var Name with one variable per name, and app/int with real terms:
+# app f [a, X] becomes f a X through univ; an atom stays an atom (univ
+# builds only compounds). Object names must not be Infera's own list
+# constructors nil and cons.
+bind_vars (rule H B) (rule H1 B1) <- object_term H H1 [] Env, object_goals B B1 Env _.
+
+object_goals [] [] Env Env.
+object_goals [cut | Gs] [cut | Os] Env0 Env <- object_goals Gs Os Env0 Env.
+object_goals [call G | Gs] [call O | Os] Env0 Env <- object_term G O Env0 Env1, object_goals Gs Os Env1 Env.
+
+object_term (int N) N Env Env.
+object_term (var "_") _ Env Env.
+object_term (var Name) V Env0 Env <-
+  Name != "_", (memberchk (pair Name V0) Env0 -> V = V0, Env = Env0 ; Env = [pair Name V | Env0]).
+object_term (app Name []) Name Env Env.
+object_term (app Name [A | As]) T Env0 Env <- object_terms [A | As] Os Env0 Env, univ T [Name | Os].
+
+object_terms [] [] Env Env.
+object_terms [A | As] [O | Os] Env0 Env <- object_term A O Env0 Env1, object_terms As Os Env1 Env.
+
+# ── Interpretation ───────────────────────────────────────────────────────
+# solve Rules Goals proves a list of goals, with every solution on
+# backtracking. A clause body is split at its first cut. Without a cut, a
+# clause is one alternative among the rest, and backtracking undoes its head
+# unification. With a cut, the head and the goals before the cut are proved
+# once as an if-then-else condition: success keeps those bindings and
+# prunes the remaining clauses; failure undoes them and tries the next
+# clause. That is cut's meaning, built without the engine's own cut.
+
+solve _ [].
+solve Rules [G | Gs] <- prove Rules G, solve Rules Gs.
+
+prove _ true.
+prove Rules G <- G != true, try_rules Rules Rules G.
+
+try_rules _ [] _ <- fail.
+try_rules All [R | Rs] G <-
+  copy_term R (rule H B), split_cut B Before Rest Cut,
+  (Cut = yes -> (once (G = H, solve All Before) -> after_cut All Rest ; try_rules All Rs G)
+  ; ((G = H, solve All Before) ; try_rules All Rs G)).
+
+# A later cut in the same body commits only the goals between the two
+# cuts, since the clause choice is already pruned.
+after_cut All B <- split_cut B Before Rest Cut,
+  (Cut = yes -> once (solve All Before), after_cut All Rest ; solve All Before).
+
+split_cut [] [] [] no.
+split_cut [cut | Rest] [] Rest yes.
+split_cut [call G | Gs] [G | Before] Rest Cut <- split_cut Gs Before Rest Cut.
+
+# Kept for the earlier ground interface: interpret Rules Goal.
+interpret Rules Goal <- solve Rules [Goal].
+
+# Parse a program text and a goal text, then solve the goal.
+query Text GoalText Goal <-
+  phrase (program Rules) Text,
+  phrase (term_text Raw) GoalText, object_term Raw Goal [] _,
+  solve Rules [Goal].
+
+> query "edge(a, b). edge(b, c). edge(c, d). path(X, Y) :- edge(X, Y). path(X, Y) :- edge(X, Z), path(Z, Y)." "path(a, W)" G?
+> query "app(end, L, L). app(node(H, T), L, node(H, R)) :- app(T, L, R)." "app(X, Y, node(a, node(b, end)))" G?
+> query "max(X, Y, X) :- ge(X, Y), !. max(X, Y, Y). ge(b, a)." "max(b, a, M)" G?
+> query "max(X, Y, X) :- ge(X, Y), !. max(X, Y, Y). ge(b, a)." "max(a, b, M)" G?
+> query "first(X) :- member(X), !. member(one). member(two)." "first(Y)" G?
+> findall 1 (interpret [rule b [cut, call missing], rule b []] b) Result?

@@ -167,6 +167,23 @@ def network(t):
         require(p.wait(timeout=5)==0,p.stderr.read())
     finally:
         if p.poll() is None:p.kill();p.wait()
+    # A late third client is registered before relaying, and the relay ends
+    # only when the last client leaves.
+    t.n+=1
+    p=subprocess.Popen([str(t.binary),'run',str(ROOT/'examples/chat.nprolog'),'0'],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,cwd=t.dir,env=t.env)
+    try:
+        line=p.stdout.readline();port=int(re.search(r'(\d+)\s*$',line.strip()).group(1))
+        a=socket.create_connection(('127.0.0.1',port),timeout=5); b=socket.create_connection(('127.0.0.1',port),timeout=5)
+        a.sendall(b'one\n');require(b.recv(100)==b'one\n','chat first relay')
+        c=socket.create_connection(('127.0.0.1',port),timeout=5)
+        # c joined before this line was sent, so it receives it too.
+        b.sendall(b'hello\n');require(a.recv(100)==b'hello\n' and c.recv(100)==b'hello\n','chat relay to early and late clients')
+        c.sendall(b'late\n');require(a.recv(100)==b'late\n' and b.recv(100)==b'late\n','chat relay from a late client')
+        a.close();b.sendall(b'two\n');require(c.recv(100)==b'two\n','chat after a client left')
+        b.close();c.close()
+        require(p.wait(timeout=5)==0,p.stderr.read())
+    finally:
+        if p.poll() is None:p.kill();p.wait()
     # A fault must close its listening socket before the process exits.
     t.n+=1;path=t.dir/'fault-socket.nprolog'
     path.write_text(t.main('open (listen "127.0.0.1" 0) update (ok L), handle_address L A, say (fmt "~w\\n" [A]), { X is 1 / 0 }'))

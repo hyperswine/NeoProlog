@@ -1,14 +1,31 @@
-# A bounded two-client line relay, using one readiness loop and no threads.
+# A line chat relay for any number of clients, with one readiness loop and
+# no threads. Each line a client sends goes to every other client. New
+# clients may join at any time; the relay ends when the last client leaves.
+#
+#   infera run examples/chat.nprolog 0     # port 0 picks a free port
+#
+# The listener is first in every wait, so a client that connected is
+# registered before lines from earlier clients are relayed.
+
 main : io.
 main [PortText] -> { str_num PortText Port }, open (listen "127.0.0.1" Port) update (ok L),
-  handle_address L Addr, say (fmt "~w\n" [Addr]), accept L (ok A), accept L (ok B),
-  relay [A,B] 4, close A, close B, close L.
-relay : io.
-relay _ 0 -> [].
-relay Hs N -> wait Hs 10000 Ready,
-  ({ Ready = [H | _] } -> read_line H R,
-    ({ R = ok Line } -> broadcast Hs H Line, { M is N - 1 }, relay Hs M ; [])
-  ; halt 1).
+  handle_address L Addr, say (fmt "~w\n" [Addr]), serve L [] no, close L.
+
+# serve Listener Clients Joined: Joined becomes yes once a client has come.
+serve : io.
+serve L Clients Joined ->
+  ({ Clients = [], Joined = yes } -> []
+  ; wait [L | Clients] -1 [H | _],
+    ({ H == L } -> accept L R,
+        ({ R = ok C } -> { append Clients [C] More }, serve L More yes ; serve L Clients Joined)
+    ; read_line H R,
+      ({ R = ok Line } -> broadcast Clients H Line, serve L Clients Joined
+      ; close H, { exclude (same H) Clients Rest }, serve L Rest Joined))).
+
+same A B <- A == B.
+
+# A client may have gone before its end of input is seen; the write then
+# reports err, which is ignored here (the read of that end comes next).
 broadcast : io.
 broadcast [] _ _ -> [].
-broadcast [H | Hs] Sender Line -> ({ H == Sender } -> [] ; say_to H (fmt "~s\n" [Line])), broadcast Hs Sender Line.
+broadcast [H | Hs] Sender Line -> ({ H == Sender } -> [] ; say_to H (fmt "~s\n" [Line]) _), broadcast Hs Sender Line.

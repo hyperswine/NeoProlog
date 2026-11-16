@@ -25,7 +25,7 @@ extra-doc-files:    README.md
                     docs/website/*.html
                     docs/website/*.css
                     docs/dash/README.md
-extra-source-files: std/*.nprolog test/fixtures/*.nprolog test/general_purpose.py infera.conf examples/*.nprolog test/cli.py test/bench.py test/example_programs.py
+extra-source-files: std/*.nprolog test/fixtures/*.nprolog test/general_purpose.py test/json_relation.py infera.conf examples/*.nprolog test/cli.py test/bench.py test/example_programs.py
                     scripts/package-release.py
                     test/core/*.nprolog
                     docs/dash/build.js docs/dash/Infera.xml

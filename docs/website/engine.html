@@ -55,7 +55,7 @@ fib <span class="v">N</span> <span class="v">F</span> <span class="k">&lt;-</spa
 <ul>
   <li>recursive (they can reach themselves through calls),</li>
   <li>pure (no <code>write</code>/<code>nl</code>, directly or transitively), and</li>
-  <li>not merely structurally recursive: predicates whose every self-call recurses on a proper subterm of a head argument (list and tree walkers such as <code>length</code> or <code>append</code>) always terminate and would only pay for their tables.</li>
+  <li>not merely structurally recursive: predicates whose every recursive call (also through mutual recursion) passes a proper subterm of a head argument, including one a body unification exposes (list and tree walkers such as <code>length</code> or <code>append</code>, and grammar rules that recurse after consuming input) always terminate when parsing and would only pay for their tables. A left-recursive grammar rule passes its input unchanged and stays tabled.</li>
 </ul>
 <p>Control it with <code>name : table …</code> / <code>name : notable.</code> per predicate, or <code>&lt;- table.</code> / <code>&lt;- notable.</code> as the file default.</p>
 <div class="note">A tabled call collects <em>all</em> its answers before continuing, so a predicate with infinitely many answers (a generator like <code>nat</code>) must be declared <code>notable</code>. Otherwise the fixpoint stops after a bound and the answer reports "Search depth limit reached". Calls whose arguments carry CLP(Z) constraints, and answers that would carry constraints, are evaluated without tabling.</div>

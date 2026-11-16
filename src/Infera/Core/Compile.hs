@@ -40,6 +40,7 @@ module Infera.Core.Compile
     compileProgram,
     compileQueryGoals,
     compileGoalTerm,
+    plainUserCall,
     candidateClauses,
     lookupFact2,
     keyOfWord,
@@ -1812,6 +1813,21 @@ coreBuiltinGoal f n =
         ("retractall", 1), ("phrase", 2), ("phrase", 3), ("phrase_from_file", 2), ("phrase_from_file", 3)
       ]
         ++ [("call", k) | k <- [1 .. 9]]
+
+-- | Whether a goal with this name and arity reaches an ordinary user
+-- predicate call in 'compileGoal', rather than a control construct or a
+-- builtin. A dynamic call of such a goal may call the predicate directly.
+plainUserCall :: String -> Int -> Bool
+plainUserCall f n =
+  not (f `elem` attributeNames || f `elem` constraintBuiltins || (f, n) `elem` leafBuiltins
+        || f == "call" || (f, n) `elem` special)
+  where
+    special =
+      [ ("true", 0), ("fail", 0), ("false", 0), ("!", 0), ("nl", 0), ("$cut", 1), (",", 2), (";", 2), ("->", 2),
+        ("not", 1), ("once", 1), ("forall", 2), ("findall", 3), ("unify", 2), ("equiv", 2), ("neq", 2),
+        ("is", 2), ("gt", 2), ("lt", 2), ("gte", 2), ("lte", 2), ("phrase", 2), ("phrase_from_file", 2), ("minimize", 2) ]
+        ++ [ (c, 1) | c <- [ "var", "nonvar", "ground", "is_int", "is_float", "is_num", "is_str", "is_atom", "is_char",
+                             "is_list", "write", "print", "writeln", "emit", "assert", "retract", "retractall" ] ]
 
 -- | Builtins whose reference implementation is a pure function of their
 -- arguments (and the preloaded files): run through 'GLeaf'.

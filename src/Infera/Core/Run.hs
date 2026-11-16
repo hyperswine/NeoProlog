@@ -36,6 +36,7 @@ import qualified Infera.CLP as CLP
 import qualified Infera.CLP.Mutable as Mutable
 import qualified Infera.Core.Constraint as NativeConstraint
 import Infera.Core.Compile
+import Infera.TermToolkit (compareTerms)
 import Infera.Core.Jit (JitKernel (..), invokeJitKernel, invokeJitKernelWith, invokeScanKernel, jitEnabled, jitRerunFree, resumeClauseUnit)
 import Infera.Core.Jit.IR (jitBailout, jitFailure, jitSuccess)
 import Infera.Core.Ops
@@ -267,7 +268,11 @@ data Machine = Machine
     -- call is valid in every branch. A fixpoint reads only the entries
     -- completed since its iteration began (see 'fxCompletedMark'), instead
     -- of filtering the whole table map on every answer.
-    mCompletedLog :: !(IORef (Int, [(Term, TableEntry)]))
+    mCompletedLog :: !(IORef (Int, [(Term, TableEntry)])),
+    -- | 'directTarget' decisions by closure functor (an atom as its negated
+    -- id less one) and number of extra arguments: the predicate a dynamic
+    -- call may enter directly, or Nothing for the general path.
+    mDirectCalls :: !(IORef (Map.Map (Int, Int) (Maybe PredRef)))
   }
 
 -- | Compile and start a query. Left names the construct that puts the
@@ -321,7 +326,7 @@ startCore measured measureSlots limit program query = do
         <*> newIORef guards <*> newIORef (Map.empty, IM.empty)
         <*> newIORef [] <*> newIORef Map.empty <*> newIORef Map.empty
         <*> newIORef Nothing <*> pure measured <*> newIORef IM.empty <*> newIORef IS.empty <*> newIORef Nothing <*> pure slots
-        <*> newIORef (0, [])
+        <*> newIORef (0, []) <*> newIORef Map.empty
       _ <- allocCells store (max 1 (cpQueryVars core))
       setFreshId store (cpQueryVars core)
       writeIORef (mVarCells m) (IM.fromList [(i, i) | i <- [0 .. cpQueryVars core - 1]])
@@ -338,6 +343,10 @@ constraintKernel m = do
       root <- Mutable.mark kernel
       writeIORef (mCLP m) (Just (kernel, root))
       pure kernel
+
+-- | No variable has a domain or a constraint.
+noConstraints :: Machine -> IO Bool
+noConstraints m = readIORef (mCLP m) >>= maybe (pure True) (fmap IS.null . Mutable.watched . fst)
 
 constraintSnapshot :: Machine -> IO CLP.Store
 constraintSnapshot m = readIORef (mCLP m) >>= maybe (pure CLP.emptyStore) (Mutable.freeze . fst)
@@ -1045,21 +1054,16 @@ step' m goal goals base barrier depth next = case goal of
         continue
   GCallDyn direct callable extra -> do
     word <- buildArg m base False callable
-    aliases <- newIORef IM.empty
-    extraTerms <- mapM (\p -> buildArg m base False p >>= exportGoal m aliases) extra
-    goalTerm <- exportGoal m aliases word
-    let goalWith = case goalTerm of
-          Atom f | null extraTerms -> Atom f
-          Atom f -> Compound f extraTerms
-          Compound f as -> Compound f (as ++ extraTerms)
-          other -> other
-    case goalWith of
-      Var _ | direct -> exportFor m word >>= raiseError m . InstantiationError
-      _ | not (S.isCallable goalWith) -> do
-            shown <- exportFor m word
-            raiseError m (TypeError "callable" shown)
-        | otherwise -> do
-            runDynamic m aliases [goalWith] [] depth (CGoals goals base barrier depth next)
+    -- A closure naming an ordinary user predicate is called directly, like
+    -- a static call: its arguments and the extra ones go straight into the
+    -- argument registers, with no exported goal to compile.
+    target <- directTarget m word (length extra)
+    case target of
+      -- Exactly the goal a static call compiles to, placed first in the
+      -- caller's goal list: the closure's arguments are constants here.
+      Just (ref, closureArgs) ->
+        runGoals m (GCall ref (map PWord closureArgs ++ extra) Nothing : goals) base barrier depth next
+      Nothing -> callDynamicGoal m direct word extra goals base barrier depth next
   GPhrase nt l -> do
     ntWord <- buildArg m base False nt
     lWord <- buildArg m base False l >>= deref (mStore m)
@@ -1102,6 +1106,26 @@ step' m goal goals base barrier depth next = case goal of
       Nothing -> do
         shown <- exportFor m word
         raiseError m (TypeError "character list from the DCG" shown)
+  -- Comparing two ground terms needs no variable identities: order them
+  -- here with the toolkit's own standard order and unify the answer.
+  GLeaf "compare" [po, pa, pb] -> do
+    let s = mStore m
+    wa <- buildArg m base False pa
+    wb <- buildArg m base False pb
+    ga <- isGroundWord s wa
+    gb <- isGroundWord s wb
+    if ga && gb
+      then do
+        ta <- exportTerm s wa
+        tb <- exportTerm s wb
+        let answer = case compareTerms ta tb of LT -> "lt"; EQ -> "eq"; GT -> "gt"
+        atom <- atmWord <$> internAtom (symbols s) answer
+        wo <- buildArg m base False po
+        ok <- unify s wo atom
+        if ok then continue else backtrack m
+      else do
+        args <- mapM (\w -> exportFor m w) =<< sequence [buildArg m base False po, pure wa, pure wb]
+        delegate m (Compound "compare" args) (CGoals goals base barrier depth next)
   GLeaf name patterns -> do
     args <- mapM (\p -> buildArg m base False p >>= exportFor m) patterns
     delegate m (Compound name args) (CGoals goals base barrier depth next)
@@ -1266,6 +1290,60 @@ stabilize s base pattern = case pattern of
 -- | Run goal terms whose variables are the alias table's words, in a fresh
 -- activation block aliasing those words; extra compiled goals run after
 -- them in the same block. Cuts stay local.
+-- | The general dynamic call: export the goal, compile it, run it.
+callDynamicGoal :: Machine -> Bool -> Word' -> [Pattern] -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
+callDynamicGoal m direct word extra goals base barrier depth next = do
+    aliases <- newIORef IM.empty
+    extraTerms <- mapM (\p -> buildArg m base False p >>= exportGoal m aliases) extra
+    goalTerm <- exportGoal m aliases word
+    let goalWith = case goalTerm of
+          Atom f | null extraTerms -> Atom f
+          Atom f -> Compound f extraTerms
+          Compound f as -> Compound f (as ++ extraTerms)
+          other -> other
+    case goalWith of
+      Var _ | direct -> exportFor m word >>= raiseError m . InstantiationError
+      _ | not (S.isCallable goalWith) -> do
+            shown <- exportFor m word
+            raiseError m (TypeError "callable" shown)
+        | otherwise -> do
+            runDynamic m aliases [goalWith] [] depth (CGoals goals base barrier depth next)
+
+-- | The user predicate a dynamic call names, with the closure's own
+-- arguments, when the call can go to it directly: the goal reaches an
+-- ordinary user call ('plainUserCall') of a compiled predicate that is
+-- neither tabled nor dynamic. Anything else takes 'callDynamicGoal'.
+directTarget :: Machine -> Word' -> Int -> IO (Maybe (PredRef, [Word']))
+directTarget m word0 extra = do
+  let s = mStore m
+      syms = symbols s
+  w <- deref s word0
+  closure <-
+    if tagOf w == tagAtm
+      then pure (Just (negate (valOf w) - 1, [], atomName syms (valOf w)))
+      else if tagOf w == tagStr
+        then do
+          f <- readCell s (valOf w)
+          args <- forM [1 .. funArity f] $ \i -> readCell s (valOf w + i)
+          pure (Just (funKey f, args, fst <$> functorName syms (funId f)))
+        else pure Nothing
+  case closure of
+    Nothing -> pure Nothing
+    Just (key, args, nameOf) -> do
+      cache <- readIORef (mDirectCalls m)
+      decided <- case Map.lookup (key, extra) cache of
+        Just known -> pure known
+        Nothing -> do
+          name <- nameOf
+          let arity = length args + extra
+              eligible = plainUserCall name arity
+                && not (P.nameHasFlag (mProgram m) name S.FlagDynamic)
+                && maybe True (not . P.predIsTabled (mProgram m)) (P.lookupPredOrDefault (name, arity) (mProgram m))
+              known = if eligible then Map.lookup (name, arity) (cpPreds (mCore m)) else Nothing
+          modifyIORef' (mDirectCalls m) (Map.insert (key, extra) known)
+          pure known
+      pure ((\ref -> (ref, args)) <$> decided)
+
 runDynamic :: Machine -> IORef (IM.IntMap Word') -> [Term] -> [Goal] -> Int -> Cont -> IO Step
 runDynamic m aliases terms extra depth cont = do
   compiled <- mapM (compileGoalTerm (symbols (mStore m)) (mProgram m) (cpPreds (mCore m))) terms
@@ -1369,7 +1447,11 @@ delegate m goal cont = case goal of
 delegateReference :: Machine -> Term -> Cont -> IO Step
 delegateReference m goal cont = do
   let s = mStore m
-  store <- constraintSnapshot m
+  -- Without active constraints the goal's exported arguments say all there
+  -- is: run it from an empty store, so the cost of a builtin does not grow
+  -- with the bindings earlier builtins returned ('leafItems').
+  plain <- noConstraints m
+  store <- if plain then pure CLP.emptyStore else constraintSnapshot m
   fresh <- freshId s
   dynamicTerms <- case goal of
     Compound "clause" _ -> do
@@ -1490,9 +1572,16 @@ leafItems m items previous cont = case items of
     case item of
       Found state -> do
         let s = mStore m
+            result = ssStore state
         current <- freshId s
         setFreshId s (max current (ssFresh state))
-        ok <- installStore m previous (ssStore state)
+        plain <- noConstraints m
+        -- A result with no domains or constraints, while none are active,
+        -- only binds variables: install those bindings and leave the
+        -- constraint store alone.
+        ok <- if plain && IM.null (CLP.stDomains result) && null (CLP.stConstraints result)
+          then installConstraintBindings m (IM.toList (IM.difference (CLP.stSubst result) previous))
+          else installStore m previous result
         if ok then do
           mapM_ (emitOutput m) (reverse (ssOutput state))
           run m cont
@@ -1742,8 +1831,10 @@ callDeclared m frame !depth predicate trust cont0 = do
             Just sig | P.sigDet sig == S.Det -> Just S.Det
             Just sig | P.sigDet sig == S.Multi -> Just S.Multi
             _ -> Nothing
+      -- A signature of unconstrained arguments (any sort, no output mode)
+      -- has nothing to check on return.
       checked <- case signature of
-        Just sig | not (pTrustReturn predicate) -> do
+        Just sig | not (pTrustReturn predicate), any needsReturnCheck (P.sigArgs sig) -> do
           args <- mapM (readArg s) [0 .. n - 1]
           pure (Just (key, sig, args))
         _ -> pure Nothing
@@ -1766,6 +1857,9 @@ callDeclared m frame !depth predicate trust cont0 = do
                 _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
           barrier <- choiceTop m
           callClausesWithFrame m (if top > limit then 0 else frame) predicate barrier depth returnCont
+
+needsReturnCheck :: S.ArgSpec -> Bool
+needsReturnCheck spec = S.argSort spec /= S.SAny || S.argMode spec == S.ModeOut
 
 -- A local operand can be overwritten only after all its outgoing arguments
 -- have been materialised. Choices protect older frames through their heap

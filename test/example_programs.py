@@ -361,7 +361,63 @@ def check_general_examples(runner):
     require(runner.query("json", 'findall 1 (once (phrase (json (array [num 1,true,str "x"])) "[1,true,\\"x\\"]")) Result') == [1], "JSON parse")
     require(runner.query("regex", 'findall 1 (phrase (match (cat (star (char \'a\')) (char \'b\'))) "aaab") Result') == [1], "regex language")
     require(runner.query("lisp", 'findall V (once (phrase (sexpr E) "(plus 2 (times 3 4))"), eval E V) Result') == [14], "Lisp arithmetic")
+    import math
+    fact = "(define fact (lambda (n) (if (lt n 1) 1 (times n (fact (minus n 1))))))"
+    require(runner.query("lisp", f'session [] ["{fact}", "(fact 25)"] [_, value Result]') == math.factorial(25), "Lisp recursion through define")
+    compose = "(define compose (lambda (f g) (lambda (x) (f (g x)))))"
+    require(runner.query("lisp", f'session [] ["{compose}", "((compose (lambda (x) (times x 2)) (lambda (x) (plus x 10))) 31)"] [_, value Result]') == (31 + 10) * 2, "Lisp closures")
     require(runner.query("prolog_in_infera", "findall 1 (interpret [rule b [cut,call missing],rule b []] b) Result") == [], "interpreted cut failure")
+    # The interpreted Prolog: reachability from an independently computed
+    # closure, all three splits of a two-element list, and cut pruning.
+    edges = [("a", "b"), ("b", "c"), ("c", "d")]
+    reach, frontier = set(), {"a"}
+    while frontier:
+        step = {y for x, y in edges if x in frontier} - reach
+        reach |= step; frontier = step
+    facts = " ".join(f"edge({x}, {y})." for x, y in edges)
+    path = facts + " path(X, Y) :- edge(X, Y). path(X, Y) :- edge(X, Z), path(Z, Y)."
+    require(sorted(runner.query("prolog_in_infera", f'findall W (query "{path}" "path(a, W)" (path a W)) Result')) == sorted(reach), "interpreted reachability")
+    app = "app(end, L, L). app(node(H, T), L, node(H, R)) :- app(T, L, R)."
+    require(runner.query("prolog_in_infera", f'findall 1 (query "{app}" "app(X, Y, node(a, node(b, end)))" _) Result') == [1, 1, 1], "interpreted list splits")
+    mx = "max(X, Y, X) :- ge(X, Y), !. max(X, Y, Y). ge(b, a)."
+    require(runner.query("prolog_in_infera", f'findall M (query "{mx}" "max(b, a, M)" (max b a M)) Result') == ["b"], "cut keeps the first clause")
+    require(runner.query("prolog_in_infera", f'findall M (query "{mx}" "max(a, b, M)" (max a b M)) Result') == ["b"], "failed guard reaches the next clause")
+
+
+def check_regex(runner):
+    # Generated expressions compared with Python's re on every string of
+    # length <= 4 over {a, b}: the compiled NFA and the backtracking matcher
+    # must both accept exactly the strings re.fullmatch accepts.
+    import random
+    rng = random.Random(20261116)
+    strings = ["".join(p) for n in range(5) for p in itertools.product("ab", repeat=n)]
+    def gen(depth):
+        if depth == 0 or rng.random() < 0.3:
+            return rng.choice([("char", "a"), ("char", "b"), ("any",), ("empty",)])
+        kind = rng.choice(["cat", "alt", "star", "plus", "opt"])
+        if kind in ("cat", "alt"):
+            return (kind, gen(depth - 1), gen(depth - 1))
+        return (kind, gen(depth - 1))
+    def term(r):
+        k = r[0]
+        if k == "char": return f"(char '{r[1]}')"
+        if k in ("any", "empty"): return k
+        return "(" + k + " " + " ".join(term(x) for x in r[1:]) + ")"
+    def pattern(r):
+        k = r[0]
+        if k == "char": return r[1]
+        if k == "any": return "."
+        if k == "empty": return "(?:)"
+        if k == "cat": return f"(?:{pattern(r[1])})(?:{pattern(r[2])})"
+        if k == "alt": return f"(?:{pattern(r[1])}|{pattern(r[2])})"
+        return f"(?:{pattern(r[1])})" + {"star": "*", "plus": "+", "opt": "?"}[k]
+    listed = "[" + ", ".join('"' + x + '"' for x in strings) + "]"
+    for _ in range(12):
+        r = gen(3)
+        expected = [i for i, x in enumerate(strings) if re.fullmatch(pattern(r), x)]
+        for goal in ("nfa_match R S", "once (phrase (match R) S)"):
+            actual = runner.query("regex", f"R = {term(r)}, findall I (nth0 I {listed} S, {goal}) Result")
+            require(actual == expected, f"regex {goal} {term(r)}: {actual} != {expected}")
 
 
 def main():
@@ -384,7 +440,7 @@ def main():
             for name in EXAMPLES:
                 output = runner.run(ROOT / "examples" / (name + ".nprolog"))
                 require(name in {"stlc", "dpll"} or "\nfalse." not in output, "demonstration failed: " + name)
-            for check in (check_general_examples, check_meta, check_sudoku, check_river, check_jobs, check_routes, check_packing,
+            for check in (check_general_examples, check_regex, check_meta, check_sudoku, check_river, check_jobs, check_routes, check_packing,
                           check_cryptarithmetic, check_magic_square, check_knight_tour,
                           check_peg_solitaire, check_mastermind, check_water_jugs):
                 check(runner)

@@ -1,6 +1,13 @@
-aggregate_all : nondet notable (any: <=>) (any: <=>) (any: <=>).
-bagof : nondet notable (any: <=>) (any: <=>) (any: <=>).
-setof : nondet notable (any: <=>) (any: <=>) (any: <=>).
+aggregate_all : notable.
+bagof : notable.
+setof : notable.
+std_agg_strip : notable.
+std_agg_minus : notable.
+std_agg_memq : notable.
+std_agg_groups : notable.
+std_agg_take : notable.
+std_agg_variant : notable.
+std_agg_number : notable.
 <- import "std/list".
 <- import "std/order".
 aggregate_all count Goal N <- findall 1 Goal Xs, length Xs N.
@@ -10,5 +17,36 @@ aggregate_all (min X) Goal N <- findall X Goal Xs, min_list Xs N.
 aggregate_all (bag X) Goal Xs <- findall X Goal Xs.
 aggregate_all (set X) Goal Xs <- findall X Goal Bag, sort Bag Xs.
 
-bagof Template Goal Bag <- std_native_bagof Template Goal Bag.
-setof Template Goal Set <- std_native_setof Template Goal Set.
+# bagof and setof over findall, so the goal runs on the engine like any
+# other search. The witness is the goal's free variables: those not in the
+# template and not bound by Var ^ Goal. Solutions are grouped by witness up
+# to renaming of variables (in witness order), and a group's witnesses are
+# unified, so variables shared through the witness stay shared.
+bagof Template Goal Bag <-
+  std_agg_strip Goal Inner Ex, term_variables (pair Template Ex) Bound,
+  term_variables Inner All, std_agg_minus All Bound Witness,
+  (Witness = [] -> findall Template Inner Bag, Bag != []
+  ; findall (pair Witness Template) Inner Pairs, Pairs != [],
+    keysort Pairs Sorted, std_agg_groups Sorted Groups, member (pair Witness Bag) Groups).
+setof Template Goal Set <- bagof Template Goal Bag, sort Bag Set.
+
+std_agg_strip G Inner Ex <- (G = (V ^ G1) -> Ex = [V | Ex1], std_agg_strip G1 Inner Ex1 ; Inner = G, Ex = []).
+
+std_agg_minus [] _ [].
+std_agg_minus [V | Vs] Bound W <- (std_agg_memq V Bound -> W = W1 ; W = [V | W1]), std_agg_minus Vs Bound W1.
+std_agg_memq V [X | Xs] <- (V == X -> true ; std_agg_memq V Xs).
+
+std_agg_groups [] [].
+std_agg_groups [pair K T | Ps] [pair K [T | Ts] | Gs] <- std_agg_take K Ps Ts Rest, std_agg_groups Rest Gs.
+std_agg_take _ [] [] [].
+std_agg_take K [pair K2 T | Ps] Ts Rest <-
+  (std_agg_variant K K2 -> K2 = K, Ts = [T | Ts1], Rest = Rest1 ; Ts = Ts1, Rest = [pair K2 T | Rest1]),
+  std_agg_take K Ps Ts1 Rest1.
+
+# Equal up to a renaming of variables: copy each, number its variables in
+# order, and compare.
+std_agg_variant A B <-
+  copy_term A A1, copy_term B B1, term_variables A1 VA, term_variables B1 VB,
+  std_agg_number VA 0 N, std_agg_number VB 0 N, A1 == B1.
+std_agg_number [] N N.
+std_agg_number [V | Vs] I N <- V = std_agg_var I, J is I + 1, std_agg_number Vs J N.

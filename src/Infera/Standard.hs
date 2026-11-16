@@ -32,8 +32,12 @@ expandStandard items = do
   (_,lib) <- gather Set.empty (requested ++ if noPrelude then [] else ["std/list","std/order","std/aggregate"])
   let own = [i | i <- items, not (directive (locatedItem i))]
       keys = Set.fromList [key | i <- own, TLClause c <- [locatedItem i], Just key <- [clauseKey c]]
+      names = Set.map fst keys
+      -- A flags-only declaration covers every arity of its name, so any user
+      -- clause of that name shadows it, not only one of the same arity.
       keep i = case locatedItem i of
         TLClause c -> maybe True (`Set.notMember` keys) (clauseKey c)
+        TLDecl d | null (declArgs d) && declDet d == Nothing -> Set.notMember (declName d) names
         TLDecl d -> Set.notMember (declName d,length (declArgs d)) keys
         _ -> False
   pure (filter keep lib ++ own)

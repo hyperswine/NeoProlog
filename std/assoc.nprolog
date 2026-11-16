@@ -1,17 +1,17 @@
-empty_assoc : nondet notable (any: <=>).
-get_assoc : nondet notable (any: <=>) (any: <=>) (any: <=>).
-put_assoc : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-std_assoc_height : nondet notable (any: <=>) (any: <=>).
-std_assoc_node : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-std_assoc_balance : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-list_to_assoc : nondet notable (any: <=>) (any: <=>).
-std_assoc_from : nondet notable (any: <=>) (any: <=>) (any: <=>).
-assoc_to_list : nondet notable (any: <=>) (any: <=>).
-std_assoc_list : nondet notable (any: <=>) (any: <=>) (any: <=>).
-assoc_to_keys : nondet notable (any: <=>) (any: <=>).
-std_assoc_keys : nondet notable (any: <=>) (any: <=>).
-assoc_to_values : nondet notable (any: <=>) (any: <=>).
-std_assoc_values : nondet notable (any: <=>) (any: <=>).
+empty_assoc : notable.
+get_assoc : notable.
+put_assoc : notable.
+std_assoc_height : notable.
+std_assoc_node : notable.
+std_assoc_balance : notable.
+list_to_assoc : notable.
+std_assoc_from : notable.
+assoc_to_list : notable.
+std_assoc_list : notable.
+assoc_to_keys : notable.
+std_assoc_keys : notable.
+assoc_to_values : notable.
+std_assoc_values : notable.
 <- import "std/list".
 empty_assoc empty.
 get_assoc K (node L V _ A B) X <- compare O K L, (O = eq -> X = V ; O = lt -> get_assoc K A X ; get_assoc K B X).

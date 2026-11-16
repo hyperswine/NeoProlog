@@ -1,0 +1,111 @@
+# One relation, three uses: JSON text <-> a structured value.
+# Run: infera examples/json_relation.nprolog
+#
+# Values: null | true | false | num N | str S | array Values | object Pairs.
+# An object is an ordered list of (pair String Value), preserving duplicate keys.
+# Text must be supplied for parsing/validation; generation takes a ground value.
+# Helpers describe syntax once. There is no separate parser/printer/validator.
+<- import "std/dcg".
+<- notable.
+
+json : semidet (any: <=>) (any: <=>).
+json Text Value <-
+  (nonvar Text -> is_str Text, str_chars Text Cs, phrase (j_document Value) Cs
+  ; ground Value, phrase (j_document Value) Cs, str_chars Text Cs).
+
+j_document Value -> j_ws, j_value Value, j_ws, eos.
+j_value null -> "null".
+j_value true -> "true".
+j_value false -> "false".
+j_value (num N) -> j_number N.
+j_value (str S) -> j_quoted S.
+j_value (array Vs) -> "[", j_ws, j_elements Vs, "]".
+j_value (object Ps) -> "{", j_ws, j_members Ps, "}".
+j_elements [] -> [].
+j_elements [V | Vs] -> j_value V, j_ws, j_more_elements Vs.
+j_more_elements [] -> [].
+j_more_elements [V | Vs] -> ",", j_ws, j_value V, j_ws, j_more_elements Vs.
+j_members [] -> [].
+j_members [pair K V | Ps] -> j_quoted K, j_ws, ":", j_ws, j_value V, j_ws, j_more_members Ps.
+j_more_members [] -> [].
+j_more_members [pair K V | Ps] -> ",", j_ws, j_quoted K, j_ws, ":", j_ws, j_value V, j_ws, j_more_members Ps.
+
+# Parsing can consume JSON whitespace. Generation chooses compact text.
+j_ws A B <- (var A -> A = B ; j_read_ws A B).
+j_read_ws -> [C], { char_code C N, (N = 32 ; N = 9 ; N = 10 ; N = 13) }, j_read_ws.
+j_read_ws -> [].
+
+j_quoted S ->
+  ({ nonvar S } -> { is_str S, str_chars S Cs }, "\"", j_chars Cs, "\""
+  ; "\"", j_chars Cs, "\"", { str_chars S Cs }).
+j_chars [] -> [].
+j_chars [C | Cs] -> j_char C, j_chars Cs.
+j_char '"' -> "\\\"".
+j_char '\\' -> "\\\\".
+j_char '\n' -> "\\n".
+j_char '\r' -> "\\r".
+j_char '\t' -> "\\t".
+j_char '\b' -> "\\b".
+j_char '\f' -> "\\f".
+j_char C -> { nonvar C, char_code C N, N < 32,
+  A is N / 16, B is N % 16, str_chars "0123456789abcdef" Hex,
+  nth0 A Hex H1, nth0 B Hex H2 }, "\\u00", [H1,H2].
+j_char C -> { var C }, "\\/", { C = '/' }.
+j_char C -> { var C }, "\\u", j_hex4 High,
+  ({ High >= 55296, High <= 56319 } -> "\\u", j_hex4 Low,
+     { Low >= 56320, Low <= 57343, Code is 65536 + (High - 55296) * 1024 + Low - 56320, char_code C Code }
+  ; { (High < 55296 ; High > 57343), char_code C High }).
+j_char C -> [C], { char_code C N, N >= 32, C != '"', C != '\\', (N < 55296 ; N > 57343) }.
+j_hex4 N -> j_hex A, j_hex B, j_hex C, j_hex D, { N is A * 4096 + B * 256 + C * 16 + D }.
+j_hex N -> [C], { char_code C Code,
+  (Code >= 48, Code <= 57 -> N is Code - 48
+  ; Code >= 65, Code <= 70 -> N is Code - 55
+  ; Code >= 97, Code <= 102, N is Code - 87) }.
+
+# Check JSON's number spelling, not the host language's permissive syntax.
+# Numeric values use Infera's arbitrary integers and finite floating point
+# (decimal fractions/exponents therefore have the usual floating-point limits).
+j_number N ->
+  ({ nonvar N } -> { is_num N, str_num S N, str_chars S Cs, phrase (j_number_parts _ _) Cs }, seq Cs
+  ; seq Cs, { Cs != [], phrase (j_number_parts Mantissa Exponent) Cs,
+      (Exponent = none -> N = Mantissa ; Exponent = exp E,
+        (E >= 0 -> N is Mantissa * (10.0 ^ E) ; Positive is 0 - E, N is (Mantissa * 1.0) / (10.0 ^ Positive))),
+      str_num Check N, Check != "Infinity", Check != "-Infinity", Check != "NaN" }).
+j_number_parts Mantissa Exponent -> j_sign Sign, j_integer Digits, j_fraction Fraction, j_exponent Exponent,
+  { append Sign Digits A, append A Fraction Cs, str_chars S Cs, str_num S Mantissa }, eos.
+j_sign ['-'] -> "-".
+j_sign [] -> [].
+j_integer ['0'] -> "0".
+j_integer [D | Ds] -> [D], { char_code D N, N >= 49, N <= 57 }, j_digits Ds.
+j_digits [D | Ds] -> j_digit D, j_digits Ds.
+j_digits [] -> [].
+j_digit D -> [D], { char_code D N, N >= 48, N <= 57 }.
+j_fraction ['.' , D | Ds] -> ".", j_digit D, j_digits Ds.
+j_fraction [] -> [].
+j_exponent (exp E) -> ("e" ; "E"), j_exp_sign Sign, j_digit D, j_digits Ds,
+  { str_chars S [D | Ds], str_num S Magnitude, E is Sign * Magnitude }.
+j_exponent none -> [].
+j_exp_sign -1 -> "-".
+j_exp_sign 1 -> "+".
+j_exp_sign 1 -> [].
+
+# 1. Parse: text is known; the structured value is discovered.
+> json "{\"name\":\"Ada\",\"scores\":[3,5],\"active\":true}" Value?
+
+# 2. Generate: the value is known; JSON text is discovered.
+> json Text (object [pair "name" (str "Ada"),pair "scores" (array [num 3,num 5]),pair "active" true])?
+
+# 3. Validate: nothing needs to be returned. Complete input must be valid JSON.
+> json " {\"ok\":true,\"nothing\":null} " _?
+> json "{\"ok\":true,}" _?
+> json "[01]" _?
+
+# 4. Match an ordered-field pattern and extract a value, without another parser.
+> json "{\"kind\":\"temperature\",\"value\":21}" (object [pair "kind" (str "temperature"),pair "value" (num Reading)])?
+
+# 5. With BOTH sides known, check that the text denotes that exact value.
+> json "[1,2,3]" (array [num 1,num 2,num 3])?
+> not (json "[1,2,3]" (array [num 1,num 2,num 4]))?
+
+# 6. A finite logical choice generates a family of valid documents.
+> findall Text (member Active [true,false], json Text (object [pair "active" Active])) Documents?

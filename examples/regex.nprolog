@@ -1,8 +1,67 @@
-# Regex syntax: char C, cat A B, alt A B, star A, empty.
+# Regular expressions two ways: a backtracking matcher that states the
+# language, and the same expressions compiled to a Thompson NFA and run as a
+# set-of-states machine by a grammar over the input.
+#
+# Syntax: empty, any, char C, cat A B, alt A B, star A, plus A, opt A.
+
+# ── The specification: match a regular expression directly ────────────────
+
 match empty -> [].
+match any -> [_].
 match (char C) -> [C].
 match (cat A B) -> match A, match B.
 match (alt A B) -> (match A ; match B).
 match (star A) S0 S <- (S0 = S ; match A S0 S1, not (S0 == S1), match (star A) S1 S).
+match (plus A) -> match A, match (star A).
+match (opt A) -> (match A ; []).
+
+# ── Compilation: Thompson's construction ──────────────────────────────────
+# nfa Start Accept Edges, with states numbered from 0. Edges are
+# eps From To, on From Char To and dot From To (any character).
+# t Re From To N0 N E0 E connects From to To with Re, allocating fresh
+# states from N0 and threading the edge list as a difference list.
+
+compile Re (nfa 0 1 Edges) <- t Re 0 1 2 _ Edges [].
+
+t empty F T N N [eps F T | E] E.
+t any F T N N [dot F T | E] E.
+t (char C) F T N N [on F C T | E] E.
+t (cat A B) F T N0 N E0 E <- N1 is N0 + 1, t A F N0 N1 N2 E0 E1, t B N0 T N2 N E1 E.
+t (alt A B) F T N0 N E0 E <- t A F T N0 N1 E0 E1, t B F T N1 N E1 E.
+# Each loop gets its own state, so a loop never shares an entry with a
+# sibling alternative.
+t (star A) F T N0 N [eps F N0, eps N0 T | E1] E <- N1 is N0 + 1, t A N0 N0 N1 N E1 E.
+t (plus A) F T N0 N E0 E <- t (cat A (star A)) F T N0 N E0 E.
+t (opt A) F T N0 N E0 E <- t (alt A empty) F T N0 N E0 E.
+
+# ── Simulation: the reachable set of states after each character ──────────
+# Sets are sorted lists without duplicates (sort with a strict order).
+
+closure Edges Set Closed <-
+  findall T (member S Set, member (eps S T) Edges) Reached,
+  append Set Reached All, sort 0 lt All Next,
+  (Next == Set -> Closed = Set ; closure Edges Next Closed).
+
+step Edges Set C Next <-
+  findall T (member S Set, (member (on S C T) Edges ; member (dot S T) Edges)) Moved,
+  sort 0 lt Moved Targets, closure Edges Targets Next.
+
+# The machine is deterministic over state sets: one clause consumes a
+# character, the other accepts at the end of the input.
+run _ Accept Set [] [] <- memberchk Accept Set.
+run Edges Accept Set [C | S0] S <- step Edges Set C Next, Next != [], run Edges Accept Next S0 S.
+
+nfa_match Re Text <-
+  compile Re (nfa Start Accept Edges),
+  closure Edges [Start] Initial,
+  phrase (run Edges Accept Initial) Text.
+
+# Both definitions accept exactly the same strings.
+agree Re Text <- (once (phrase (match Re) Text) -> nfa_match Re Text ; not (nfa_match Re Text)).
+
+> compile (cat (star (char 'a')) (char 'b')) Machine?
 > phrase (match (cat (star (char 'a')) (char 'b'))) "aaab"?
-> phrase (match (star empty)) ""?
+> nfa_match (cat (star (char 'a')) (char 'b')) "aaab"?
+> nfa_match (star (alt (char 'a') (cat (char 'b') (char 'c')))) "abcbca"?
+> not (nfa_match (plus (char 'a')) "")?
+> forall (member S ["", "a", "ab", "abc", "abcabc", "acb", "bcbc"]) (agree (star (alt (char 'a') (cat (char 'b') (char 'c')))) S)?

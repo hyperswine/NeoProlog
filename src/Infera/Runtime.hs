@@ -15,6 +15,10 @@ import qualified Data.Map.Strict as Map
 import Data.List (intercalate, nub)
 import Data.Unique (newUnique, hashUnique)
 import Foreign.C.Types
+import Foreign.Marshal.Array (withArrayLen, allocaArray, peekArray)
+import Foreign.Ptr (Ptr)
+import qualified GHC.IO.FD as FD
+import GHC.IO.Handle.FD (handleToFd)
 import qualified Data.ByteString as BS
 import GHC.Clock (getMonotonicTimeNSec)
 import qualified Network.Socket as N
@@ -39,7 +43,8 @@ import Infera.Unify
 import Infera.Effects
 import Infera.Machine.Trace.Types
 
-foreign import ccall unsafe "infera_poll_read" pollRead :: CInt -> IO CInt
+-- Safe: it blocks for the caller's timeout.
+foreign import ccall safe "infera_poll_many" pollMany :: Ptr CInt -> CInt -> CLLong -> Ptr CInt -> IO CInt
 
 data Failure = Fault SolveError Term [String] | Halt Int | InputFailure deriving (Show,Typeable)
 instance E.Exception Failure
@@ -50,7 +55,7 @@ data Resource = Resource Object Bool
 data Runner = Runner { program :: Program, resources :: IORef (IM.IntMap Resource),
   serial :: Int, world :: IORef Int, nextHandle :: IORef Int,
   parseCaches :: IORef (IM.IntMap (IORef (IM.IntMap Char, Bool, Int))),
-  positions :: IORef (IM.IntMap Int), parseBudget :: IORef Int,
+  positions :: IORef (IM.IntMap Int),
   -- | No attributes and no dynamic predicates: pure goals can run on the
   -- Core engine ('pureSearch') and no attribute hooks are ever pending.
   coreEligible :: Bool }
@@ -115,7 +120,7 @@ runEffectQuery p q
 
 newRunner :: Program -> IO Runner
 newRunner p = Runner p <$> newIORef (IM.fromList [(0,Resource (Stream H.stdin) False),(1,Resource (Stream H.stdout) False),(2,Resource (Stream H.stderr) False)])
-  <*> (hashUnique <$> newUnique) <*> newIORef 0 <*> newIORef 3 <*> newIORef IM.empty <*> newIORef IM.empty <*> newIORef 0
+  <*> (hashUnique <$> newUnique) <*> newIORef 0 <*> newIORef 3 <*> newIORef IM.empty <*> newIORef IM.empty
   <*> pure (not (usesAttributes p []) && null (dynamicNames p))
 
 -- | Solve pure goals from the runner's state. Programs without attributes or
@@ -177,12 +182,19 @@ renameWith f t = case t of
 cleanup :: Runner -> IO ()
 cleanup r = readIORef (resources r) >>= mapM_ (\(Resource o owned) -> when owned (ignore (closeObject o))) . IM.elems
   where ignore a = a `E.catch` \(_ :: E.IOException) -> pure ()
+-- | Closing always succeeds. Every successful write has already flushed, so
+-- data left in a buffer at close belongs to a write that reported err (for
+-- example to a peer that has gone); flushing it again would fail the same
+-- way, so that error is dropped.
 closeObject :: Object -> IO ()
-closeObject (Stream h) = H.hClose h
-closeObject (SocketStream s h) = H.hClose h `E.finally` N.close s
+closeObject (Stream h) = quietly (H.hClose h)
+closeObject (SocketStream s h) = quietly (H.hClose h) `E.finally` N.close s
 closeObject (Listener s) = N.close s
 closeObject (Datagram s) = N.close s
 closeObject (Memory _ _ _) = pure ()
+
+quietly :: IO () -> IO ()
+quietly action = action `E.catch` \(_ :: E.IOException) -> pure ()
 
 fault :: Term -> [String] -> SolveError -> IO a
 fault g frames e = E.throwIO (Fault e g frames)
@@ -494,11 +506,22 @@ renderGrammar r g f s nt = do
       _ ->fault g f (TypeError "character-list grammar" nt)
   where isChar(CharLit _)=True; isChar _=False
 
-ready :: Term -> [String] -> Object -> IO Bool
-ready _ _ (Memory _ _ _)=pure True
-ready _ _ (Listener sock)=N.withFdSocket sock (fmap (/=0) . pollRead)
-ready _ _ (Datagram sock)=N.withFdSocket sock (fmap (/=0) . pollRead)
-ready g f obj=streamHandle g f obj >>= \h -> H.hWaitForInput h 0 `E.catch` \(e::E.IOException) -> if isEOFError e then pure True else E.throwIO e
+-- | Readable without blocking because input is already buffered in the
+-- object itself. Listeners and datagram sockets buffer nothing.
+bufferedNow :: Term -> [String] -> Object -> IO Bool
+bufferedNow _ _ (Memory _ _ _)=pure True
+bufferedNow _ _ (Listener _)=pure False
+bufferedNow _ _ (Datagram _)=pure False
+bufferedNow g f obj=streamHandle g f obj >>= \h -> H.hWaitForInput h 0 `E.catch` \(e::E.IOException) -> if isEOFError e then pure True else E.throwIO e
+
+-- | The descriptor 'wait' polls; Nothing for an object that never blocks.
+descriptor :: Object -> IO (Maybe CInt)
+descriptor (Memory _ _ _)=pure Nothing
+descriptor (Listener sock)=Just <$> N.withFdSocket sock pure
+descriptor (Datagram sock)=Just <$> N.withFdSocket sock pure
+descriptor (SocketStream sock _)=Just <$> N.withFdSocket sock pure
+descriptor (Stream h)=(Just . FD.fdFD <$> handleToFd h) `E.catch` \(_::E.SomeException)->pure Nothing
+
 
 -- Result-bearing operations return expected environmental failures as values.
 action :: Runner -> [String] -> State -> Term -> String -> [Term] -> IO State
@@ -546,8 +569,12 @@ action r f s g name args = case (name,args) of
     result<-attempt(openObject r g f (Compound "file"[path]) (Atom "read"))
     case result of
       Compound "ok"[h]->do
+        -- A complete-file parse needs no incremental reads: read the text
+        -- and parse it with phrase on the Core, like an inline query.
         (key,Resource obj _)<-object r g f h
-        parseHandleWith True r f s g h nt `E.finally` (closeObject obj >> modifyIORef'(resources r)(IM.delete key))
+        text<-(streamHandle g f obj >>= H.hGetContents') `E.finally` (closeObject obj >> modifyIORef'(resources r)(IM.delete key))
+        found<-firstPure f g (pureSearch r s [Compound "phrase"[nt,StrLit text]])
+        maybe (E.throwIO InputFailure) pure found
       _->fault g f(UserError("unchecked input failure: "++show result++"; use open to handle environmental errors"))
   ("accept",[h,out]) -> do
     (_,Resource obj _)<-object r g f h
@@ -571,20 +598,38 @@ action r f s g name args = case (name,args) of
               (_,x)->x
         outBind out value
   ("wait",[hs,t,out]) -> do
-    timeout<-integer g f t
+    -- Milliseconds; a negative timeout waits until a handle is ready.
+    timeout<-case t of
+      IntLit n | n < 0 -> pure (-1)
+      _ -> integer g f t
     handles<-case unfoldCons hs of (xs,Nothing)->pure xs; _->fault g f(TypeError "handle list" hs)
     objects<-mapM (object r g f) handles
-    start<-getMonotonicTimeNSec
-    let loop=do
-          flags<-mapM (\(key,Resource o _)->do
-            caches<-readIORef(parseCaches r)
-            pos<-IM.findWithDefault 0 key <$> readIORef(positions r)
-            buffered<-case IM.lookup key caches of Nothing->pure False; Just c->do (_,eof,count)<-readIORef c; pure(eof || pos<count)
-            if buffered then pure True else ready g f o) objects
-          now<-getMonotonicTimeNSec
-          let available=[h | (h,True)<-zip handles flags]
-          if not(null available) || now-start >= fromIntegral timeout*1000000 then pure available else threadDelay 1000>>loop
-    loop >>= outBind out . flip mkList Nothing
+    -- Input already buffered (a parser's read-ahead, an in-memory string, a
+    -- handle's buffer) is ready now; otherwise one blocking poll covers
+    -- every descriptor until one is readable or the timeout passes.
+    buffered<-mapM (\(key,Resource o _)->do
+      caches<-readIORef(parseCaches r)
+      pos<-IM.findWithDefault 0 key <$> readIORef(positions r)
+      cached<-case IM.lookup key caches of Nothing->pure False; Just c->do (_,eof,count)<-readIORef c; pure(eof || pos<count)
+      if cached then pure True else bufferedNow g f o) objects
+    -- With input already buffered somewhere, the others are polled without
+    -- blocking, so every ready handle is reported in the order given (a
+    -- listener first in the list is seen alongside a client's data).
+    descriptors<-mapM (\(_,Resource o _)->descriptor o) objects
+    let pending=[d | (Just d,False)<-zip descriptors buffered]
+        limit=if or buffered then 0 else timeout
+    flags<-if null pending then (when (not (or buffered) && timeout>=0) (threadDelay (min (maxBound `div` 1000) timeout*1000)) >> pure [])
+      else withArrayLen pending $ \n fds->allocaArray n $ \outs->do
+        rc<-pollMany fds (fromIntegral n) (fromIntegral limit) outs
+        when (rc<0) (fault g f(UserError ("poll failed: errno "++show (negate rc))))
+        map (/=0) <$> peekArray n outs
+    let assign ((_,True):rest) xs=True:assign rest xs
+        assign ((Just _,False):rest) (x:xs)=x:assign rest xs
+        assign ((Just _,False):rest) []=False:assign rest []
+        assign ((Nothing,False):rest) xs=True:assign rest xs
+        assign [] _=[]
+        available=assign (zip descriptors buffered) flags
+    outBind out (mkList [h | (h,True)<-zip handles available] Nothing)
   ("send_to",[h,address,payload,out]) -> do
     (_,Resource obj _)<-object r g f h; bs<-bytes g f payload
     case obj of
@@ -645,7 +690,6 @@ parseHandle = parseHandleWith False
 
 parseHandleWith :: Bool -> Runner -> [String] -> State -> Term -> Term -> Term -> IO State
 parseHandleWith complete r f s g h nt = do
-  writeIORef (parseBudget r) 0
   (key,Resource obj _)<-object r g f h
   caches<-readIORef(parseCaches r)
   cache<-case IM.lookup key caches of
@@ -689,8 +733,6 @@ parseHandleWith complete r f s g h nt = do
 parseGoals :: Runner -> [String] -> Int -> Object -> IORef(IM.IntMap Char,Bool,Int) -> State -> [Term] -> (State -> IO(Maybe State)) -> IO(Maybe State)
 parseGoals _ _ _ _ _ s [] done=done s
 parseGoals r f key obj cache s (goal:goals) done = do
-  used<-atomicModifyIORef' (parseBudget r) (\n->(n+1,n+1))
-  when (used>R.maxResolutionDepth) (fault goal f (UserError "input grammar resolution budget exhausted"))
   let next st=parseGoals r f key obj cache st goals done
       one t cont=parseGoals r f key obj cache s [t] cont
       g=walkS s goal

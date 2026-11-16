@@ -1,26 +1,110 @@
 <- import "std/dcg".
-# Grammars over text have many parses (a symbol can split anywhere), so
-# tabling would collect them all before `once` takes the first.
-<- notable.
-# One S-expression per line. An intentionally small Scheme-like evaluator:
-# integers, +, *, quote and if. EOF exits the REPL normally.
+# A small Scheme: integers, symbols, quote, if, lambda (closures), let,
+# define, and the primitives plus, times, minus, lt and eq (lt and eq answer
+# 1 or 0; if treats 0 as false). One S-expression per line; define adds to
+# the global environment for later lines, so definitions can be recursive.
+# EOF exits the REPL normally.
+#
+#   printf '(define sq (lambda (n) (times n n)))\n(sq 12)\n' | infera run examples/lisp.nprolog
+
+# ── The REPL: effects only here ──────────────────────────────────────────
+
 main : io.
-main _ -> repl.
+main _ -> repl [].
+
 repl : io.
-repl -> read_line stdin R,
+repl G -> read_line stdin R,
   ({ R = eof } -> []
-  ; { R = ok Line } -> ({ once (phrase (sexpr Expr) Line), eval Expr Value } -> say (fmt "~w\n" [Value]) ; say "invalid expression\n"), repl
+  ; { R = ok Line } ->
+      ({ once (phrase (sexpr Expr) Line), step G Expr G1 Out } -> say (shown Out), say "\n", repl G1
+      ; say "invalid expression\n", repl G)
   ; halt 1).
+
+# ── Reading ──────────────────────────────────────────────────────────────
+
 sexpr E -> whites, expr E, whites, eos.
 expr (num N) -> integer N.
 expr (sym Name) -> string_without [' ', '\t', '\r', '\n', '(', ')'] Cs, { Cs != [], str_chars S Cs, str_atom S Name }.
 expr (list Es) -> "(", whites, exprs Es, ")".
 exprs [] -> [].
 exprs [E | Es] -> expr E, whites, exprs Es.
-eval (num N) N.
-eval (list [sym quote,X]) X.
-eval (list [sym if,C,A,B]) R <- eval C V, (V = 0 -> eval B R ; eval A R).
-eval (list [sym plus | Es]) R <- maplist eval Es Ns, sum_list Ns R.
-eval (list [sym times | Es]) R <- maplist eval Es Ns, foldl multiply Ns 1 R.
+
+# ── Evaluation ───────────────────────────────────────────────────────────
+# eval_in Globals Locals Expr Value. Environments are lists of pair Name
+# Value; a closure keeps its defining locals, and globals are looked up at
+# call time, which is what lets a defined function call itself.
+
+step G (list [sym define, sym Name, E]) [pair Name V | G] (defined Name) <- eval_in G [] E V.
+step G E G (value V) <- not (is_define E), eval_in G [] E V.
+
+is_define (list [sym define | _]).
+
+eval E V <- eval_in [] [] E V.
+
+eval_in _ _ (num N) N.
+eval_in G Env (sym Name) V <- lookup Name Env G V.
+eval_in _ _ (list [sym quote, X]) X.
+eval_in G Env (list [sym if, C, A, B]) V <- eval_in G Env C T, (T = 0 -> eval_in G Env B V ; eval_in G Env A V).
+eval_in _ Env (list [sym lambda, list Ps, Body]) (closure Names Body Env) <- maplist sym_name Ps Names.
+eval_in G Env (list [sym let, list Bs, Body]) V <-
+  maplist (binding G Env) Bs Pairs, append Pairs Env Env1, eval_in G Env1 Body V.
+eval_in G Env (list [F | Args]) V <-
+  not (special F), eval_in G Env F Fn, maplist (eval_in G Env) Args Vs, apply G Fn Vs V.
+
+special (sym quote).
+special (sym if).
+special (sym lambda).
+special (sym let).
+special (sym define).
+
+sym_name (sym Name) Name.
+binding G Env (list [sym Name, E]) (pair Name V) <- eval_in G Env E V.
+
+lookup Name Env G V <-
+  (memberchk (pair Name V0) Env -> V = V0
+  ; memberchk (pair Name V0) G -> V = V0
+  ; primitive Name -> V = prim Name).
+
+primitive plus.
+primitive times.
+primitive minus.
+primitive lt.
+primitive eq.
+
+apply G (closure Names Body Env) Vs V <- bind_args Names Vs Pairs, append Pairs Env Env1, eval_in G Env1 Body V.
+apply _ (prim Op) Vs V <- maplist is_int Vs, primop Op Vs V.
+
+bind_args [] [] [].
+bind_args [N | Ns] [V | Vs] [pair N V | Ps] <- bind_args Ns Vs Ps.
+
+primop plus Ns R <- sum_list Ns R.
+primop times Ns R <- foldl multiply Ns 1 R.
+primop minus [A, B] R <- R is A - B.
+primop lt [A, B] R <- (A < B -> R = 1 ; R = 0).
+primop eq [A, B] R <- (A == B -> R = 1 ; R = 0).
+
 multiply X A R <- R is X * A.
-> phrase (sexpr E) "(plus 2 (times 3 4))", eval E Result?
+
+# A whole session as a pure relation: the outputs of a list of lines.
+session _ [] [].
+session G [Line | Lines] [Out | Outs] <- once (phrase (sexpr E) Line), step G E G1 Out, session G1 Lines Outs.
+
+# ── Printing ─────────────────────────────────────────────────────────────
+
+shown (defined Name) -> wr Name.
+shown (value V) -> show V.
+show N -> { is_int N }, wr N.
+show (closure _ _ _) -> "#<procedure>".
+show (prim Name) -> "#<primitive ", wr Name, ">".
+show (sym Name) -> wr Name.
+show (num N) -> wr N.
+show (list Xs) -> "(", items Xs, ")".
+items [] -> [].
+items [X] -> show X.
+items [X, Y | Xs] -> show X, " ", items [Y | Xs].
+
+> once (phrase (sexpr E) "(plus 2 (times 3 4))"), eval E Value?
+> once (phrase (sexpr E) "((lambda (x y) (minus x y)) 10 4)"), eval E Value?
+> once (phrase (sexpr E) "(let ((sq (lambda (n) (times n n)))) (sq 7))"), eval E Value?
+> once (phrase (sexpr E) "(quote (a (b c)))"), eval E V, phrase (show V) Text, str_chars S Text?
+> session [] ["(define fact (lambda (n) (if (lt n 1) 1 (times n (fact (minus n 1))))))", "(fact 10)"] Out?

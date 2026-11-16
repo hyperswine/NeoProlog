@@ -1,14 +1,13 @@
-msort : nondet notable (any: <=>) (any: <=>).
-std_order_split : nondet notable (any: <=>) (any: <=>) (any: <=>).
-sort : nondet notable (any: <=>) (any: <=>).
-predsort : nondet notable (any: <=>) (any: <=>) (any: <=>).
-std_order_pred : nondet notable (any: <=>) (any: <=>) (any: <=>).
-std_order_pmerge : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-pairs_keys_values : nondet notable (any: <=>) (any: <=>) (any: <=>).
-pairs_keys : nondet notable (any: <=>) (any: <=>).
-pairs_values : nondet notable (any: <=>) (any: <=>).
-keysort : nondet notable (any: <=>) (any: <=>).
-sort : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+msort : notable.
+std_order_split : notable.
+sort : notable.
+predsort : notable.
+std_order_pred : notable.
+std_order_pmerge : notable.
+pairs_keys_values : notable.
+pairs_keys : notable.
+pairs_values : notable.
+keysort : notable.
 <- import "std/list".
 msort L S <- std_native_msort L S.
 std_order_split [] [] [].

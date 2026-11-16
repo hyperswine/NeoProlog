@@ -1,12 +1,12 @@
-split : nondet notable (any: <=>) (any: <=>) (any: <=>).
-std_str_split : nondet notable (any: <=>) (any: <=>) (any: <=>).
-std_str_piece : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-join : nondet notable (any: <=>) (any: <=>) (any: <=>).
-std_str_join : nondet notable (any: <=>) (any: <=>) (any: <=>).
-trim : nondet notable (any: <=>) (any: <=>).
-std_str_ltrim : nondet notable (any: <=>) (any: <=>).
-sub_str : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-str_code_list : nondet notable (any: <=>) (any: <=>).
+split : notable.
+std_str_split : notable.
+std_str_piece : notable.
+join : notable.
+std_str_join : notable.
+trim : notable.
+std_str_ltrim : notable.
+sub_str : notable.
+str_code_list : notable.
 <- import "std/list".
 split Text Sep Parts <- str_chars Text Cs, str_chars Sep Ds, Ds != [], std_str_split Cs Ds Chunks, maplist str_chars Parts Chunks.
 std_str_split Cs Ds [Part | Rest] <- std_str_piece Cs Ds Part Tail Hit, (Hit = yes -> std_str_split Tail Ds Rest ; Rest = []).

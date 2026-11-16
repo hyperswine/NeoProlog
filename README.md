@@ -225,7 +225,10 @@ reverses the ordering; this does not change term identity.
 * **Tabling** (linear tabling with fixpoint iteration): calls are memoised by
   variant, left recursion terminates, `fib` is linear.  On by default for
   predicates that are recursive, pure (no output) and not merely structurally
-  recursive (list walkers), except *deterministic counter-driven loops*
+  recursive (list walkers, and grammars whose recursion follows consumed
+  input: every recursive call, also through mutual recursion, passes a proper
+  subterm of a head argument, including one reached through a body
+  unification such as a DCG terminal's `S0 = [c | S1]`), except *deterministic counter-driven loops*
   (after 2.2.0; see [the criterion](docs/2026-11-01-AUTO-TABLING-COST.md#criterion)):
   self-recursive predicates whose only self-call is the last goal and steps
   a head variable by `V1 is V - c` / `V + c`, and whose clauses are exclusive
@@ -276,6 +279,11 @@ linear effect grammars, file/string/socket handles and attributed variables.
 Examples include `wc`, a small Lisp REPL, HTTP and chat, type inference,
 Datalog and watched-literal SAT. See the report for precise interfaces and
 local qualification limits.
+
+[`json_relation.nprolog`](examples/json_relation.nprolog) demonstrates one
+`json Text Value` relation used to parse, generate, validate, extract a field
+by unification, and generate a finite family of documents. Run it with
+`infera examples/json_relation.nprolog`.
 
 The [term toolkit](docs/2026-11-15-TERM-TOOLKIT.md) provides `functor`, `arg`,
 `univ`, `copy_term`, `term_variables`, `compare` and `clause`, with fresh clause

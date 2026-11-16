@@ -26,6 +26,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Set (Set)
+import qualified Data.IntSet as IS
 import qualified Data.Set as Set
 import Infera.Arith (arithOps, compareNumeric, evalNumeric)
 import Infera.Effects (effectKeys)
@@ -110,6 +111,8 @@ markGraphFacts prog =
             | Set.member x seen = go seen xs
             | otherwise = go (Set.insert x seen) (Map.findWithDefault [] x callees ++ xs)
       recursive k = Set.member k (reachable k)
+      -- The predicates on a cycle through k (k itself when it is recursive).
+      cycleOf k = Set.filter (\c -> Set.member k (reachable c)) (reachable k)
       directlyImpure p =
         any
           (\g -> maybe False (\name -> name `elem` impureBuiltins || nameHasFlag prog name FlagDynamic) (fst <$> functorOf g))
@@ -123,7 +126,7 @@ markGraphFacts prog =
         p
           { predRecursive = recursive (predKey p),
             predPure = not (Set.member (predKey p) impure),
-            predStructural = structurallyRecursive p,
+            predStructural = structurallyRecursive (cycleOf (predKey p)) p,
             predCounterLoop = selfOnly (predKey p) && counterLoop p,
             predGuardedCounter = selfOnly (predKey p) && counterLoop p && guardExclusive p,
             predDistinctCounter = selfOnly (predKey p) && counterLoop p && distinctCounterGenerator p
@@ -279,26 +282,50 @@ distinctCounterGenerator p = case partition recurses (IM.elems (predClauses p)) 
 
 data StepDir = Up | Down
 
--- | Every direct self-call passes, at some argument position, a variable that
--- is a proper subterm of the head argument at that position.
-structurallyRecursive :: Pred -> Bool
-structurallyRecursive p =
-  not (null selfCalls) && all structural selfCalls
+-- | Every recursive call, to the predicate itself or to another predicate
+-- on a cycle through it, passes at some argument position a variable that
+-- is a proper subterm of the head argument at that position. A subterm is
+-- one inside the head pattern, or inside a structure the body unifies with
+-- the head argument (transitively): @unify S0 [c | S1]@ makes @S1@ a proper
+-- subterm of @S0@. That is how a DCG rule consumes a terminal, so grammars
+-- whose recursion follows consumed input are structural and are not tabled
+-- by default; a left-recursive rule passes @S0@ unchanged and stays tabled.
+structurallyRecursive :: Set.Set PredKey -> Pred -> Bool
+structurallyRecursive cycle p =
+  not (null calls) && all structural calls
   where
-    selfCalls =
-      [ (headArgs cl, as)
+    calls =
+      [ (descendants cl, as)
       | cl <- IM.elems (predClauses p),
         g@(Compound _ as) <- bodyGoals cl,
-        functorOf g == Just (predKey p)
+        maybe False (`Set.member` cycle) (functorOf g)
       ]
-    headArgs cl = case clauseHead cl of
-      Compound _ hs -> hs
-      _ -> []
-    structural (hs, as) = or (zipWith descends hs as)
-    descends h (Var v) = case h of
-      Compound _ _ -> v `elem` termVarIds h
-      _ -> False
+    structural (ds, as) = or (zipWith descends ds as)
+    descends d (Var v) = IS.member v d
     descends _ _ = False
+    -- For each head argument, the variables that are proper subterms of it.
+    descendants cl =
+      let hs = case clauseHead cl of
+            Compound _ xs -> xs
+            _ -> []
+          equalities = [(a, b) | Compound "unify" [a, b] <- bodyGoals cl]
+          inner t = case t of
+            Compound _ xs -> IS.fromList (concatMap termVarIds xs)
+            _ -> IS.empty
+          close roots below =
+            let grow = IS.unions
+                  [ inner t
+                  | (a, b) <- equalities ++ [(b', a') | (a', b') <- equalities],
+                    Var u <- [a],
+                    IS.member u roots || IS.member u below,
+                    t@(Compound _ _) <- [b]
+                  ]
+                below' = IS.union below grow
+             in if below' == below then below else close roots below'
+          start h = case h of
+            Var x -> close (IS.singleton x) IS.empty
+            _ -> close IS.empty (inner h)
+       in map start hs
 
 -- ─── SORT INFERENCE ──────────────────────────────────────────────────────────
 

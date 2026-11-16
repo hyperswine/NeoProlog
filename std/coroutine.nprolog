@@ -1,16 +1,16 @@
-std_coroutine_has : nondet notable (any: <=>) (any: <=>).
-std_coroutine_add : nondet notable (any: <=>) (any: <=>).
-std_coroutine_watch : nondet notable (any: <=>) (any: <=>).
-dif : nondet notable (any: <=>) (any: <=>).
-freeze : nondet notable (any: <=>) (any: <=>).
-when : nondet notable (any: <=>) (any: <=>).
-std_coroutine_resume : nondet notable (any: <=>).
-std_coroutine_ready : nondet notable (any: <=>).
-frozen : nondet notable (any: <=>) (any: <=>).
-std_coroutine_goals : nondet notable (any: <=>) (any: <=>).
-coroutine:attr_unify_hook : nondet notable (any: <=>) (any: <=>).
-std_coroutine_run : nondet notable (any: <=>).
-coroutine:attribute_goals : nondet notable (any: <=>) (any: <=>) (any: <=>).
+std_coroutine_has : notable.
+std_coroutine_add : notable.
+std_coroutine_watch : notable.
+dif : notable.
+freeze : notable.
+when : notable.
+std_coroutine_resume : notable.
+std_coroutine_ready : notable.
+frozen : notable.
+std_coroutine_goals : notable.
+coroutine:attr_unify_hook : notable.
+std_coroutine_run : notable.
+coroutine:attribute_goals : notable.
 <- import "std/list".
 # The private unbound token gives each suspension an identity. Re-watching
 # the same suspension does not register it twice on an aliased variable.
@@ -40,6 +40,6 @@ std_coroutine_run [].
 std_coroutine_run [Task | Tasks] <- std_coroutine_resume Task, std_coroutine_run Tasks.
 coroutine:attribute_goals V -> { get_attr V coroutine Tasks, std_coroutine_goals Tasks Goals }, seq Goals.
 
-std_coroutine_call : nondet notable (any: <=>).
+std_coroutine_call : notable.
 std_coroutine_call true.
 std_coroutine_call Goal <- not (Goal == true), call Goal.

@@ -218,3 +218,151 @@ diagnostic.
 
 The Minesweeper properties load the example without its inline query, as the
 Breadboard properties do, so the Haskell suite passes with the shipped file.
+
+## 2026-11-16: open items from the audit
+
+All measurements below are on an Apple M4: whole process, warm, medians of
+three runs. The first run after a rebuild pays about 0.6 s of cold start and
+is discarded.
+
+### `wait` blocks in one poll
+
+`wait Handles Milliseconds Ready` no longer polls every 1 ms.
+
+- Input already buffered is ready at once: a parser's read-ahead, an
+  in-memory string, or a handle's buffer.
+- Otherwise a single `poll()` over every descriptor blocks until one is
+  readable or the timeout passes (`infera_poll_many`).
+- When something is buffered, the remaining handles are still polled
+  without blocking. Every ready handle is reported, in the order given, so a
+  listener listed first is seen alongside a client's data.
+- A negative timeout waits until a handle is ready.
+
+A 2 s idle wait now uses 0.01 s of CPU.
+
+`close` always succeeds, as documented. A write that failed (to a peer that
+has gone) left its data buffered, and the later `close` raised the same error
+as a fault; closing now drops it.
+
+### No resolution budget in the handle parser
+
+`phrase_from` faulted after 100,000 resolutions per parse: a total count,
+not a depth, so a 300 KB file could not be parsed. The budget is gone. A
+looping input grammar now loops, as untabled left recursion does anywhere
+else.
+
+`phrase_from_file`, which parses a complete file, now reads the file and runs
+`phrase` on the Core instead of the incremental parser. Parsing 300,000
+characters takes 0.08 s. The incremental parser, still used by streaming
+`phrase_from` on sockets and stdin, needs about 2.6 KB per character, which
+is open work.
+
+### Grammars are not tabled by default
+
+Every recursive DCG rule was tabled by default. The structural-recursion test
+looked only at head patterns, and a DCG rule consumes input with a body goal
+`S0 = [c | S1]`. A tabled call computes every answer before returning one, so
+grammars became quadratic (a 4,000-character file took 16 s) or exponential
+under `once` (the Lisp example's ambiguous tokenizer).
+
+`structurallyRecursive` now follows body unifications with a head argument,
+and covers every predicate on a cycle, not only direct self-calls. A grammar
+whose recursion follows consumed input is untabled. A left-recursive rule
+passes `S0` unchanged and stays tabled, so it still terminates. The
+`<- notable.` added to `lisp.nprolog` on 2026-11-15 is removed again.
+
+### Examples
+
+- **`regex.nprolog`** keeps the backtracking matcher as the specification and
+  adds Thompson compilation to an NFA, run as a set-of-states machine by a
+  grammar. `test/example_programs.py` compares both on 12 generated
+  expressions against Python's `re.fullmatch`, on every string of length up to
+  4 over {a, b}.
+- **`prolog_in_infera.nprolog`** parses Prolog clause syntax with variables and
+  compound terms (built with `univ`) and interprets it with unification,
+  backtracking and cut. Clauses are renamed with `copy_term`. Cut is built from
+  if-then-else, not the engine's own cut: a clause with a cut proves its head
+  and the goals before the cut as a condition. Atoms take their own clause
+  because `univ` builds only compounds, and object programs cannot use `nil`
+  and `cons`, which are Infera's list constructors.
+- **`lisp.nprolog`** adds closures, `lambda`, `let`, `define` across REPL lines
+  (so definitions can recurse), `minus`, `lt` and `eq`, and printing of values.
+  `session` runs a list of lines as a pure relation.
+- **`chat.nprolog`** serves any number of clients until the last one leaves.
+
+`std/dcg`'s `integer` and `number` take the longest numeral deterministically.
+Before, `once` committed to `1` in `10`.
+
+### The 2x gate (`bench/std-gate.py`)
+
+The gate first exposed problems that made library code orders of magnitude
+slower:
+
+1. **Catch-all declarations.** Every library predicate was declared
+   `nondet notable (any: <=>)...`. Declared signatures override inference, so
+   the library lost inferred determinism, and declared nondet calls were
+   quadratic: `numlist` with `sum_list` over 40,000 elements took 32 s. The
+   modules now declare only `name : notable.`, and their signatures are
+   inferred. A flags-only library declaration is shadowed by any user clause
+   of that name, since it covers every arity.
+2. **The declared-call return check.** A declared call stacked a return-check
+   frame even when its signature constrained nothing, which blocked frame
+   reuse and made `contDepth` walk the chain on every call. A declared nondet
+   counter over 40,000 calls took 9.85 s and now takes 0.06 s.
+   Signatures with real output checks still stack those frames (open).
+3. **Leaf builtins.** Every result of a term-toolkit or string builtin was
+   kept in the constraint store's substitution and re-diffed on each later
+   call, so 8,000 `compare` calls took 3.86 s. With no constraints active, a
+   leaf runs from an empty store and installs only its own bindings: 100,000
+   calls take 0.17 s. A ground `compare` is now ordered on the Core with the
+   toolkit's `compareTerms`, without the reference resolver.
+4. **`call/N`.** A closure naming an ordinary, untabled, non-dynamic user
+   predicate becomes the same `GCall` a static call compiles to, placed first
+   in the caller's goal list. There is no export or compile per call, and the
+   decision is cached per functor. `foldl` over 200,000 elements: 0.38 s to
+   0.15 s.
+5. **Library code.**
+   - `length` counts with an accumulator; it hit the 100,000 depth limit on
+     long lists.
+   - `nth0`/`nth1` take a separate deterministic path for a bound index.
+   - `bagof`/`setof` run over `findall` with variant grouping of witnesses,
+     instead of the reference resolver.
+
+Seconds of work after startup is subtracted. "Local" is the same algorithm
+written in the program, and SWI-Prolog is 10.0.2.
+
+| workload | std | local | SWI | std / SWI |
+| --- | --- | --- | --- | --- |
+| reverse 1000 x 2000 | 0.023 | 0.025 | 0.108 | 0.21 |
+| sum_list 1e6 | 0.109 | 0.170 | 0.069 | 1.58 |
+| length 1e6 | 0.116 | 0.167 | 0.049 | 2.34 |
+| msort 200k | 0.739 | 0.731 | 0.115 | 6.45 |
+| maplist 300k | 0.200 | 0.083 | 0.054 | 3.68 |
+| foldl 1e6 | 0.454 | 0.165 | 0.117 | 3.89 |
+| nth1 2000 x 2000 | 0.002 | 0.001 | 0.010 | 0.17 |
+| assoc 50k put + get | 1.931 | - | 0.051 | 37.6 |
+| setof 100k | 0.421 | - | 0.052 | 8.04 |
+| aggregate_all count, between 1e6 | 0.357 | 0.002 | 0.045 | 7.93 |
+
+Before these changes, `nth1` was 681x, `foldl` 13x, `assoc` 67x and `setof`
+12x SWI-Prolog, and `sum_list`, `length` and `setof` timed out at these
+sizes.
+
+Workloads still outside the gate, and the change each one points to:
+
+- **`msort`, `setof`.** Sorting exports the list to the reference resolver and
+  back. Sort on Core heap words with the toolkit order.
+- **`assoc`.** Inference cannot prove `put_assoc` deterministic: its clauses
+  are exclusive on a bound (not ground) argument. Declaring it `semidet` was
+  slower still, because declared calls carry their own cost. Inferring
+  exclusivity on a bound principal functor would fix the library without
+  declarations.
+- **`aggregate_all count`.** It builds the list of solutions to count it. A
+  counting form of `findall` would not.
+- **`maplist`/`foldl`.** 2.4x the hand-written loop: the closure call still
+  builds its goal per call.
+- **`length`.** 2.3x.
+- **Engine.** The engine-wide default resolution depth of 100,000
+  (`INFERA_MAX_DEPTH`) is itself an arbitrary bound.
+
+Run `python3 bench/std-gate.py "$(cabal list-bin exe:infera)"`.

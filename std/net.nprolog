@@ -1,2 +1,2 @@
-crlf : nondet notable (any: <=>) (any: <=>).
+crlf : notable.
 crlf -> "\r\n".

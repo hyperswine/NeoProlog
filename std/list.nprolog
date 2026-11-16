@@ -1,39 +1,37 @@
-member : nondet notable (any: <=>) (any: <=>).
-memberchk : nondet notable (any: <=>) (any: <=>).
-append : nondet notable (any: <=>) (any: <=>) (any: <=>).
-length : nondet notable (any: <=>) (any: <=>).
-std_list_len_to : nondet notable (any: <=>) (any: <=>).
-std_list_len_from : nondet notable (any: <=>) (any: <=>).
-nth0 : nondet notable (any: <=>) (any: <=>) (any: <=>).
-nth1 : nondet notable (any: <=>) (any: <=>) (any: <=>).
-last : nondet notable (any: <=>) (any: <=>).
-reverse : nondet notable (any: <=>) (any: <=>).
-std_list_rev : nondet notable (any: <=>) (any: <=>) (any: <=>).
-select : nondet notable (any: <=>) (any: <=>) (any: <=>).
-permutation : nondet notable (any: <=>) (any: <=>).
-sum_list : nondet notable (any: <=>) (any: <=>).
-std_list_sum : nondet notable (any: <=>) (any: <=>) (any: <=>).
-max_list : nondet notable (any: <=>) (any: <=>).
-std_list_max : nondet notable (any: <=>) (any: <=>) (any: <=>).
-min_list : nondet notable (any: <=>) (any: <=>).
-std_list_min : nondet notable (any: <=>) (any: <=>) (any: <=>).
-between : nondet notable (any: <=>) (any: <=>) (any: <=>).
-numlist : nondet notable (any: <=>) (any: <=>) (any: <=>).
-take : nondet notable (any: <=>) (any: <=>) (any: <=>).
-std_list_take : nondet notable (any: <=>) (any: <=>) (any: <=>).
-drop : nondet notable (any: <=>) (any: <=>) (any: <=>).
-std_list_drop : nondet notable (any: <=>) (any: <=>) (any: <=>).
-zip : nondet notable (any: <=>) (any: <=>) (any: <=>).
-maplist : nondet notable (any: <=>) (any: <=>).
-maplist : nondet notable (any: <=>) (any: <=>) (any: <=>).
-maplist : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-maplist : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-foldl : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-foldl : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-foldl : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>) (any: <=>).
-include : nondet notable (any: <=>) (any: <=>) (any: <=>).
-exclude : nondet notable (any: <=>) (any: <=>) (any: <=>).
-partition : nondet notable (any: <=>) (any: <=>) (any: <=>) (any: <=>).
+member : notable.
+memberchk : notable.
+append : notable.
+length : notable.
+std_list_len_to : notable.
+std_list_len_from : notable.
+std_list_len_acc : notable.
+nth0 : notable.
+std_list_nth_from : notable.
+std_list_nth_at : notable.
+nth1 : notable.
+last : notable.
+reverse : notable.
+std_list_rev : notable.
+select : notable.
+permutation : notable.
+sum_list : notable.
+std_list_sum : notable.
+max_list : notable.
+std_list_max : notable.
+min_list : notable.
+std_list_min : notable.
+between : notable.
+numlist : notable.
+take : notable.
+std_list_take : notable.
+drop : notable.
+std_list_drop : notable.
+zip : notable.
+maplist : notable.
+foldl : notable.
+include : notable.
+exclude : notable.
+partition : notable.
 # Standard lists. The loader supplies conservative relational declarations.
 member X [X | _].
 member X [_ | T] <- member X T.
@@ -43,11 +41,20 @@ append [X | Xs] Y [X | Zs] <- append Xs Y Zs.
 length Xs N <- (nonvar N -> N >= 0, std_list_len_to N Xs ; std_list_len_from Xs N).
 std_list_len_to 0 [].
 std_list_len_to N [_ | Xs] <- N > 0, M is N - 1, std_list_len_to M Xs.
-std_list_len_from [] 0.
-std_list_len_from [_ | Xs] N <- std_list_len_from Xs M, N is M + 1.
-nth0 0 [X | _] X.
-nth0 N [_ | Xs] X <- (var N -> nth0 M Xs X, N is M + 1 ; N > 0, M is N - 1, nth0 M Xs X).
-nth1 N Xs X <- (var N -> nth0 M Xs X, N is M + 1 ; N > 0, M is N - 1, nth0 M Xs X).
+# Counting with an accumulator keeps the recursion last, so a long list
+# needs no stack and enumerating the lengths of a partial list keeps order.
+std_list_len_from Xs N <- std_list_len_acc Xs 0 N.
+std_list_len_acc [] N N.
+std_list_len_acc [_ | Xs] A N <- B is A + 1, std_list_len_acc Xs B N.
+# A bound index walks the list on its own path, whose clauses are exclusive
+# (0 or N > 0), so the lookup is deterministic; an unbound index enumerates
+# the positions in order.
+nth0 N Xs X <- (var N -> std_list_nth_from Xs X 0 N ; is_int N, N >= 0, std_list_nth_at N Xs X).
+nth1 N Xs X <- (var N -> std_list_nth_from Xs X 1 N ; is_int N, N >= 1, M is N - 1, std_list_nth_at M Xs X).
+std_list_nth_from [X | _] X I I.
+std_list_nth_from [_ | Xs] X I N <- J is I + 1, std_list_nth_from Xs X J N.
+std_list_nth_at 0 [X | _] X.
+std_list_nth_at N [_ | Xs] X <- N > 0, M is N - 1, std_list_nth_at M Xs X.
 last [X] X.
 last [_ , Y | Xs] X <- last [Y | Xs] X.
 reverse Xs Ys <- std_list_rev Xs [] Ys.
