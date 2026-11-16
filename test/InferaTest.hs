@@ -847,14 +847,8 @@ prop_minimize = unit $ do
   assertErrorContains "" "minimize X (X = 1 ; X is 1 / 0)?" "division by zero"
   assertErrorContains "" "minimize X true?" "not sufficiently instantiated"
   assertErrorContains "" "minimize X (X = 1.5)?" "expected an integer"
-  let src = "gen 0. gen N <- gen M, N is M + 1."
-  prog <- loadOrFail src
-  q <- case parseQuery "minimize X (gen X)?" of
-    Left err -> annotate err >> failure
-    Right query -> pure query
-  let summary = solveAll prog q
-  summaryAnswers summary === []
-  assert (summaryExhausted summary)
+  -- A left-recursive generator is tabled; minimize sees its whole finite set.
+  assertAnswers "gen 5. gen N <- gen M, N is M - 1, N >= 0." "minimize X (gen X)?" ["X = 0"]
 
 prop_label_minimum :: Property
 prop_label_minimum = unit $ do

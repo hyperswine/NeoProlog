@@ -9,6 +9,8 @@ module Infera.Repl
   )
 where
 
+import Control.Exception (AsyncException (HeapOverflow))
+import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
@@ -252,9 +254,15 @@ runRepl = do
       outputStrLn (renderDoc label)
       renderEntry prog q
 
-    renderEntry prog q = do
+    -- Running out of memory ends the query, not the session: the error is
+    -- reported and the memory is free again for the next one.
+    renderEntry prog q = Catch.handle outOfMemory $ do
       effectResult <- liftIO (runEffectQuery prog q)
       renderQuerySummary (maybe (solveAll prog q) id effectResult)
+
+    outOfMemory e = case e of
+      HeapOverflow -> outputStrLn (renderDoc (docErr "out of memory: the query exhausted the heap limit (three quarters of physical memory, or +RTS -M)"))
+      other -> Catch.throwM other
 
     queryVarName q v = maybe (showVarDefault v) id (lookup v [(vid, n) | (n, vid) <- queryNames q])
 

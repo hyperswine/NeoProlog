@@ -149,9 +149,11 @@ prop_fallback_observations = unit $ do
 
 prop_iteration_exhaustion :: Property
 prop_iteration_exhaustion = unit $ do
-  summary <- compareTables "p : table. p (next X) <- p X. p zero." "p Result?"
-  summaryExhausted summary === True
-  length (summaryAnswers summary) === Reference.maxTableIterations + 1
+  -- Fixpoint iteration has no count bound: a growing answer set runs to its
+  -- end (or to the heap limit), so a long finite chain completes.
+  summary <- compareTables "p : table. p N <- p M, N is M + 1, N <= 350. p 0." "p Result?"
+  summaryExhausted summary === False
+  length (summaryAnswers summary) === 351
 
 -- The facade can replay through the legacy machine when a construct is
 -- unsupported. Check this acceptance query by draining the core directly,

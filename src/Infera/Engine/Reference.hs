@@ -117,19 +117,24 @@ data Env = Env
 mkEnv :: Program -> Env
 mkEnv prog = Env prog (progFiles prog)
 
+-- | No resolution depth limit by default: a search is bounded by memory,
+-- and exhausting the heap is reported as an out-of-memory fault (see
+-- cbits/infera_memory.c). @INFERA_MAX_DEPTH@ sets an explicit limit for
+-- tools and tests that want one. Half of 'maxBound' leaves the depth
+-- arithmetic room without overflow.
 {-# NOINLINE maxResolutionDepth #-}
 maxResolutionDepth :: Int
 maxResolutionDepth = unsafePerformIO $ do
   m <- lookupEnv "INFERA_MAX_DEPTH"
   pure $ case m >>= readMaybe of
     Just n | n > 0 -> n
-    _ -> 100000
+    _ -> maxBound `div` 2
 
--- | Upper bound on fixpoint iterations for one tabled call.  Predicates with
--- infinitely many answers (generators) hit this bound; declare them
--- @notable@ instead.
+-- | No bound on fixpoint iterations for one tabled call: a tabled predicate
+-- with infinitely many answers runs until memory is exhausted, which is a
+-- fault. Declare generators @notable@.
 maxTableIterations :: Int
-maxTableIterations = 300
+maxTableIterations = maxBound
 
 initialState :: Int -> SolverState
 initialState fresh =

@@ -239,7 +239,7 @@ reverses the ordering; this does not change term identity.
   `perf-tabled-counter-loop` for counter loops that are still tabled.  Disable with `notable` / `<- notable.`, force with
   `table`.  A tabled call collects all its answers first, so predicates with
   infinitely many answers must be declared `notable`; otherwise the fixpoint
-  stops after a bound and reports "search depth limit reached".  Calls
+  never completes and runs until memory is exhausted.  Calls
   involving constrained variables are never tabled.
 * **Cut** uses explicit choice-stack barriers. It is transparent through `,`,
   `;` and the selected arm of `->`; `call`, `not`, `once`, `findall` and an

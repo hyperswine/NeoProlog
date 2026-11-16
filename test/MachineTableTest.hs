@@ -508,12 +508,13 @@ prop_resolution_and_iteration_exhaustion = unit $ do
         native = Machine.solveGoals environment fuel state (queryGoals query)
         expected = Reference.solveGoals environment fuel state (queryGoals query)
     observe query native === observe query expected
-  limited <- load "p : table.\np (next X) <- p X.\np zero."
+  -- No iteration bound: a long but finite fixpoint completes.
+  limited <- load "p : table.\np N <- p M, N is M + 1, N <= 350.\np 0."
   limitedQuery <- queryText "p Result?"
   actual <- compareQuery limited limitedQuery
   let summary = Reference.summarizeSearch limitedQuery actual
-  Reference.summaryExhausted summary === True
-  length (Reference.summaryAnswers summary) === 301
+  Reference.summaryExhausted summary === False
+  length (Reference.summaryAnswers summary) === 351
 
 -- A completed table must remain immutable while the answer iterator advances
 -- and while an older checkpoint is resumed independently.

@@ -39,8 +39,11 @@ import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
+foreign import ccall unsafe "infera_cap_heap" capHeap :: IO ()
+
 main :: IO ()
 main = do
+  capHeap
   args <- getArgs
   case args of
     ["--version"] -> putStrLn ("infera " ++ showVersion version)

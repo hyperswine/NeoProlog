@@ -213,11 +213,13 @@ prop_delta_resolution_exhaustion = unit $ do
       summaryExhausted (run fuel program) === True
     ) [0, 1, 2]
 
+-- There is no iteration bound: a fixpoint needing far more than the former
+-- 300 iterations completes, with every answer and no exhaustion.
 prop_delta_iteration_exhaustion :: Property
 prop_delta_iteration_exhaustion = unit $ do
-  summary <- compareTables "p : table.\np (next X) <- p X.\np zero." "p Result?"
-  summaryExhausted summary === True
-  length (summaryAnswers summary) === 301
+  summary <- compareTables "p : table.\np N <- p M, N is M + 1, N <= 350.\np 0." "p Result?"
+  summaryExhausted summary === False
+  length (summaryAnswers summary) === 351
 
 tablingGroup :: Group
 tablingGroup = Group "incremental tabling"

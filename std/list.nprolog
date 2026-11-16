@@ -73,8 +73,8 @@ std_list_max [X | Xs] A M <- (X > A -> B = X ; B = A), std_list_max Xs B M.
 min_list [X | Xs] M <- std_list_min Xs X M.
 std_list_min [] M M.
 std_list_min [X | Xs] A M <- (X < A -> B = X ; B = A), std_list_min Xs B M.
-between Lo Hi Lo <- Lo <= Hi.
-between Lo Hi X <- Lo < Hi, Next is Lo + 1, between Next Hi X.
+# Integer bounds; enumerated natively, one answer per integer in order.
+between Lo Hi X <- std_native_between Lo Hi X.
 numlist Lo Hi [] <- Lo > Hi.
 numlist Lo Hi [Lo | Xs] <- Lo <= Hi, Next is Lo + 1, numlist Next Hi Xs.
 take Xs N Ys <- (N <= 0 -> Ys = [] ; std_list_take Xs N Ys).

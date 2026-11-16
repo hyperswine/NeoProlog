@@ -783,6 +783,7 @@ builtinDet name arity = case (name, arity) of
   ("get_attr", 3) -> Just Semidet
   ("del_attr", 2) -> Just Semidet
   ("copy_term_nat", 2) -> Just Semidet
+  ("std_native_between", 3) -> Just Nondet
   ("std_native_msort", 2) -> Just Semidet
   ("std_native_sort", 2) -> Just Semidet
   ("std_native_sort_by", 4) -> Just Semidet

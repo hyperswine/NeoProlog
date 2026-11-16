@@ -366,3 +366,91 @@ Workloads still outside the gate, and the change each one points to:
   (`INFERA_MAX_DEPTH`) is itself an arbitrary bound.
 
 Run `python3 bench/std-gate.py "$(cabal list-bin exe:infera)"`.
+
+## 2026-11-16 (later): remaining gate gaps and the fixed limits
+
+### Native sorting and between on the Core
+
+`msort`, `sort/2` and `sort/4` of a proper list of ground terms now sort on the
+Core instead of going through the reference resolver. Elements keep their heap
+words; keys are exported once and ordered by the toolkit's `compareTerms`. A
+list of immediate integers is counted in an `IntMap` keyed by value, since
+equal integers are the same word and rank alike. Non-ground lists, missing keys
+and errors take the general path, so the messages are unchanged. 800,000
+integers sort in about 0.7 s (1.4 s before), and setof over 100,000 takes
+0.18 s.
+
+`between` is native (`std_native_between`, private, in the toolkit for the
+reference and earlier machine). Its bounds must be integers. Enumerating takes
+one choice that holds the next integer and a saved cell for the target, which
+collection marks and relocates; a bound target is a range check. Counting a
+million answers with `aggregate_all count` takes about 0.3 s. The remaining
+cost is `findall` itself: a choice and a copy per answer. That is general
+engine work.
+
+### Declared calls with real checks
+
+A return frame now records its depth, so `contDepth` is constant time instead
+of walking the chain of return frames that declared calls with output or sort
+checks build. A declared `nondet (int: <=) (int: <=)` recursion over 80,000
+calls takes 0.06 s.
+
+### No fixed limits: memory bounds a search
+
+These limits are gone:
+
+- the default resolution depth (100,000), also enforced by the JIT's budget;
+- the 300-iteration cap per tabled fixpoint;
+- `functor`'s arity cap of 1,000,000.
+
+At startup the runtime caps the Haskell heap at three quarters of physical
+memory (`cbits/infera_memory.c`), unless `+RTS -M` chose a limit. Exceeding it
+raises `HeapOverflow`, which is reported, not a crash:
+
+- the REPL and inline queries print an out-of-memory error for that query, and
+  the session continues once the memory is free;
+- `infera run` reports a fault with exit status 2.
+
+`INFERA_MAX_DEPTH` still sets an explicit depth limit for tools and tests:
+`test/jit_depth.py` uses it to check that the JIT and the interpreter cross a
+limit at the same point. Explicit fuel passed to the solver APIs is unchanged.
+
+Consequences:
+
+- Infinite tail recursion loops, as in other Prologs.
+- Non-tail runaway recursion grows until the heap limit, which on a large
+  machine can take minutes and gigabytes. Each level of non-tail recursion
+  costs roughly 800 bytes of continuation.
+- A tabled predicate with infinitely many answers never completes; declare
+  generators `notable`.
+- The CLP propagation budget stays: it can only weaken pruning, never change
+  answers.
+
+The two table tests that asserted an infinite tabled predicate stopped at 301
+answers now check that a finite fixpoint needing 350 iterations completes.
+The Haskell suite's `main` (`test/Spec.hs`) sets `INFERA_MAX_DEPTH=100000`
+unless it is already set, because some tests drive the default entry point
+into an infinite tail loop on purpose. `prop_minimize` and
+`prop_iteration_exhaustion` used infinite tabled generators. They now use finite
+ones: `minimize` over a countdown answers `X = 0`, and a 350-step chain
+completes with 351 answers.
+
+Gate after this batch (`bench/std-gate.py --runs 3`, std ÷ SWI-Prolog 10.0.2):
+
+| workload | std/swipl | std/local |
+|---|---|---|
+| reverse | 0.33 | 1.35 |
+| sum_list | 1.69 | 0.68 |
+| length | 2.30 | 0.63 |
+| msort | 3.40 | 0.99 |
+| maplist | 3.87 | 2.62 |
+| foldl | 3.80 | 2.74 |
+| nth1 | 0.38 | 1.00 |
+| assoc | 45.8 | - |
+| setof | 3.66 | - |
+| between count | 7.06 | - |
+
+Native sort brought msort level with a hand-written version (it was 6.45× SWI),
+and setof roughly halved (8.0 → 3.7×). The remaining gaps are assoc
+(interpreted AVL code; put_assoc is not provably det), the per-answer cost of
+findall and aggregate_all, and closure calls in maplist and foldl.

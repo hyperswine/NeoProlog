@@ -1,5 +1,8 @@
 """JIT and interpreter must agree on the resolution depth limit.
 
+There is no limit by default (memory bounds a search); INFERA_MAX_DEPTH sets
+one, and this check sets it to 100000 so both modes cross it at one point.
+
 Depth is continuation depth: a last call does not deepen it, so tail loops
 run unbounded in the interpreter and must also run unbounded in native
 kernels. Non-tail recursion still exhausts at the same point in both.
@@ -46,7 +49,7 @@ QUERIES = [
 
 
 def answers(jit):
-    env = dict(os.environ, INFERA_JIT=jit)
+    env = dict(os.environ, INFERA_JIT=jit, INFERA_MAX_DEPTH="100000")
     with tempfile.TemporaryDirectory(prefix="infera-jit-depth-") as tmp:
         out = []
         for query, _ in QUERIES:

@@ -12,7 +12,7 @@ import Infera.CLP
 import Infera.Unify (deepWalk)
 
 toolkitKeys :: [(String, Int)]
-toolkitKeys = [("std_native_msort",2),("std_native_sort",2),("std_native_sort_by",4),("functor",3),("arg",3),("univ",2),("copy_term",2),
+toolkitKeys = [("std_native_between",3),("std_native_msort",2),("std_native_sort",2),("std_native_sort_by",4),("functor",3),("arg",3),("univ",2),("copy_term",2),
                ("term_variables",2),("compare",3),("clause",2)]
 
 -- | Conservative relational declarations, also shown by :sig.
@@ -66,7 +66,16 @@ toolkit program dynamic store fresh goal = case goal of
     alternatives "clause" [h,b] = case clausesFor h of
       Left err -> [Left err]
       Right clauses -> map (reflect h b) clauses
+    -- Integers from Lo to Hi in order; a bound X is a range check.
+    alternatives "std_native_between" [lo,hi,x] = case (lo,hi) of
+      (IntLit l, IntLit h) -> case x of
+        Var _ -> [unifyMany fresh [(x,IntLit i)] | i <- [l..h]]
+        IntLit v | l <= v && v <= h -> [Right [(store,fresh)]]
+        _ -> []
+      (IntLit _, other) -> [Left (boundError other)]
+      (other, _) -> [Left (boundError other)]
     alternatives name args = [run name args]
+    boundError t = case t of Var _ -> InstantiationError t; _ -> TypeError "integer bound" t
     bad t = Left (TypeError "positive-arity non-list compound term toolkit request" t)
     unifyMany n pairs = go store pairs
       where
@@ -115,9 +124,8 @@ toolkit program dynamic store fresh goal = case goal of
       unifyMany fresh [(out,mkList (map snd selected) Nothing)]
     run "functor" [t,n,a] = case t of
       Var _ -> case a of
+        -- Any arity memory allows; exhausting memory is a fault.
         IntLit k | k > 0, k <= fromIntegral (maxBound :: Int) -> do
-          -- Bound the host allocation by a checked language-level limit.
-          if k > 1000000 then bad a else do
             term <- construct n (map Var [fresh..fresh+fromInteger k-1])
             unifyMany (fresh+fromInteger k) [(t,term)]
         _ -> bad a

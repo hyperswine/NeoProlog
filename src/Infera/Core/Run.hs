@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 
@@ -20,6 +21,7 @@ module Infera.Core.Run
 where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
+import Data.List (groupBy, sortBy)
 import Data.Array ((!))
 import qualified Data.Array.IArray as IA
 import Data.Array.Base (getNumElements, numElements, unsafeAt, unsafeRead, unsafeWrite)
@@ -91,7 +93,7 @@ data Cont
   | -- | after a contract-bearing call: commit height (-1 none), guard base
     -- (-1 none: guards at or above it are marked, and removed on commit),
     -- output check
-    CReturn !Int !Int !(Maybe (PredKey, P.Signature, [Word'])) Cont
+    CReturn !Int !Int !(Maybe (PredKey, P.Signature, [Word'])) !Int Cont
   | -- | condition succeeded: cut to the sentinel, run the then-goals
     CExitIf !Int [Goal] !Int !Int !Int Cont
   | -- | negated goal succeeded (sentinel, flag, depth)
@@ -153,6 +155,9 @@ data Alt
     AltNative !Pred !JitKernel !Int !Int !Int !Int Cont
   | -- | remaining dynamic facts to consume
     AltDynFacts !PredKey !(Seq.Seq DynFact) !Int !Int Cont
+  | -- | the next integer of a native between, its upper bound, the saved
+    -- cell holding the target, continuation
+    AltBetween !Integer !Integer !Int Cont
 
 -- | The state of a minimize scope: entry marks and the best candidate so
 -- far as the bindings it made to older cells, its output, tables and facts.
@@ -689,7 +694,7 @@ run' m cont = case cont of
       cutTo m commitHeight
       when (guardBase >= 0) (removeGuardsFrom m guardBase)
     runStream m stream pc base barrier depth next
-  CReturn commitHeight guardBase check next -> do
+  CReturn commitHeight guardBase check _ next -> do
     problem <- case check of
       Nothing -> pure Nothing
       Just (key, signature, args) -> checkOutputs m key signature args
@@ -784,7 +789,7 @@ contDepth :: Cont -> Int
 contDepth cont = case cont of
   CDone -> 0
   CGoals _ _ _ depth _ -> depth
-  CReturn _ _ _ next -> contDepth next
+  CReturn _ _ _ d _ -> d
   CExitIf _ _ _ _ depth _ -> depth
   CExitNot _ _ depth -> depth
   CExitFindAll _ _ _ _ _ _ depth -> depth
@@ -1126,6 +1131,46 @@ step' m goal goals base barrier depth next = case goal of
       else do
         args <- mapM (\w -> exportFor m w) =<< sequence [buildArg m base False po, pure wa, pure wb]
         delegate m (Compound "compare" args) (CGoals goals base barrier depth next)
+  -- Integers from Lo to Hi: a choice holds the next one, so enumerating
+  -- is one unification per answer. Non-integer bounds take the general
+  -- path, which reports the error.
+  GLeaf "std_native_between" [plo, phi, px] -> do
+    let s = mStore m
+    lo <- buildArg m base False plo >>= integerOf m
+    hi <- buildArg m base False phi >>= integerOf m
+    case (lo, hi) of
+      (Just l, Just h) -> do
+        wx <- buildArg m base False px >>= deref s
+        if tagOf wx == tagRef
+          then if l > h then backtrack m else do
+            when (l < h) $ do
+              saved <- reserveCells s 1
+              writeCell s saved wx
+              () <$ pushChoice m (AltBetween (l + 1) h saved (CGoals goals base barrier depth next))
+            number <- numberWord s (NVInt l)
+            ok <- unify s wx number
+            if ok then continue else backtrack m
+          else do
+            v <- integerOf m wx
+            case v of
+              Just x | l <= x && x <= h -> continue
+              _ -> backtrack m
+      _ -> do
+        args <- mapM (\p -> buildArg m base False p >>= exportFor m) [plo, phi, px]
+        delegate m (Compound "std_native_between" args) (CGoals goals base barrier depth next)
+  -- Sorting a proper list of ground terms needs no variable identities:
+  -- sort the heap words here by the toolkit's order and keep the elements
+  -- themselves. Anything else (and every error) takes the general path.
+  GLeaf name patterns | name `elem` ["std_native_msort", "std_native_sort", "std_native_sort_by"] -> do
+    words' <- mapM (buildArg m base False) patterns
+    sorted <- nativeSort m name words'
+    case sorted of
+      Just (out, result) -> do
+        ok <- unify (mStore m) out result
+        if ok then continue else backtrack m
+      Nothing -> do
+        args <- mapM (exportFor m) words'
+        delegate m (Compound name args) (CGoals goals base barrier depth next)
   GLeaf name patterns -> do
     args <- mapM (\p -> buildArg m base False p >>= exportFor m) patterns
     delegate m (Compound name args) (CGoals goals base barrier depth next)
@@ -1290,6 +1335,89 @@ stabilize s base pattern = case pattern of
 -- | Run goal terms whose variables are the alias table's words, in a fresh
 -- activation block aliasing those words; extra compiled goals run after
 -- them in the same block. Cuts stay local.
+-- | An integer word (immediate or boxed), or Nothing.
+integerOf :: Machine -> Word' -> IO (Maybe Integer)
+integerOf m w0 = do
+  let s = mStore m
+  w <- deref s w0
+  if tagOf w == tagInt then pure (Just (toInteger (valOf w)))
+    else if tagOf w == tagBox then do
+      value <- boxed s w
+      pure (case value of BInt n -> Just n; _ -> Nothing)
+    else pure Nothing
+
+-- | The ground case of the toolkit sorts ('Infera.TermToolkit'): the output
+-- word and the sorted list, or Nothing for the general path.
+nativeSort :: Machine -> String -> [Word'] -> IO (Maybe (Word', Word'))
+nativeSort m name args = case (name, args) of
+  ("std_native_msort", [xs, out]) -> withList xs $ \ws -> smallInts ws >>= \case
+    Just counts -> Just <$> finish out (concat [replicate n w | (w, n) <- IM.elems counts])
+    Nothing -> keyed ws (pure . Just) >>= mapM (\d -> finish out (map snd (sortBy cmpUp d)))
+  ("std_native_sort", [xs, out]) -> withList xs $ \ws -> smallInts ws >>= \case
+    Just counts -> Just <$> finish out (map fst (IM.elems counts))
+    Nothing -> keyed ws (pure . Just) >>= mapM (\d -> finish out (map snd (firsts (sortBy cmpUp d))))
+  ("std_native_sort_by", [fieldW, orderW, xs, out]) -> do
+    field <- deref s fieldW
+    order <- deref s orderW
+    orderName <- if tagOf order == tagAtm then Just <$> atomName (symbols s) (valOf order) else pure Nothing
+    case orderName of
+      Just o | tagOf field == tagInt, valOf field >= 0, o `elem` ["lt", "lte", "gt", "gte"] ->
+        withList xs $ \ws -> do
+          decorated <- keyed ws (keyOf (valOf field))
+          let cmp = if o `elem` ["gt", "gte"] then flip cmpUp else cmpUp
+              pick d = if o `elem` ["lt", "gt"] then firsts d else d
+          mapM (\d -> finish out (map snd (pick (sortBy cmp d)))) decorated
+      _ -> pure Nothing
+  _ -> pure Nothing
+  where
+    s = mStore m
+    cmpUp (a, _) (b, _) = compareTerms a b
+    firsts d = [x | x : _ <- groupBy (\(a, _) (b, _) -> compareTerms a b == EQ) d]
+    withList xs k = do
+      ws <- listElements xs
+      case ws of
+        Just elements -> do
+          ground <- and <$> mapM (isGroundWord s) elements
+          if ground then k elements else pure Nothing
+        Nothing -> pure Nothing
+    -- Immediate integers all rank alike in the standard order, and equal ones
+    -- are the same word, so a list of them sorts by counting each word.
+    smallInts ws = do
+      ds <- mapM (deref s) ws
+      pure $ if all (\d -> tagOf d == tagInt) ds
+        then Just (IM.fromListWith (\(w, a) (_, b) -> (w, a + b)) [(valOf d, (d, 1 :: Int)) | d <- ds])
+        else Nothing
+    -- Every element's key, exported once; Nothing when a key is missing.
+    -- Immediate integers are their own terms, without an export.
+    keyed ws key = fmap sequence . forM ws $ \w -> do
+      k <- key w
+      case k of
+        Just kw -> do
+          d <- deref s kw
+          if tagOf d == tagInt
+            then pure (Just (S.IntLit (toInteger (valOf d)), w))
+            else (\t -> Just (t, w)) <$> exportTerm s kw
+        Nothing -> pure Nothing
+    keyOf 0 w = pure (Just w)
+    keyOf n w = do
+      d <- deref s w
+      if tagOf d /= tagStr then pure Nothing else do
+        f <- readCell s (valOf d)
+        if funKey f == cpCons (mCore m) || n > funArity f then pure Nothing
+          else Just <$> readCell s (valOf d + n)
+    listElements w0 = do
+      w <- deref s w0
+      if w == cpNil (mCore m) then pure (Just []) else
+        if tagOf w /= tagStr then pure Nothing else do
+          f <- readCell s (valOf w)
+          if funKey f /= cpCons (mCore m) then pure Nothing else do
+            hd <- readCell s (valOf w + 1)
+            rest <- readCell s (valOf w + 2) >>= listElements
+            pure ((hd :) <$> rest)
+    finish out ws = do
+      list <- foldM (\tl x -> structure s (cpCons (mCore m)) [x, tl]) (cpNil (mCore m)) (reverse ws)
+      pure (out, list)
+
 -- | The general dynamic call: export the goal, compile it, run it.
 callDynamicGoal :: Machine -> Bool -> Word' -> [Pattern] -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
 callDynamicGoal m direct word extra goals base barrier depth next = do
@@ -1598,8 +1726,8 @@ commitsImmediately :: Cont -> Bool
 commitsImmediately cont = case cont of
   CExitIf {} -> True
   CExitNot {} -> True
-  CReturn h _ Nothing _ | h >= 0 -> True
-  CReturn (-1) _ Nothing next -> commitsImmediately next
+  CReturn h _ Nothing _ _ | h >= 0 -> True
+  CReturn (-1) _ Nothing _ next -> commitsImmediately next
   CGoals [] _ _ _ next -> commitsImmediately next
   CGoals (GTrue : gs) b bar d next -> commitsImmediately (CGoals gs b bar d next)
   CGoals (GCut : _) _ _ _ _ -> True
@@ -1623,8 +1751,8 @@ commitsWithoutCall !rerunFree = go
       CExitMinimize {} -> rerunFree
       CExitIf {} -> True
       CExitNot {} -> True
-      CReturn h _ Nothing _ | h >= 0 -> True
-      CReturn (-1) _ Nothing next -> go next
+      CReturn h _ Nothing _ _ | h >= 0 -> True
+      CReturn (-1) _ Nothing _ next -> go next
       CGoals gs _ _ _ next -> goalsWithoutCall gs && go next
       CStream stream pc _ _ _ h _ next
         | h >= 0 -> True
@@ -1664,7 +1792,7 @@ unwrapFindAllCont :: Cont -> Maybe (IORef [(Copy, [OutputEvent])], Pattern, Int,
 unwrapFindAllCont cont = case cont of
   CExitFindAll _ results template base entryHeap _ _ -> Just (results, template, base, entryHeap)
   CGoals [] _ _ _ next -> unwrapFindAllCont next
-  CReturn (-1) (-1) Nothing next -> unwrapFindAllCont next
+  CReturn (-1) (-1) Nothing _ next -> unwrapFindAllCont next
   CStream stream pc _ _ _ (-1) (-1) next
     | unsafeAt (csCode stream) pc == opProceed -> unwrapFindAllCont next
   _ -> Nothing
@@ -1797,7 +1925,7 @@ callPlain m frame !depth predicate cont0 = do
           -- this call's choice points as well: the call keeps it whether or
           -- not it would commit, so the groundness test is skipped.
           returnCont <- case cont of
-            CReturn h _ Nothing _ | h >= 0 -> pure cont
+            CReturn h _ Nothing _ _ | h >= 0 -> pure cont
             CStream _ _ _ _ _ h _ _ | h >= 0 -> pure cont
             _ -> do
               commits <- case pSwitch predicate of
@@ -1810,7 +1938,7 @@ callPlain m frame !depth predicate cont0 = do
                   pure $ case cont of
                     CStream s' pc' base' bar' d' (-1) (-1) next' ->
                       CStream s' pc' base' bar' d' entry guardBase next'
-                    _ -> CReturn entry guardBase Nothing cont
+                    _ -> CReturn entry guardBase Nothing (contDepth cont) cont
           dispatchCandidates m frame' predicate entry d returnCont cands
 
 -- | A call to a predicate with declared contracts.
@@ -1850,11 +1978,11 @@ callDeclared m frame !depth predicate trust cont0 = do
               -- and no check can share such a frame.
               returnCont = case (commits || hasGuard, checked, cont) of
                 (False, Nothing, _) -> cont
-                (True, Nothing, CReturn h _ Nothing _) | h >= 0 -> cont
+                (True, Nothing, CReturn h _ Nothing _ _) | h >= 0 -> cont
                 (True, Nothing, CStream _ _ _ _ _ h _ _) | h >= 0 -> cont
                 (True, Nothing, CStream s' pc' base' bar' d' (-1) (-1) next') ->
                   CStream s' pc' base' bar' d' (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) next'
-                _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
+                _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked (contDepth cont) cont
           barrier <- choiceTop m
           callClausesWithFrame m (if top > limit then 0 else frame) predicate barrier depth returnCont
 
@@ -1891,7 +2019,7 @@ frameDead base = dead
       | other < base = True
       | otherwise = dead next
     dead (CStream _ _ other _ _ _ _ next) = if other == base then False else other < base || dead next
-    dead (CReturn _ _ _ next) = dead next
+    dead (CReturn _ _ _ _ next) = dead next
     dead (CExitIf _ _ other _ _ next) = other /= base && dead next
     dead (CExitNot _ _ _) = True
     dead (CExitFindAll _ _ _ other _ _ _) = other /= base
@@ -2439,7 +2567,7 @@ callClausesWithFrame m frame predicate barrier depth returnCont =
 -- an inferred switch asks for, as for interpreted candidates.
 scanCommit :: Machine -> Pred -> Int -> Cont -> IO Cont
 scanCommit m predicate entry cont = case cont of
-  CReturn h _ Nothing _ | h >= 0 -> pure cont
+  CReturn h _ Nothing _ _ | h >= 0 -> pure cont
   CStream _ _ _ _ _ h _ _ | h >= 0 -> pure cont
   _ -> do
     commits <- case pSwitch predicate of
@@ -2452,7 +2580,7 @@ scanCommit m predicate entry cont = case cont of
         pure $ case cont of
           CStream s' pc' base' bar' d' (-1) (-1) next' ->
             CStream s' pc' base' bar' d' entry guardBase next'
-          _ -> CReturn entry guardBase Nothing cont
+          _ -> CReturn entry guardBase Nothing (contDepth cont) cont
 {-# NOINLINE scanCommit #-}
 
 -- | Run a list search's native kernel ('scanShape') on the argument
@@ -2553,7 +2681,7 @@ shallowCandidates m !frame predicate ordinals !saved !h0 !tr0 !older !k !barrier
       let !ordinal = ordinals `unsafeAt` k
           !clause = pClauses predicate ! ordinal
           !cont' = case returnCont of
-            CReturn h g (Just _) next | clTrustReturn clause -> CReturn h g Nothing next
+            CReturn h g (Just _) d next | clTrustReturn clause -> CReturn h g Nothing d next
             _ -> returnCont
       base <-
         if clVars clause == 0 && isNothing (mSlotStats m)
@@ -2672,7 +2800,7 @@ recordSlots m reused count = case mSlotStats m of
 enterClause :: Machine -> Clause -> Int -> Int -> Int -> Cont -> IO Step
 enterClause m clause base barrier depth cont = do
   let !cont' = case cont of
-        CReturn h g (Just _) next | clTrustReturn clause -> CReturn h g Nothing next
+        CReturn h g (Just _) d next | clTrustReturn clause -> CReturn h g Nothing d next
         _ -> cont
   case clStream clause of
     Just stream | streamEnabled -> runStream m stream 0 base barrier depth cont'
@@ -3027,6 +3155,13 @@ backtrackChoice m top =
         AltRetract facts key saved cont -> do
           pop
           retractFacts m facts key saved cont
+        AltBetween value hi saved cont -> do
+          pop
+          when (value < hi) $ () <$ pushChoice m (AltBetween (value + 1) hi saved cont)
+          target <- readCell (mStore m) saved
+          number <- numberWord (mStore m) (NVInt value)
+          ok <- unify (mStore m) target number
+          if ok then run m cont else backtrack m
         AltMinimize ref buffer cont -> do
           pop
           issues <- reverse <$> readIORef buffer
@@ -3688,7 +3823,7 @@ callTabled m predicate cont0 = do
       let hasGuard = required /= Nothing
           returnCont = case (commits || hasGuard, checked) of
             (False, Nothing) -> cont
-            _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked cont
+            _ -> CReturn (if commits then entry else -1) (if commits || hasGuard then guardBase else -1) checked (contDepth cont) cont
       saved <- saveArgs s n
       (callKey, _) <- canonicalCall m (fst key) saved n
       constrained <- callConstrained m saved n
@@ -3998,7 +4133,7 @@ checkInvariants m cont = do
   when (or (zipWith (>) trs (drop 1 trs)) || any (> trTop) trs) (traceMsg ("INVARIANT: choice trail marks wrong " ++ show trs ++ " top " ++ show trTop))
   let checkCont c = case c of
         CGoals _ base _ _ next -> checkBase base >> checkCont next
-        CReturn _ _ _ next -> checkCont next
+        CReturn _ _ _ _ next -> checkCont next
         CExitIf _ _ base _ _ next -> checkBase base >> checkCont next
         CExitFindAll _ _ _ base _ _ _ -> checkBase base
         CExitMinimize _ base _ -> checkBase base
@@ -4016,6 +4151,7 @@ checkInvariants m cont = do
         AltLeaf _ _ c -> checkCont c
         AltAnswers _ _ _ c -> checkCont c
         AltRetract _ _ _ c -> checkCont c
+        AltBetween _ _ _ c -> checkCont c
         AltMinimize _ _ c -> checkCont c
         _ -> pure ()
   checkCont cont
@@ -4112,7 +4248,7 @@ collect m cont nargs = do
       markCont c = case c of
         CDone -> pure ()
         CGoals goals base _ _ next -> Liveness.visitGoals markWord base goals >> markCont next
-        CReturn _ _ check next -> do
+        CReturn _ _ check _ next -> do
           forM_ (maybe [] (\(_, _, ws) -> ws) check) markWord
           markCont next
         CExitIf _ goals base _ _ next -> Liveness.visitGoals markWord base goals >> markCont next
@@ -4158,6 +4294,7 @@ collect m cont nargs = do
           markCont (fxCont fx)
         AltAnswers _ saved arity c -> forM_ [saved .. saved + arity - 1] markCell >> markCont c
         AltRetract _ _ saved c -> markCell saved >> markCont c
+        AltBetween _ _ saved c -> markCell saved >> markCont c
         AltMinimize ref _ c -> do
           mn <- readIORef ref
           forM_ (mnBest mn) $ \(_, bound, _, _, _, _, watched) -> do
@@ -4278,11 +4415,11 @@ collect m cont nargs = do
         CDone -> pure CDone
         CGoals goals base barrier depth next ->
           (\gs -> CGoals gs 0 barrier depth) <$> Liveness.relocateGoals reloc base goals <*> relocCont next
-        CReturn commit guard check next -> do
+        CReturn commit guard check d next -> do
           check' <- case check of
             Nothing -> pure Nothing
             Just (key, sig, ws) -> Just . (,,) key sig <$> mapM reloc ws
-          CReturn commit guard check' <$> relocCont next
+          CReturn commit guard check' d <$> relocCont next
         CExitIf sentinel thenGoals base barrier depth next ->
           (\gs -> CExitIf sentinel gs 0 barrier depth) <$> Liveness.relocateGoals reloc base thenGoals <*> relocCont next
         CExitNot sentinel flag depth -> pure (CExitNot sentinel flag depth)
@@ -4330,6 +4467,7 @@ collect m cont nargs = do
           AltAnswers answers <$> forward saved <*> pure arity <*> relocCont c
         AltRetract facts key saved c ->
           AltRetract facts key <$> forward saved <*> relocCont c
+        AltBetween value hi saved c -> AltBetween value hi <$> forward saved <*> relocCont c
         AltMinimize ref buffer c -> do
           mn <- readIORef ref
           best' <- case mnBest mn of

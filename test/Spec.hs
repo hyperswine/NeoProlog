@@ -1,6 +1,7 @@
 module Main (main, replay) where
 
 import Control.Monad (unless)
+import System.Environment (lookupEnv, setEnv)
 import Data.String (fromString)
 import Hedgehog
 import InferaTest (inferaGroup)
@@ -91,6 +92,11 @@ groups =
 
 main :: IO ()
 main = do
+  -- The engine has no depth limit by default: an infinite tail loop runs
+  -- forever in constant memory. Tests that drive the default entry point
+  -- into such loops choose an explicit bound, as a user would.
+  depth <- lookupEnv "INFERA_MAX_DEPTH"
+  maybe (setEnv "INFERA_MAX_DEPTH" "100000") (const (pure ())) depth
   arguments <- getArgs
   selected <- case arguments of
     [] -> pure groups

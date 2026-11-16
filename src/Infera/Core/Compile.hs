@@ -1833,7 +1833,7 @@ plainUserCall f n =
 -- arguments (and the preloaded files): run through 'GLeaf'.
 leafBuiltins :: [(String, Int)]
 leafBuiltins =
-  [ ("std_native_msort",2), ("std_native_sort",2), ("std_native_sort_by",4), ("std_native_bagof",3), ("std_native_setof",3), ("functor",3), ("arg",3), ("univ",2), ("copy_term",2), ("term_variables",2), ("compare",3), ("clause",2),
+  [ ("std_native_between",3), ("std_native_msort",2), ("std_native_sort",2), ("std_native_sort_by",4), ("std_native_bagof",3), ("std_native_setof",3), ("functor",3), ("arg",3), ("univ",2), ("copy_term",2), ("term_variables",2), ("compare",3), ("clause",2),
     ("str_concat", 3), ("str_length", 2), ("str_chars", 2), ("str_atom", 2), ("str_num", 2),
     ("str_upper", 2), ("str_lower", 2), ("str_lines", 2), ("term_str", 2), ("char_code", 2),
     ("read_file", 2), ("fmt", 4), ("wr", 3), ("sp", 2), ("nl", 2), ("seq", 3), ("padl", 4), ("padr", 4)

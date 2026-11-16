@@ -72,7 +72,9 @@ runProgram file args = do
         let w = worldTerm r 0
             goal = Compound "main" [mkList (map StrLit args) Nothing,w,Var 0]
         unless (nameHasFlag p "main" FlagIo) (fault goal [] (UserError "main must be declared io"))
-        outcome <- execGoals r [] (R.initialState 1) [goal]
+        outcome <- execGoals r [] (R.initialState 1) [goal] `E.catch` \e -> case e of
+          E.HeapOverflow -> fault goal [] (UserError "out of memory: the program exhausted the heap limit (three quarters of physical memory, or +RTS -M)")
+          other -> E.throwIO other
         pure (case outcome of Nothing -> 1; Just _ -> 0)) `E.catch` \(e::E.IOException) -> fault (Atom "main") [] (UserError (show (reason e)))
       code <- case result of
         Right n -> pure n
