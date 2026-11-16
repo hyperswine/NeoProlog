@@ -27,7 +27,7 @@ class Tests:
     def check(self, source, error=False):
         self.n += 1; p=self.dir/f'check{self.n}.nprolog';p.write_text(source)
         result=subprocess.run([str(self.binary),'check','--json',str(p)],text=True,capture_output=True,cwd=self.dir,env=self.env)
-        rows=json.loads(result.stdout)
+        rows=json.loads(result.stdout)['diagnostics']
         require(any(x['severity']=='error' for x in rows)==error,(source,rows))
     def main(self, body, extra=''):
         return 'main : io.\nmain _ -> '+body+'.\n'+extra

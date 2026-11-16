@@ -6,10 +6,26 @@ const { pathToFileURL } = require('url')
 
 const SEVERITIES = { error: 1, warning: 2, information: 3, hint: 4 }
 
+// `check --json` reports {diagnostics, predicates}; older compilers report
+// the diagnostic array alone. Predicate facts (recursion verdicts) are kept
+// for the checked document only.
+function compilerReport(stdout, filePath) {
+  const parsed = JSON.parse(stdout)
+  const rows = Array.isArray(parsed) ? parsed : parsed && parsed.diagnostics
+  const facts = !Array.isArray(parsed) && parsed && Array.isArray(parsed.predicates) ? parsed.predicates : []
+  const predicates = facts.filter(p => p && typeof p.file === 'string' && typeof p.name === 'string'
+    && Number.isInteger(p.arity) && Number.isInteger(p.line) && typeof p.recursion === 'string'
+    && typeof p.verdict === 'string' && canonicalFile(p.file) === canonicalFile(filePath))
+  return { diagnostics: diagnosticRows(rows, filePath), predicates }
+}
+
+function compilerDiagnostics(stdout, filePath) {
+  return compilerReport(stdout, filePath).diagnostics
+}
+
 // The compiler emits LSP-compatible, zero-based ranges. Imported-file
 // diagnostics retain their location and link back from the checked document.
-function compilerDiagnostics(stdout, filePath) {
-  const rows = JSON.parse(stdout)
+function diagnosticRows(rows, filePath) {
   if (!Array.isArray(rows)) throw new Error('expected a diagnostic array')
   return rows.map(d => {
     if (!d || typeof d.file !== 'string' || !d.file || typeof d.code !== 'string'
@@ -54,4 +70,4 @@ function visibleDiagnostics(diagnostics, settings) {
     ? diagnostics.filter(d => d.severity === 1 || !String(d.code).startsWith('perf-')) : diagnostics
 }
 
-module.exports = { compilerDiagnostics, visibleDiagnostics, canonicalFile }
+module.exports = { compilerReport, compilerDiagnostics, visibleDiagnostics, canonicalFile }

@@ -67,8 +67,8 @@ checkFiles :: Bool -> [FilePath] -> IO ()
 checkFiles json paths
   | null paths = checkUsage
   | otherwise = do
-      diagnostics <- concat <$> mapM checkFile paths
-      reportDiagnostics json paths diagnostics
+      reports <- mapM checkFileReport paths
+      reportDiagnostics json paths (concatMap fst reports) (concatMap snd reports)
 
 -- | Read the active buffer from stdin and optional dependency snapshots from
 -- temporary files. Snapshot paths never replace source identities in reports.
@@ -82,10 +82,10 @@ checkBuffer json path args = case bufferArgs args of
         contents <- readFile snapshot >>= strict
         pure (original, contents)) buffers
       pure (src, dependencies)
-    diagnostics <- case input of
-      Left ex -> pure [Diagnostic (SourceSpan path 1 1 1 2) Error "load-error" (show (ex :: CE.IOException))]
-      Right (src, dependencies) -> checkSource path src dependencies
-    reportDiagnostics json [path] diagnostics
+    (diagnostics, facts) <- case input of
+      Left ex -> pure ([Diagnostic (SourceSpan path 1 1 1 2) Error "load-error" (show (ex :: CE.IOException))], [])
+      Right (src, dependencies) -> checkSourceReport path src dependencies
+    reportDiagnostics json [path] diagnostics facts
   where
     strict s = length s `seq` pure s
     bufferArgs [] = Just []
@@ -96,10 +96,10 @@ checkUsage :: IO ()
 checkUsage = hPutStrLn stderr
   "Usage: infera check [--json] FILE... | infera check [--json] --stdin FILE [--buffer SOURCE SNAPSHOT]..." >> exitFailure
 
-reportDiagnostics :: Bool -> [FilePath] -> [Diagnostic] -> IO ()
-reportDiagnostics json paths diagnostics = do
+reportDiagnostics :: Bool -> [FilePath] -> [Diagnostic] -> [PredicateFact] -> IO ()
+reportDiagnostics json paths diagnostics facts = do
   if json
-    then putStrLn (diagnosticsJSON diagnostics)
+    then putStrLn (reportJSON diagnostics facts)
     else do
       mapM_ (hPutStrLn stderr . renderDiagnostic) diagnostics
       if any ((== Error) . diagnosticSeverity) diagnostics

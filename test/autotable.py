@@ -138,11 +138,11 @@ with tempfile.TemporaryDirectory(prefix="infera-autotable-") as tmp:
     target = Path(tmp) / "main.nprolog"
     target.write_text(NREV)
     rows = json.loads(subprocess.run([binary, "check", "--json", str(target)], cwd=tmp,
-                                     capture_output=True, text=True, timeout=60).stdout)
+                                     capture_output=True, text=True, timeout=60).stdout)["diagnostics"]
     hints = [d for d in rows if d["code"] == "perf-tabled-counter-loop"]
     assert len(hints) == 1 and "dup" in hints[0]["message"], rows
     target.write_text(NREV + "dup : table.\n")
     rows = json.loads(subprocess.run([binary, "check", "--json", str(target)], cwd=tmp,
-                                     capture_output=True, text=True, timeout=60).stdout)
+                                     capture_output=True, text=True, timeout=60).stdout)["diagnostics"]
     assert not [d for d in rows if d["code"] == "perf-tabled-counter-loop"], rows
 print("autotable: ok")

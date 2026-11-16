@@ -10,6 +10,7 @@
 -- are enforced at runtime.
 module Infera.Infer
   ( inferProgram,
+    groundDependencies,
     subGoals,
     builtinDet,
     impureBuiltins,
@@ -61,6 +62,13 @@ inferProgram prog0 =
       mode False True = ModeOut
       mode False False = ModeInOut
    in prog1 {progPreds = Map.map finish (progPreds prog1)}
+
+-- | For each predicate, which arguments are ground after a successful call
+-- whenever all its other arguments were ground at the call.
+groundDependencies :: Program -> Map PredKey [Bool]
+groundDependencies prog0 =
+  let prog1 = markGraphFacts prog0
+   in snd (inferGroundness prog1 (inferInModes prog1))
 
 -- ─── GOAL STRUCTURE ──────────────────────────────────────────────────────────
 

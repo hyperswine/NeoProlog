@@ -4,7 +4,7 @@ const assert = require('node:assert/strict')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { compilerDiagnostics, visibleDiagnostics } = require('../server/checker')
+const { compilerReport, compilerDiagnostics, visibleDiagnostics } = require('../server/checker')
 
 const range = { start: { line: 2, character: 4 }, end: { line: 2, character: 12 } }
 const row = { file: '/tmp/main.nprolog', severity: 'error', code: 'undefined-predicate', message: 'undefined predicate: missing/1', range }
@@ -55,4 +55,12 @@ test('canonical compiler paths match symlinked and not-yet-saved editor paths', 
   const [d] = compilerDiagnostics(JSON.stringify([{ ...row, file }]), path.join(root, 'alias', 'new.nprolog'))
   assert.deepEqual(d.range, range)
   assert.equal(d.relatedInformation, undefined)
+})
+
+test('compiler reports carry recursion verdicts for the checked file only', () => {
+  const fact = { file: row.file, name: 'last', arity: 2, line: 3, recursion: 'total', verdict: 'total when argument 1 is ground (subterm descent)' }
+  const report = compilerReport(JSON.stringify({ diagnostics: [row], predicates: [fact, { ...fact, file: '/tmp/other.nprolog' }, { name: 'bad' }] }), row.file)
+  assert.equal(report.diagnostics.length, 1)
+  assert.deepEqual(report.predicates, [fact])
+  assert.deepEqual(compilerReport('[]', row.file), { diagnostics: [], predicates: [] })
 })

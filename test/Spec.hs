@@ -11,6 +11,7 @@ import InferenceTest (inferenceGroup)
 import CLPPerformanceTest (clpPerformanceGroup)
 import BreadboardTest (breadboardGroup)
 import TablingTest (tablingGroup)
+import TerminationTest (terminationGroup)
 import MachineHeapTest (machineHeapGroup)
 import MachineControlTest (machineControlGroup)
 import MachineSubsearchTest (machineSubsearchGroup)
@@ -57,7 +58,7 @@ groups :: [(String, Group)]
 groups =
   [ ("core", inferaGroup), ("models", correctnessGroup), ("mines", minesweeperGroup),
     ("inference", inferenceGroup), ("clp", clpPerformanceGroup), ("breadboard", breadboardGroup),
-    ("tabling", tablingGroup), ("machine-heap", machineHeapGroup),
+    ("tabling", tablingGroup), ("termination", terminationGroup), ("machine-heap", machineHeapGroup),
     ("machine-control", machineControlGroup), ("machine-subsearch", machineSubsearchGroup),
     ("machine-clp", machineCLPGroup), ("machine-breadboard", machineBreadboardGroup),
     ("machine-tail", machineTailGroup), ("machine-reclaim", machineReclaimGroup),

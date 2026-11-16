@@ -1,6 +1,7 @@
 # Total recursion inference
 
-Date: 16 November 2026. Kind: design proposal. Status: not started. Base:
+Date: 16 November 2026. Kind: design proposal. Status: step 0 implemented
+(see [Step 0](#2026-11-16-step-0-verdicts-with-no-behaviour-change)). Base:
 `22280a6`.
 
 Infera should work out, for every recursive predicate, whether its recursion
@@ -353,3 +354,92 @@ Each step gets a dated section in this document when it lands.
 - **One marker:** should a predicate that is only partial keep its effect
   check by having two kinds of `unsafe`? This proposal says no, to keep a
   single marker.
+
+## 2026-11-16: Step 0, verdicts with no behaviour change
+
+`src/Infera/Termination.hs` computes a verdict for every predicate. Nothing
+in the engine reads the verdicts yet; tabling, loading and diagnostics are
+unchanged. `infera check --json` reports them, and the language server shows
+them on hover.
+
+**The verifier is size-change termination.** Each call within a recursive
+group gives a graph of arcs from the caller's argument positions to the
+callee's. An arc is strict when the callee's argument is a proper subterm of
+the caller's, and non-strict when the two are equal. The graphs are closed
+under composition, and the recursion ends when every idempotent graph from a
+predicate to itself has a strict arc from a position to itself (Lee, Jones
+and Ben-Amram). This replaces the plan's list of measure kinds:
+- size-change termination covers permuted arguments, lexicographic descent,
+  merges and mutual recursion with one test;
+- step 1 adds list length and integer norms as further kinds of arc, not as
+  separate measures;
+- sums of norms remain to be shown necessary.
+
+**What gives an arc:**
+- **Subterms.** Proper subterms of the head argument, following the
+  unifications that certainly ran before the call. These are the head and
+  the goals of the enclosing conjunctions, plus the condition of an
+  if-then-else for calls in its then branch. A unification in one branch of
+  a disjunction proves nothing about a call after it.
+- **Ground source.** An arc only counts from a position that is ground at
+  the call, so its size cannot grow through later bindings.
+- **Groundness at the call.** Groundness follows the head, unifications,
+  `is`, and calls before it in the clause. A call grounds argument *j* when
+  its other arguments were ground and `Infer.groundDependencies` says *j*
+  follows from them. That inference was internal; it is now exported.
+  Ackermann needs this step: the result `R1` of the first recursive call is
+  the second argument of the next.
+- **Conditions.** A verdict's condition lists every minimal set of positions
+  that, ground at entry, proves the recursion. Each set is verified.
+  Only positions that carry an arc out of the predicate are searched, so the
+  search does not grow with the arity.
+
+**Closures in the call graph:**
+- **Meta positions.** These come from a fixpoint over the program: a head
+  variable that is called, passed to `phrase`, or passed on in another
+  predicate's meta position.
+- **Statically known closures.** A closure such as `maplist (binding G Env)`
+  is a call to its predicate, with the captured arguments in place and the
+  extra arguments unknown.
+- **Received closures.** A predicate that calls a closure it received is
+  "total … given that its closure arguments are total" (`maplist`, `foldl`).
+- **Run-time goals.** A goal built at run time leaves its predicate
+  unproven, since that goal could call anything.
+- **Dynamic predicates** are unproven, and io predicates whose recursion is
+  not proven are `reactive`.
+
+**Report.** `check --json` now prints `{"diagnostics": [...], "predicates":
+[...]}`. Each predicate defined outside std gives its file, name, arity,
+zero-based line, `recursion` (`total`, `unproven`, `reactive`,
+`not-recursive`) and a rendered verdict. The language server accepts both
+this object and the older bare array, and adds a **Recursion** line to
+predicate hovers. The Python acceptance tests now read `["diagnostics"]`.
+
+**Census.** Over `examples/*.nprolog`, compared with `predStructural`:
+- **Structural predicates:** every one is still proven except `solve/2` in
+  prolog_in_infera. It is mutually recursive with `prove` and `try_rules`,
+  which call `solve` on the body of a freshly copied clause, so it is
+  genuinely partial.
+- **Newly proven** by built subterms: `last`, `take` (also when its result
+  is ground), `drop`, `increasing`, `valid_path`, `items`, `join`,
+  `object_term`, `price_path`.
+- **Counter loops:** the 13 counter loops are not proven. The counter-loop
+  flag never was a termination proof (it says calls never repeat a
+  variant); integer measures are step 1.
+- **Time:** `check` over all 44 examples takes 0.29 s.
+
+**Defects found in the tabling heuristic.** `predStructural` decides whether
+a predicate is tabled, and it is wrong in two ways that step 4 removes when
+the verdict replaces it:
+- **Different arguments.** It accepts recursion where each call shrinks
+  *some* argument, even a different one each time.
+  `p [X | Xs] Y <- p Xs [X | Y]` together with `p X [Y | Ys] <- p [Y | X] Ys`
+  counts as structural and is not tabled, yet `p [c] [d]` runs until the
+  heap is exhausted.
+- **Disjunctions.** It follows unifications anywhere in the body, including
+  those in a disjunction branch that did not run.
+
+Tests: `test/TerminationTest.hs` (structural, built subterms, grammars, the
+alternating case rejected, merge with conditions {3} or {1, 2}, Ackermann
+{1, 2}, mutual recursion, disjunction branches, closures, run-time goals,
+dynamic and io), and a language-server test for the report object.

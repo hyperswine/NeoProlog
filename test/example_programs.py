@@ -430,7 +430,7 @@ def main():
                                   *(str(ROOT / "examples" / (name + ".nprolog")) for name in EXAMPLES),
                                   "+RTS", "-N1", "-RTS"], capture_output=True, text=True, timeout=30, cwd=ROOT)
     require(diagnostics.returncode == 0, diagnostics.stdout + diagnostics.stderr)
-    require(all(d["severity"] == "information" for d in json.loads(diagnostics.stdout)),
+    require(all(d["severity"] == "information" for d in json.loads(diagnostics.stdout)["diagnostics"]),
             "examples must have no diagnostic warnings or errors: " + diagnostics.stdout)
     modes = [("1", "1"), ("0", "1"), ("1", "0"), ("0", "0")] if args.all_modes else [("1", "1")]
     for jit, stream in modes:

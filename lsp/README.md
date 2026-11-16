@@ -25,6 +25,9 @@ Language support for [Infera v2](https://github.com/hyperswine/NeoProlog)
   Messages, codes, severities and source ranges match command-line checks.
   Imported errors link to their owning file, and superseded checks are cancelled.
   Untitled buffers use the workspace as their import context.
+- Recursion verdicts on hover: the compiler reports whether each recursive
+  predicate is proven total, and when (which arguments must be ground), or
+  the call where the proof fails (docs/2026-11-16-TOTAL-RECURSION.md).
 - Dependency-aware checks: edits schedule only the changed document and its
   transitive importers. Repeated saves, identical content updates and unchanged
   watcher notifications reuse diagnostics. Cache identity includes source and

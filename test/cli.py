@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
         target.write_text(source)
         result = subprocess.run([binary, "check", "--json", str(target)], cwd=root,
                                 capture_output=True, text=True, timeout=20)
-        rows = json.loads(result.stdout)
+        rows = json.loads(result.stdout)["diagnostics"]
         assert (result.returncode == 0) == success, (result, rows)
         if expected_code:
             assert any(d["code"] == expected_code for d in rows), rows
@@ -117,7 +117,7 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     before = target.read_text()
     result = subprocess.run([binary, "check", "--json", "--stdin", str(target)], input="live.\n",
                             cwd=root, capture_output=True, text=True)
-    assert result.returncode == 0 and json.loads(result.stdout) == [], result
+    assert result.returncode == 0 and json.loads(result.stdout)["diagnostics"] == [], result
     assert target.read_text() == before
     new_file = root / "not-yet-saved.nprolog"
     result = subprocess.run([binary, "check", "--json", "--stdin", str(new_file)], input="new.\n",
@@ -130,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
                              "--buffer", str(imported), str(snapshot)],
                             input='<- import "lib#test".\nmain <- lib:greet.\n', cwd=root,
                             capture_output=True, text=True)
-    rows = json.loads(result.stdout)
+    rows = json.loads(result.stdout)["diagnostics"]
     assert result.returncode == 1 and rows[0]["file"] == str(imported), (result, rows)
     assert rows[0]["code"] == "undefined-predicate" and imported.read_text() == "greet.\n", rows
     for args in [["--stdin"], ["--stdin", str(target), "--buffer", str(imported)]]:
@@ -207,7 +207,7 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     for example in sorted(examples.glob("*.nprolog")):
         result = subprocess.run([binary, "check", "--json", str(example)], cwd=root,
                                 capture_output=True, text=True, timeout=20)
-        errors = [d for d in json.loads(result.stdout) if d["severity"] == "error"]
+        errors = [d for d in json.loads(result.stdout)["diagnostics"] if d["severity"] == "error"]
         if example.name == "v2_decls.nprolog":
             # This example intentionally demonstrates two invalid sort calls.
             assert len(errors) == 2 and all(d["code"] == "call-sort-mismatch" for d in errors), errors
@@ -254,7 +254,7 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     portable = project / "examples" / "facts2.nprolog"
     result = subprocess.run([binary, "check", "--json", str(portable)], cwd=project,
                             capture_output=True, text=True, timeout=20)
-    assert result.returncode == 0 and not [d for d in json.loads(result.stdout)
+    assert result.returncode == 0 and not [d for d in json.loads(result.stdout)["diagnostics"]
                                           if d["severity"] == "error"], result
     result = subprocess.run([binary, str(portable)], cwd=project, input="",
                             capture_output=True, text=True, timeout=20)
@@ -265,7 +265,7 @@ with tempfile.TemporaryDirectory(prefix="infera-cli-") as tmp:
     stale.write_text('<- import "facts#not-registered".\n')
     result = subprocess.run([binary, "check", "--json", str(stale)], cwd=project,
                             capture_output=True, text=True, timeout=20)
-    assert result.returncode == 1 and any(d["code"] == "load-error" for d in json.loads(result.stdout)), result
+    assert result.returncode == 1 and any(d["code"] == "load-error" for d in json.loads(result.stdout)["diagnostics"]), result
 
     # Registration writes its own path-derived key, which can be imported directly.
     result = subprocess.run([binary, "reg", str(project / "examples" / "facts.nprolog")], cwd=project,

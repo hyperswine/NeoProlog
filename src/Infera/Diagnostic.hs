@@ -2,6 +2,7 @@
 module Infera.Diagnostic
   ( Severity (..), Diagnostic (..), checkFile, checkSource, diagnose,
     renderDiagnostic, diagnosticsJSON,
+    PredicateFact (..), checkFileReport, checkSourceReport, predicateFacts, reportJSON,
   ) where
 
 import Data.Char (ord)
@@ -17,6 +18,7 @@ import Infera.Module (loadLocatedFile, loadLocatedWithSources)
 import Infera.Infer (inferProgram)
 import Infera.Program
 import Infera.Purity (clauseViolations, describeViolation)
+import Infera.Termination (Verdict, renderVerdict, verdictStatus, verdicts)
 import Infera.Syntax
 import Infera.Unify (Subst, deepWalk, termVars, unifyPlain, walk)
 import Numeric (showHex)
@@ -38,6 +40,39 @@ checkFile path = do
 checkSource :: FilePath -> String -> [(FilePath, String)] -> IO [Diagnostic]
 checkSource path src dependencies =
   diagnoseLoaded <$> loadLocatedWithSources (dependencies ++ [(path, src)]) path
+
+-- | What the compiler knows about one predicate of the checked sources, for
+-- editor hovers: where it is defined and its recursion verdict.
+data PredicateFact = PredicateFact
+  { factSpan :: SourceSpan,
+    factKey :: PredKey,
+    factVerdict :: Verdict
+  }
+
+checkFileReport :: FilePath -> IO ([Diagnostic], [PredicateFact])
+checkFileReport path = reportLoaded <$> loadLocatedFile path
+
+checkSourceReport :: FilePath -> String -> [(FilePath, String)] -> IO ([Diagnostic], [PredicateFact])
+checkSourceReport path src dependencies =
+  reportLoaded <$> loadLocatedWithSources (dependencies ++ [(path, src)]) path
+
+reportLoaded :: Either (SourceSpan, String) [LocatedTopLevel] -> ([Diagnostic], [PredicateFact])
+reportLoaded result = case result of
+  Left _ -> (diagnoseLoaded result, [])
+  Right items -> (diagnose items, predicateFacts items)
+
+-- | Facts for the predicates defined outside std, at their first clause.
+predicateFacts :: [LocatedTopLevel] -> [PredicateFact]
+predicateFacts items =
+  [ PredicateFact loc key verdict
+  | (key, loc) <- Map.toList firstClauses,
+    take 5 (spanFile loc) /= "<std/",
+    Just verdict <- [Map.lookup key found]
+  ]
+  where
+    found = verdicts (buildProgram (map locatedItem items))
+    firstClauses = Map.fromListWith (\_ first -> first)
+      [(key, locatedSpan item) | item <- items, TLClause cl <- [locatedItem item], Just key <- [clauseKey cl]]
 
 diagnoseLoaded :: Either (SourceSpan, String) [LocatedTopLevel] -> [Diagnostic]
 diagnoseLoaded result = case result of
@@ -367,6 +402,21 @@ severityText :: Severity -> String
 severityText Error = "error"
 severityText Warning = "warning"
 severityText Information = "information"
+
+-- | The @check --json@ report: diagnostics, and facts about each predicate.
+reportJSON :: [Diagnostic] -> [PredicateFact] -> String
+reportJSON ds facts =
+  "{\"diagnostics\":" ++ diagnosticsJSON ds ++ ",\"predicates\":[" ++ intercalate "," (map fact facts) ++ "]}"
+  where
+    fact f =
+      let loc = factSpan f
+          (name, arity) = factKey f
+       in "{\"file\":" ++ jsonString (spanFile loc)
+            ++ ",\"name\":" ++ jsonString name
+            ++ ",\"arity\":" ++ show arity
+            ++ ",\"line\":" ++ show (max 0 (spanLine loc - 1))
+            ++ ",\"recursion\":" ++ jsonString (verdictStatus (factVerdict f))
+            ++ ",\"verdict\":" ++ jsonString (renderVerdict (factVerdict f)) ++ "}"
 
 diagnosticsJSON :: [Diagnostic] -> String
 diagnosticsJSON ds = "[" ++ intercalate "," (map render ds) ++ "]"

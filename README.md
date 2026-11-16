@@ -43,7 +43,7 @@ selects; build with `DEVELOPER_DIR=/Library/Developer/CommandLineTools`.
 infera <file.nprolog>      # load a file, run its inline queries, drop into the REPL
 infera reg <file.nprolog>  # register a module in ./neoprolog.conf
 infera check <files...>    # parse and analyse files, report errors (exit 1 on failure)
-infera check --json <files...> # structured diagnostics for editors and tools
+infera check --json <files...> # diagnostics and recursion verdicts for editors and tools
 infera check --json --stdin <file> # check source from stdin at this file's path
 infera --trace <file> ["query?"] # trace an explicit query, or the file's inline queries
 ```

@@ -28,7 +28,7 @@ const { execFile } = require('child_process')
 const { pathToFileURL, fileURLToPath } = require('url')
 
 const analysis = require('./analysis')
-const { compilerDiagnostics, visibleDiagnostics, canonicalFile } = require('./checker')
+const { compilerReport, visibleDiagnostics, canonicalFile } = require('./checker')
 const { checkerInputs, executableIdentity } = require('./inputs')
 const { CONF_NAMES, findModuleContext, parseConf } = require('./modules')
 const { tokenize, analyzeDocument, BUILTIN_DOCS, DECL_DOCS, BUILTIN_PREDICATES, KEYWORD_ATOMS, DET_WORDS, FLAG_WORDS, SORT_WORDS, TOKEN_TYPES, TOKEN_MODIFIERS, TT, TM } = analysis
@@ -95,7 +95,8 @@ const checkerProcesses = new Map()
 const documentVersions = new Map()
 const documentSources = new Map()
 const inputSnapshots = new Map()
-const checkedResults = new Map() // uri -> input/compiler key and unfiltered diagnostics
+const checkedResults = new Map() // uri -> input/compiler key, unfiltered diagnostics and predicate facts
+const checkerPredicates = new Map() // uri -> predicate facts from `infera check` (recursion verdicts)
 const checkerReasons = new Map()
 let checkerSerial = 0
 
@@ -212,6 +213,7 @@ async function runChecker(uri, run, reason) {
     const cached = checkedResults.get(uri)
     if (cached?.key === key) {
       checkerDiagnostics.set(uri, visibleDiagnostics(cached.diagnostics, settings))
+      checkerPredicates.set(uri, cached.predicates || [])
       publish(uri)
       return
     }
@@ -231,7 +233,8 @@ async function runChecker(uri, run, reason) {
         if (!current()) { resolve(); return }
         try {
           if (err && (err.killed || typeof err.code !== 'number')) throw err
-          const diags = compilerDiagnostics(stdout, filePath)
+          const report = compilerReport(stdout, filePath)
+          const diags = report.diagnostics
           if (err && !diags.some(d => d.severity === DiagnosticSeverity.Error)) throw err
           // A disk dependency can change even without a delivered watcher
           // notification. Never cache a result against a different snapshot.
@@ -240,7 +243,8 @@ async function runChecker(uri, run, reason) {
             resolve()
             return
           }
-          checkedResults.set(uri, { key, diagnostics: diags })
+          checkedResults.set(uri, { key, diagnostics: diags, predicates: report.predicates })
+          checkerPredicates.set(uri, report.predicates)
           checkerDiagnostics.set(uri, visibleDiagnostics(diags, settings))
           publish(uri)
         } catch (failure) {
@@ -460,6 +464,7 @@ documents.onDidClose(e => {
   documentSources.delete(e.document.uri)
   inputSnapshots.delete(e.document.uri)
   checkedResults.delete(e.document.uri)
+  checkerPredicates.delete(e.document.uri)
   checkerReasons.delete(e.document.uri)
   invalidateCheck(e.document.uri)
   checkerRuns.delete(e.document.uri)
@@ -540,6 +545,9 @@ connection.onHover(({ textDocument, position }) => {
   }
   if (a.predicateDefs.has(word)) {
     parts.push(describeDefs(word, a.predicateDefs.get(word), a.decls.get(word), null))
+    const verdicts = (checkerPredicates.get(textDocument.uri) || [])
+      .filter(p => p.name === word && p.recursion !== 'not-recursive')
+    if (verdicts.length) parts.push(verdicts.map(p => `**Recursion** \`${p.name}/${p.arity}\`: ${p.verdict}`).join('\n\n'))
   } else if (a.decls.has(word)) {
     parts.push(`**Declared:** \n\n\`\`\`infera\n${a.decls.get(word).map(d => d.text).join('\n')}\n\`\`\`\n\n_No clauses in this file._`)
   } else if (!BUILTIN_DOCS[word] && !declKind && a.predicateRefs.has(word)) {
