@@ -148,9 +148,92 @@ prop_dead_graph_reclaimed = unit $ do
     assert (live < 64)
     assert (reclaimed > 3 * size)
 
+-- Fusion must preserve isolated bindings, output, cut barriers, errors,
+-- fallback targets and GC roots. Compare the actual item stream to Reference.
+prop_count_fusion :: Property
+prop_count_fusion = unit $ do
+  let source = unlines
+        [ "<- notable.", "effect : unsafe.", "counted : unsafe.", "cut_count : unsafe.",
+          "effect X <- between 1 3 X, write X.",
+          "counted N <- findall X (effect X) Bag, length Bag N.",
+          "count N <- findall X (between 1 40 X) Bag, length Bag N.",
+          "filtered N <- findall X (between 1 40 X, X < 8) Bag, length Bag N.",
+          "prefix : unsafe.", "prefix N <- findall X (write start, between 1 3 X) Bag, length Bag N.",
+          "constrained X N <- findall X (between 1 4 X) Bag, length Bag N.",
+          "cut_count N <- findall X (between 1 4 X, !) Bag, length Bag N.",
+          "empty_count N <- findall X fail Bag, length Bag N.",
+          "bad_count N <- findall X (X is 1 / 0) Bag, length Bag N.",
+          "nested N <- findall X (between 1 3 _, count X) Bag, length Bag N."
+        ]
+  program <- evalEither (loadProgramText source)
+  forM_ ["count N?", "count 40?", "count 39?", "counted N?",
+         "cut_count N?", "empty_count N?", "bad_count N?", "nested N?",
+         "count 40.0?", "count nope?", "(count N, fail ; count M)?",
+         "filtered N?", "prefix N?", "X in 2..3, constrained X N?",
+         "findall N (between 1 3 _, count N) Ns?"] $ \text -> do
+    query <- evalEither (parseQuery text)
+    annotate text
+    forM_ [1, 16, Store.initialCollectLimit] $ \limit -> do
+      actual <- evalIO (direct limit program query)
+      observed query actual === observed query (Reference.solveQuery program query)
+  -- Public and private std predicates remain overridable. A contract on
+  -- length, or an overridden dependency, must prevent fusion too.
+  forM_ ["length _ 99.", "std_list_len_acc _ _ 77.",
+         "length : det (int: <=) (int: =>)."] $ \override -> do
+    changed <- evalEither (loadProgramText (source ++ override))
+    query <- evalEither (parseQuery "count N?")
+    actual <- evalIO (direct 1 changed query)
+    observed query actual === observed query (Reference.solveQuery changed query)
+
+prop_native_std_words :: Property
+prop_native_std_words = withTests 40 . property $ do
+  keys <- forAll (Gen.list (Range.linear 64 160) (Gen.int (Range.linear (-10000) 10000)))
+  let sortKeys = [-1152921504606846976,1152921504606846975,0,-1,0] ++ keys
+      pairs = "[" ++ join "," ["pair " ++ show k ++ " " ++ show i | (i,k)<-zip[0::Int ..]keys] ++ "]"
+      source = "<- import \"std/assoc\"."
+  program <- evalEither (loadProgramText source)
+  forM_ ["list_to_assoc " ++ pairs ++ " Tree, assoc_to_list Tree Ps?",
+         "msort " ++ show sortKeys ++ " Sorted, sort " ++ show sortKeys ++ " Unique?"] $ \text -> do
+    query <- evalEither (parseQuery text)
+    actual <- evalIO (direct 1 program query)
+    observed query actual === observed query (Reference.solveQuery program query)
+  where
+    join _ [] = ""
+    join _ [x] = x
+    join separator (x:xs) = x ++ separator ++ join separator xs
+
+prop_native_assoc_fallbacks :: Property
+prop_native_assoc_fallbacks = unit $ do
+  let source = "<- import \"std/assoc\"."
+  program <- evalEither (loadProgramText source)
+  forM_ ["list_to_assoc [pair 3 a,pair 2 b,pair 1 c] T?",
+         "list_to_assoc [pair 1 a,pair 2 b,pair 3 c] T?",
+         "list_to_assoc [pair 3 a,pair 1 b,pair 2 c] T?",
+         "list_to_assoc [pair 1 a,pair 3 b,pair 2 c] T?",
+         "list_to_assoc [pair 1 X,pair 2 Y,pair 1 Z] T, get_assoc 1 T V, V = alive?",
+         "list_to_assoc [pair a X,pair b Y] T, get_assoc a T V, V = X?",
+         "get_assoc 7 (node 7 X odd empty empty) V, V = X?",
+         "put_assoc 7 (node 7 old odd empty empty) new R?",
+         "put_assoc 2 (node 1 a 1 empty bogus) b R?",
+         "get_assoc 2 empty V?",
+         "list_to_assoc [pair 1 a,pair 2 b] T, put_assoc 1 T c U, assoc_to_list T Old, assoc_to_list U New?",
+         "msort [-1152921504606846976,1152921504606846975,0,-1,0] S?",
+         "sort [1152921504606846976,1.0,1,-2,z,'a'] S?"] $ \text -> do
+    query <- evalEither (parseQuery text)
+    forM_ [1,16,Store.initialCollectLimit] $ \limit -> do
+      actual <- evalIO (direct limit program query)
+      observed query actual === observed query (Reference.solveQuery program query)
+  changed <- evalEither (loadProgramText (source ++ "std_assoc_balance _ _ _ _ custom."))
+  query <- evalEither (parseQuery "list_to_assoc [pair 1 a,pair 2 b] T?")
+  actual <- evalIO (direct 1 changed query)
+  observed query actual === observed query (Reference.solveQuery changed query)
+
 coreLivenessGroup :: Group
 coreLivenessGroup = Group "core activation liveness"
-  [ ("fixture", prop_fixture),
+  [ ("native integer sorting and AVL maps vs reference", prop_native_std_words),
+    ("native AVL fallbacks and variable identities", prop_native_assoc_fallbacks),
+    ("streaming count scope and fallback parity", prop_count_fusion),
+    ("fixture", prop_fixture),
     ("generated_slots", prop_generated_slots),
     ("retained_answers", prop_retained_answers),
     ("sparse_identity_rollback", prop_sparse_identity_rollback),

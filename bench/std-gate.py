@@ -137,12 +137,15 @@ def main():
     ap.add_argument("--swipl", default=os.environ.get("SWIPL_BIN") or shutil.which("swipl"))
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--workload", action="append", choices=WORKLOADS, help="measure only selected workloads (repeatable)")
     a = ap.parse_args()
     rows = []
     with tempfile.TemporaryDirectory(prefix="std-gate-") as d:
         base_i, _ = infera(a.binary, d, "empty", "zero 0.", "zero R", a.runs)
         base_s, _ = swipl(a.swipl, d, "empty", "", "R = 0", a.runs) if a.swipl else (0, None)
         for name, (std_goal, local, local_goal, swi_goal) in WORKLOADS.items():
+            if a.workload and name not in a.workload:
+                continue
             t_std, v_std = infera(a.binary, d, name + "_std", INFERA_EXTRA.get(name, ""), std_goal, a.runs)
             t_loc, v_loc = (infera(a.binary, d, name + "_local", local, local_goal, a.runs) if local else (None, None))
             t_swi, v_swi = (swipl(a.swipl, d, name, SWI_EXTRA.get(name, ""), swi_goal, a.runs) if a.swipl else (None, None))

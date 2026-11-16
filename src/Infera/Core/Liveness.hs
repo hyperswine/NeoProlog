@@ -62,6 +62,8 @@ visitGoals visit base = mapM_ goal
       GNot inner -> goals inner
       GOnce inner -> goals inner
       GFindAll template inner target -> pattern template >> goals inner >> pattern target
+      GCount inner target fallback -> goals inner >> pattern target >> goals fallback
+      GAssoc _ ps fallback -> patterns ps >> goals fallback
       GCheck _ p -> pattern p
       GWrite _ p -> pattern p
       GNl -> pure ()
@@ -127,6 +129,8 @@ relocateGoals relocate base = mapM goal
       GNot inner -> GNot <$> goals inner
       GOnce inner -> GOnce <$> goals inner
       GFindAll template inner target -> GFindAll <$> pattern template <*> goals inner <*> pattern target
+      GCount inner target fallback -> GCount <$> goals inner <*> pattern target <*> goals fallback
+      GAssoc insert ps fallback -> GAssoc insert <$> patterns ps <*> goals fallback
       GCheck check p -> GCheck check <$> pattern p
       GWrite newline p -> GWrite newline <$> pattern p
       GNl -> pure GNl

@@ -454,3 +454,79 @@ Native sort brought msort level with a hand-written version (it was 6.45× SWI),
 and setof roughly halved (8.0 → 3.7×). The remaining gaps are assoc
 (interpreted AVL code; put_assoc is not provably det), the per-answer cost of
 findall and aggregate_all, and closure calls in maplist and foldl.
+
+
+## 2026-11-17: std workload overhead reduction
+
+Baseline: `3834f70` (recursion inference), measured against the updated working
+tree using `bench/std-gate.py --runs 3`. Every workload's checksum agrees with
+its local and SWI counterparts. Raw paired results are in
+[before](../bench/results/2026-11-17-std-overhead-before.json) and
+[after](../bench/results/2026-11-17-std-overhead-after.json). Measurements are
+whole-process medians minus a separately measured startup; small results can
+fall below this method's timing floor. These are local macOS/aarch64 results,
+not Linux CI or a universal speed guarantee.
+
+| workload | before, ms | after, ms | improvement |
+|---|---:|---:|---:|
+| associative maps, 50k inserts and lookups | 1386.50 | 135.33 | 10.2× |
+| msort, 200k integers | 188.38 | 101.87 | 1.85× |
+| setof over 100k generated integers | 128.75 | 98.41 | 1.31× |
+| count between 1 and 1,000,000 | 251.23 | below startup timing floor | terminal generator counted directly |
+
+**Counting.** The compiler fuses a clause consisting of `findall Template Goal
+Bag, length Bag Count` when Bag is private to those two goals and the public
+length predicate and all its helpers still match the shipped, contract-free
+implementation. The Core uses a strict integer accumulator instead of copying
+solutions and building a list. Outputs, cuts, errors, incomplete dependencies,
+GC roots and scope rollback use the same collector protocol. Bound unusual
+targets retain the original body, so malformed inputs and arithmetic data keep
+their original behavior. Overridden public/private std definitions and explicit
+contracts prevent the optimization.
+
+A terminal native `between` leaf can add its exact cardinality when no filters,
+return checks, cuts, CLP state or per-answer output intervene and its generated
+argument is unbound. This avoids enumeration entirely. The shortcut is not
+selected by the public name `between`: it runs only at the actual native leaf,
+so shadowing the public predicate remains valid. Filtered, constrained,
+output-producing and cut-sensitive searches still enumerate normally.
+
+**Sorting.** Large lists of immediate integers use signed byte radix passes
+in two unboxed buffers. Small lists use ordinary integer sorting. Dereferencing
+is done while reading the list; immediate integers need no separate recursive
+groundness traversal or temporary term exports. Mixed values, bignums,
+non-ground lists and general term keys retain the previous path. A comparison-
+sort experiment regressed and was discarded.
+
+**Associative maps.** The Core recognizes the exact shipped get/put AVL
+clauses and their dependencies. It executes integer-key searches and updates
+on heap words, including all four rotations and persistent path copying.
+Values and untouched branches retain their words and variable identities.
+Height lookup reads only the height field. Unsupported keys, shapes, heights,
+contracts or overridden helpers run the original clauses. A bounded native
+walk also leaves unusually deep trees to the original engine. The library
+source remains available unchanged to `clause` and meta-interpreters.
+
+Immediate integer and character `compare` calls also avoid exporting terms.
+No new public builtin or unchecked name-based replacement is introduced.
+
+**What remains.** The final std/SWI ratios are length 2.32×, maplist 3.76×,
+foldl 3.72×, assoc 4.37× and setof 2.91×. The maplist/foldl timings are essentially
+unchanged in this batch; their closure dispatch remains a separate optimization.
+msort is now 1.80× SWI on this workload. Startup-subtracted timings near zero
+(for example nth1 and the terminal count) do not justify a precise speedup.
+This batch does not claim that the universal 2× admission gate is closed.
+
+**Validation.** Generated reference-parity checks cover 40 integer-key/list
+inputs, radix signed boundaries and duplicates, AVL rotations, retained map
+versions, variable identities, mixed terms, helper overrides and malformed
+inputs. Collector parity includes filters, CLP domains, output prefixes,
+cuts, nested scopes, errors and bound targets. All run under forced collection,
+and the focused group also runs with the Core instruction stream disabled.
+The final Haskell suite passes 488 properties across 47 groups. CLI,
+tabling, indexing, if-then-else, determinism guards, JSON and the 54-file
+recursion census pass. General-purpose acceptance passes 262 checks in each
+of four JIT/stream combinations; example acceptance passes 86 independent
+queries and 21 demonstrations in each combination. All 56 Python benchmark-
+harness tests pass. These are local results; CI has not been observed for
+this commit.

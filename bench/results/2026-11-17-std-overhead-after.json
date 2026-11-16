@@ -1,0 +1,96 @@
+{
+  "startup_infera_s": 0.03196450002724305,
+  "startup_swipl_s": 0.013597332988865674,
+  "rows": [
+    {
+      "workload": "reverse",
+      "answer": "2000000",
+      "std_s": 0.017987791972700506,
+      "local_s": 0.026973666972480714,
+      "swipl_s": 0.09294629201758653,
+      "std_vs_swipl": 0.19352888191921638,
+      "std_vs_local": 0.666864909063056
+    },
+    {
+      "workload": "sum_list",
+      "answer": "500000500000",
+      "std_s": 0.08309074997669086,
+      "local_s": 0.12545883300481364,
+      "swipl_s": 0.05042441701516509,
+      "std_vs_swipl": 1.6478276774464522,
+      "std_vs_local": 0.6622949376031803
+    },
+    {
+      "workload": "length",
+      "answer": "1000000",
+      "std_s": 0.08437825000146404,
+      "local_s": 0.12506154098082334,
+      "swipl_s": 0.03643316705711186,
+      "std_vs_swipl": 2.3159735158130634,
+      "std_vs_local": 0.6746938294515531
+    },
+    {
+      "workload": "msort",
+      "answer": "999993",
+      "std_s": 0.10187487496295944,
+      "local_s": 0.10069520794786513,
+      "swipl_s": 0.05666912498418242,
+      "std_vs_swipl": 1.7977139225529761,
+      "std_vs_local": 1.011715224975801
+    },
+    {
+      "workload": "maplist",
+      "answer": "45000450000",
+      "std_s": 0.15302120795240626,
+      "local_s": 0.05826329195406288,
+      "swipl_s": 0.04066695901565254,
+      "std_vs_swipl": 3.7627895386401784,
+      "std_vs_local": 2.626374219861355
+    },
+    {
+      "workload": "foldl",
+      "answer": "500000500000",
+      "std_s": 0.35523574997205287,
+      "local_s": 0.12530683301156387,
+      "swipl_s": 0.09548025002004579,
+      "std_vs_swipl": 3.720515498204835,
+      "std_vs_local": 2.8349272057595627
+    },
+    {
+      "workload": "nth1",
+      "answer": "2001000",
+      "std_s": 0.0,
+      "local_s": 2.0832987502217293e-05,
+      "swipl_s": 0.007664001022931188,
+      "std_vs_swipl": 0.0,
+      "std_vs_local": 0.0
+    },
+    {
+      "workload": "assoc",
+      "answer": "1250025000",
+      "std_s": 0.13532524998299778,
+      "local_s": null,
+      "swipl_s": 0.030984832963440567,
+      "std_vs_swipl": 4.367467468443993,
+      "std_vs_local": null
+    },
+    {
+      "workload": "setof",
+      "answer": "95233",
+      "std_s": 0.09840937500121072,
+      "local_s": null,
+      "swipl_s": 0.03386191703611985,
+      "std_vs_swipl": 2.906196211402897,
+      "std_vs_local": null
+    },
+    {
+      "workload": "between",
+      "answer": "1000000",
+      "std_s": 0.0,
+      "local_s": 0.0,
+      "swipl_s": 0.03627395903458819,
+      "std_vs_swipl": 0.0,
+      "std_vs_local": null
+    }
+  ]
+}

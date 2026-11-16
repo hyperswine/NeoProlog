@@ -70,6 +70,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Infera.Infer (joinSort)
 import qualified Infera.Program as P
 import Infera.AttributeSupport (attributeNames)
+import Infera.Standard (standardModule)
 import qualified Infera.Syntax as S
 import Infera.Syntax (Term (..))
 import System.Mem.StableName (StableName, makeStableName)
@@ -177,6 +178,10 @@ data Goal
   | GNot [Goal]
   | GOnce [Goal]
   | GFindAll Pattern [Goal] Pattern
+  | -- | Verified findall/length fusion; original goals cover unusual targets.
+    GCount [Goal] Pattern [Goal]
+  | -- | Verified std AVL operation (put/get), arguments and original body.
+    GAssoc !Bool [Pattern] [Goal]
   | GCheck !Check Pattern
   | -- | write (False) or writeln (True)
     GWrite !Bool Pattern
@@ -1492,7 +1497,22 @@ compileClause ctx sigs clause = do
     case entryFact sigs i of
       Just sort -> assumePattern ctx pattern sort
       Nothing -> pure ()
-  body <- compileBody ctx (S.clauseBody clause)
+  originalBody <- compileBody ctx (S.clauseBody clause)
+  let countedBody = case (S.clauseBody clause, originalBody) of
+        ([Compound "findall" [template, inner, Var tmp], Compound "length" [Var used, Var result]],
+         [GFindAll _ innerGoals _, _])
+          | tmp == used, tmp /= result,
+            tmp `notElem` S.termVarIds (S.clauseHead clause),
+            tmp `notElem` S.termVarIds template, tmp `notElem` S.termVarIds inner,
+            standardLength (ctxProgram ctx) -> [GCount innerGoals (PSlot result) originalBody]
+        _ -> originalBody
+      body = case S.clauseKey clause of
+        Just ("get_assoc",3) | standardPredicates "std/assoc" [("get_assoc",3)] (ctxProgram ctx) ->
+          [GAssoc False (map boundPattern headPatterns) originalBody]
+        Just ("put_assoc",4) | not (null originalBody),
+          standardPredicates "std/assoc" [("put_assoc",4),("std_assoc_height",2),("std_assoc_node",5),("std_assoc_balance",5)] (ctxProgram ctx) ->
+          [GAssoc True (map boundPattern headPatterns) originalBody]
+        _ -> countedBody
   trusted <-
     if null sigs
       then pure False
@@ -1506,11 +1526,32 @@ compileClause ctx sigs clause = do
   let compiled = Clause count initialize headPatterns body trusted Nothing
   pure compiled {clStream = encodeClause compiled}
   where
+    boundPattern pattern = case pattern of
+      PFirst offset -> PSlot offset
+      PStruct f xs -> PStruct f (map boundPattern xs)
+      PArith f op xs -> PArith f op (map boundPattern xs)
+      _ -> pattern
     firstSlots pattern = case pattern of
       PFirst offset -> [offset]
       PStruct _ children -> concatMap firstSlots children
       PArith _ _ children -> concatMap firstSlots children
       _ -> []
+
+-- Fusion may erase only the shipped, contract-free length implementation.
+-- Check its dependencies too: a user can override any std helper.
+standardLength :: P.Program -> Bool
+standardLength = standardPredicates "std/list"
+  [("length",2),("std_list_len_to",2),("std_list_len_from",2),("std_list_len_acc",3)]
+
+standardPredicates :: String -> [PredKey] -> P.Program -> Bool
+standardPredicates moduleName keys program = case standardModule moduleName of
+  Left _ -> False
+  Right items -> all same keys
+    where
+      same key = case P.lookupPred key program of
+        Just p -> null (P.predDecls p) && not (P.predIsDynamic program p) &&
+          IM.elems (P.predClauses p) == [cl | item <- items, S.TLClause cl <- [S.locatedItem item], S.clauseKey cl == Just key]
+        Nothing -> False
 
 argSort :: P.Signature -> Int -> S.Sort
 argSort sig i = case drop i (P.sigArgs sig) of

@@ -21,11 +21,11 @@ module Infera.Core.Run
 where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
-import Data.List (groupBy, sortBy)
+import Data.List (groupBy, sort, sortBy)
 import Data.Array ((!))
 import qualified Data.Array.IArray as IA
 import Data.Array.Base (getNumElements, numElements, unsafeAt, unsafeRead, unsafeWrite)
-import Data.Bits ((.|.))
+import Data.Bits ((.|.), (.&.), shiftR, xor, finiteBitSize)
 import Data.Array.IO (IOArray, IOUArray, newArray, newArray_)
 import Data.Array.Unboxed (UArray)
 import Data.IORef
@@ -36,6 +36,7 @@ import Foreign.Ptr (Ptr)
 import Infera.Arith (NumericValue (..), compareNumeric, numericDouble, numericTerm)
 import qualified Infera.CLP as CLP
 import qualified Infera.CLP.Mutable as Mutable
+import qualified Infera.Core.Assoc as NativeAssoc
 import qualified Infera.Core.Constraint as NativeConstraint
 import Infera.Core.Compile
 import Infera.TermToolkit (compareTerms)
@@ -101,6 +102,8 @@ data Cont
   | -- | a findall solution: copy the template and look for more
     -- (sentinel, results, template, base, entry heap, entry output, depth)
     CExitFindAll !Int !(IORef [(Copy, [OutputEvent])]) Pattern !Int !Int !Int !Int
+  | -- | streaming count, output mark and depth; no copied template roots
+    CExitCount !(IORef (Integer, [[OutputEvent]])) !Int !Int
   | -- | a solution of a tabled fixpoint iteration
     CExitTable !(IORef Fix)
   | -- | a candidate of a minimize scope: cost pattern, base, state ref
@@ -134,6 +137,7 @@ data Alt
   | AltNot !(IORef Bool) !(IORef [SearchItem]) Cont
   | AltIf !(IORef Int) (Maybe ([Goal], Int, Int, Int)) Cont
   | AltFindAll !(IORef [(Copy, [OutputEvent])]) !(IORef [SearchItem]) Pattern !Int !Int Cont
+  | AltCount !(IORef (Integer, [[OutputEvent]])) !(IORef [SearchItem]) Pattern !Int !Int Cont
   | -- | remaining reference items of a delegated goal and the substitution
     -- the goal started from
     AltLeaf [SearchItem] !(IM.IntMap Term) Cont
@@ -778,6 +782,11 @@ run' m cont = case cont of
         fxUnsafe = fxUnsafe fx || bad
       }
     backtrack m
+  CExitCount results entryOut _ -> do
+    produced <- outputSince m entryOut
+    modifyIORef' results $ \(!count, outputs) ->
+      (count + 1, if null produced then outputs else produced : outputs)
+    backtrack m
   CExitFindAll _ results template base entryHeap entryOut _ -> do
     word <- buildArg m base False template
     copy <- copyOut m entryHeap word
@@ -793,6 +802,7 @@ contDepth cont = case cont of
   CExitIf _ _ _ _ depth _ -> depth
   CExitNot _ _ depth -> depth
   CExitFindAll _ _ _ _ _ _ depth -> depth
+  CExitCount _ _ depth -> depth
   CExitTable _ -> 0
   CExitMinimize _ _ _ -> 0
   CStream _ _ _ _ depth _ _ _ -> depth
@@ -931,7 +941,7 @@ goalName g = case g of
   GRetract _ -> "retract"; GRetractAll _ -> "retractall"; GMinimize _ _ -> "minimize"; GCallDyn _ _ _ -> "calldyn"
   GAnd _ -> "and"; GUnify _ _ -> "unify"; GEquiv _ _ -> "equiv"; GNeq _ _ -> "neq"; GIs _ _ _ -> "is"; GCmp _ _ _ _ _ -> "cmp"
   GTrue -> "true"; GFail -> "fail"; GCut -> "cut"; GOr _ _ -> "or"; GIf _ _ _ -> "if"; GNot _ -> "not"; GOnce _ -> "once"
-  GFindAll _ _ _ -> "findall"; GCheck _ _ -> "check"; GWrite _ _ -> "write"; GNl -> "nl"; GError _ -> "error"
+  GAssoc {} -> "assoc"; GCount {} -> "count"; GFindAll _ _ _ -> "findall"; GCheck _ _ -> "check"; GWrite _ _ -> "write"; GNl -> "nl"; GError _ -> "error"
   GLeaf n _ -> "leaf " ++ n; GPhrase _ _ -> "phrase"; GPhraseFile _ _ -> "phrasefile"; GEmit _ -> "emit"; GEmitText _ -> "emittext"
   GUnsupported _ -> "unsupported"
 
@@ -1115,22 +1125,29 @@ step' m goal goals base barrier depth next = case goal of
   -- here with the toolkit's own standard order and unify the answer.
   GLeaf "compare" [po, pa, pb] -> do
     let s = mStore m
-    wa <- buildArg m base False pa
-    wb <- buildArg m base False pb
-    ga <- isGroundWord s wa
-    gb <- isGroundWord s wb
-    if ga && gb
-      then do
-        ta <- exportTerm s wa
-        tb <- exportTerm s wb
-        let answer = case compareTerms ta tb of LT -> "lt"; EQ -> "eq"; GT -> "gt"
-        atom <- atmWord <$> internAtom (symbols s) answer
-        wo <- buildArg m base False po
-        ok <- unify s wo atom
-        if ok then continue else backtrack m
-      else do
-        args <- mapM (\w -> exportFor m w) =<< sequence [buildArg m base False po, pure wa, pure wb]
-        delegate m (Compound "compare" args) (CGoals goals base barrier depth next)
+    wa <- buildArg m base False pa >>= deref s
+    wb <- buildArg m base False pb >>= deref s
+    let answer ordering = do
+          let name = case ordering of LT -> "lt"; EQ -> "eq"; GT -> "gt"
+          atom <- atmWord <$> internAtom (symbols s) name
+          wo <- buildArg m base False po
+          ok <- unify s wo atom
+          if ok then continue else backtrack m
+    if tagOf wa == tagInt && tagOf wb == tagInt
+      then answer (compare (valOf wa) (valOf wb))
+      else if tagOf wa == tagChr && tagOf wb == tagChr
+        then answer (compare (valOf wa) (valOf wb))
+        else do
+          ga <- isGroundWord s wa
+          gb <- isGroundWord s wb
+          if ga && gb
+            then do
+              ta <- exportTerm s wa
+              tb <- exportTerm s wb
+              answer (compareTerms ta tb)
+            else do
+              args <- mapM (\w -> exportFor m w) =<< sequence [buildArg m base False po, pure wa, pure wb]
+              delegate m (Compound "compare" args) (CGoals goals base barrier depth next)
   -- Integers from Lo to Hi: a choice holds the next one, so enumerating
   -- is one unification per answer. Non-integer bounds take the general
   -- path, which reports the error.
@@ -1141,7 +1158,17 @@ step' m goal goals base barrier depth next = case goal of
     case (lo, hi) of
       (Just l, Just h) -> do
         wx <- buildArg m base False px >>= deref s
-        if tagOf wx == tagRef
+        counted <- case unwrapCountCont (CGoals goals base barrier depth next) of
+          Just (results,entryOut) | tagOf wx == tagRef -> do
+            constraints <- readIORef (mCLP m)
+            produced <- outputSince m entryOut
+            if isNothing constraints && null produced
+              then do
+                modifyIORef' results (\(!count,outputs) -> (count + max 0 (h-l+1),outputs))
+                pure True
+              else pure False
+          _ -> pure False
+        if counted then backtrack m else if tagOf wx == tagRef
           then if l > h then backtrack m else do
             when (l < h) $ do
               saved <- reserveCells s 1
@@ -1293,6 +1320,28 @@ step' m goal goals base barrier depth next = case goal of
     sentinel <- pushChoice m (AltNot flag buffer rest)
     pushScope m (SBuffer buffer)
     runGoals m inner base (sentinel + 1) depth (CExitNot sentinel flag depth)
+  GAssoc insert patterns fallback -> do
+    words' <- mapM (buildArg m base False) patterns
+    result <- NativeAssoc.nativeAssoc (mStore m) insert words'
+    case result of
+      Nothing -> runGoals m fallback base barrier depth (CGoals goals base barrier depth next)
+      Just Nothing -> backtrack m
+      Just (Just value) -> do
+        ok <- unify (mStore m) (last words') value
+        if ok then continue else backtrack m
+  GCount inner target fallback -> do
+    word <- buildArg m base False target >>= deref (mStore m)
+    integer <- integerOf m word
+    if tagOf word /= tagRef && integer == Nothing
+      then runGoals m fallback base barrier depth (CGoals goals base barrier depth next)
+      else do
+        results <- newIORef (0, [])
+        buffer <- newIORef []
+        entryOut <- outLen (mStore m)
+        let rest = CGoals goals base barrier depth next
+        sentinel <- pushChoice m (AltCount results buffer target base depth rest)
+        pushScope m (SBuffer buffer)
+        runGoals m inner base (sentinel + 1) depth (CExitCount results entryOut depth)
   GFindAll template inner target -> do
     results <- newIORef []
     buffer <- newIORef []
@@ -1351,10 +1400,10 @@ integerOf m w0 = do
 nativeSort :: Machine -> String -> [Word'] -> IO (Maybe (Word', Word'))
 nativeSort m name args = case (name, args) of
   ("std_native_msort", [xs, out]) -> withList xs $ \ws -> smallInts ws >>= \case
-    Just counts -> Just <$> finish out (concat [replicate n w | (w, n) <- IM.elems counts])
+    Just sorted -> Just <$> finish out sorted
     Nothing -> keyed ws (pure . Just) >>= mapM (\d -> finish out (map snd (sortBy cmpUp d)))
   ("std_native_sort", [xs, out]) -> withList xs $ \ws -> smallInts ws >>= \case
-    Just counts -> Just <$> finish out (map fst (IM.elems counts))
+    Just sorted -> Just <$> finish out [first | first:_ <- groupBy (==) sorted]
     Nothing -> keyed ws (pure . Just) >>= mapM (\d -> finish out (map snd (firsts (sortBy cmpUp d))))
   ("std_native_sort_by", [fieldW, orderW, xs, out]) -> do
     field <- deref s fieldW
@@ -1377,16 +1426,15 @@ nativeSort m name args = case (name, args) of
       ws <- listElements xs
       case ws of
         Just elements -> do
-          ground <- and <$> mapM (isGroundWord s) elements
+          ground <- if all (\w -> tagOf w == tagInt) elements
+            then pure True else and <$> mapM (isGroundWord s) elements
           if ground then k elements else pure Nothing
         Nothing -> pure Nothing
-    -- Immediate integers all rank alike in the standard order, and equal ones
-    -- are the same word, so a list of them sorts by counting each word.
-    smallInts ws = do
-      ds <- mapM (deref s) ws
-      pure $ if all (\d -> tagOf d == tagInt) ds
-        then Just (IM.fromListWith (\(w, a) (_, b) -> (w, a + b)) [(valOf d, (d, 1 :: Int)) | d <- ds])
-        else Nothing
+    -- Immediate integer words preserve signed numeric order. Sorting the
+    -- words avoids an IntMap node/count pair per distinct value; equal
+    -- integers are identical words, so no source identity is lost.
+    smallInts ws = if all (\w -> tagOf w == tagInt) ws
+      then Just <$> sortImmediateWords ws else pure Nothing
     -- Every element's key, exported once; Nothing when a key is missing.
     -- Immediate integers are their own terms, without an export.
     keyed ws key = fmap sequence . forM ws $ \w -> do
@@ -1411,12 +1459,58 @@ nativeSort m name args = case (name, args) of
         if tagOf w /= tagStr then pure Nothing else do
           f <- readCell s (valOf w)
           if funKey f /= cpCons (mCore m) then pure Nothing else do
-            hd <- readCell s (valOf w + 1)
+            hd <- readCell s (valOf w + 1) >>= deref s
             rest <- readCell s (valOf w + 2) >>= listElements
             pure ((hd :) <$> rest)
     finish out ws = do
       list <- foldM (\tl x -> structure s (cpCons (mCore m)) [x, tl]) (cpNil (mCore m)) (reverse ws)
       pure (out, list)
+
+-- Immediate integers are ordered by their signed tagged words. Use stable
+-- byte radix passes in unboxed buffers for large lists; the most significant
+-- byte flips the sign bit so negatives sort before nonnegative values.
+sortImmediateWords :: [Word'] -> IO [Word']
+sortImmediateWords words'
+  | n < 64 = pure (sort words')
+  | otherwise = do
+      source <- newArray_ (0,n-1) :: IO (IOUArray Int Int)
+      target <- newArray_ (0,n-1) :: IO (IOUArray Int Int)
+      counts <- newArray (0,255) 0 :: IO (IOUArray Int Int)
+      let fill !_ [] = pure ()
+          fill !i (w:ws) = unsafeWrite source i w >> fill (i+1) ws
+          bytes = finiteBitSize (0::Int) `div` 8
+          bucket pass word = ((word `shiftR` (8*pass)) .&. 255) `xor` (if pass == bytes-1 then 128 else 0)
+          pass !index from to
+            | index == bytes = mapM (unsafeRead from) [0..n-1]
+            | otherwise = do
+                forM_ [0..255] $ \i -> unsafeWrite counts i 0
+                let histogram !i | i == n = pure ()
+                                 | otherwise = do
+                      w <- unsafeRead from i
+                      let b=bucket index w
+                      c <- unsafeRead counts b
+                      unsafeWrite counts b (c+1)
+                      histogram (i+1)
+                    offsets !i !total | i == 256 = pure ()
+                                      | otherwise = do
+                      c <- unsafeRead counts i
+                      unsafeWrite counts i total
+                      offsets (i+1) (total+c)
+                    distribute !i | i == n = pure ()
+                                  | otherwise = do
+                      w <- unsafeRead from i
+                      let b=bucket index w
+                      offset <- unsafeRead counts b
+                      unsafeWrite to offset w
+                      unsafeWrite counts b (offset+1)
+                      distribute (i+1)
+                histogram 0
+                offsets 0 0
+                distribute 0
+                pass (index+1) to from
+      fill 0 words'
+      pass 0 source target
+  where n=length words'
 
 -- | The general dynamic call: export the goal, compile it, run it.
 callDynamicGoal :: Machine -> Bool -> Word' -> [Pattern] -> [Goal] -> Int -> Int -> Int -> Cont -> IO Step
@@ -1747,6 +1841,7 @@ commitsWithoutCall !rerunFree = go
   where
     go cont = case cont of
       CDone -> rerunFree
+      CExitCount {} -> rerunFree
       CExitFindAll {} -> rerunFree
       CExitMinimize {} -> rerunFree
       CExitIf {} -> True
@@ -1795,6 +1890,19 @@ unwrapFindAllCont cont = case cont of
   CReturn (-1) (-1) Nothing _ next -> unwrapFindAllCont next
   CStream stream pc _ _ _ (-1) (-1) next
     | unsafeAt (csCode stream) pc == opProceed -> unwrapFindAllCont next
+  _ -> Nothing
+
+-- No filters, output checks or cuts may intervene. At the terminal native
+-- between leaf an unconstrained fresh result has exactly Hi-Lo+1 answers;
+-- counting them does not need to bind or allocate each one. The leaf checks
+-- that no CLP state or per-answer output can make the answers observable.
+unwrapCountCont :: Cont -> Maybe (IORef (Integer, [[OutputEvent]]), Int)
+unwrapCountCont cont = case cont of
+  CExitCount results entryOut _ -> Just (results,entryOut)
+  CGoals [] _ _ _ next -> unwrapCountCont next
+  CReturn (-1) (-1) Nothing _ next -> unwrapCountCont next
+  CStream stream pc _ _ _ (-1) (-1) next
+    | unsafeAt (csCode stream) pc == opProceed -> unwrapCountCont next
   _ -> Nothing
 
 drainNativeFindAll :: Machine -> Pred -> JitKernel -> Int -> Int -> Int -> Int -> IORef [(Copy, [OutputEvent])] -> Pattern -> Int -> Int -> Bool -> Cont -> IO Step
@@ -2022,6 +2130,7 @@ frameDead base = dead
     dead (CReturn _ _ _ _ next) = dead next
     dead (CExitIf _ _ other _ _ next) = other /= base && dead next
     dead (CExitNot _ _ _) = True
+    dead (CExitCount {}) = True
     dead (CExitFindAll _ _ _ other _ _ _) = other /= base
     dead (CExitTable _) = False
     dead (CExitMinimize _ other _) = other /= base
@@ -3134,6 +3243,18 @@ backtrackChoice m top =
         AltOptimize variables variable lower cost ref cont -> do
           pop
           nativeMinimumValues m variables variable lower cost ref cont
+        AltCount results buffer target base _ cont -> do
+          pop
+          issues <- reverse <$> readIORef buffer
+          case [e | e@(BranchError _) <- issues] of
+            e:_ -> raiseItems m (filter isDependency issues ++ [e]) (backtrack m)
+            [] -> raiseItems m issues $ do
+              (count, outputs) <- readIORef results
+              mapM_ (mapM_ (emitOutput m)) (reverse outputs)
+              number <- numberWord s (NVInt count)
+              wt <- buildArg m base False target
+              ok <- unify s wt number
+              if ok then run m cont else backtrack m
         AltFindAll results buffer target base _ cont -> do
           pop
           issues <- reverse <$> readIORef buffer
@@ -4147,6 +4268,7 @@ checkInvariants m cont = do
         AltGoals _ base _ _ c -> checkBase base >> checkCont c
         AltNot _ _ c -> checkCont c
         AltIf _ e c -> forM_ e (\(_, base, _, _) -> checkBase base) >> checkCont c
+        AltCount _ _ _ base _ c -> checkBase base >> checkCont c
         AltFindAll _ _ _ base _ c -> checkBase base >> checkCont c
         AltLeaf _ _ c -> checkCont c
         AltAnswers _ _ _ c -> checkCont c
@@ -4253,6 +4375,7 @@ collect m cont nargs = do
           markCont next
         CExitIf _ goals base _ _ next -> Liveness.visitGoals markWord base goals >> markCont next
         CExitNot _ _ _ -> pure ()
+        CExitCount {} -> pure ()
         CExitFindAll _ results template base _ _ _ -> Liveness.visitPattern markWord base template >> markResults results
         CExitTable fixRef -> do
           fx <- readIORef fixRef
@@ -4286,6 +4409,7 @@ collect m cont nargs = do
         AltIf _ elseGoals c -> do
           forM_ elseGoals (\(goals, base, _, _) -> Liveness.visitGoals markWord base goals)
           markCont c
+        AltCount _ _ target base _ c -> Liveness.visitPattern markWord base target >> markCont c
         AltFindAll results _ target base _ c -> Liveness.visitPattern markWord base target >> markResults results >> markCont c
         AltLeaf _ _ c -> markCont c
         AltTable fixRef -> do
@@ -4423,6 +4547,7 @@ collect m cont nargs = do
         CExitIf sentinel thenGoals base barrier depth next ->
           (\gs -> CExitIf sentinel gs 0 barrier depth) <$> Liveness.relocateGoals reloc base thenGoals <*> relocCont next
         CExitNot sentinel flag depth -> pure (CExitNot sentinel flag depth)
+        CExitCount results entryOut depth -> pure (CExitCount results entryOut depth)
         -- Shared buffers are relocated once, through the sentinel's alternative.
         CExitFindAll sentinel results template base entryHeap entryOut depth ->
           (\p h -> CExitFindAll sentinel results p 0 h entryOut depth) <$> Liveness.relocatePattern reloc base template <*> forward entryHeap
@@ -4453,6 +4578,8 @@ collect m cont nargs = do
               goals' <- Liveness.relocateGoals reloc base goals
               pure (Just (goals', 0, barrier, depth))
           AltIf counter elseGoals' <$> relocCont c
+        AltCount results buffer target base depth c ->
+          (\p -> AltCount results buffer p 0 depth) <$> Liveness.relocatePattern reloc base target <*> relocCont c
         AltFindAll results buffer target base depth c -> do
           relocResults results
           (\p -> AltFindAll results buffer p 0 depth) <$> Liveness.relocatePattern reloc base target <*> relocCont c
