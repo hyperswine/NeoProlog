@@ -1,0 +1,15 @@
+# Enumerate a finite, pure domain of ground inputs. Check returns a witness
+# only for a violation. Both callbacks must terminate on their stated modes.
+verify_all : notable.
+verify_all Domain Check Result <-
+  (once (call Domain _) ->
+    (once (call Domain X, call Check X W) -> Result = (refuted X W) ; Result = proved)
+  ; Result = empty_domain).
+
+# A transition contract requires exactly one ground result passing Valid.
+verify_one : notable.
+verify_one Valid [X] <- ground X, call Valid X.
+
+# Preserve missing and duplicate answers for checking or reporting.
+verify_outcomes : notable.
+verify_outcomes X Goal Answers <- findall X Goal Answers.

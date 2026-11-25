@@ -38,7 +38,13 @@ def main():
               1.25, -0.125, '', 'quote " slash / backslash \\', 'line\n\t\b\f\r',
               ''.join(map(chr,range(32))), 'λ🙂', [], {}, [1,True,None,'x'],
               {'name':'Ada','scores':[3,5],'active':True}, {'nested':{'xs':[[],{}]}}]
-    checks = []
+    source += '\nempty_sample _ <- fail.\njson_echo X X.\n'
+    checks = [
+        'verify_all json_sample json_roundtrip_failure proved',
+        'verify_all json_bad_text json_bad_accepted proved',
+        'verify_all empty_sample json_bad_accepted empty_domain',
+        'verify_all json_sample json_echo (refuted null null)',
+    ]
     for value in values:
         text = json.dumps(value,ensure_ascii=False,separators=(',',':'))
         checks += [f'json {quote(text)} Parsed, Parsed = {term(value)}',
@@ -88,6 +94,16 @@ def main():
                 text=''.join(map(chr,ast.literal_eval(raw)))
                 actual=json.loads(text,parse_constant=bad_constant)
                 assert actual==expected,(text,actual,expected)
+            # Drop the newline escape during generation. Demand the exact witness.
+            mutant = source.replace(r"""j_char '\n' -> "\\n".""", r"""j_char '\n' A B <- (var A -> A = ['x' | B] ; fail).""")
+            assert mutant != source
+            original, corrupted = 'a\n"b', 'ax"b'
+            witness = (f'(refuted {term(original)} (observed '
+                       f'[{quote(json.dumps(corrupted))}] [{term(corrupted)}]))')
+            file.write_text(mutant + f'\n> verify_all json_sample json_roundtrip_failure {witness}?\n')
+            result = subprocess.run([str(binary), str(file)], input=':quit\n', text=True,
+                                    capture_output=True, cwd=d, env=env, timeout=30)
+            assert result.returncode == 0 and re.search(r'^true\.$', result.stdout, re.M), result
             print(json.dumps({'status':'ok','jit':jit,'stream':stream,
                               'relation_checks':len(checks),'generated_documents':len(values)}),flush=True)
 

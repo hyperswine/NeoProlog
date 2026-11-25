@@ -234,3 +234,25 @@ The broader example runner passes 22 demonstrations in all four modes, and
 the 54-file recursion census has no unacknowledged partial recursion. CI now
 runs the CPU acceptance script; these recorded results are local, not an
 observation of a completed remote CI run.
+
+## Reusing the checks
+
+Import `std/verify` explicitly. The CPU collects all successors with
+`verify_outcomes Next (execute Op S Next) Answers`, then calls
+`verify_one valid_state Answers`. The latter requires a singleton containing
+a ground state before invoking the validator. A missing, duplicate or partly
+unbound successor therefore fails this contract.
+
+For a finite, pure generator of ground inputs, use
+`verify_all Domain Violation Result`. The generator takes one argument.
+The violation relation takes an input and a witness, succeeding when the
+property fails. The result is `empty_domain`, `refuted Input Witness` for
+the first failure in search order, or `proved` after exhausting the domain.
+Both callbacks must terminate. The generator runs once to establish that
+the domain is inhabited and again to search it.
+
+In `examples/json_relation.nprolog`, run
+`verify_all json_sample json_roundtrip_failure Result?` to generate text
+and parse it back for each value in the sample. The witness includes the
+generated texts and parsed values. A second check searches a small corpus
+of malformed inputs for an unexpected successful parse.

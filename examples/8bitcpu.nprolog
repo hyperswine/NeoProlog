@@ -1,3 +1,4 @@
+<- import "std/verify".
 # 8-bit CPU: simulation, exhaustive finite proofs, and counterexamples.
 # Run: infera examples/8bitcpu.nprolog
 # Tutorial and exact proof domains: docs/2026-11-17-CPU-VERIFICATION.md
@@ -194,8 +195,8 @@ test_op hlt.
 test_op (lda I) <- representative I.
 test_op (ldb I) <- representative I.
 test_op Op <- branch_op Op.
-outcomes Op S Answers <- findall Next (execute Op S Next) Answers.
-one_valid [S] <- ground S, valid_state S.
+outcomes Op S Answers <- verify_outcomes Next (execute Op S Next) Answers.
+one_valid Answers <- verify_one valid_state Answers.
 counterexample transition_functional (instruction Op from S answers Answers) <-
   test_op Op, between 0 7 P, representative A, representative B, flag_value Z, flag_value C,
   S = (cpu P A B Z C), findall Next (execute Op S Next) Answers, not (one_valid Answers).

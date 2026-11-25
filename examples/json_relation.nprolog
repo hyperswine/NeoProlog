@@ -1,3 +1,4 @@
+<- import "std/verify".
 # One relation, three uses: JSON text <-> a structured value.
 # Run: infera examples/json_relation.nprolog
 #
@@ -114,6 +115,21 @@ j_exp_sign 1 -> "+".
 j_exp_sign 1 -> [].
 
 # 1. Parse: text is known; the structured value is discovered.
+# The checker cannot infer termination of json in these callback modes.
+json_roundtrip_failure : unsafe.
+json_bad_accepted : unsafe.
+
+# Round-trip a finite corpus through the same relation in both directions.
+json_sample V <- member V [null,true,false,num 0,str "hello",str "a\n\"b",array [],object [],array [str "a",num 1]].
+json_roundtrip_failure V (observed Texts Parsed) <-
+  verify_outcomes T (json T V) Texts,
+  findall P (member T Texts, json T P) Parsed,
+  not (Texts = [_], Parsed == [V]).
+json_bad_text T <- member T ["[01]","{","[true,]"].
+json_bad_accepted T V <- json T V.
+> verify_all json_sample json_roundtrip_failure Result?
+> verify_all json_bad_text json_bad_accepted Result?
+
 > json "{\"name\":\"Ada\",\"scores\":[3,5],\"active\":true}" Value?
 
 # 2. Generate: the value is known; JSON text is discovered.

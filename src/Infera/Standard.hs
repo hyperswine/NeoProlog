@@ -7,7 +7,7 @@ import Language.Haskell.TH.Syntax (addDependentFile, lift, runIO)
 
 sources :: [(String,String)]
 sources = $(do
-  let names = ["list","order","aggregate","assoc","str","dcg","coroutine","io","net","os"]
+  let names = ["list","order","aggregate","assoc","str","dcg","coroutine","io","net","os","verify"]
   pairs <- mapM (\n -> do
     let path = "std/" ++ n ++ ".nprolog"
     addDependentFile path
