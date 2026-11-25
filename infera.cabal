@@ -34,7 +34,7 @@ extra-source-files: std/*.nprolog test/fixtures/*.nprolog test/general_purpose.p
                     bench/run.sh bench/run.py bench/runtime-compare.py bench/runtime-compare.pl
                     bench/core-external.pl bench/core_external.py
                     bench/bench.nprolog bench/bench.pl bench/check-tail-memory.py
-                    bench/std-gate.py bench/results/*.json test/recursion_census.py
+                    bench/std-gate.py bench/results/*.json test/recursion_census.py test/cpu_verification.py
 tested-with:        GHC == 9.8.2
 
 source-repository head

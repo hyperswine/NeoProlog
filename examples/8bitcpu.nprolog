@@ -1,189 +1,245 @@
-# ─── 8-bit CPU Simulator in N Prolog ─────────────────────────────────────────
+# 8-bit CPU: simulation, exhaustive finite proofs, and counterexamples.
+# Run: infera examples/8bitcpu.nprolog
+# Tutorial and exact proof domains: docs/2026-11-17-CPU-VERIFICATION.md
 #
-# CPU state:  cpu(PC, A, B, ZF, CF)
-#   PC  — program counter (instruction address)
-#   A   — accumulator register (0-255)
-#   B   — B register (0-255)
-#   ZF  — zero flag  (1 = last result was zero,  0 = non-zero)
-#   CF  — carry flag (1 = last add/inc overflowed 8 bits, 0 = no overflow)
-#
-# Program memory:  instr(Address, Instruction)
-#
-# Instruction set:
-#   lda Imm   — A := Imm mod 256, update ZF, clear CF
-#   ldb Imm   — B := Imm mod 256
-#   add       — A := (A + B) mod 256, update ZF and CF
-#   sub       — A := (A - B + 256) mod 256, update ZF, clear CF
-#   inc       — A := (A + 1) mod 256, update ZF and CF
-#   dec       — A := (A - 1 + 256) mod 256, update ZF, clear CF
-#   mova      — A := B, update ZF
-#   movb      — B := A
-#   jmp Addr  — PC := Addr  (unconditional)
-#   jz  Addr  — if ZF=1 then PC := Addr  else PC := PC+1
-#   jnz Addr  — if ZF=0 then PC := Addr  else PC := PC+1
-#   nop       — PC := PC+1, flags unchanged
-#   hlt       — halt: state is unchanged (step is identity)
+# cpu PC A B Z C: byte registers A/B; boolean zero/carry flags.
+# PC is an integer instruction address, NOT an 8-bit wrapping register.
+# hlt stutters: the state stays unchanged, allowing bounded traces after halt.
+# sub/dec clear carry; this model does not expose a borrow flag.
+<- notable.
+# Proof gap: the termination checker cannot combine ROM/state modes with
+# the integer execution budget used by these finite verification searches.
+counterexample : unsafe.
+check : unsafe.
+proof_suite : unsafe.
 
-# ─── Flag helpers ─────────────────────────────────────────────────────────────
-
-# zflag(Value, ZeroFlag)
+# Validators never instantiate an invalid or unknown output. Keep them
+# distinct from the finite generators used to quantify proof inputs.
+byte N <- is_int N, N >= 0, N <= 255.
+bit N <- is_int N, N >= 0, N <= 1.
+byte_value N <- between 0 255 N.
+flag_value 0.
+flag_value 1.
+valid_state (cpu P A B Z C) <- is_int P, P >= 0, byte A, byte B, bit Z, bit C.
 zflag 0 1.
 zflag V 0 <- V != 0.
-
-# cflag(Sum8, CarryFlag)  — carry when 8-bit sum overflows
 cflag S C <- C is S / 256.
 
-# ─── Instruction stepping ─────────────────────────────────────────────────────
+# One instruction relation, independent of a particular ROM.
+execute (lda I) (cpu P _ B _ _) (cpu Q R B Z 0) <-
+  R is I % 256, Q is P + 1, zflag R Z.
+# Loading B preserves BOTH flags. Anonymous output flags were a model bug.
+execute (ldb I) (cpu P A _ Z C) (cpu Q A R Z C) <- R is I % 256, Q is P + 1.
+execute add (cpu P A B _ _) (cpu Q R B Z C) <-
+  S is A + B, R is S % 256, Q is P + 1, zflag R Z, cflag S C.
+execute sub (cpu P A B _ _) (cpu Q R B Z 0) <-
+  R is (A - B + 256) % 256, Q is P + 1, zflag R Z.
+execute inc (cpu P A B _ _) (cpu Q R B Z C) <-
+  S is A + 1, R is S % 256, Q is P + 1, zflag R Z, cflag S C.
+execute dec (cpu P A B _ _) (cpu Q R B Z 0) <-
+  R is (A - 1 + 256) % 256, Q is P + 1, zflag R Z.
+execute mova (cpu P _ B _ _) (cpu Q B B Z 0) <- Q is P + 1, zflag B Z.
+execute movb (cpu P A _ Z C) (cpu Q A A Z C) <- Q is P + 1.
+execute (jmp T) (cpu _ A B Z C) (cpu T A B Z C).
+execute (jz T) (cpu _ A B 1 C) (cpu T A B 1 C).
+execute (jz _) (cpu P A B 0 C) (cpu Q A B 0 C) <- Q is P + 1.
+execute (jnz T) (cpu _ A B 0 C) (cpu T A B 0 C).
+execute (jnz _) (cpu P A B 1 C) (cpu Q A B 1 C) <- Q is P + 1.
+execute nop (cpu P A B Z C) (cpu Q A B Z C) <- Q is P + 1.
+execute hlt S S.
 
-# lda Imm — load immediate into A
-step (cpu PC _ B _ _) (cpu NPC NA B NZ 0) <-
-  instr PC (lda Imm),
-  NA is Imm % 256,
-  NPC is PC + 1,
-  zflag NA NZ.
+# Named ROMs coexist: no commenting out instruction facts between demos.
+rom addition 0 (lda 45).
+rom addition 1 (ldb 200).
+rom addition 2 add.
+rom addition 3 hlt.
+rom overflow 0 (lda 200).
+rom overflow 1 (ldb 100).
+rom overflow 2 add.
+rom overflow 3 hlt.
+# Test BEFORE decrementing. A do-while loop would wrap zero to 255.
+rom (countdown N) 0 (lda N).
+rom (countdown _) 1 (jz 4).
+rom (countdown _) 2 dec.
+rom (countdown _) 3 (jmp 1).
+rom (countdown _) 4 hlt.
 
-# ldb Imm — load immediate into B
-step (cpu PC A _ _ CF) (cpu NPC A NB _ CF) <-
-  instr PC (ldb Imm),
-  NB is Imm % 256,
-  NPC is PC + 1.
+step Program (cpu P A B Z C) Next <- rom Program P Op, execute Op (cpu P A B Z C) Next.
+run _ S 0 S.
+run Program S N Final <- N > 0, step Program S Next, M is N - 1, run Program Next M Final.
+trace _ S 0 [S].
+trace Program S N [S | Rest] <- N > 0, step Program S Next, M is N - 1, trace Program Next M Rest.
+# Original query arities select the addition ROM.
+instr P Op <- rom addition P Op.
+step S Next <- step addition S Next.
+run S N Final <- run addition S N Final.
 
-# add — A := A + B (8-bit), update ZF and CF
-step (cpu PC A B _ _) (cpu NPC NA B NZ NC) <-
-  instr PC add,
-  Sum is A + B,
-  NA is Sum % 256,
-  NPC is PC + 1,
-  zflag NA NZ,
-  cflag Sum NC.
+# An independent relational ALU contract, expressed as conservation laws.
+# All operands/results are finite CLP integers. Unlike execute's `is`, this
+# relation also works backwards. Addition conserves A+B across a carry bit;
+# subtraction conserves R+B across an existential borrow bit.
+alu_spec add A B R Z C <-
+  [A,B,R] in 0..255, [Z,C] in 0..1,
+  A + B #= R + 256 * C, reify (R #= 0) Z.
+alu_spec sub A B R Z 0 <-
+  [A,B,R] in 0..255, [Z,Borrow] in 0..1,
+  R + B #= A + 256 * Borrow, reify (R #= 0) Z.
 
-# sub — A := A - B (wrapping), update ZF, set CF to 0
-step (cpu PC A B _ _) (cpu NPC NA B NZ 0) <-
-  instr PC sub,
-  NA is (A - B + 256) % 256,
-  NPC is PC + 1,
-  zflag NA NZ.
+# Every counterexample predicate FIRST enumerates a finite input domain,
+# then executes, then checks the negation of the desired postcondition.
+# A result is a witness. Exhausting the domain without a witness is a proof
+# for that domain, assuming this interpreter and this CPU model are correct.
+claim add_contract.
+claim sub_contract.
+claim add_commutative.
+claim add_sub_inverse.
+claim add_zero.
+claim sub_self.
+claim inc_contract.
+claim dec_contract.
+claim inc_dec_inverse.
+claim dec_inc_inverse.
+claim immediate_normalization.
+claim ldb_preserves.
+claim movb_preserves.
+claim nop_frame.
+claim halt_frame.
+claim branch_contract.
+claim transition_functional.
+claim countdown_rank.
+claim countdown_all_inputs.
+claim halt_absorbs.
 
-# inc — A := A + 1 (8-bit), update ZF and CF
-step (cpu PC A B _ _) (cpu NPC NA B NZ NC) <-
-  instr PC inc,
-  Sum is A + 1,
-  NA is Sum % 256,
-  NPC is PC + 1,
-  zflag NA NZ,
-  cflag Sum NC.
+counterexample add_contract (inputs A B got Answers) <-
+  byte_value A, byte_value B, outcomes add (cpu 0 A B 0 0) Answers,
+  not (Answers = [Next], one_valid Answers, Next = (cpu 1 R B Z C), alu_spec add A B R Z C).
+counterexample sub_contract (inputs A B got Answers) <-
+  byte_value A, byte_value B, outcomes sub (cpu 0 A B 0 0) Answers,
+  not (Answers = [Next], one_valid Answers, Next = (cpu 1 R B Z C), alu_spec sub A B R Z C).
+counterexample add_commutative (inputs A B got Left Right) <-
+  byte_value A, byte_value B,
+  outcomes add (cpu 0 A B 0 0) Left, outcomes add (cpu 0 B A 0 0) Right,
+  not (Left = [cpu 1 X B Z C], Right = [cpu 1 Y A W D],
+       one_valid Left, one_valid Right, X == Y, Z == W, C == D).
+counterexample add_sub_inverse (inputs A B got Results) <-
+  byte_value A, byte_value B,
+  findall R (execute add (cpu 0 A B 0 0) Mid, execute sub Mid (cpu 2 R B _ _)) Results,
+  not (Results == [A]).
+counterexample add_zero (input A got Answers) <-
+  byte_value A, outcomes add (cpu 0 A 0 0 0) Answers,
+  not (Answers = [cpu 1 R 0 _ C], one_valid Answers, R == A, C == 0).
+counterexample sub_self (input A got Answers) <-
+  byte_value A, outcomes sub (cpu 0 A A 0 0) Answers, not (Answers == [cpu 1 0 A 1 0]).
+counterexample inc_contract (input A got Answers) <-
+  byte_value A, outcomes inc (cpu 0 A 37 0 0) Answers,
+  not (Answers = [cpu 1 R 37 Z C], one_valid Answers, alu_spec add A 1 R Z C).
+counterexample dec_contract (input A got Answers) <-
+  byte_value A, outcomes dec (cpu 0 A 37 0 0) Answers,
+  not (Answers = [cpu 1 R 37 Z 0], one_valid Answers, alu_spec sub A 1 R Z 0).
+counterexample inc_dec_inverse (input A got Results) <-
+  byte_value A, findall R (execute inc (cpu 0 A 37 0 0) Mid, execute dec Mid (cpu 2 R 37 _ _)) Results,
+  not (Results == [A]).
+counterexample dec_inc_inverse (input A got Results) <-
+  byte_value A, findall R (execute dec (cpu 0 A 37 0 0) Mid, execute inc Mid (cpu 2 R 37 _ _)) Results,
+  not (Results == [A]).
+# Three complete sets of byte residues, including negative immediates.
+counterexample immediate_normalization (immediate I got Answers) <-
+  Lo is 0 - 256, between Lo 511 I, outcomes (lda I) (cpu 0 99 37 0 1) Answers,
+  Expected is I % 256,
+  not (Answers = [cpu 1 R 37 Z 0], one_valid Answers, R == Expected, zflag R Z).
+counterexample ldb_preserves (inputs A I Z C got Answers) <-
+  byte_value A, byte_value I, flag_value Z, flag_value C,
+  outcomes (ldb I) (cpu 0 A 91 Z C) Answers, not (Answers == [(cpu 1 A I Z C)]).
+counterexample movb_preserves (inputs A B Z C got Answers) <-
+  byte_value A, byte_value B, flag_value Z, flag_value C,
+  outcomes movb (cpu 0 A B Z C) Answers, not (Answers == [(cpu 1 A A Z C)]).
+counterexample nop_frame (inputs A B Z C got Answers) <-
+  byte_value A, byte_value B, flag_value Z, flag_value C,
+  outcomes nop (cpu 0 A B Z C) Answers, not (Answers == [(cpu 1 A B Z C)]).
+counterexample halt_frame (inputs A B Z C got Answers) <-
+  byte_value A, byte_value B, flag_value Z, flag_value C,
+  outcomes hlt (cpu 3 A B Z C) Answers, not (Answers == [(cpu 3 A B Z C)]).
 
-# dec — A := A - 1 (wrapping), update ZF
-step (cpu PC A B _ _) (cpu NPC NA B NZ 0) <-
-  instr PC dec,
-  NA is (A - 1 + 256) % 256,
-  NPC is PC + 1,
-  zflag NA NZ.
+# Exhaust every branch/flag/address combination in this finite PC window.
+# Data values are five boundary representatives, stated explicitly.
+representative 0.
+representative 1.
+representative 127.
+representative 128.
+representative 255.
+branch_op (jmp T) <- between 0 7 T.
+branch_op (jz T) <- between 0 7 T.
+branch_op (jnz T) <- between 0 7 T.
+branch_pc (jmp T) _ _ T.
+branch_pc (jz T) _ 1 T.
+branch_pc (jz _) P 0 Q <- Q is P + 1.
+branch_pc (jnz T) _ 0 T.
+branch_pc (jnz _) P 1 Q <- Q is P + 1.
+counterexample branch_contract (instruction Op from S got Answers) <-
+  branch_op Op, between 0 7 P, representative A, representative B, flag_value Z, flag_value C,
+  S = (cpu P A B Z C), outcomes Op S Answers, branch_pc Op P Z Q,
+  not (Answers == [cpu Q A B Z C]).
 
-# mova — A := B, update ZF
-step (cpu PC _ B _ _) (cpu NPC B B NZ 0) <-
-  instr PC mova,
-  NPC is PC + 1,
-  zflag B NZ.
+# Totality/determinism must not be "proved" by testing only returned answers:
+# missing clauses give zero answers; duplicate clauses give two answers;
+# anonymous output flags give an incomplete state. All three are rejected.
+test_op add.
+test_op sub.
+test_op inc.
+test_op dec.
+test_op mova.
+test_op movb.
+test_op nop.
+test_op hlt.
+test_op (lda I) <- representative I.
+test_op (ldb I) <- representative I.
+test_op Op <- branch_op Op.
+outcomes Op S Answers <- findall Next (execute Op S Next) Answers.
+one_valid [S] <- ground S, valid_state S.
+counterexample transition_functional (instruction Op from S answers Answers) <-
+  test_op Op, between 0 7 P, representative A, representative B, flag_value Z, flag_value C,
+  S = (cpu P A B Z C), findall Next (execute Op S Next) Answers, not (one_valid Answers).
 
-# movb — B := A
-step (cpu PC A _ _ CF) (cpu NPC A A _ CF) <-
-  instr PC movb,
-  NPC is PC + 1.
+# A loop-cycle invariant: at PC=1, positive A decreases strictly in three
+# instructions and stays a byte. At zero the guard exits before decrement.
+counterexample countdown_rank (input A got Answers) <-
+  between 1 255 A, findall Next (run (countdown A) (cpu 1 A 0 0 0) 3 Next) Answers,
+  Expected is A - 1,
+  not (Answers = [cpu 1 R 0 Z 0], one_valid Answers, R < A, R == Expected, zflag R Z).
+# This is exhaustive over all 256 legal initial counter values, not a few
+# hand-picked traces. The exact reach-halt bound is 2 + 3*N, including N=0.
+counterexample countdown_all_inputs (input N steps Steps got Answers) <-
+  byte_value N, Steps is 2 + 3 * N,
+  findall Final (run (countdown N) (cpu 0 0 0 0 0) Steps Final) Answers,
+  not (Answers == [cpu 4 0 0 1 0]).
+counterexample halt_absorbs (steps N got Answers) <-
+  between 0 8 N, findall Final (run addition (cpu 3 245 200 0 0) N Final) Answers,
+  not (Answers == [cpu 3 245 200 0 0]).
 
-# jmp Addr — unconditional jump
-step (cpu PC A B ZF CF) (cpu Addr A B ZF CF) <-
-  instr PC (jmp Addr).
+# Report EVERY named claim, including failures. Unknown claim names fail;
+# they cannot acquire a vacuous `proved` result.
+check Name Result <- claim Name,
+  (once (counterexample Name Witness) -> Result = (refuted Witness) ; Result = proved).
+proof_suite Report <- findall (result Name Outcome) (check Name Outcome) Report.
 
-# jz Addr — jump if ZF = 1
-step (cpu PC A B 1 CF) (cpu Addr A B 1 CF) <-
-  instr PC (jz Addr).
+# Deliberate bugs: a good verifier must produce concrete failing inputs.
+broken_inc A R <- R is A + 1.
+mutant_counterexample no_wrap (input A got R) <- byte_value A, broken_inc A R, not (byte R).
+mutant_counterexample lost_carry (inputs A B) <-
+  byte_value A, byte_value B, R is (A + B) % 256, zflag R Z, not (alu_spec add A B R Z 0).
+# The original ldb pattern produced a free output flag. Detect this WITHOUT
+# binding that free variable to a valid flag in the checker itself.
+broken_ldb I (cpu P A _ _ C) (cpu Q A I _ C) <- Q is P + 1.
+mutant_counterexample undefined_flag (input Z) <-
+  flag_value Z, broken_ldb 7 (cpu 0 23 91 Z 1) Next, not (ground Next).
 
-# jz fall-through when ZF = 0
-step (cpu PC A B 0 CF) (cpu NPC A B 0 CF) <-
-  instr PC (jz _),
-  NPC is PC + 1.
-
-# jnz Addr — jump if ZF = 0
-step (cpu PC A B 0 CF) (cpu Addr A B 0 CF) <-
-  instr PC (jnz Addr).
-
-# jnz fall-through when ZF = 1
-step (cpu PC A B 1 CF) (cpu NPC A B 1 CF) <-
-  instr PC (jnz _),
-  NPC is PC + 1.
-
-# nop
-step (cpu PC A B ZF CF) (cpu NPC A B ZF CF) <-
-  instr PC nop,
-  NPC is PC + 1.
-
-# hlt — halt: state does not change
-step (cpu PC A B ZF CF) (cpu PC A B ZF CF) <-
-  instr PC hlt.
-
-# ─── Execution engine ─────────────────────────────────────────────────────────
-
-# run(StateIn, Steps, StateOut)
-# Runs the CPU for exactly Steps instruction cycles.
-run S 0 S.
-run S N SF <-
-  N > 0,
-  step S S1,
-  N1 is N - 1,
-  run S1 N1 SF.
-
-# ─── Example program A: 45 + 200 = 245 ───────────────────────────────────────
-#
-# addr 0:  lda 45   — A = 45
-# addr 1:  ldb 200  — B = 200
-# addr 2:  add      — A = 245, CF = 0  (no overflow)
-# addr 3:  hlt
-#
-# Initial state: cpu(0, 0, 0, 0, 0)
-# Query (3 steps to reach hlt):
-#   run (cpu 0 0 0 0 0) 3 R?
-
-instr 0 (lda 45).
-instr 1 (ldb 200).
-instr 2 add.
-instr 3 hlt.
-
-# ─── Example program B: countdown loop ───────────────────────────────────────
-# (comment out program A's instr facts and uncomment these to run)
-#
-# Counts A down from 5 to 0 using dec and jnz.
-#
-# addr 0:  lda 5    — A = 5
-# addr 1:  dec      — A = A - 1, set ZF when A reaches 0
-# addr 2:  jnz 1    — if ZF=0, jump back to addr 1
-# addr 3:  hlt      — A = 0
-#
-# Steps to reach hlt: 1 (lda) + 5*(dec + jnz or fall-through) = 11 steps
-# Query:
-#   run (cpu 0 0 0 0 0) 11 R?
-#
-# instr 0 (lda 5).
-# instr 1 dec.
-# instr 2 (jnz 1).
-# instr 3 hlt.
-
-# ─── Example program C: overflow detection ───────────────────────────────────
-# (comment out other instr facts and uncomment these)
-#
-# Adds 200 + 100 = 300, which overflows 8 bits: result = 44, CF = 1
-#
-# addr 0:  lda 200
-# addr 1:  ldb 100
-# addr 2:  add       — A = 44, CF = 1
-# addr 3:  hlt
-#
-# Query:
-#   run (cpu 0 0 0 0 0) 3 R?
-#
-# instr 0 (lda 200).
-# instr 1 (ldb 100).
-# instr 2 add.
-# instr 3 hlt.
-
+# Demos and the complete finite proof report run automatically.
 > run (cpu 0 0 0 0 0) 3 R?
+> run overflow (cpu 0 0 0 0 0) 3 R?
+> trace (countdown 2) (cpu 0 0 0 0 0) 8 States?
+> proof_suite Report?
+> once (mutant_counterexample no_wrap Witness)?
+> once (mutant_counterexample lost_carry Witness)?
+> once (mutant_counterexample undefined_flag Witness)?
+# The SAME specification can synthesize missing inputs, rather than execute.
+> alu_spec add 255 B 0 1 1, label [B]?

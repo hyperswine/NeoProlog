@@ -287,6 +287,13 @@ local qualification limits.
 by unification, and generate a finite family of documents. Run it with
 `infera examples/json_relation.nprolog`.
 
+[`8bitcpu.nprolog`](examples/8bitcpu.nprolog) demonstrates finite formal
+verification: 20 counterexample-based checks of an 8-bit CPU, relational ALU
+contracts, a countdown ranking invariant and deliberately broken instructions.
+Run `infera examples/8bitcpu.nprolog`; the
+[CPU verification tutorial](docs/2026-11-17-CPU-VERIFICATION.md) states the
+exact domains and explains what each proof establishes.
+
 The [term toolkit](docs/2026-11-15-TERM-TOOLKIT.md) provides `functor`, `arg`,
 `univ`, `copy_term`, `term_variables`, `compare` and `clause`, with fresh clause
 reflection for meta-interpreters. Structural requests on lists, zero-arity

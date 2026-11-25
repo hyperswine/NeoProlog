@@ -22,7 +22,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = (
-    "meta_vanilla", "meta_cost", "meta_tabled", "stlc", "datalog", "dpll", "json", "regex", "lisp", "prolog_in_infera", "sudoku4", "river_crossing", "job_shop", "route_planning", "supply_packing",
+    "8bitcpu", "meta_vanilla", "meta_cost", "meta_tabled", "stlc", "datalog", "dpll", "json", "regex", "lisp", "prolog_in_infera", "sudoku4", "river_crossing", "job_shop", "route_planning", "supply_packing",
     "send_more_money", "magic_square", "knight_tour", "peg_solitaire", "mastermind", "water_jugs",
 )
 

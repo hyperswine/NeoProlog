@@ -1,3 +1,4 @@
+# Compact legacy companion. Formal-verification tutorial: 8bitcpu.nprolog.
 # CPU state: cpu PC A B ZF CF
 
 # Flags
@@ -10,7 +11,7 @@ cflag S C <- C is S / 256.
 step (cpu PC _ B _ _) (cpu NPC NA B NZ 0) <- instr PC (lda Imm), NA is Imm % 256, NPC is PC + 1, zflag NA NZ.
 
 # ldb Imm — load immediate into B
-step (cpu PC A _ _ CF) (cpu NPC A NB _ CF) <- instr PC (ldb Imm), NB is Imm % 256, NPC is PC + 1.
+step (cpu PC A _ ZF CF) (cpu NPC A NB ZF CF) <- instr PC (ldb Imm), NB is Imm % 256, NPC is PC + 1.
 
 # add — A := A + B (8-bit), update ZF and CF
 step (cpu PC A B _ _) (cpu NPC NA B NZ NC) <- instr PC add, Sum is A + B, NA is Sum % 256, NPC is PC + 1, zflag NA NZ, cflag Sum NC.
@@ -28,7 +29,7 @@ step (cpu PC A B _ _) (cpu NPC NA B NZ 0) <- instr PC dec, NA is (A - 1 + 256) %
 step (cpu PC _ B _ _) (cpu NPC B B NZ 0) <- instr PC mova, NPC is PC + 1, zflag B NZ.
 
 # movb — B := A
-step (cpu PC A _ _ CF) (cpu NPC A A _ CF) <- instr PC movb, NPC is PC + 1.
+step (cpu PC A _ ZF CF) (cpu NPC A A ZF CF) <- instr PC movb, NPC is PC + 1.
 
 # jmp Addr — unconditional jump
 step (cpu PC A B ZF CF) (cpu Addr A B ZF CF) <- instr PC (jmp Addr).
