@@ -530,3 +530,18 @@ of four JIT/stream combinations; example acceptance passes 86 independent
 queries and 21 demonstrations in each combination. All 56 Python benchmark-
 harness tests pass. These are local results; CI has not been observed for
 this commit.
+
+### Higher-order calls, November 26
+
+The maplist and foldl local controls now carry the same closure argument,
+call the same arithmetic predicate by name, and use the same checksum code.
+Seven-run medians on the local Apple Silicon checkout, subtracting startup,
+were 155 ms for library maplist and 216 ms for its direct loop (300,000
+elements). Library foldl took 373 ms against 88 ms for its direct loop
+(1,000,000 elements). Both checksums matched SWI. These are whole-workload
+comparisons, including any differences in compilation of the two loops.
+The direct fold is a promising prototype for specialization when the closure
+is statically known. The direct map did not improve this workload.
+
+Reproduce with `bench/std-gate.py BINARY --workload maplist --workload foldl --runs 7`.
+Raw data: [higher-order comparison](../bench/results/2026-11-26-higher-order.json).

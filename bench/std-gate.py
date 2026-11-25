@@ -53,13 +53,13 @@ my_len [_ | Xs] A N <- B is A + 1, my_len Xs B N.""", "numlist 1 1000000 L, my_l
     "msort": ("lcg 200000 7 L, msort L S, last S R", """my_last [X] X.
 my_last [_, Y | Ys] X <- my_last [Y | Ys] X.""", "lcg 200000 7 L, msort L S, my_last S R",
         "lcg(200000, 7, L), msort(L, S), last(S, R)"),
-    "maplist": ("numlist 1 300000 L, maplist plus1 L M, sum_list M R", """my_map [] [].
-my_map [X | Xs] [Y | Ys] <- Y is X + 1, my_map Xs Ys.
-my_sum [] S S.
-my_sum [X | Xs] A S <- B is A + X, my_sum Xs B S.""", "numlist 1 300000 L, my_map L M, my_sum M 0 R",
+    "maplist": ("numlist 1 300000 L, maplist plus1 L M, sum_list M R", """plus1 X Y <- Y is X + 1.
+my_map _ [] [].
+my_map F [X | Xs] [Y | Ys] <- plus1 X Y, my_map F Xs Ys.""", "numlist 1 300000 L, my_map plus1 L M, sum_list M R",
         "numlist(1, 300000, L), maplist(plus1, L, M), sum_list(M, R)"),
-    "foldl": ("numlist 1 1000000 L, foldl add L 0 R", """my_fold [] A A.
-my_fold [X | Xs] A R <- B is A + X, my_fold Xs B R.""", "numlist 1 1000000 L, my_fold L 0 R",
+    "foldl": ("numlist 1 1000000 L, foldl add L 0 R", """add X A B <- B is A + X.
+my_fold _ [] A A.
+my_fold F [X | Xs] A R <- add X A B, my_fold F Xs B R.""", "numlist 1 1000000 L, my_fold add L 0 R",
         "numlist(1, 1000000, L), foldl(add, L, 0, R)"),
     "nth1": ("numlist 1 2000 L, nloop 2000 L 0 R", """my_nth 1 [X | _] X.
 my_nth N [_ | Xs] X <- N > 1, M is N - 1, my_nth M Xs X.
