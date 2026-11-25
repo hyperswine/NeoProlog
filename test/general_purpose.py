@@ -48,6 +48,22 @@ def library(t):
     t.pure('<- noprelude.\np a.','findall H (clause H true) Result','[p a]')
     t.pure('odd N <- R is N % 2, R = 1.','partition odd [1,2,3,4] A B, Result = [A,B]','[[1, 3], [2, 4]]')
     t.pure('add X A B <- B is X + A.','foldl add [1,2,3] 0 Result','6')
+    choices = 'pick X _ X.\npick _ A A.'
+    t.pure(choices, 'findall R (foldl pick [1,2] 0 R) Result', '[2, 1, 2, 0]')
+    t.pure(choices, 'foldl pick [] A B, A == B, Result = yes', 'yes')
+    t.pure(choices, 'findall R (foldl pick [1|bad] 0 R) Result', '[]')
+    t.pure('foldl _ _ _ shadow.\nadd X A B <- B is X + A.',
+           'foldl add [1,2] 0 Result', 'shadow')
+    t.pure(choices + '\nrun F L A R <- foldl F L A R.',
+           'findall R (run pick [1,2] 0 R) Dynamic, '
+           'findall R (foldl pick [1,2] 0 R) Static, Static == Dynamic, Result = ok', 'ok')
+    t.pure('plus K X A B <- B is A + X + K.',
+           'foldl (plus 10) [1,2] 0 Result', '23')
+    t.pure('first : unsafe.\nprobe : unsafe.\nfirst X _ X <- !.\nfirst _ A A.',
+           'findall R (member S [0,1], foldl first [2] S R) Result', '[2, 2]')
+    t.pure('dup : table.\ndup X _ X.\ndup X _ X.',
+           'findall R (foldl dup [a] z R) Result', '[a]')
+    t.pure('keep X _ X.', 'foldl keep [A,B] z R, R == B, var A, Result = ok', 'ok')
     t.pure('p a 2.\np b 1.\np a 1.\np a 2.', 'findall (pair K B) (bagof X (p K X) B) Result','[pair a [2, 1, 2], pair b [1]]')
     t.pure('p a 2.\np b 1.\np a 1.\np a 2.', 'setof X (K ^ (p K X)) Result','[1, 2]')
     t.pure('p K K.\np K (box K).', 'bagof T (p K T) [A,box B], A == B, Result = yes', 'yes')

@@ -54,7 +54,7 @@ import Data.Array.Base (numElements, unsafeAt, unsafeFreeze, unsafeRead, unsafeW
 import Data.Array.IO (IOUArray, newArray)
 import Data.Array.Unboxed (UArray)
 import Data.Bits (shiftR, (.&.))
-import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, withMVar)
 import Data.IORef
 import Data.List (nub)
 import Data.Maybe (isJust, isNothing)
@@ -371,6 +371,7 @@ data Ctx = Ctx
     ctxPreds :: Map.Map PredKey PredRef,
     -- | compiling a goal handed to call/N at runtime: nothing is recorded
     ctxDynamic :: Bool,
+    ctxFolds :: Maybe (MVar (Map.Map String PredRef)),
     ctxProblems :: IORef [String],
     -- | slots proven ground, with their sort, at this point of the clause
     ctxFacts :: IORef (IM.IntMap S.Sort),
@@ -391,6 +392,7 @@ subSort a b = joinSort a b == b
 -- and shared by every query against that program.
 data ProgramImage = ProgramImage
   { piPreds :: Map.Map PredKey PredRef,
+    piFolds :: MVar (Map.Map String PredRef),
     piNil :: !Word',
     piCons :: !Word',
     piArith :: !(IM.IntMap ArithOp),
@@ -452,8 +454,9 @@ compileImage syms program = do
     pure (P.predKey p, ref)
   facts <- newIORef IM.empty
   seen <- newIORef IS.empty
+  folds <- newMVar Map.empty
   let table = Map.fromList refs
-      ctx = Ctx syms program table False problems facts seen consW nilW
+      ctx = Ctx syms program table False (Just folds) problems facts seen consW nilW
   forM_ preds $ \p -> do
     compiled <- compilePred ctx p
     writeIORef (table Map.! P.predKey p) compiled
@@ -464,6 +467,7 @@ compileImage syms program = do
   pure
     ProgramImage
       { piPreds = table,
+        piFolds = folds,
         piNil = nilW,
         piCons = consW,
         piArith = IM.fromList arith,
@@ -480,7 +484,7 @@ compileQueryGoals scope query = do
   facts <- newIORef IM.empty
   seen <- newIORef IS.empty
   let ctx =
-        Ctx (scopeSymbols scope) (scopeProgram scope) (piPreds image) False problems
+        Ctx (scopeSymbols scope) (scopeProgram scope) (piPreds image) False (Just (piFolds image)) problems
           facts seen (piCons image) (piNil image)
   goals <- compileBody ctx (S.queryGoals query)
   found <- reverse <$> readIORef problems
@@ -1834,7 +1838,8 @@ compileGoal ctx term = case term of
                   [] -> Nothing
             -- The callee's verified or proven contract gives its outputs.
             forM_ (zip [0 ..] patterns) $ \(i, pattern) -> forM_ (outputFact sigs i) (assumePattern ctx pattern)
-            pure (GCall ref patterns trust)
+            target <- specializeFold ctx f as ref
+            pure (GCall target patterns trust)
       Nothing
         | P.nameHasFlag (ctxProgram ctx) f S.FlagDynamic -> GCallFacts (f, length as) <$> mapM arg as
         | otherwise -> pure (GError (UnknownPredicate (f, length as)))
@@ -1854,6 +1859,44 @@ coreBuiltinGoal f n =
         ("retractall", 1), ("phrase", 2), ("phrase", 3), ("phrase_from_file", 2), ("phrase_from_file", 3)
       ]
         ++ [("call", k) | k <- [1 .. 9]]
+
+-- Compile a private copy of the shipped fold loop for a literal callback.
+-- Keep its four arguments, calling convention and ordinary callback call.
+-- The recursive edge points to the copy only inside this compile context.
+specializeFold :: Ctx -> String -> [Term] -> PredRef -> IO PredRef
+specializeFold ctx "foldl" [Atom callback, _, _, _] _
+  | Just cache <- ctxFolds ctx
+    , let program = ctxProgram ctx
+          key = ("foldl", 4)
+          privateName = "$foldl:" ++ callback
+          privateKey = (privateName, 4)
+    , standardPredicates "std/list" [key] program
+    , Just loop <- P.lookupPred key program
+    , not (P.predIsTabled program loop)
+    , Just callee <- P.lookupPred (callback, 3) program
+    , plainUserCall callback 3
+    , not (P.nameHasFlag program callback S.FlagDynamic || P.predIsTabled program callee)
+    , Nothing <- P.lookupPred privateKey program
+    , Map.notMember privateName (P.progNameFlags program) = modifyMVar cache $ \copies ->
+      case Map.lookup callback copies of
+        Just ref -> pure (copies, ref)
+        Nothing -> do
+          let specialize (Compound "call" (Var _ : args)) = Compound callback args
+              specialize (Compound "foldl" args) = Compound privateName args
+              specialize term = term
+              rename cl = cl { S.clauseHead = specialize (S.clauseHead cl),
+                               S.clauseBody = map specialize (S.clauseBody cl) }
+              copy = loop { P.predKey = privateKey, P.predFlags = P.effectiveFlags program loop, P.predClauses = IM.map rename (P.predClauses loop) }
+              localProgram = program { P.progPreds = Map.insert privateKey copy (P.progPreds program) }
+          ref <- newIORef (error "fold loop compiled later")
+          facts <- newIORef IM.empty
+          seen <- newIORef IS.empty
+          let local = ctx { ctxProgram = localProgram, ctxPreds = Map.insert privateKey ref (ctxPreds ctx),
+                            ctxFacts = facts, ctxSeen = seen, ctxFolds = Nothing }
+          compiled <- compilePred local copy
+          writeIORef ref compiled
+          pure (Map.insert callback ref copies, ref)
+specializeFold _ _ _ original = pure original
 
 -- | Whether a goal with this name and arity reaches an ordinary user
 -- predicate call in 'compileGoal', rather than a control construct or a
@@ -1899,4 +1942,4 @@ compileGoalTerm syms program preds term = do
   seen <- newIORef IS.empty
   nilW <- atmWord <$> internAtom syms "nil"
   consW <- (\f -> funWord f 2) <$> internFunctor syms "cons" 2
-  compileGoal (Ctx syms program preds True problems facts seen consW nilW) term
+  compileGoal (Ctx syms program preds True Nothing problems facts seen consW nilW) term

@@ -545,3 +545,30 @@ is statically known. The direct map did not improve this workload.
 
 Reproduce with `bench/std-gate.py BINARY --workload maplist --workload foldl --runs 7`.
 Raw data: [higher-order comparison](../bench/results/2026-11-26-higher-order.json).
+
+### Compiling a fold with a known callback
+
+For the shipped untabled `foldl/4`, Core now compiles a literal predicate
+name into a direct call inside a private copy of the recursive loop. The
+compiled program shares one copy per eligible callback across clauses and
+queries. Variables and compound closures use ordinary dispatch. The compiler
+also checks the fold definition and contracts and excludes dynamic or tabled
+callbacks. The private copy stays outside the public predicate table.
+
+The one-million-element sum produced 500000500000 in every benchmark.
+Seven-run whole-process medians on Apple Silicon, after subtracting startup:
+
+| Engine | Literal callback | Variable callback | Direct loop |
+| --- | ---: | ---: | ---: |
+| Infera, JIT on | 94 ms | 384 ms | 97 ms |
+| Infera, JIT off | 375 ms | 454 ms | 418 ms |
+
+The largest gain came with native compilation enabled. The same-build
+variable-callback control adds one wrapper invocation per workload. With
+the JIT on, the previous compiler took 373 ms for the literal call. The
+SWI-Prolog control took 102 ms in both new runs. These measurements cover
+integer addition on a ground list; the acceptance suite checks relational
+behavior separately.
+
+[Default benchmark](../bench/results/2026-11-26-fold-specialization.json)
+and [JIT-disabled benchmark](../bench/results/2026-11-26-fold-specialization-no-jit.json).

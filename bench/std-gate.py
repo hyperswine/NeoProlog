@@ -157,6 +157,14 @@ def main():
                    "local_s": w(t_loc, base_i), "swipl_s": w(t_swi, base_s)}
             row["std_vs_swipl"] = (row["std_s"] / row["swipl_s"]) if row["swipl_s"] else None
             row["std_vs_local"] = (row["std_s"] / row["local_s"]) if row["local_s"] else None
+            if name == "foldl":
+                # Same shipped loop, but the callback is supplied by the caller.
+                clauses = INFERA_EXTRA[name] + "\napply_fold F L A R <- foldl F L A R."
+                elapsed, answer = infera(a.binary, d, "foldl_variable", clauses,
+                                         std_goal.replace("foldl add", "apply_fold add"), a.runs)
+                if answer != v_std:
+                    raise SystemExit(f"foldl: variable callback returned {answer}, expected {v_std}")
+                row["variable_callback_s"] = w(elapsed, base_i)
             rows.append(row)
     if a.json:
         print(json.dumps({"startup_infera_s": base_i, "startup_swipl_s": base_s, "rows": rows}, indent=1))
@@ -167,6 +175,8 @@ def main():
     for r in rows:
         print(f"{r['workload']:10} {f(r['std_s']):>8} {f(r['local_s']):>8} {f(r['swipl_s']):>8} "
               f"{f(r['std_vs_swipl'], 2):>10} {f(r['std_vs_local'], 2):>10}")
+        if "variable_callback_s" in r:
+            print(f"  foldl with a variable callback: {r['variable_callback_s']:.3f} s")
 
 
 if __name__ == "__main__":
